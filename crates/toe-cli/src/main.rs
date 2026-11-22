@@ -476,6 +476,14 @@ fn exp_start(
     json: bool,
 ) -> Result<u8> {
     let id = experiment::start(store, name, candidate, against)?;
+    let best = experiment::get(store, name)?.best;
+    let live = experiment::live_tree_variants(store, name, &[candidate, against.unwrap_or(&best)]);
+    if !live.is_empty() {
+        eprintln!(
+            "warning: {} has no snapshot (recorded before snapshots, or outside git) and runs in the live working tree; record it again with `toe exp candidate {name}` to pin it",
+            live.join(", ")
+        );
+    }
     let mut child = spawn_exp_worker(store, &id)?;
     if detach {
         if json {
