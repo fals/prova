@@ -27,7 +27,10 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Ordered migrations; index + 1 is the `user_version` after applying.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_runs.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_runs.sql"),
+    include_str!("migrations/0002_tests.sql"),
+];
 
 pub struct Store {
     conn: Connection,
@@ -219,10 +222,63 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.unchecked_transaction()?;
+        let mut suite: Option<String> = None;
         for e in events {
             insert_event(&tx, &e.run, e.seq, e.ts_ms, &e.kind)?;
+            if let EventKind::TestFinished {
+                test,
+                attempt,
+                outcome,
+                duration_ms,
+                message,
+                source,
+            } = &e.kind
+            {
+                if suite.is_none() {
+                    suite = Some(tx.query_row(
+                        "SELECT suite FROM runs WHERE id = ?1",
+                        params![e.run],
+                        |r| r.get(0),
+                    )?);
+                }
+                let suite = suite.as_deref().unwrap_or_default();
+                let id = test_id(suite, test);
+                tx.execute(
+                    "INSERT OR IGNORE INTO tests (id, suite, file, path, name, display, first_seen_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![id, suite, test.file, serde_json::to_string(&test.path)?, test.name, test.display(), e.ts_ms as i64],
+                )?;
+                let fingerprint = outcome.is_failure().then(|| {
+                    let lines: Vec<String> = message
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .take(5)
+                        .map(str::to_owned)
+                        .collect();
+                    crate::identity::output_fingerprint(&lines)
+                });
+                tx.execute(
+                    "INSERT OR IGNORE INTO attempts
+                       (run_id, test_id, attempt, outcome, duration_ms, message, fingerprint, source, ts_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        e.run, id, attempt, outcome.as_str(), duration_ms.map(|d| d as i64),
+                        message, fingerprint, source.as_u8(), e.ts_ms as i64
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a result file copied to `.toe/artifacts/<sha256>`.
+    pub fn add_artifact(&self, run: &str, kind: &str, source: &str, sha256: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO artifacts (run_id, kind, source, sha256) VALUES (?1, ?2, ?3, ?4)",
+            params![run, kind, source, sha256],
+        )?;
         Ok(())
     }
 
@@ -442,6 +498,17 @@ pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
         .truncate(true)
         .mode(0o600)
         .open(path)
+}
+
+/// Stable test identity (ADR 0006): suite, file, suite path and name.
+pub fn test_id(suite: &str, t: &crate::model::TestKey) -> String {
+    let key = format!(
+        "{suite}\0{}\0{}\0{}",
+        t.file.as_deref().unwrap_or(""),
+        t.path.join("\u{1f}"),
+        t.name
+    );
+    crate::ids::sha256_hex(key.as_bytes())[..16].to_owned()
 }
 
 fn run_status(conn: &Connection, run: &str) -> Result<Status> {

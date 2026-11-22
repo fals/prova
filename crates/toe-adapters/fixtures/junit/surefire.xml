@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="com.acme.CalcTest" time="0.5" tests="5" errors="1" skipped="1" failures="1">
+  <properties><property name="java.version" value="21"/></properties>
+  <testcase name="adds" classname="com.acme.CalcTest" time="0.012"/>
+  <testcase name="divides" classname="com.acme.CalcTest" time="0.003">
+    <failure message="expected:&lt;2&gt; but was:&lt;3&gt;" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected:<2> but was:<3>
+	at com.acme.CalcTest.divides(CalcTest.java:20)]]></failure>
+  </testcase>
+  <testcase name="io" classname="com.acme.CalcTest" time="0.001">
+    <error message="disk gone" type="java.io.IOException">java.io.IOException: disk gone</error>
+  </testcase>
+  <testcase name="later" classname="com.acme.CalcTest" time="0">
+    <skipped message="not yet"/>
+  </testcase>
+  <testcase name="flaky" classname="com.acme.CalcTest" time="0.2">
+    <flakyFailure message="timing" type="AssertionError" time="0.1">AssertionError: timing</flakyFailure>
+    <system-out>retrying</system-out>
+  </testcase>
+</testsuite>

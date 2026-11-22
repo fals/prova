@@ -40,10 +40,18 @@ pub trait Observer {
         Vec::new()
     }
     /// Called after the process exited; may ingest result files.
-    /// Returns events and the level they reach.
-    fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> (Vec<EventKind>, Level) {
-        (Vec::new(), Level::Opaque)
+    fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> ExitReport {
+        ExitReport::default()
     }
+}
+
+/// What an observer found after the process exited.
+#[derive(Debug, Default)]
+pub struct ExitReport {
+    pub events: Vec<EventKind>,
+    pub level: Option<Level>,
+    /// Files to keep as artifacts: (kind, absolute path).
+    pub artifacts: Vec<(String, PathBuf)>,
 }
 
 /// Observer that sees nothing: a level-0 run.
@@ -385,12 +393,17 @@ fn observe_child(
         drain(sup, &mut open_streams, observer);
     }
 
-    let (file_events, file_level) = observer.on_exit(Path::new(store.root()), started_ms);
-    for e in file_events {
+    let report = observer.on_exit(Path::new(store.root()), started_ms);
+    for e in report.events {
         sup.emit(e);
     }
-    if file_level > sup.level {
-        sup.level = file_level;
+    if let Some(l) = report.level
+        && l > sup.level
+    {
+        sup.level = l;
+    }
+    for (kind, path) in &report.artifacts {
+        keep_artifact(store, run, kind, path)?;
     }
     store.set_level(run, sup.level)?;
 
@@ -447,6 +460,25 @@ fn observe_child(
     )
 }
 
+/// Copies a file into `.toe/artifacts/<sha256>` and records it.
+fn keep_artifact(store: &Store, run: &str, kind: &str, path: &Path) -> Result<()> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let sha = crate::ids::sha256_hex(&bytes);
+    let dir = store.root().join(".toe").join("artifacts");
+    crate::store::private_dir(&dir)?;
+    let dest = dir.join(&sha);
+    if !dest.exists() {
+        crate::store::private_file(&dest)?.write_all(&bytes)?;
+    }
+    let source = path
+        .strip_prefix(store.root())
+        .unwrap_or(path)
+        .to_string_lossy();
+    store.add_artifact(run, kind, &source, &sha)
+}
+
 // ------------------------------------------------------------------ wait
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +506,9 @@ pub struct Failure {
     pub test: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// History of this test: seen before, flaky, last passing code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::analysis::FailureContext>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -612,8 +647,8 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
     let row = store.run(run)?;
     let events = store.events_after(run, 0)?;
-    let mut counts = Counts::default();
-    let mut failures = Vec::new();
+    // Final outcome per test: the last attempt counts, retries do not.
+    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
     for e in &events {
@@ -624,18 +659,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 message,
                 ..
             } => {
-                match outcome {
-                    Outcome::Passed => counts.passed += 1,
-                    Outcome::Failed => counts.failed += 1,
-                    Outcome::Skipped => counts.skipped += 1,
-                    Outcome::Errored => counts.errored += 1,
-                }
-                if outcome.is_failure() {
-                    failures.push(Failure {
-                        test: test.display(),
-                        message: message.clone(),
-                    });
-                }
+                finals.insert(
+                    test.display(),
+                    (test.clone(), *outcome, message.clone(), e.seq),
+                );
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { .. } => stalled_ms = None,
@@ -643,13 +670,35 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             _ => {}
         }
     }
+    let mut counts = Counts::default();
+    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64)> = Vec::new();
+    for f in finals.values() {
+        match f.1 {
+            Outcome::Passed => counts.passed += 1,
+            Outcome::Failed => counts.failed += 1,
+            Outcome::Skipped => counts.skipped += 1,
+            Outcome::Errored => counts.errored += 1,
+        }
+        if f.1.is_failure() {
+            failing.push(f);
+        }
+    }
+    failing.sort_by_key(|f| f.3); // in the order they happened
+    let mut failures = Vec::new();
+    for (key, _, message, _) in failing.iter().take(20).copied() {
+        let id = crate::store::test_id(&row.suite, key);
+        failures.push(Failure {
+            test: key.display(),
+            message: message.clone(),
+            context: crate::analysis::failure_context(store, &id, run)?,
+        });
+    }
+    let n_failures = failing.len();
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
     let want_tail = failed_run
         || reason == WaitReason::Stall
         || (reason == WaitReason::Failure && failures.iter().all(|f| f.message.is_none()));
-    let n_failures = failures.len();
-    failures.truncate(20);
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();

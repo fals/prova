@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use toe_core::analysis;
 use toe_core::config::{self, CommandSpec, DEFAULT_KILL_AFTER, DEFAULT_STALL_AFTER, RunSpec};
 use toe_core::engine::{self, NewRunRequest, Summary, Until, WaitReason};
 use toe_core::ids::{now_ms, parse_duration};
@@ -112,6 +113,33 @@ enum Cmd {
         run: String,
         #[arg(long)]
         tail: Option<usize>,
+    },
+    /// History and flake statistics of tests matching a name.
+    History {
+        /// Substring of the test's full name.
+        test: String,
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        window: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tests with flaky evidence: passed on retry, or both passed and failed on the same code.
+    Flaky {
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        window: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare per-test results of two runs.
+    Diff {
+        base: String,
+        head: String,
+        #[arg(long)]
+        json: bool,
     },
     #[command(name = "__supervise", hide = true)]
     Supervise {
@@ -325,6 +353,98 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             Ok(exit::PASSED)
         }
+        Cmd::History {
+            test,
+            suite,
+            window,
+            json,
+        } => {
+            let (store, _, _) = open_here()?;
+            let found = analysis::find_tests(&store, &test, suite.as_deref())?;
+            let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
+            // Same name in several suites: take the one that ran most recently.
+            let displays: std::collections::BTreeSet<&str> =
+                found.iter().map(|t| t.1.as_str()).collect();
+            let pick = match (exact.as_slice(), found.as_slice()) {
+                ([one], _) => one.0.clone(),
+                ([], [one]) => one.0.clone(),
+                (_, [_, ..]) if displays.len() == 1 => analysis::most_recent(&store, &found)?,
+                (_, []) => {
+                    bail!("no test matching {test:?}; tests are recorded from level 1 runs on")
+                }
+                _ => {
+                    println!("{} tests match {test:?}; be more specific:", found.len());
+                    for (_, display, suite) in found.iter().take(20) {
+                        println!("  {display}  (suite {suite})");
+                    }
+                    return Ok(exit::USAGE);
+                }
+            };
+            match analysis::stats(&store, &pick, window)? {
+                Some(s) => render::test_stats(&s, json),
+                None => bail!("test disappeared"),
+            }
+            Ok(exit::PASSED)
+        }
+        Cmd::Flaky {
+            suite,
+            window,
+            json,
+        } => {
+            let (store, _, _) = open_here()?;
+            let list = analysis::flaky(&store, suite.as_deref(), window)?;
+            if json {
+                println!("{}", serde_json::to_string(&list)?);
+            } else if list.is_empty() {
+                println!("no flaky tests in recorded history");
+            } else {
+                for s in &list {
+                    println!(
+                        "{:5.1}% fail  {:2} retry-passes  {:2} same-code flips  {}",
+                        s.failure_rate * 100.0,
+                        s.passed_on_retry,
+                        s.flips_on_same_code,
+                        render::clean(&s.display)
+                    );
+                }
+            }
+            Ok(exit::PASSED)
+        }
+        Cmd::Diff { base, head, json } => {
+            let (store, _, _) = open_here()?;
+            let d = analysis::diff(
+                &store,
+                &store.resolve_run(&base)?,
+                &store.resolve_run(&head)?,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&d)?);
+            } else {
+                println!("diff {} -> {}", d.base, d.head);
+                for (label, v) in [
+                    ("newly failing", &d.newly_failing),
+                    ("fixed", &d.fixed),
+                    ("still failing", &d.still_failing),
+                    ("added", &d.added),
+                    ("removed", &d.removed),
+                ] {
+                    if !v.is_empty() {
+                        println!("{label} ({}):", v.len());
+                        v.iter()
+                            .take(30)
+                            .for_each(|t| println!("  {}", render::clean(t)));
+                    }
+                }
+                for (t, a, b) in &d.slower {
+                    println!("slower: {} {a}ms -> {b}ms", render::clean(t));
+                }
+            }
+            Ok(if d.newly_failing.is_empty() {
+                exit::PASSED
+            } else {
+                exit::FAILED
+            })
+        }
         Cmd::Supervise { root, run } => {
             let store = Store::open(&root)?;
             let row = store.run(&run)?;
@@ -348,6 +468,7 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
     }
     let mut cursor = 0;
     let mut cancel_sent = false;
+    let mut reported: std::collections::BTreeSet<String> = Default::default();
     loop {
         if interrupted.load(std::sync::atomic::Ordering::SeqCst) && !cancel_sent {
             cancel_sent = true;
@@ -368,7 +489,7 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
                 render::summary(&s, json);
                 return Ok(exit_code(&s));
             }
-            WaitReason::Failure | WaitReason::Stall if !json => render::progress(&s),
+            WaitReason::Failure | WaitReason::Stall if !json => render::progress(&s, &mut reported),
             _ => {}
         }
     }
