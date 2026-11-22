@@ -305,6 +305,10 @@ fn in_container(tag: &str, dir: &Path, prepare: &str, script: &str) -> Output {
 
 /// Same check inside the language image.
 fn exp_check_docker(lang: &str, fixture: &str, prepare: &str, args: &str) {
+    exp_check_docker_expect(lang, fixture, prepare, args, VERDICTS);
+}
+
+fn exp_check_docker_expect(lang: &str, fixture: &str, prepare: &str, args: &str, expected: &str) {
     let tag = image(lang);
     let d = copy_fixture_as(fixture, &format!("{fixture}-exp"));
     std::fs::copy(repo().join("fixtures/exp-check.sh"), d.join("exp-check.sh")).unwrap();
@@ -312,7 +316,7 @@ fn exp_check_docker(lang: &str, fixture: &str, prepare: &str, args: &str) {
     let out = String::from_utf8_lossy(&o.stdout);
     assert_eq!(
         out.lines().last().unwrap_or("").trim(),
-        VERDICTS,
+        expected,
         "stdout: {out}\nstderr: {}",
         String::from_utf8_lossy(&o.stderr)
     );
@@ -421,6 +425,23 @@ fn csharp_experiments() {
         "csharp-dotnet",
         "dotnet build -nologo -v q bench",
         "CountPrimes.mean_ns Primes.cs -- dotnet run -c Release --project bench -- --filter '*'",
+    );
+}
+
+/// Spec-gated experiment: the Go fixture's Lean specification (theorems
+/// checked by `lake build`, answers compared with the implementation for
+/// every n < 3000) gates the experiment. The sieve is accepted; a faster
+/// sieve that counts n itself is rejected by the oracle, never measured.
+#[test]
+#[ignore = "large: needs docker (Go + Lean image)"]
+fn go_lean_spec_experiment() {
+    exp_check_docker_expect(
+        "lean",
+        "go-make",
+        "true",
+        "BenchmarkCountPrimes.ns_per_op primes.go --spec spec/Primes.lean --oracle 'sh spec/oracle.sh' \
+         --variants 'faster wrong' -- go test -run '^$' -bench CountPrimes -count 3 .",
+        "faster=accept wrong=reject(spec)",
     );
 }
 

@@ -39,6 +39,13 @@ Each fixture's `experiments/README.md` gives the command and the metric.
 | `java-maven` | JMH | `PrimesBench.countPrimes.ns_per_op` |
 | `csharp-dotnet` | BenchmarkDotNet | `CountPrimes.mean_ns` |
 
+`go-make` also carries a Lean specification of the workload
+(`spec/Primes.lean`: an executable definition plus checked theorems) and a
+fourth change, `wrong`: a faster sieve that miscounts. With `--spec` and
+`--oracle`, toe accepts the correct sieve and rejects the wrong one before
+measuring it (`faster=accept wrong=reject(spec)`, image
+`docker/lean.Dockerfile`).
+
 `exp-check.sh` registers the experiment on the committed baseline and runs
 the three changes against it. The large tests assert, for each language,
 that toe finds the bug per test (not just "the run failed") with an
