@@ -45,14 +45,41 @@ inject = ["pytest-junit"]     # or "go-nocache"; also: toe run --inject <recipe>
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 toe or infrastructure error, 5 still running.
 
-## Performance claims
+## Is the change better?
+
+Speed, step counts, accuracy: one procedure. See what a command yields, then
+declare the experiment before measuring.
 
 ```
-toe exp new speed --hypothesis "cache cuts p50" --metric wall_ms --min-effect 2% -- ./bench.sh
+toe exp metrics -- go test -run '^$' -bench . -count 3       # BenchmarkX.ns_per_op, wall_ms, ...
+toe exp new speed --hypothesis "sieve beats trial division" \
+  --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- go test -run '^$' -bench . -count 3
 # change code (uncommitted; baseline is HEAD)
 toe exp candidate speed
 toe exp run speed             # interleaved trials, Mann-Whitney + Hodges-Lehmann CI, verdict
 ```
+
+Native benchmark output is read directly (`go test -bench`, criterion,
+pytest-benchmark, Vitest bench, JMH, BenchmarkDotNet); anything else prints
+`{"metric": "accuracy", "value": 0.93}` lines. Use `--better higher` for
+accuracy or throughput, `--setup "npm ci"` when the baseline checkout needs
+dependencies installed.
+
+## Specification first
+
+For algorithms and protocols, state what a correct answer is before writing
+code, check that statement, and let it judge (skill `toe-spec`):
+
+```
+quint run spec/ipam.qnt --invariant safety        # the specification holds
+toe run conformance                                # the implementation follows it
+toe exp new ipam-fast --hypothesis "free list makes ADD O(1)" \
+  --spec spec/ipam.qnt --oracle "make conformance" \
+  --metric add_ns --min-effect 10% -- ./bench-add.sh
+```
+
+The specification is frozen with the protocol; a candidate that fails the
+oracle is rejected without being measured.
 
 ## For MCP clients
 

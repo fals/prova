@@ -165,14 +165,18 @@ same data.
 
 ## Experiments
 
-For performance claims: a protocol frozen before data, interleaved trials, and a
-verdict.
+For any claim that a change is better: faster, fewer steps, more accurate. A
+protocol frozen before data, an optional specification that defines a correct
+answer, interleaved trials, and a verdict.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Declared: toe exp new (hypothesis, metric, min effect, trials)
+    [*] --> Declared: toe exp new (hypothesis, metric, min effect, trials, spec, oracle)
     Declared --> Declared: toe exp protocol (allowed until the first trial)
-    Declared --> Running: toe exp run (protocol frozen)
+    Declared --> Checked: toe exp run (protocol frozen), oracle on both arms
+    Checked --> Reject: candidate violates the specification (never measured)
+    Checked --> Failed: baseline violates the specification
+    Checked --> Running: both satisfy it
     Running --> Running: baseline, candidate, baseline, ... (ABAB)
     Running --> Running: inconclusive, add trials up to max
     Running --> Accept: improvement CI clears min effect, guardrails hold
@@ -188,7 +192,24 @@ stateDiagram-v2
 The baseline is a git ref run in a worktree; the candidate is the working tree
 as recorded (toe refuses a candidate whose files changed since). Statistics:
 exact Mann-Whitney U, Hodges-Lehmann interval, Holm correction across an
-improvement loop, verified against SciPy.
+improvement loop, verified against SciPy. Deterministic metrics (accuracy on a
+fixed dataset, step counts) are valid samples.
+
+**Metrics** come from the workload's output: JSON lines
+`{"metric": .., "value": .., "unit": ..}`, or the native benchmark tools
+`go test -bench`, criterion, pytest-benchmark, Vitest bench, JMH and
+BenchmarkDotNet (times normalized to nanoseconds; `go test -count N` repeats
+reduced to their median). `wall_ms` is always recorded. `toe exp metrics --
+<cmd>` lists what a command yields.
+
+**Specification first.** `--spec <file>` freezes the problem's specification
+(Quint, Lean, a labelled dataset) by content hash in the protocol;
+`--oracle <cmd>` (model checker plus trace conformance, property tests, a
+proof build) runs once in each variant before any trial. Only implementations
+that satisfy the specification are measured; a violator can never be
+accepted. The gate is part of the experiment lifecycle spec
+(`spec/experiment.qnt`). The `toe-spec` skill teaches writing the
+specification, checking it, and turning it into an oracle.
 
 ## Storage
 

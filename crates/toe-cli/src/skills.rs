@@ -18,6 +18,26 @@ pub const FILES: &[(&str, &str, &str)] = &[
         include_str!("../../../skills/toe-experiment/SKILL.md"),
     ),
     (
+        "toe-spec",
+        "SKILL.md",
+        include_str!("../../../skills/toe-spec/SKILL.md"),
+    ),
+    (
+        "toe-spec",
+        "references/conformance.md",
+        include_str!("../../../skills/toe-spec/references/conformance.md"),
+    ),
+    (
+        "toe-spec",
+        "examples/ipam.qnt",
+        include_str!("../../../skills/toe-spec/examples/ipam.qnt"),
+    ),
+    (
+        "toe-spec",
+        "examples/shortest.qnt",
+        include_str!("../../../skills/toe-spec/examples/shortest.qnt"),
+    ),
+    (
         "toe-rust",
         "SKILL.md",
         include_str!("../../../skills/toe-rust/SKILL.md"),
@@ -55,7 +75,7 @@ pub const FILES: &[(&str, &str, &str)] = &[
 ];
 
 /// Workflow skills are always installed; language skills when detected.
-pub const WORKFLOW: &[&str] = &["toe-adopt", "toe-test", "toe-experiment"];
+pub const WORKFLOW: &[&str] = &["toe-adopt", "toe-test", "toe-experiment", "toe-spec"];
 
 pub const AGENTS_SECTION: &str = "<!-- toe:begin -->
 ## Tests and experiments: use toe
@@ -65,8 +85,10 @@ Do not run test commands directly or wrap them in timeouts.
 
 - Tests: `toe run <suite> --detach`, then `toe wait <run>`; fix the first
   failure while it runs. Skill: `toe-test`.
-- Performance claims: `toe exp ...` with a frozen protocol and a verdict.
-  Skill: `toe-experiment`.
+- Claims that a change is better (faster, fewer steps, more accurate): `toe exp ...` with a
+  frozen protocol and a verdict. Skill: `toe-experiment`.
+- Algorithms and protocols: write the specification first, check it, then
+  implement and judge with it as the oracle. Skill: `toe-spec`.
 - Suites are in `toe.toml`; no `toe.toml` yet? Start with skill
   `toe-adopt`. History lives in the toe home (`~/.local/share/toe`), shared
   by all clones and worktrees.
