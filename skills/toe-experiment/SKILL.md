@@ -100,7 +100,7 @@ changed since it was recorded.
 - `INCONCLUSIVE` turns into more trials up to `--max-trials`, then `REJECT`.
 - `INVALID`: trials ran on different machines; rerun on one machine.
 - Failed comparison: a trial or the setup crashed, or the baseline violates
-  the specification; the reason names the log.
+  the specification; `toe exp log <name>` prints what failed.
 
 Before reporting: `toe exp revalidate <name>` runs the best against the
 original baseline with fresh trials. `toe exp status <name>` shows the

@@ -214,19 +214,35 @@ specification, checking it, and turning it into an oracle.
 
 ## Storage
 
-One toe home per user; the
-project's folder keeps nothing.
+One toe home per user; the project's folder keeps nothing, and a finished
+run is rows in one SQLite file per repository: no log files pile up.
 
 ```text
 ~/.local/share/toe/            (TOE_HOME)
   catalog.db                   repositories and where they were seen
   repos/<repo-id>/
-    toe.db                     runs, events, tests, attempts, experiments
-    runs/<run>/output.log      captured output (owner-only)
-    artifacts/<sha256>         result files
-    experiments/<id>/          trial logs
-    worktrees/<commit>/        baselines for experiments
+    toe.db                     runs, events, tests, attempts, experiments,
+                               and the kept output (compressed)
+    runs/<run>/output.log      only while the run is live (owner-only)
+    experiments/<id>/          only while a comparison runs
+    worktrees/<commit>/        only while a comparison runs
 ```
+
+What is kept of the output once a run ends:
+
+- every test's outcome, duration and message, as before;
+- each **failing** test's own output (stack trace, captured output, from the
+  stream or the result file), up to 64 KB;
+- an **excerpt** of the run's output: the first lines, every block that looks
+  like an error with its context, and the last lines, up to 64 KB, with the
+  elided parts counted. A passed run keeps its last 20 lines;
+- for experiments, the output of a trial, setup or oracle that failed.
+
+Kept output is compressed and shares a 64 MB budget per repository; the
+oldest is dropped first, and results and history are never dropped. Read it
+with `toe output <run>` (text), `toe output <run> --test <name>`, `--json`
+(sections and elided counts for agents), and `toe exp log <experiment>`.
+`toe run --keep-output` keeps the whole output of one run.
 
 - The repository id comes from its first commit, so clones and worktrees share
   one history.
@@ -269,7 +285,7 @@ These are stable interfaces; changing them is a breaking change.
 | `toe run <suite> [--select <test>] [--detach]` / `toe run -- <cmd>` | start a run |
 | `toe wait <run> [--until first-failure\|stall\|done] [--after <seq>] [--max-wait 30s]` | next significant event |
 | `toe cancel <run>` | stop the process group |
-| `toe status [<run>] [--all]`, `toe output <run> [--tail N]`, `toe events <run>` | inspect |
+| `toe status [<run>] [--all]`, `toe output <run> [--tail N] [--test <name>] [--json]`, `toe events <run>` | inspect |
 | `toe history <test>`, `toe flaky`, `toe diff <a> <b>`, `toe sizes` | memory |
 | `toe exp new\|candidate\|run\|wait\|status\|revalidate` | experiments |
 | `toe init`, `toe adopt [--write] [--verify <suite> --filter <test>]` | adoption |
