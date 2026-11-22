@@ -33,6 +33,15 @@ toe run default --select <test>
 toe history <test>            # new failure, flaky, or pre-existing?
 ```
 
+Hidden detail behind the project's own command (`pytest -q`, Go's test
+cache)? Opt in per suite, never by default:
+
+```toml
+[suite.make]
+run = "make test"
+inject = ["pytest-junit"]     # or "go-nocache"; also: toe run --inject <recipe> -- <command>
+```
+
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 toe or infrastructure error, 5 still running.
 

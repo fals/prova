@@ -74,6 +74,9 @@ enum Cmd {
         /// Kill the run after this long in total (e.g. 30m).
         #[arg(long)]
         kill_after: Option<String>,
+        /// Opt-in environment injection recipe (repeatable), e.g. pytest-junit.
+        #[arg(long = "inject")]
+        inject: Vec<String>,
         #[arg(long)]
         json: bool,
         /// Command to run, after `--`.
@@ -533,6 +536,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
     if let (Some(suite), Some(filter)) = (verify, filter) {
         let cfg = config::load(&root)?;
         let spec = cfg.run_spec(&suite, Some(&filter))?;
+        toe_adapters::inject::validate(&spec.inject).map_err(|e| anyhow!(e))?;
         let s = run_to_end(
             &store,
             &NewRunRequest {
@@ -784,6 +788,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             detach,
             stall_after,
             kill_after,
+            inject,
             json,
             command,
         } => {
@@ -807,6 +812,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     kill_after_ms: DEFAULT_KILL_AFTER.as_millis() as u64,
                     results: Vec::new(),
                     adapter: None,
+                    inject: Vec::new(),
                 };
                 (config::implicit_suite(&command, &rel), spec, cwd)
             } else {
@@ -837,6 +843,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             if let Some(ms) = duration_arg(&kill_after, "kill-after")? {
                 spec.kill_after_ms = ms;
             }
+            for name in inject {
+                if !spec.inject.contains(&name) {
+                    spec.inject.push(name);
+                }
+            }
+            toe_adapters::inject::validate(&spec.inject).map_err(|e| anyhow!(e))?;
             let id = engine::create_run(
                 &store,
                 &NewRunRequest {

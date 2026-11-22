@@ -1,0 +1,119 @@
+//! Medium tests: opt-in environment injection (ADR 0013 section 6, #33).
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const TOE: &str = env!("CARGO_BIN_EXE_toe");
+
+fn workspace(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("toe-inject-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn toe(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut c = Command::new(TOE);
+    c.args(args)
+        .current_dir(dir)
+        .env_remove("PYTEST_ADDOPTS")
+        .env_remove("GOFLAGS");
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.output().unwrap()
+}
+
+fn json(o: &Output) -> serde_json::Value {
+    serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)))
+}
+
+/// Pretends to be pytest: writes JUnit where PYTEST_ADDOPTS asks, if asked.
+const FAKE_PYTEST: &str = r#"
+out=$(printf '%s' "$PYTEST_ADDOPTS" | sed -n 's/.*--junitxml=\([^ ]*\).*/\1/p')
+echo "1 failed, 2 passed in 0.01s"
+[ -n "$out" ] && cat > "$out" <<XML
+<testsuite name="pytest"><testcase classname="tests.test_m" name="test_a"/><testcase classname="tests.test_m" name="test_b"/><testcase classname="tests.test_m" name="test_c"><failure message="boom"/></testcase></testsuite>
+XML
+exit 1
+"#;
+
+#[test]
+fn nothing_is_injected_unless_asked() {
+    let d = workspace("off");
+    let s = json(&toe(
+        &d,
+        &["run", "--json", "--", "sh", "-c", FAKE_PYTEST],
+        &[],
+    ));
+    assert_eq!(s["level"], "opaque");
+    assert!(
+        s["notes"]
+            .as_array()
+            .is_none_or(|n| n.iter().all(|m| !m.as_str().unwrap().contains("injected")))
+    );
+}
+
+#[test]
+fn pytest_junit_recipe_lifts_the_run_and_is_visible() {
+    let d = workspace("pytest");
+    std::fs::write(
+        d.join("toe.toml"),
+        "[suite.py]\nrun = \"sh fake.sh\"\ninject = [\"pytest-junit\"]\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("fake.sh"), FAKE_PYTEST).unwrap();
+    let s = json(&toe(&d, &["run", "py", "--json"], &[]));
+    assert_eq!(s["level"], "result_files", "{s}");
+    assert_eq!(s["counts"]["passed"], 2);
+    assert_eq!(s["failures"][0]["test"], "tests.test_m::test_c");
+    let notes = s["notes"].to_string();
+    assert!(
+        notes.contains("injected by toe.toml (opt-in): PYTEST_ADDOPTS=--junitxml="),
+        "{notes}"
+    );
+    assert!(
+        !d.join("pytest-junit.xml").exists(),
+        "report goes to the run's private dir"
+    );
+}
+
+#[test]
+fn recipes_append_to_the_users_own_value() {
+    let d = workspace("append");
+    let o = toe(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--inject",
+            "go-nocache",
+            "--",
+            "sh",
+            "-c",
+            r#"[ "$GOFLAGS" = "-mod=mod -count=1" ]"#,
+        ],
+        &[("GOFLAGS", "-mod=mod")],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
+
+#[test]
+fn unknown_recipes_are_refused_before_running() {
+    let d = workspace("unknown");
+    let o = toe(&d, &["run", "--inject", "path-shims", "--", "true"], &[]);
+    assert_eq!(o.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("known: pytest-junit, go-nocache"));
+    assert!(
+        !d.join(".toe/runs").exists()
+            || std::fs::read_dir(d.join(".toe/runs")).unwrap().count() == 0
+    );
+}

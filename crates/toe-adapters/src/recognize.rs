@@ -459,13 +459,27 @@ fn split_rust_path(name: &str) -> (Vec<String>, String) {
     }
 }
 
+/// "tests/test_x.py::TestCls::test_a[p]" -> path ["tests.test_x.TestCls"],
+/// name "test_a[p]": the same key pytest's JUnit report produces
+/// (classname, name), so live and file results are one test.
 fn pytest_key(id: &str) -> TestKey {
-    // "tests/test_x.py::TestCls::test_a[param]"
     let mut parts: Vec<&str> = id.split("::").collect();
     let name = parts.pop().unwrap_or(id).to_owned();
-    let file = parts.first().map(|f| f.to_string());
-    let path = parts.iter().skip(1).map(|p| p.to_string()).collect();
-    TestKey { file, path, name }
+    let mut class: Vec<String> = Vec::new();
+    if let Some(file) = parts.first() {
+        class.push(file.trim_end_matches(".py").replace('/', "."));
+    }
+    class.extend(parts.iter().skip(1).map(|p| p.to_string()));
+    let path = if class.is_empty() {
+        Vec::new()
+    } else {
+        vec![class.join(".")]
+    };
+    TestKey {
+        file: None,
+        path,
+        name,
+    }
 }
 
 #[cfg(test)]
@@ -586,12 +600,16 @@ mod tests {
         let EventKind::TestFinished { test, message, .. } = &ev[2] else {
             panic!()
         };
-        assert_eq!(test.file.as_deref(), Some("tests/test_x.py"));
+        assert_eq!(
+            test.path,
+            vec!["tests.test_x".to_string()],
+            "same as pytest JUnit classname"
+        );
         assert_eq!(message.as_deref(), Some("AssertionError: assert 1 == 2"));
         let EventKind::TestFinished { test, .. } = &ev[1] else {
             panic!()
         };
-        assert_eq!(test.path, vec!["TestK".to_string()]);
+        assert_eq!(test.path, vec!["tests.test_x.TestK".to_string()]);
     }
 
     #[test]

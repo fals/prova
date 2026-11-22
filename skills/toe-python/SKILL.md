@@ -7,7 +7,10 @@ description: toe setup details for Python projects (pytest). Use together with t
 
 - Use `python3 -m pytest -v -rfE`: `-v` prints each test (recognized live)
   and `-rfE` prints the failure summary lines that carry messages.
-- `pytest -q` prints dots: toe sees failures only at the end.
+- `pytest -q` prints dots: toe sees failures only at the end. If the
+  project's own command must stay as is, opt in to `inject = ["pytest-junit"]`
+  in the suite: toe adds `--junitxml` through `PYTEST_ADDOPTS` (shown in
+  every summary) and gets every test with its message and duration.
 - JUnit for full detail and durations: add `--junitxml=reports/junit.xml`;
   toe ingests it after the run.
 - Single test: `select = "python3 -m pytest -v -rfE -k {filter}"`. `-k`

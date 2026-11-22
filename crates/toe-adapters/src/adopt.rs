@@ -268,6 +268,25 @@ pub fn to_toml(p: &Proposal) -> String {
         if let Some(sel) = &suite.select {
             s.push_str(&format!("select = {sel:?}\n"));
         }
+        // The project's own command hides detail; offer the opt-in recipe.
+        if p.existing.as_deref() == Some(suite.run.as_str()) {
+            for (lang, recipe, what) in [
+                (
+                    "python",
+                    "pytest-junit",
+                    "per-test results from pytest via PYTEST_ADDOPTS",
+                ),
+                (
+                    "go",
+                    "go-nocache",
+                    "stop go replaying cached passes via GOFLAGS",
+                ),
+            ] {
+                if p.languages.iter().any(|l| l == lang) {
+                    s.push_str(&format!("# inject = [\"{recipe}\"]  # opt-in: {what}\n"));
+                }
+            }
+        }
     }
     s
 }
@@ -306,6 +325,23 @@ mod tests {
         assert_eq!(
             parsed["suite"]["default"]["run"].as_str(),
             Some("make test")
+        );
+    }
+
+    #[test]
+    fn own_command_gets_an_opt_in_injection_hint() {
+        let p = propose(&dir(
+            "hint",
+            &[
+                ("pytest.ini", "[pytest]"),
+                ("Makefile", "test: lint\n\truff .\n\tpytest -q\n"),
+            ],
+        ));
+        let t = to_toml(&p);
+        assert!(t.contains("# inject = [\"pytest-junit\"]"), "{t}");
+        assert!(
+            !t.contains("\ninject ="),
+            "only a comment: injection stays opt-in"
         );
     }
 

@@ -151,10 +151,25 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     go(&segs(pattern), &segs(path))
 }
 
-impl Observer for ResultFiles {
-    fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
+/// Regular files directly inside `dir`, sorted.
+pub fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+impl ResultFiles {
+    /// Parses result files into test events; unparseable files are skipped.
+    pub fn ingest(&self, paths: Vec<PathBuf>) -> ExitReport {
         let mut report = ExitReport::default();
-        for path in self.find(root, started_ms) {
+        for path in paths {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -185,6 +200,12 @@ impl Observer for ResultFiles {
             report.level = Some(Level::ResultFiles);
         }
         report
+    }
+}
+
+impl Observer for ResultFiles {
+    fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
+        self.ingest(self.find(root, started_ms))
     }
 }
 
