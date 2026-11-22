@@ -54,6 +54,9 @@ fn replay(path: &PathBuf) -> usize {
                 let holds = picks["holds"]["value"].as_bool().unwrap();
                 assert!(c.check_spec(arm, holds), "{ctx}: engine refused spec check");
             }
+            // The live tree changing is outside the engine: arms run from
+            // their snapshots, so nothing in the comparison moves.
+            "editWorkTree" => {}
             "rejectViolation" => {
                 assert!(
                     c.reject_violation().is_some(),
@@ -75,6 +78,10 @@ fn replay(path: &PathBuf) -> usize {
         assert_eq!(c.verdict, verdict(&s["verdict"]), "{ctx}: verdict");
         assert_eq!(c.base_spec, check(&s["baseSpec"]), "{ctx}: baseline spec");
         assert_eq!(c.cand_spec, check(&s["candSpec"]), "{ctx}: candidate spec");
+        assert!(
+            int(&s["measured"]) == 0 || int(&s["measured"]) == int(&s["recorded"]),
+            "{ctx}: measured content differs from the recorded snapshot"
+        );
         // Disabled actions in the spec must be refused by the engine too.
         let mut probe = c.clone();
         let spec_can_decide = s["verdict"]["tag"] == "NoVerdict" && c.base >= 2 && c.cand >= 2;
