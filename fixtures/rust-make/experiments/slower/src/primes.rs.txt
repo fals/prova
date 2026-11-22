@@ -1,0 +1,19 @@
+/// Number of primes below `n` (trial division by every divisor).
+pub fn count_primes(n: u32) -> u32 {
+    let mut count = 0;
+    for k in 2..n {
+        let mut prime = true;
+        let mut d = 2;
+        while d * d <= k {
+            if k % d == 0 {
+                prime = false;
+                break;
+            }
+            d += 1;
+        }
+        if prime {
+            count += 1;
+        }
+    }
+    count
+}

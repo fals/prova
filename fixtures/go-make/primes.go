@@ -1,0 +1,26 @@
+package calc
+
+// CountPrimes returns the number of primes below n (trial division).
+func CountPrimes(n int) int {
+	count := 0
+	for k := 2; k < n; k++ {
+		if k == 2 {
+			count++
+			continue
+		}
+		if k%2 == 0 {
+			continue
+		}
+		prime := true
+		for d := 3; d*d <= k; d += 2 {
+			if k%d == 0 {
+				prime = false
+				break
+			}
+		}
+		if prime {
+			count++
+		}
+	}
+	return count
+}

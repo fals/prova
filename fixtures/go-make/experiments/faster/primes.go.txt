@@ -1,0 +1,20 @@
+package calc
+
+// CountPrimes returns the number of primes below n (sieve of Eratosthenes).
+func CountPrimes(n int) int {
+	if n < 3 {
+		return 0
+	}
+	composite := make([]bool, n)
+	count := 0
+	for k := 2; k < n; k++ {
+		if composite[k] {
+			continue
+		}
+		count++
+		for m := k * k; m < n; m += k {
+			composite[m] = true
+		}
+	}
+	return count
+}

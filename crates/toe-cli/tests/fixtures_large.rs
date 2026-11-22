@@ -5,6 +5,9 @@
 //!
 //! Go and Rust use the host toolchain. Python, TypeScript, Java and C# run
 //! inside official images with toe copied in (`COPY --from`, ADR 0010).
+//! Each fixture also runs its native benchmark as toe experiments: the
+//! prepared `faster` change must be accepted, `same` and `slower` rejected.
+//!
 //! Opt-in: `toe run large` (or `cargo test -p toe-cli --test fixtures_large -- --ignored`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -19,8 +22,12 @@ fn repo() -> PathBuf {
 }
 
 fn copy_fixture(name: &str) -> PathBuf {
+    copy_fixture_as(name, name)
+}
+
+fn copy_fixture_as(name: &str, copy: &str) -> PathBuf {
     let src = repo().join("fixtures").join(name);
-    let d = std::env::temp_dir().join(format!("toe-large-{name}-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("toe-large-{copy}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     assert!(
         Command::new("cp")
@@ -133,6 +140,81 @@ fn rust() {
     check_host("rust-make", &["make", "test"], "divides");
 }
 
+const VERDICTS: &str = "faster=accept same=reject slower=reject";
+
+/// Runs fixtures/exp-check.sh in a copy of the fixture with the built toe.
+fn exp_check_host(fixture: &str, args: &[&str]) {
+    let d = copy_fixture_as(fixture, &format!("{fixture}-exp"));
+    std::fs::copy(repo().join("fixtures/exp-check.sh"), d.join("exp-check.sh")).unwrap();
+    let bin = Path::new(TOE).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let o = Command::new("sh")
+        .arg("exp-check.sh")
+        .args(args)
+        .current_dir(&d)
+        .env("PATH", path)
+        .env("TOE_HOME", home_of(&d))
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        out.trim(),
+        VERDICTS,
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+#[test]
+#[ignore = "large: needs go"]
+fn go_experiments() {
+    exp_check_host(
+        "go-make",
+        &[
+            "BenchmarkCountPrimes.ns_per_op",
+            "primes.go",
+            "--",
+            "go",
+            "test",
+            "-run",
+            "^$",
+            "-bench",
+            "CountPrimes",
+            "-count",
+            "3",
+            ".",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "large: needs cargo, compiles criterion"]
+fn rust_experiments() {
+    exp_check_host(
+        "rust-make",
+        &[
+            "count_primes.time_ns",
+            "src/primes.rs",
+            "--",
+            "cargo",
+            "bench",
+            "-q",
+            "--bench",
+            "primes",
+            "--",
+            "--warm-up-time",
+            "1",
+            "--measurement-time",
+            "2",
+            "--noplot",
+        ],
+    );
+}
+
 // ------------------------------------------------------------- docker
 
 fn docker(args: &[&str]) -> Output {
@@ -221,6 +303,21 @@ fn in_container(tag: &str, dir: &Path, prepare: &str, script: &str) -> Output {
     ])
 }
 
+/// Same check inside the language image.
+fn exp_check_docker(lang: &str, fixture: &str, prepare: &str, args: &str) {
+    let tag = image(lang);
+    let d = copy_fixture_as(fixture, &format!("{fixture}-exp"));
+    std::fs::copy(repo().join("fixtures/exp-check.sh"), d.join("exp-check.sh")).unwrap();
+    let o = in_container(&tag, &d, prepare, &format!("sh exp-check.sh {args}"));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        out.lines().last().unwrap_or("").trim(),
+        VERDICTS,
+        "stdout: {out}\nstderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 fn check_docker(lang: &str, fixture: &str, prepare: &str, cmd: &str, bug: &str) {
     let tag = image(lang);
     let d = copy_fixture(fixture);
@@ -280,6 +377,50 @@ fn csharp() {
         "dotnet build -nologo -v q",
         "dotnet test --no-build",
         "Divides",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker"]
+fn python_experiments() {
+    exp_check_docker(
+        "python",
+        "python-make",
+        "true",
+        "test_count_primes.median_ns primes.py -- python3 -m pytest benchmarks -q -p no:cacheprovider --benchmark-only --benchmark-min-rounds=5 --benchmark-columns=min,max,mean,median,stddev,rounds",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and npm registry access"]
+fn typescript_experiments() {
+    exp_check_docker(
+        "node",
+        "ts-vitest",
+        "npm install --no-audit --no-fund",
+        "countPrimes.mean_ns src/primes.ts --setup 'npm install --no-audit --no-fund' -- npx vitest bench --run",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and Maven Central access"]
+fn java_experiments() {
+    exp_check_docker(
+        "java",
+        "java-maven",
+        "mvn -q -B -Pbench package -DskipTests",
+        "PrimesBench.countPrimes.ns_per_op src/main/java/calc/Primes.java -- sh bench.sh",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and NuGet access"]
+fn csharp_experiments() {
+    exp_check_docker(
+        "dotnet",
+        "csharp-dotnet",
+        "dotnet build -nologo -v q bench",
+        "CountPrimes.mean_ns Primes.cs -- dotnet run -c Release --project bench -- --filter '*'",
     );
 }
 

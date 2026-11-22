@@ -5,3 +5,10 @@ edition = "2021"
 
 # Standalone: not part of the toe workspace.
 [workspace]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "primes"
+harness = false

@@ -1,0 +1,16 @@
+// Number of primes below n, by trial division over odd divisors.
+export function countPrimes(n: number): number {
+  if (n <= 2) return 0;
+  let count = 1; // 2 is the only even prime
+  for (let k = 3; k < n; k += 2) {
+    let prime = true;
+    for (let d = 3; d * d <= k; d += 2) {
+      if (k % d === 0) {
+        prime = false;
+        break;
+      }
+    }
+    if (prime) count++;
+  }
+  return count;
+}
