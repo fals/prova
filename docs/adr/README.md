@@ -20,5 +20,6 @@ All records below are **Proposed** and wait for review. Evidence lives in [`../r
 | [0011](0011-formalization-quint-not-lean.md) | Formalization: Quint spec, Lean deferred | **yes**: Lean not used in v1 |
 | [0012](0012-skills-packaging.md) | Skills: Agent Skills standard, workflow plus language skills | no |
 | [0013](0013-black-box-adoption.md) | Black-box adoption and fidelity ladder; amends 0001, 0003, 0004, 0005, 0012 | refines "bring your own suite" |
+| [0014](0014-storage-scope-across-repositories.md) | Storage scope: one store per repository shared by worktrees, repository identity, optional cross-repository index | no |
 
 The three deviations are the points most worth challenging in review.
