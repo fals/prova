@@ -21,6 +21,33 @@ pub struct Ladder {
     inject: Vec<String>,
     /// Where injected reports are written (the run's private directory).
     inject_dir: Option<std::path::PathBuf>,
+    /// Side streams the framework appends to, read live.
+    streams: Vec<Stream>,
+}
+
+/// A file read like output: from where the last read stopped, whole lines.
+struct Stream {
+    path: std::path::PathBuf,
+    offset: u64,
+    partial: String,
+}
+
+impl Stream {
+    fn read_lines(&mut self) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(self.offset)).is_err() || f.read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        self.offset += buf.len() as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&buf));
+        let mut lines: Vec<String> = self.partial.split('\n').map(str::to_owned).collect();
+        self.partial = lines.pop().unwrap_or_default();
+        lines
+    }
 }
 
 pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
@@ -29,6 +56,7 @@ pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
         files: results::ResultFiles::new(&spec.results),
         inject: spec.inject.clone(),
         inject_dir: None,
+        streams: Vec::new(),
     })
 }
 
@@ -45,6 +73,19 @@ impl Observer for Ladder {
         if toe_core::store::private_dir(&dir).is_err() {
             return Vec::new();
         }
+        for (name, content) in inject::files(&self.inject) {
+            if std::fs::write(dir.join(name), content).is_err() {
+                return Vec::new();
+            }
+        }
+        self.streams = inject::streams(&self.inject)
+            .into_iter()
+            .map(|name| Stream {
+                path: dir.join(name),
+                offset: 0,
+                partial: String::new(),
+            })
+            .collect();
         self.inject_dir = Some(dir.clone());
         inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
@@ -53,17 +94,41 @@ impl Observer for Ladder {
         self.live.line(line)
     }
 
+    fn poll(&mut self, _now_ms: u64) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        for i in 0..self.streams.len() {
+            for line in self.streams[i].read_lines() {
+                out.extend(self.live.line(line.trim_end()));
+            }
+        }
+        out
+    }
+
     /// Result files are authoritative for tests the live output missed;
     /// tests already reported live are not reported twice. Disagreements
     /// are logged as recognizer defects (supervisor.log).
     fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
-        let held = self.live.finish();
+        // Whatever the streams got after the last tick, including a final
+        // line without a newline.
+        let mut held = self.poll(0);
+        for i in 0..self.streams.len() {
+            let rest = std::mem::take(&mut self.streams[i].partial);
+            if !rest.trim().is_empty() {
+                held.extend(self.live.line(rest.trim_end()));
+            }
+        }
+        held.extend(self.live.finish());
         let mut report = self.files.on_exit(root, started_ms);
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
             report.events.extend(injected.events);
             report.artifacts.extend(injected.artifacts);
             report.level = report.level.max(injected.level);
+            for st in &self.streams {
+                if st.path.exists() {
+                    report.artifacts.push(("stream".into(), st.path.clone()));
+                }
+            }
         }
         // Live and file results are matched by display name (best effort:
         // result files rarely carry the same file attribute).
@@ -92,13 +157,13 @@ impl Observer for Ladder {
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
         let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
         let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
-        if self.live.reported_total > seen {
+        if self.live.total() > seen {
             report.events.push(EventKind::RunNote {
                 message: format!(
                     "the framework reported {} tests but toe saw {seen} individually (condensed or quiet output): \
                      passing tests are not recorded, so flaky detection and durations are incomplete. \
                      Run the framework with verbose output or a JUnit report (`toe adopt` shows how).",
-                    self.live.reported_total
+                    self.live.total()
                 ),
             });
         }

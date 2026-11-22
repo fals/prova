@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.46s
+     Running unittests src/lib.rs (target/debug/deps/calc-da887a491089d60a)
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "tests::adds" }
+{ "type": "test", "event": "started", "name": "tests::divides" }
+{ "type": "test", "event": "started", "name": "tests::flaky_clock" }
+{ "type": "test", "event": "started", "name": "tests::hangs_when_asked" }
+{ "type": "test", "event": "started", "name": "tests::slow_integration" }
+{ "type": "test", "name": "tests::adds", "event": "ok", "exec_time": 0.00000022 }
+{ "type": "test", "name": "tests::flaky_clock", "event": "ok", "exec_time": 0.000000281 }
+{ "type": "test", "name": "tests::divides", "event": "failed", "exec_time": 0.000018105, "stdout": "\nthread 'tests::divides' (1472737) panicked at src/lib.rs:23:9:\nassertion `left == right` failed\n  left: 16\n right: 4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "test", "name": "tests::hangs_when_asked", "event": "ok", "exec_time": 0.000002605 }
+{ "type": "test", "name": "tests::slow_integration", "event": "ok", "exec_time": 1.500058767 }
+{ "type": "suite", "event": "failed", "passed": 4, "failed": 1, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.5003496699999999 }
+error: test failed, to rerun pass `--lib`

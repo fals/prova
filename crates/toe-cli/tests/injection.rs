@@ -112,7 +112,10 @@ fn unknown_recipes_are_refused_before_running() {
     let d = workspace("unknown");
     let o = toe(&d, &["run", "--inject", "path-shims", "--", "true"], &[]);
     assert_eq!(o.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("known: pytest-junit, go-nocache"));
+    assert!(
+        String::from_utf8_lossy(&o.stderr)
+            .contains("known: pytest-junit, pytest-reportlog, vitest-stream, go-nocache")
+    );
     let status = toe(&d, &["status", "--json"], &[]);
     assert_eq!(
         String::from_utf8_lossy(&status.stdout).trim(),
@@ -124,4 +127,53 @@ fn unknown_recipes_are_refused_before_running() {
 /// Isolated toe home for a test workspace, outside it (ADR 0014).
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
+}
+
+/// Pretends to be Vitest with toe's reporter: writes a failure to the
+/// stream file, then keeps running. Nothing goes to stdout.
+const FAKE_STREAMING: &str = r#"
+[ -f "$TOE_VITEST_REPORTER" ] || { echo "reporter not materialized"; exit 3; }
+printf '%s\n' '{"type":"test","event":"started","name":"divides","file":"src/calc.test.ts"}' >> "$TOE_STREAM"
+printf '%s\n' '{"type":"test","event":"failed","name":"divides","file":"src/calc.test.ts","exec_time":0.004,"message":"expected 16 to be 4"}' >> "$TOE_STREAM"
+printf '%s' '{"type":"test","event":"started","name":"slow","file":"src/calc.test.ts"}' >> "$TOE_STREAM"
+sleep 30
+"#;
+
+/// The stream is read while the run is still going: the first failure
+/// arrives through `toe wait` long before the process ends.
+#[test]
+fn stream_recipe_reports_the_first_failure_live() {
+    let d = workspace("stream");
+    std::fs::write(
+        d.join("toe.toml"),
+        "[suite.ts]\nrun = \"sh fake.sh\"\ninject = [\"vitest-stream\"]\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("fake.sh"), FAKE_STREAMING).unwrap();
+    let started = std::time::Instant::now();
+    let r = json(&toe(&d, &["run", "ts", "--detach", "--json"], &[]));
+    let run = r["run"].as_str().unwrap().to_owned();
+    let w = json(&toe(
+        &d,
+        &[
+            "wait",
+            &run,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "15s",
+            "--json",
+        ],
+        &[],
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "returned before the run ended"
+    );
+    assert_eq!(w["status"], "running", "{w}");
+    assert_eq!(w["level"], "native", "{w}");
+    assert_eq!(w["failures"][0]["test"], "src/calc.test.ts::divides", "{w}");
+    assert_eq!(w["failures"][0]["message"], "expected 16 to be 4", "{w}");
+    let c = toe(&d, &["cancel", &run], &[]);
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
 }
