@@ -39,8 +39,15 @@ cache)? Opt in per suite, never by default:
 ```toml
 [suite.make]
 run = "make test"
-inject = ["pytest-junit"]     # or "go-nocache"; also: toe run --inject <recipe> -- <command>
+inject = ["pytest-reportlog"] # every test live; or "pytest-junit", "go-nocache"
+                              # also: toe run --inject <recipe> -- <command>
 ```
+
+Every test live with its duration (native level): Rust via cargo-nextest's
+libtest JSON (`toe adopt` proposes it when nextest 0.9.66+ is installed), Go via
+`go test -json`, Python via `inject = ["pytest-reportlog"]`, Vitest via
+`inject = ["vitest-stream"]` plus `--reporter=default --reporter="$TOE_VITEST_REPORTER"`
+in the suite command.
 
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 toe or infrastructure error, 5 still running.

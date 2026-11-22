@@ -48,6 +48,7 @@ Rust stable, edition 2024, Cargo workspace.
 
 ```
 cargo build
+cargo install cargo-nextest --locked                      # once: small and medium run under nextest
 cargo install --path crates/toe-cli --root .toe/stable   # refresh stable toe from green main
 .toe/stable/bin/toe run small                             # inner loop
 scripts/ci.sh                                             # full local gate (mirror of CI)

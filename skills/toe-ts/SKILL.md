@@ -5,8 +5,20 @@ description: toe setup details for JavaScript and TypeScript projects (Vitest, J
 
 # toe for JavaScript and TypeScript
 
-- Vitest: `npx vitest run --reporter=verbose` prints each test with ✓/×,
-  recognized live. Add `--reporter=junit --outputFile=reports/junit.xml`
+- Vitest, best: toe's own reporter streams every test live (level
+  `native`, durations and messages). Opt in and add the reporter next to
+  the default one; the project's files stay untouched:
+
+  ```toml
+  [suite.default]
+  run = "npx vitest run --reporter=default --reporter=\"$TOE_VITEST_REPORTER\""
+  select = "npx vitest run --reporter=default --reporter=\"$TOE_VITEST_REPORTER\" -t {filter}"
+  inject = ["vitest-stream"]
+  ```
+
+  Through npm: `npm test -- --reporter=default --reporter="$TOE_VITEST_REPORTER"`.
+- Vitest without the reporter: `npx vitest run --reporter=verbose` prints
+  each test with ✓/×, recognized live. Add `--reporter=junit --outputFile=reports/junit.xml`
   (as a second reporter) for durations and messages.
 - Jest: add `jest-junit` and run `npx jest --ci --reporters=default --reporters=jest-junit`;
   toe ingests `junit.xml`.

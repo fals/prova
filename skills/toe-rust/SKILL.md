@@ -5,6 +5,19 @@ description: toe setup details for Rust projects (cargo test, cargo-nextest). Us
 
 # toe for Rust
 
+- Best: cargo-nextest 0.9.66+ with its libtest JSON stream (level
+  `native`: every test live, with its duration and output). `toe adopt`
+  proposes it when it finds nextest:
+
+  ```toml
+  [suite.default]
+  run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1"
+  select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}"
+  ```
+
+  The format is experimental upstream; `--message-format-version 0.1` pins
+  it. Nightly `cargo test -- -Z unstable-options --format json` is read the
+  same way.
 - `cargo test` output is recognized live (level `recognized output`):
   `test path::name ... ok|FAILED|ignored`. Nothing to configure.
 - `cargo test --quiet` (often inside `make test`) prints only failures:
@@ -39,7 +52,7 @@ description: toe setup details for Rust projects (cargo test, cargo-nextest). Us
   size = "medium"
   ```
 
-- Benchmarks for `toe exp`: print `{"metric": ..., "value": ...}` from a
-  small binary, or wrap `hyperfine --export-json` output.
+- Benchmarks for `toe exp`: criterion output is read directly
+  (`name.time_ns`); otherwise print `{"metric": ..., "value": ...}`.
 
 See `references/pitfalls.md` for common problems.
