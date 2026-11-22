@@ -22,5 +22,6 @@ All records below are **Accepted** (2026-11-22). Later amendments are noted in e
 | [0013](0013-black-box-adoption.md) | Black-box adoption and fidelity ladder; amends 0001, 0003, 0004, 0005, 0012 | refines "bring your own suite" |
 | [0014](0014-central-store-and-server.md) | Central store partitioned by repository; local everywhere, server deferred; supersedes the location in 0008 | **yes**: not per-workspace |
 | [0015](0015-spec-first-experiments.md) | Spec-first experiments: the specification is the oracle; any objective; amends 0007, 0011 | **yes**: Lean usable by projects |
+| [0016](0016-distilled-output-no-log-files.md) | Distilled output: everything in SQLite, no log files after a run; supersedes raw-output parts of 0001, 0008, 0013 | no |
 
 The deviations from the README were accepted with the records.

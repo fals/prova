@@ -20,6 +20,9 @@ pub struct Attempt {
 pub struct Case {
     pub key: TestKey,
     pub attempts: Vec<Attempt>,
+    /// Body of the final `<failure>`/`<error>` (stack trace, captured
+    /// output), unclipped: kept as the failing test's own output.
+    pub output: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +93,7 @@ struct Current {
     time: Option<u64>,
     final_kind: Option<Outcome>,
     final_msg: Option<String>,
+    final_body: Option<String>,
     retries: Vec<Attempt>,
 }
 
@@ -126,6 +130,7 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                 name: c.name,
             },
             attempts,
+            output: c.final_body,
         });
     };
 
@@ -217,10 +222,14 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                     }
                 }
                 b"failure" | b"error" | b"skipped" => {
-                    if let (Text::Final, Some(c)) = (&text, cur.as_mut())
-                        && c.final_msg.is_none()
-                    {
-                        c.final_msg = clip(&buf);
+                    if let (Text::Final, Some(c)) = (&text, cur.as_mut()) {
+                        if c.final_msg.is_none() {
+                            c.final_msg = clip(&buf);
+                        }
+                        let body = buf.trim();
+                        if !body.is_empty() && c.final_kind.is_some_and(|k| k.is_failure()) {
+                            c.final_body = Some(body.to_owned());
+                        }
                     }
                     text = Text::None;
                 }
@@ -265,6 +274,7 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
                 duration_ms: c.2,
                 message: clip(msg),
             }],
+            output: (c.1.is_failure() && !msg.trim().is_empty()).then(|| msg.trim().to_owned()),
         });
     };
     loop {

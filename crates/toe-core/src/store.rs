@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_tests.sql"),
     include_str!("migrations/0003_experiments.sql"),
     include_str!("migrations/0004_origin.sql"),
+    include_str!("migrations/0005_output.sql"),
 ];
 
 pub struct Store {
@@ -141,6 +142,9 @@ impl Store {
             "tests",
             "runs",
             "artifacts",
+            "run_output",
+            "test_output",
+            "comparison_output",
             "samples",
             "trials",
             "decisions",
@@ -181,7 +185,10 @@ impl Store {
         copied?;
         for sub in ["runs", "artifacts", "experiments"] {
             copy_tree(&old_dir.join(sub), &self.dir.join(sub))?;
+            // Copied: the workspace keeps nothing (ADR 0014, 0016).
+            let _ = std::fs::remove_dir_all(old_dir.join(sub));
         }
+        crate::output::sweep(self)?;
         for f in ["toe.db", "toe.db-wal", "toe.db-shm"] {
             let p = old_dir.join(f);
             if p.exists() {
@@ -231,6 +238,11 @@ impl Store {
             tx.execute_batch(sql)?;
             tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
             tx.commit()?;
+        }
+        // Distilled output (ADR 0016): files left by earlier versions are
+        // distilled into the store, then removed.
+        if current < 5 && latest >= 5 {
+            crate::output::sweep(self)?;
         }
         Ok(())
     }

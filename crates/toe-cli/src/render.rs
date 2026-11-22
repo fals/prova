@@ -373,8 +373,10 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
                 r.experiment
             ),
             _ => format!(
-                "read the trial logs in {}",
-                r.logs.as_deref().unwrap_or("the store")
+                "read what failed: {}",
+                r.logs
+                    .clone()
+                    .unwrap_or_else(|| format!("toe exp log {}", r.experiment))
             ),
         };
         println!("next: {next}");

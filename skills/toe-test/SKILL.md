@@ -48,7 +48,10 @@ needs attention.
 ## Useful
 
 - `toe status` recent runs; `toe status <run>` one run.
-- `toe output <run> --tail 200` raw output when messages are not enough.
+- `toe output <run> --test <name>` prints a failing test's own output
+  (stack trace, captured output); `toe output <run>` prints the run's kept
+  excerpt (first lines, error blocks, last lines). While the run is still
+  going, `toe output <run>` shows everything printed so far.
 - `toe diff <run-a> <run-b>` newly failing, fixed, slower tests.
 - `toe flaky` known flaky tests. `toe sizes` tests by observed duration.
 

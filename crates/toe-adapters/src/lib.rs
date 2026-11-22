@@ -122,13 +122,8 @@ impl Observer for Ladder {
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
             report.events.extend(injected.events);
-            report.artifacts.extend(injected.artifacts);
+            report.test_outputs.extend(injected.test_outputs);
             report.level = report.level.max(injected.level);
-            for st in &self.streams {
-                if st.path.exists() {
-                    report.artifacts.push(("stream".into(), st.path.clone()));
-                }
-            }
         }
         // Live and file results are matched by display name (best effort:
         // result files rarely carry the same file attribute).
@@ -170,6 +165,9 @@ impl Observer for Ladder {
         // Live events still held by a recognizer (after the file dedupe,
         // which they must survive).
         report.events.splice(0..0, held);
+        // Failing tests' output from live streams: richer than a result
+        // file's body, so recorded last (it wins).
+        report.test_outputs.append(&mut self.live.failure_output);
         let live = self.live.level;
         report.level = match (report.level, live) {
             (Some(a), Some(b)) => Some(a.max(b)),

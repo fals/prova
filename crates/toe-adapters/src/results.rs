@@ -179,13 +179,10 @@ impl ResultFiles {
             if cases.is_empty() {
                 continue;
             }
-            let kind = if path.extension().is_some_and(|e| e == "trx") {
-                "trx"
-            } else {
-                "junit"
-            };
-            report.artifacts.push((kind.to_owned(), path.clone()));
             for case in cases {
+                if let Some(out) = &case.output {
+                    report.test_outputs.push((case.key.clone(), out.clone()));
+                }
                 for (i, a) in case.attempts.into_iter().enumerate() {
                     report.events.push(EventKind::TestFinished {
                         test: case.key.clone(),

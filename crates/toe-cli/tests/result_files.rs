@@ -106,13 +106,26 @@ fn diff_reports_newly_failing_and_fixed() {
     assert_eq!(back["fixed"][0], "suite::b");
 }
 
+/// ADR 0016: result files are parsed into the store and not copied; the
+/// failing test's body is kept as its own output, and the run leaves no
+/// files behind.
 #[test]
-fn result_files_are_kept_as_artifacts() {
-    let d = workspace("artifacts");
-    let s = run(&d, "pass");
+fn result_files_are_distilled_not_copied() {
+    let d = workspace("distilled");
+    let s = run(&d, "fail");
     let store = PathBuf::from(s["store"].as_str().unwrap());
-    let n = std::fs::read_dir(store.join("artifacts")).unwrap().count();
-    assert_eq!(n, 1);
+    assert!(
+        !store.join("artifacts").exists(),
+        "no copies of result files"
+    );
+    assert!(
+        !store.join("runs").join(s["run"].as_str().unwrap()).exists(),
+        "no run files"
+    );
+    let run_id = s["run"].as_str().unwrap();
+    let o = toe(&d, &["output", run_id, "--test", "suite::b", "--json"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(json(&o)[0]["output"], "trace");
 }
 
 /// Isolated toe home for a test workspace, outside it (ADR 0014).

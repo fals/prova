@@ -133,6 +133,9 @@ pub struct RunSpec {
     pub adapter: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject: Vec<String>,
+    /// Keep the whole output, compressed, not only the excerpt (ADR 0016).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_output: bool,
 }
 
 pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(60);
@@ -224,6 +227,7 @@ impl Config {
             results: s.results.clone(),
             adapter: s.adapter.clone(),
             inject: s.inject.clone(),
+            keep_output: false,
         })
     }
 }

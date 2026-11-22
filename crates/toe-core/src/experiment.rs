@@ -797,6 +797,72 @@ fn fingerprint() -> String {
 
 /// Body of `toe __exp`: runs trials and decides.
 pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()> {
+    let result = work_comparison(store, comparison, parse);
+    let cleaned = keep_failed_logs(store, comparison);
+    result.and(cleaned)
+}
+
+/// After a comparison (ADR 0016): the logs of what failed (a trial, the
+/// setup, the oracle) are kept as excerpts in the store; the log directory
+/// and the baseline worktrees are removed.
+fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
+    let logs = store.dir().join("experiments").join(comparison);
+    let (exp, base, cand, status, result): (String, String, String, String, Option<String>) =
+        store.conn().query_row(
+            "SELECT experiment, baseline, candidate, status, result FROM comparisons WHERE id = ?1",
+            params![comparison],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+    let failed_trials: Vec<u32> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT seq FROM trials WHERE comparison = ?1 AND state = 'failed'")?;
+        stmt.query_map(params![comparison], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let violated = result
+        .as_deref()
+        .is_some_and(|r| r.contains("\"specification\":\"violated\""));
+    let mut keep: Vec<String> = failed_trials.iter().map(|s| s.to_string()).collect();
+    for arm in ["baseline", "candidate"] {
+        if status == "failed" {
+            keep.push(format!("setup-{arm}"));
+        }
+        if status == "failed" || violated {
+            keep.push(format!("oracle-{arm}"));
+        }
+    }
+    for name in keep {
+        if let Some(ex) = crate::output::distill_file(&logs.join(format!("{name}.log")), false)
+            && ex.total_lines > 0
+        {
+            crate::output::keep_comparison(store, comparison, &name, &ex)?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&logs);
+    for name in [base, cand] {
+        if let Ok(v) = variant(store, &exp, &name)
+            && let Some(sha) = &v.commit_sha
+        {
+            let wt = store.dir().join("worktrees").join(&sha[..12]);
+            if wt.exists() {
+                let _ = Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&wt)
+                    .current_dir(store.root())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = std::fs::remove_dir_all(&wt);
+            }
+        }
+    }
+    crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
+    Ok(())
+}
+
+fn work_comparison(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()> {
     let (exp, base_name, cand_name): (String, String, String) = store.conn().query_row(
         "SELECT experiment, baseline, candidate FROM comparisons WHERE id = ?1",
         params![comparison],
@@ -876,7 +942,7 @@ pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()>
                 .unwrap_or(false);
             if !ok {
                 let reason = format!(
-                    "setup `{setup}` failed for {} (see setup-{}.log)",
+                    "setup `{setup}` failed for {} (`toe exp log {exp} setup-{}`)",
                     arm.as_str(),
                     arm.as_str()
                 );
@@ -889,6 +955,7 @@ pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()>
         let verdict = satisfies_spec(p, &dirs[i], &logs, *arm)?;
         c.check_spec(*arm, verdict.is_ok());
         if let Err(why) = verdict {
+            let why = why.replace("<experiment>", &exp);
             if *arm == Arm::Baseline {
                 let reason = format!(
                     "baseline violates the specification: {why}; measure only implementations that satisfy it"
@@ -925,8 +992,9 @@ pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()>
             let Some(arm) = c.next_arm() else { break };
             if !run_one(arm, false)? {
                 let reason = format!(
-                    "{} trial {} failed (exit != 0)",
+                    "{} trial {} failed (exit != 0; `toe exp log {exp} {}`)",
                     arm.as_str(),
+                    counter.get(),
                     counter.get()
                 );
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
@@ -989,8 +1057,8 @@ fn satisfies_spec(
         Ok(())
     } else {
         Err(format!(
-            "oracle `{oracle}` failed (see {})",
-            logs.join(name).display()
+            "oracle `{oracle}` failed (`toe exp log <experiment> {}`)",
+            name.trim_end_matches(".log")
         ))
     })
 }
@@ -1165,7 +1233,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ComparisonReport>,
     pub decisions: Vec<serde_json::Value>,
-    /// Directory with trial logs of the latest comparison.
+    /// How to read the kept logs of the latest comparison, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
 }
@@ -1259,14 +1327,15 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     let e = get(store, exp)?; // best may have changed
-    let logs = comparison.as_ref().map(|c| {
-        store
-            .dir()
-            .join("experiments")
-            .join(&c.id)
-            .display()
-            .to_string()
-    });
+    let logs = comparison
+        .as_ref()
+        .filter(|c| {
+            c.status == "failed"
+                || c.result
+                    .as_ref()
+                    .is_some_and(|r| r["specification"] == "violated")
+        })
+        .map(|_| format!("toe exp log {exp}"));
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,

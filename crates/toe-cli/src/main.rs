@@ -77,6 +77,10 @@ enum Cmd {
         /// Opt-in environment injection recipe (repeatable), e.g. pytest-junit.
         #[arg(long = "inject")]
         inject: Vec<String>,
+        /// Keep the whole output (compressed), not only the excerpt: for
+        /// debugging toe's recognizers.
+        #[arg(long)]
+        keep_output: bool,
         #[arg(long)]
         json: bool,
         /// Command to run, after `--`.
@@ -117,11 +121,18 @@ enum Cmd {
         #[arg(long)]
         follow: bool,
     },
-    /// Print a run's captured output.
+    /// Print a run's output: live while it runs; once it ended, the kept
+    /// excerpt (head, error blocks, tail) and failing tests' own output.
     Output {
         run: String,
+        /// Last lines only.
         #[arg(long)]
         tail: Option<usize>,
+        /// One failing test's own output (substring of its name).
+        #[arg(long)]
+        test: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// History and flake statistics of tests matching a name.
     History {
@@ -337,6 +348,13 @@ enum ExpCmd {
     Cancel { name: String },
     /// List experiments.
     List,
+    /// Kept logs of what failed in the latest comparison (a trial, the
+    /// setup, the oracle).
+    Log {
+        name: String,
+        /// One log: a trial number, setup-baseline, oracle-candidate, ...
+        entry: Option<String>,
+    },
     /// Run a workload once and show the metrics toe reads from it
     /// (benchmark tools and JSON metric lines), to choose --metric.
     Metrics {
@@ -773,6 +791,24 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)
         }
+        ExpCmd::Log { name, entry } => {
+            let Some(c) = experiment::latest_comparison(&store, &name)? else {
+                bail!("experiment {name} has no comparison yet");
+            };
+            let kept = toe_core::output::comparison_excerpts(&store, &c)?;
+            let shown: Vec<_> = kept
+                .iter()
+                .filter(|(n, _)| entry.as_deref().is_none_or(|e| e == n))
+                .collect();
+            if shown.is_empty() {
+                println!("nothing kept for comparison {c}: logs are kept only for what failed");
+            }
+            for (n, e) in shown {
+                println!("== {n}");
+                print!("{}", e.render());
+            }
+            Ok(exit::PASSED)
+        }
         ExpCmd::Metrics { json, command } => {
             let start = std::time::Instant::now();
             let out = std::process::Command::new(&command[0])
@@ -865,6 +901,84 @@ fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
     Ok((store, root, cwd))
 }
 
+/// `toe output`: the live spool while the run is going, then what was
+/// kept (ADR 0016).
+fn print_output(
+    store: &Store,
+    id: &str,
+    tail: Option<usize>,
+    test: Option<&str>,
+    json: bool,
+) -> Result<u8> {
+    use toe_core::output::{self, Kept};
+    if let Some(name) = test {
+        let found: Vec<(String, String)> = output::test_outputs(store, id)?
+            .into_iter()
+            .filter(|(d, _)| d.contains(name))
+            .collect();
+        if found.is_empty() {
+            bail!("no kept output for a failing test matching {name:?} in run {id}");
+        }
+        if json {
+            let v: Vec<_> = found
+                .iter()
+                .map(|(d, t)| serde_json::json!({ "test": d, "output": t }))
+                .collect();
+            println!("{}", serde_json::to_string(&v)?);
+        } else {
+            for (d, t) in found {
+                println!("== {d}\n{t}");
+            }
+        }
+        return Ok(exit::PASSED);
+    }
+    if let Some(n) = tail {
+        for l in engine::output_tail(store, id, n) {
+            println!("{l}");
+        }
+        return Ok(exit::PASSED);
+    }
+    let spool = store.run_dir(id).join("output.log");
+    if !store.run(id)?.status.is_terminal() && spool.exists() {
+        let mut f = std::fs::File::open(&spool).with_context(|| format!("{}", spool.display()))?;
+        std::io::copy(&mut f, &mut std::io::stdout())?;
+        return Ok(exit::PASSED);
+    }
+    if let Some(full) = output::run_full(store, id)? {
+        print!("{full}");
+        return Ok(exit::PASSED);
+    }
+    let tests = output::test_outputs(store, id)?;
+    match output::run_excerpt(store, id)? {
+        Kept::Excerpt(e) if json => {
+            let v = serde_json::json!({
+                "run": id,
+                "excerpt": e,
+                "elided_lines": e.total_lines - e.kept_lines(),
+                "failing_tests_with_output": tests.iter().map(|(d, _)| d).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string(&v)?);
+        }
+        Kept::Excerpt(e) => {
+            print!("{}", e.render());
+            if !tests.is_empty() {
+                println!(
+                    "-- kept output of {} failing test(s); `toe output {id} --test <name>`:",
+                    tests.len()
+                );
+                for (d, _) in &tests {
+                    println!("   {d}");
+                }
+            }
+        }
+        Kept::Pruned => println!(
+            "output of run {id} was dropped to stay within the output budget; results and failures are kept"
+        ),
+        Kept::Missing => println!("no output kept for run {id}"),
+    }
+    Ok(exit::PASSED)
+}
+
 fn duration_arg(v: &Option<String>, name: &str) -> Result<Option<u64>> {
     v.as_ref()
         .map(|s| {
@@ -884,6 +998,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             stall_after,
             kill_after,
             inject,
+            keep_output,
             json,
             command,
         } => {
@@ -908,6 +1023,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     results: Vec::new(),
                     adapter: None,
                     inject: Vec::new(),
+                    keep_output: false,
                 };
                 (config::implicit_suite(&command, &rel), spec, cwd)
             } else {
@@ -943,6 +1059,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     spec.inject.push(name);
                 }
             }
+            spec.keep_output |= keep_output;
             toe_adapters::inject::validate(&spec.inject).map_err(|e| anyhow!(e))?;
             let id = engine::create_run(
                 &store,
@@ -1061,21 +1178,15 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 let _ = engine::wait(&store, &id, Until::Done, cursor, Duration::from_millis(500))?;
             }
         }
-        Cmd::Output { run, tail } => {
+        Cmd::Output {
+            run,
+            tail,
+            test,
+            json,
+        } => {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
-            match tail {
-                Some(n) => engine::output_tail(&store, &id, n)
-                    .iter()
-                    .for_each(|l| println!("{l}")),
-                None => {
-                    let path = store.run_dir(&id).join("output.log");
-                    let mut f = std::fs::File::open(&path)
-                        .with_context(|| format!("{}", path.display()))?;
-                    std::io::copy(&mut f, &mut std::io::stdout())?;
-                }
-            }
-            Ok(exit::PASSED)
+            print_output(&store, &id, tail, test.as_deref(), json)
         }
         Cmd::History {
             test,

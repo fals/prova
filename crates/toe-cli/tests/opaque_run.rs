@@ -290,7 +290,39 @@ fn store_is_private_to_the_owner() {
     assert_eq!(mode(store.clone()), 0o700);
     assert_eq!(mode(store.join("toe.db")), 0o600);
     let run = s["run"].as_str().unwrap();
-    assert_eq!(mode(store.join("runs").join(run).join("output.log")), 0o600);
+    assert!(
+        !store.join("runs").join(run).exists(),
+        "a finished run leaves no files"
+    );
+    // The live spool is private while the run is going.
+    let live = json(&toe(
+        &d,
+        &[
+            "run",
+            "--detach",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "echo up; sleep 30",
+        ],
+    ));
+    let live_run = live["run"].as_str().unwrap();
+    let spool = store.join("runs").join(live_run).join("output.log");
+    let w = toe(
+        &d,
+        &[
+            "wait",
+            live_run,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "2s",
+        ],
+    );
+    assert_eq!(w.status.code(), Some(5), "still running");
+    assert_eq!(mode(spool), 0o600);
+    assert!(toe(&d, &["cancel", live_run]).status.success());
     assert_eq!(
         toe(&d, &["status", "%"]).status.code(),
         Some(4),
@@ -301,4 +333,39 @@ fn store_is_private_to_the_owner() {
 /// Isolated toe home for a test workspace, outside it (ADR 0014).
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
+}
+
+/// ADR 0016: a finished run keeps an excerpt (head, error blocks, tail) in
+/// the store, not a log file; `--keep-output` keeps everything.
+#[test]
+fn long_output_is_distilled_into_an_excerpt() {
+    let d = workspace("excerpt");
+    let script = "i=1; while [ $i -le 2000 ]; do if [ $i = 1000 ]; then echo 'error: the real cause'; else echo \"line $i\"; fi; i=$((i+1)); done; exit 3";
+    let s = json(&toe(&d, &["run", "--json", "--", "sh", "-c", script]));
+    let run = s["run"].as_str().unwrap();
+    let store = PathBuf::from(s["store"].as_str().unwrap());
+    assert!(!store.join("runs").join(run).exists());
+    let out = stdout(&toe(&d, &["output", run]));
+    assert!(out.starts_with("line 1\n"), "{out}");
+    assert!(
+        out.contains("error: the real cause"),
+        "error block kept: {out}"
+    );
+    assert!(out.contains("lines elided ...]"), "{out}");
+    assert!(out.trim_end().ends_with("line 2000"), "{out}");
+    let j: serde_json::Value =
+        serde_json::from_str(&stdout(&toe(&d, &["output", run, "--json"]))).unwrap();
+    assert_eq!(j["excerpt"]["total_lines"], 2000);
+    assert!(j["elided_lines"].as_u64().unwrap() > 1500);
+    assert_eq!(
+        stdout(&toe(&d, &["output", run, "--tail", "1"])).trim(),
+        "line 2000"
+    );
+
+    let k = json(&toe(
+        &d,
+        &["run", "--json", "--keep-output", "--", "sh", "-c", script],
+    ));
+    let full = stdout(&toe(&d, &["output", k["run"].as_str().unwrap()]));
+    assert_eq!(full.lines().count(), 2000, "whole output kept on request");
 }
