@@ -21,5 +21,6 @@ All records below are **Proposed** and wait for review. Evidence lives in [`../r
 | [0012](0012-skills-packaging.md) | Skills: Agent Skills standard, workflow plus language skills | no |
 | [0013](0013-black-box-adoption.md) | Black-box adoption and fidelity ladder; amends 0001, 0003, 0004, 0005, 0012 | refines "bring your own suite" |
 | [0014](0014-central-store-and-server.md) | Central store partitioned by repository; local everywhere, server deferred; supersedes the location in 0008 | **yes**: not per-workspace |
+| [0015](0015-spec-first-experiments.md) | Spec-first experiments: the specification is the oracle; any objective; amends 0007, 0011 | **yes**: Lean usable by projects |
 
 The three deviations are the points most worth challenging in review.
