@@ -2,7 +2,15 @@
 # PreToolUse hook (Bash): this repository dogfoods toe, so tests run through
 # toe, never directly (AGENTS.md, Dogfooding). Blocks `cargo test` and
 # `cargo nextest` unless the command is a toe invocation.
-cmd=$(jq -r '.tool_input.command // empty')
+raw=$(jq -r '.tool_input.command // empty')
+# Only the shell code counts: drop heredoc bodies and quoted strings, so
+# commit messages or PR text that mention `cargo test` are not blocked.
+cmd=$(printf '%s\n' "$raw" | awk '
+  heredoc { if ($0 ~ "^[[:space:]]*" tag "$") heredoc = 0; next }
+  { line = $0
+    if (match(line, /<<-?[[:space:]]*[\047"]?[A-Za-z_]+/)) {
+      tag = substr(line, RSTART, RLENGTH); gsub(/<<-?[[:space:]]*[\047"]?/, "", tag); heredoc = 1 }
+    print line }' | sed -E "s/'[^']*'//g; s/\"([^\"\\\\]|\\\\.)*\"//g")
 # A toe invocation runs cargo itself; that is the allowed path.
 if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\s)(\S*/)?toe\s+(run|wait|exp)\b'; then
   exit 0
