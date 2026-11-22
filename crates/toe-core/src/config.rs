@@ -96,6 +96,9 @@ pub struct SuiteConfig {
     /// `["pytest-junit"]`. Off unless listed; recorded with every run.
     #[serde(default)]
     pub inject: Vec<String>,
+    /// `false` for a command that legitimately runs no tests (a lint step):
+    /// "no test ran" is then neither a failure nor a warning (ADR 0017).
+    pub expect_tests: Option<bool>,
 }
 
 /// How to start the process under test.
@@ -136,6 +139,16 @@ pub struct RunSpec {
     /// Keep the whole output, compressed, not only the excerpt (ADR 0016).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_output: bool,
+    /// `Some(false)`: no test is expected (ADR 0017).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_tests: Option<bool>,
+}
+
+impl RunSpec {
+    /// Whether "no test ran" is suspicious for this run.
+    pub fn expects_tests(&self) -> bool {
+        self.expect_tests != Some(false)
+    }
 }
 
 pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(60);
@@ -228,6 +241,7 @@ impl Config {
             adapter: s.adapter.clone(),
             inject: s.inject.clone(),
             keep_output: false,
+            expect_tests: s.expect_tests,
         })
     }
 }

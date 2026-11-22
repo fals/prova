@@ -33,8 +33,19 @@ needs attention.
    - `note:` lines say what toe could not see (e.g. quiet output hides
      passing tests). Take them seriously: flaky detection depends on it.
 
+   - `PASSED (unverified: ...)` with `warning:` lines: the command
+     succeeded but proved little: no test was observed, every test was
+     skipped, tests from the last passing run did not run, or the output
+     shows a crash outside any test. Do not report "tests pass" on an
+     unverified run; read the warnings and make the suite run its tests.
+     In `--json`, `verified` is `true` only for a clean pass.
+   - A run fails, even with exit 0, when the framework itself says it
+     failed or ran nothing (`detail:` names the reason), when a test never
+     finished, or when the suite's tests vanished since its last pass.
+
    Exit codes: 0 passed, 1 test failure, 3 stall/slow/killed, 4 toe or
-   infrastructure error, 5 still running (call `toe wait <run> --after <seq>`).
+   infrastructure error (also: the test command could not start), 5 still
+   running (call `toe wait <run> --after <seq>`).
 
 3. React immediately: fix the first failure while the run continues, or
    `toe cancel <run>`. On `SLOW` or `STALLED`, decide: cancel, or keep

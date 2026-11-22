@@ -295,12 +295,21 @@ These are stable interfaces; changing them is a breaking change.
 
 | Code | Meaning |
 |---|---|
-| 0 | passed (or the command succeeded) |
-| 1 | test failure (or experiment rejected) |
+| 0 | passed (or the command succeeded); check `verified` |
+| 1 | test failure, or evidence against a pass (or experiment rejected) |
 | 2 | usage error |
 | 3 | stall, slow test, cancelled or killed |
-| 4 | toe or infrastructure error |
+| 4 | toe or infrastructure error; the test command could not start (exit 126/127) |
 | 5 | still running: call `toe wait <run> --after <seq>` |
+
+**No false passes.** A pass must be earned. The run fails, whatever the exit
+code, when a test errored or never finished, when the framework's own summary
+counts more failures than toe recorded, when the framework says no test ran
+(or a selection matched none), or when the suite ran tests in its last
+passing run and observed none now. A pass that proved little stays a pass
+with `verified: false` and `warnings`: no test observed, every test skipped,
+tests from the last passing run missing, or a crash in the output. A suite
+that runs no tests on purpose declares `expect_tests = false`.
 
 **Events** are JSON Lines with schema [`schemas/event.v1.json`](../schemas/event.v1.json):
 `run_started`, `test_started`, `test_slow`, `test_finished`, `run_stalled`,

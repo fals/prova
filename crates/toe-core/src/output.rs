@@ -145,6 +145,29 @@ fn clip(line: &str) -> String {
     }
 }
 
+/// Lines that mean something broke, even in a passing run (stricter than
+/// `looks_like_error`, which also matches test names and log levels).
+fn looks_like_crash(line: &str) -> bool {
+    let t = line.trim_start();
+    const STARTS: &[&str] = &[
+        "Traceback (most recent call last)",
+        "fatal:",
+        "panic:",
+        "npm ERR!",
+        "error[",
+        "error:",
+        "Unhandled",
+        "Segmentation fault",
+    ];
+    const CONTAINS: &[&str] = &[
+        "panicked at",
+        "core dumped",
+        "ModuleNotFoundError",
+        "ImportError",
+    ];
+    STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
+}
+
 /// Builds an excerpt in one pass, with bounded memory, as lines arrive.
 #[derive(Debug, Default)]
 pub struct Distiller {
@@ -209,6 +232,26 @@ impl Distiller {
         if self.recent.len() > TAIL_FAILED {
             self.recent.pop_front();
         }
+    }
+
+    /// First line that looks like a crash, with its line number.
+    pub fn first_crash(&self) -> Option<(u64, String)> {
+        self.first_matching(looks_like_crash)
+    }
+
+    /// First line that looks like an error, with its line number.
+    pub fn first_error(&self) -> Option<(u64, String)> {
+        self.first_matching(looks_like_error)
+    }
+
+    fn first_matching(&self, f: fn(&str) -> bool) -> Option<(u64, String)> {
+        self.errors.iter().find_map(|s| {
+            s.lines
+                .iter()
+                .enumerate()
+                .find(|(_, l)| f(l))
+                .map(|(i, l)| (s.start + i as u64, l.clone()))
+        })
     }
 
     /// The excerpt: a passed run keeps only its last lines.
