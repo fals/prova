@@ -1,6 +1,6 @@
-# 0014: Central store, partitioned by repository, with an optional server
+# 0014: Central store, partitioned by repository
 
-Status: Accepted (owner, 2026-11-22). Sections 1, 2, 4 and 5 implemented; section 3 (`toe serve`) next. Supersedes the storage location in [0008](0008-storage-sqlite.md); amends [0001](0001-architecture-overview.md) (a long-lived service becomes an optional component) and [0010](0010-deployment.md) (the image also runs that service).
+Status: Accepted (owner, 2026-11-22). Sections 1, 2, 4 and 5 implemented. Section 3, a server, is **deferred** by the owner: toe stays local, also in CI and Kubernetes. Supersedes the storage location in [0008](0008-storage-sqlite.md).
 
 ## Context
 
@@ -10,13 +10,13 @@ Today every workspace keeps its own store at `<root>/.toe/toe.db` and there is n
 2. **Clusters.** When tests and experiments run in pods (a kind cluster during development, a real cluster in CI or for load tests), each pod's filesystem is ephemeral. A store inside the workspace disappears with the pod, and results from parallel pods never meet. Everything toe records (runs, flake statistics, experiment trials) is lost exactly where it matters most.
 3. **Experiments across machines.** Trials must be compared on a known machine fingerprint ([0007](0007-experiments.md)); that only works if trials from every node land in one place that can see all fingerprints.
 
-The owner's direction: keep the database centralized, split per repository where needed, and make cluster capture a first-class case.
+The owner's direction: keep the database centralized per machine and split per repository; keep toe local and delay cluster-wide capture (section 3).
 
 ## Decision
 
 ### 1. One logical store, partitioned by repository
 
-toe has a single store per installation (a machine user, or a server), not per folder. Inside it, data is partitioned by **repository**:
+toe has a single store per installation (a machine user), not per folder. Inside it, data is partitioned by **repository**:
 
 - **Repository id**: hash of the repository's root commit (`git rev-list --max-parents=0 HEAD`, the oldest if several). Identical for every clone, worktree and pod of the same repository. Outside git: hash of the `origin`-less root path, marked as local-only.
 - Recorded with it: `origin` URL (credentials stripped), display name, and every workspace path it was seen at.
@@ -40,39 +40,51 @@ $TOE_HOME/
 - The workspace keeps nothing. `.toe/` in the workspace remains only as a fallback when `TOE_HOME` is not writable, and toe says so in a run note.
 - Still no daemon: the CLI and per-run supervisors write directly, as today.
 
-### 3. Server mode for clusters: `toe serve`
+### 3. No server for now: local storage everywhere (deferred)
 
-The same store can be owned by a long-running service, shipped in the existing container image:
+A `toe serve` design (one service owning the store, clients replicating runs to
+it) was prototyped in [PR #49](https://github.com/fals/toe/pull/49) and closed:
+the owner chose to keep toe local and delay that complexity. Tests run
+sandboxed with local storage in every environment:
 
-- `toe serve` exposes the store over HTTPS (JSON API, streaming for events). Behind it: the same per-repository SQLite layout on a persistent volume. A different backend (Postgres) is a later decision, only if one server outgrows SQLite; the API does not change.
-- Clients opt in with `TOE_SERVER=https://toe.toe-system.svc:7777` (or `server` in `toe.toml`) and a bearer token (`TOE_TOKEN`).
-- **Execution stays local.** The supervisor still runs next to the tests, in the pod or on the machine, because only there can it watch the process tree, kill process groups and read result files ([0004](0004-liveness-and-fail-fast.md)). It streams run records, events and artifacts to the server instead of writing a local file.
-- `toe wait`, `toe status`, `toe history`, `toe flaky`, `toe exp ...` query the server, so an agent outside the cluster can wait on a run inside it.
-- **No data loss on network trouble.** The supervisor spools events to a local journal and replays them when the server is reachable; events are idempotent on `(run, seq)`. A run whose spool never reaches the server is reported as such, not silently dropped.
-- **Experiments in a cluster**: trials record the node and its fingerprint; a verdict over trials from different fingerprints is invalid ([0007](0007-experiments.md)). `toe exp` accepts a node constraint so a controller can pin trials to one node.
-- **Kubernetes packaging**: a Deployment (one replica, it owns the volume), a PersistentVolumeClaim, a Service, and a Secret with tokens. Test pods get the binary by `COPY --from` ([0010](0010-deployment.md)) and `TOE_SERVER`/`TOE_TOKEN` from the environment. A Helm chart or plain manifests live in `deploy/`.
-- **Security**: TLS, per-client tokens, a token scoped to a set of repository ids for CI; commands and output are stored as given ([0008](0008-storage-sqlite.md)), so the server's volume is treated like a log store with retention (`toe gc`).
+| Where | How history is kept |
+|---|---|
+| Developer machine, agent sandbox | `~/.local/share/toe` (default home) |
+| GitHub Actions, GitLab CI | `TOE_HOME` inside the job; persisted between jobs with the CI cache (`actions/cache`, GitLab `cache:`) or job artifacts |
+| Container, devcontainer | `TOE_HOME` on a mounted volume |
+| Kubernetes | `TOE_HOME` on a volume mounted by one writer at a time (ReadWriteOnce), or one home per job |
+
+Limits accepted for now:
+
+- **SQLite on shared network storage** (NFS, ReadWriteMany volumes) is unsafe
+  with several concurrent writers: WAL needs one host, and network file locks
+  are unreliable. Run one writer per volume, or give each job its own home.
+- **Parallel CI jobs** that restore and save the same cache overwrite each
+  other's history (last save wins); nothing is merged.
+- **No live view from outside**: an agent waits on runs only where they run.
+
+If merging homes or live remote views become necessary, the next step is a
+file-level `toe export` / `toe import` of a repository's store (no service),
+before reconsidering a server.
 
 ### 4. Configuration precedence
 
-`TOE_SERVER` set → server. Otherwise `TOE_HOME` (or its default) → local central store. Otherwise (not writable) → workspace `.toe/` with a warning. Every run summary states which store it used.
+`TOE_HOME` (or its default) → local central store. Otherwise (not writable) → workspace `.toe/` with a warning. Every run summary states which store it used.
 
 ### 5. Migration
 
-On first use by a version implementing this ADR, an existing workspace `.toe/toe.db` is imported into the central store under the workspace's repository id, then left with a `MOVED` note. Run ids are random and test ids content hashes, so imports from several worktrees never collide. `toe push --server` uploads a local central store into a server the same way.
+On first use by a version implementing this ADR, an existing workspace `.toe/toe.db` is imported into the central store under the workspace's repository id, then left with a `MOVED` note. Run ids are random and test ids content hashes, so imports from several worktrees never collide.
 
 ## Consequences
 
-- One history per repository across folders, worktrees, machines and pods; flaky detection and experiments see all of it.
-- Clusters become a supported environment instead of a place where results vanish.
-- toe gains a service to run, but only where wanted: local use stays daemon-free.
-- The store layer needs a boundary with two implementations (local files, remote server). The engine already talks to the store through one type; that type becomes an interface with a local and an HTTP implementation, and the medium tests run against both.
-- Concurrency: local writes are per repository file (WAL, short transactions); on the server one process serializes writes per repository.
-- New attack surface (network API, tokens); it needs its own security review before release.
+- One history per repository across folders and worktrees on a machine; flaky detection and experiments see all of it.
+- No service to run anywhere. CI and Kubernetes keep history by persisting `TOE_HOME` (cache, artifact or volume), within the limits in section 3.
+- Results from different machines or pods do not meet unless their homes are moved together; cross-machine experiments are compared per machine (fingerprints, [0007](0007-experiments.md)).
+- Concurrency: writes are per repository file (WAL, short transactions); one writer per volume.
 
 ## Alternatives
 
-- **Store inside the repository's git directory, shared by worktrees** (the previous draft of this ADR): fixes worktrees but not clusters, ephemeral containers, or cross-machine experiments. Rejected.
+- **Store inside the repository's git directory, shared by worktrees** (an earlier draft): history would vanish with every container and could not be cached as one directory. Rejected.
 - **One SQLite file for all repositories**: simplest queries, but one write lock for every agent on the machine and no clean per-repository deletion or export. Rejected in favour of a file per repository under one home.
-- **Server only**: forces a service even for one developer on a laptop. Rejected; the server is opt-in.
-- **Postgres from the start**: operationally heavier for a single-replica service whose load is test events; kept as a later backend behind the same API.
+- **`toe serve`, a central service** (prototyped in PR #49): live results from pods and CI in one place, at the cost of a service, tokens and a network API. Deferred by the owner.
+- **Postgres**: only relevant with a service; deferred with it.

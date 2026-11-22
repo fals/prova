@@ -62,6 +62,39 @@ toe mcp                       # stdio; tools run_start, run_wait, run_status, ru
 
 Example Claude Code config: `claude mcp add toe -- toe mcp`.
 
+## In CI
+
+toe needs no service in CI: keep its home in the job and persist it.
+
+```yaml
+# GitHub Actions
+- uses: actions/cache@v4
+  with:
+    path: .toe-home
+    key: toe-${{ github.ref_name }}-${{ github.run_id }}
+    restore-keys: toe-${{ github.ref_name }}-
+- run: toe run --json -- make test
+  env:
+    TOE_HOME: ${{ github.workspace }}/.toe-home
+    TOE_ACTOR: github-actions
+```
+
+```yaml
+# GitLab CI
+test:
+  variables:
+    TOE_HOME: $CI_PROJECT_DIR/.toe-home
+  cache:
+    key: toe-$CI_COMMIT_REF_SLUG
+    paths: [.toe-home/]
+  script:
+    - toe run --json -- make test
+```
+
+Parallel jobs saving the same cache overwrite each other (last save wins), and
+SQLite must not be shared by several writers over network storage; see
+[ADR 0014](adr/0014-central-store-and-server.md#3-no-server-for-now-local-storage-everywhere-deferred).
+
 ## What toe stores
 
 One central home per user (ADR 0014): `~/.local/share/toe` (or `TOE_HOME`),
