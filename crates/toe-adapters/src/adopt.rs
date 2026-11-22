@@ -55,9 +55,10 @@ fn detect(root: &Path) -> Vec<Framework> {
     if root.join("go.mod").exists() {
         out.push(Framework {
             language: "go",
-            run: "go test -json ./...",
-            select: "go test -json -run {filter} ./...",
-            why: "go.mod; -json gives the native event stream".into(),
+            run: "go test -json -count=1 ./...",
+            select: "go test -json -count=1 -run {filter} ./...",
+            why: "go.mod; -json gives the native event stream, -count=1 disables the test cache"
+                .into(),
         });
     }
     let py = [
@@ -298,7 +299,7 @@ mod tests {
         assert_eq!(p.suites[0].run, "make test");
         assert_eq!(
             p.suites[0].select.as_deref(),
-            Some("go test -json -run {filter} ./...")
+            Some("go test -json -count=1 -run {filter} ./...")
         );
         let toml = to_toml(&p);
         let parsed: toml::Value = toml::from_str(&toml).unwrap();

@@ -151,7 +151,7 @@ impl Supervisor<'_> {
             duration_ms: d @ None,
             ..
         } = &mut kind
-            && let Some((_, started, _, _)) = self.running.get(&test.display())
+            && let Some((_, started, _, _)) = self.running.get(&test.unique())
         {
             *d = Some(started.elapsed().as_millis() as u64);
         }
@@ -159,13 +159,11 @@ impl Supervisor<'_> {
         let ok = match &kind {
             EventKind::TestStarted { test } => {
                 let budget = self.slow_budget(test);
-                self.running.insert(
-                    test.display(),
-                    (test.clone(), Instant::now(), budget, false),
-                );
-                let n = self.attempts.entry(test.display()).or_insert(0);
+                self.running
+                    .insert(test.unique(), (test.clone(), Instant::now(), budget, false));
+                let n = self.attempts.entry(test.unique()).or_insert(0);
                 *n += 1;
-                let key = format!("{}#{}", test.display(), n);
+                let key = format!("{}#{}", test.unique(), n);
                 self.lifecycle.test_started(&key).is_ok()
             }
             EventKind::TestFinished {
@@ -174,8 +172,8 @@ impl Supervisor<'_> {
                 outcome,
                 ..
             } => {
-                self.running.remove(&test.display());
-                let key = format!("{}#{attempt}", test.display());
+                self.running.remove(&test.unique());
+                let key = format!("{}#{attempt}", test.unique());
                 let ok = self.lifecycle.test_finished(&key, *outcome).is_ok();
                 if ok && outcome.is_failure() {
                     self.any_test_failed = true;
@@ -725,6 +723,12 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
 
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
     let row = store.run(run)?;
+    // An event matched, but the run is over by now: report the end.
+    let reason = if row.status.is_terminal() && reason != WaitReason::Running {
+        WaitReason::Done
+    } else {
+        reason
+    };
     let events = store.events_after(run, 0)?;
     // Final outcome per test: the last attempt counts, retries do not.
     let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
@@ -740,9 +744,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 message,
                 ..
             } => {
-                slow.remove(&test.display());
+                slow.remove(&test.unique());
                 finals.insert(
-                    test.display(),
+                    test.unique(),
                     (test.clone(), *outcome, message.clone(), e.seq),
                 );
             }
@@ -752,7 +756,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 budget_ms,
             } => {
                 slow.insert(
-                    test.display(),
+                    test.unique(),
                     SlowTest {
                         test: test.display(),
                         elapsed_ms: *elapsed_ms,

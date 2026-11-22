@@ -131,6 +131,16 @@ impl TestKey {
         }
     }
 
+    /// Key that tells apart same-named tests in different files or test
+    /// binaries. Use for deduplication; `display` is for people.
+    pub fn unique(&self) -> String {
+        format!(
+            "{}\u{1f}{}",
+            self.file.as_deref().unwrap_or(""),
+            self.display()
+        )
+    }
+
     /// Human-readable full name, `path::name`.
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = self.path.iter().map(String::as_str).collect();

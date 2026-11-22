@@ -165,3 +165,25 @@ fn selected_runs_do_not_count_as_suite_history() {
         "the selected run is not suite history: {s}"
     );
 }
+
+/// Regression (usability session 2): waiting on a finished run reports the
+/// end, not "failing (run still going)".
+#[test]
+fn wait_on_a_finished_run_reports_done() {
+    let d = workspace("finished");
+    toe(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo 'test a ... FAILED'; echo 'test b ... FAILED'; exit 1",
+        ],
+    );
+    let w = toe(&d, &["wait", "last", "--after", "1", "--json"]);
+    let s = json(&w);
+    assert_eq!(s["reason"], "done", "{s}");
+    assert_eq!(s["status"], "finished");
+    assert_eq!(w.status.code(), Some(1));
+}

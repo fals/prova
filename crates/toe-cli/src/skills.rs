@@ -67,7 +67,8 @@ Do not run test commands directly or wrap them in timeouts.
   failure while it runs. Skill: `toe-test`.
 - Performance claims: `toe exp ...` with a frozen protocol and a verdict.
   Skill: `toe-experiment`.
-- Suites are in `toe.toml`; history lives in `.toe/` (not committed).
+- Suites are in `toe.toml`; no `toe.toml` yet? Start with skill
+  `toe-adopt`. History lives in `.toe/` (not committed).
 <!-- toe:end -->
 ";
 
