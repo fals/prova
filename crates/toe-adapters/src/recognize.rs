@@ -1,9 +1,12 @@
 //! Levels 2 and 3: per-test events from live output (ADR 0013).
 //!
 //! Each recognizer looks at one line at a time and is cheap. They run on
-//! every run; lines that match no known format are ignored. Go's
-//! `test2json` stream is the framework's own structured output (level 3);
-//! the others parse human-readable output (level 2).
+//! every run; lines that match no known format are ignored. Structured
+//! streams are level 3 (native): Go's `test2json`, libtest JSON (`cargo test
+//! -- --format json`, nextest `--message-format libtest-json`, and toe's own
+//! Vitest reporter, which writes the same shape), and pytest-reportlog. The
+//! others parse human-readable output (level 2). The same key is built for a
+//! test whichever format reports it, so a test seen in two streams counts once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +35,10 @@ pub struct Recognizers {
     go_current: Option<String>,
     /// Tests the framework says it ran (from its own summary lines).
     pub reported_total: u64,
+    /// Totals from structured suite events (libtest JSON). When present they
+    /// replace the text totals, which a runner may echo from inside its
+    /// captured output (nextest prints libtest's "test result:" lines).
+    pub structured_total: Option<u64>,
     /// libtest results for a test already seen in this run (the same test
     /// binary executed twice); they count toward `reported_total`.
     pub repeats: u64,
@@ -152,7 +159,15 @@ impl Recognizers {
             });
         }
         if line.starts_with('{') {
-            self.go_json(line, &mut out);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("Action").is_some() {
+                    self.go_json(&v, &mut out);
+                } else if v.get("$report_type").is_some() {
+                    self.reportlog(&v, &mut out);
+                } else if v.get("type").is_some() && v.get("event").is_some() {
+                    self.libtest_json(&v, &mut out);
+                }
+            }
         } else {
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
@@ -166,10 +181,7 @@ impl Recognizers {
 
     // ------------------------------------------------------------- go json
 
-    fn go_json(&mut self, line: &str, out: &mut Vec<EventKind>) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            return;
-        };
+    fn go_json(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
         let (Some(action), Some(pkg)) = (v["Action"].as_str(), v["Package"].as_str()) else {
             return;
         };
@@ -231,6 +243,104 @@ impl Recognizers {
             }
             _ => {}
         }
+    }
+
+    // ------------------------------------------------------------- libtest json
+
+    /// libtest's JSON events (`{"type": "test", "event": "ok", "name": ..}`).
+    /// Names: `tests::adds` (cargo; the binary comes from cargo's "Running"
+    /// line), `binary-id$tests::adds` (nextest), or a `file` field plus a
+    /// `describe > test` name (toe's Vitest reporter).
+    fn libtest_json(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        let (Some(kind), Some(event)) = (v["type"].as_str(), v["event"].as_str()) else {
+            return;
+        };
+        if kind == "suite" {
+            if event != "started" {
+                lift(&mut self.level, Level::Native);
+                let n = ["passed", "failed", "ignored", "measured"]
+                    .iter()
+                    .filter_map(|k| v[*k].as_u64())
+                    .sum::<u64>();
+                *self.structured_total.get_or_insert(0) += n;
+            }
+            return;
+        }
+        let Some(name) = v["name"].as_str().filter(|_| kind == "test") else {
+            return;
+        };
+        let key = if let Some(file) = v["file"].as_str() {
+            TestKey {
+                file: None,
+                path: vec![file.to_owned()],
+                name: name.to_owned(),
+            }
+        } else if let Some((binary, test)) = name.split_once('$') {
+            let (path, leaf) = split_rust_path(test);
+            TestKey {
+                file: Some(binary.to_owned()),
+                path,
+                name: leaf,
+            }
+        } else {
+            self.libtest_key(name)
+        };
+        lift(&mut self.level, Level::Native);
+        let outcome = match event {
+            "started" => return self.started(key, out),
+            "ok" => Outcome::Passed,
+            "failed" => Outcome::Failed,
+            "ignored" => Outcome::Skipped,
+            _ => return, // "timeout" is a warning; the test is still running
+        };
+        let duration = v["exec_time"].as_f64().map(|s| (s * 1000.0).round() as u64);
+        let msg = if outcome == Outcome::Failed {
+            let text = v["message"].as_str().or(v["stdout"].as_str()).unwrap_or("");
+            message(&text.lines().map(str::to_owned).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        self.finished(key, outcome, duration, msg, Level::Native, out);
+    }
+
+    // ------------------------------------------------------------- pytest-reportlog
+
+    /// pytest-reportlog: one `TestReport` per phase (setup, call,
+    /// teardown). Setup starts the test (or ends it when it fails or skips),
+    /// call ends it.
+    fn reportlog(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        if v["$report_type"] != "TestReport" {
+            return;
+        }
+        let (Some(id), Some(when), Some(result)) = (
+            v["nodeid"].as_str(),
+            v["when"].as_str(),
+            v["outcome"].as_str(),
+        ) else {
+            return;
+        };
+        lift(&mut self.level, Level::Native);
+        let key = pytest_key(id);
+        let outcome = match (when, result) {
+            ("setup", "passed") => return self.started(key, out),
+            ("setup", "failed") => Outcome::Errored,
+            ("call", "passed") => Outcome::Passed,
+            ("call", "failed") => Outcome::Failed,
+            (_, "skipped") => Outcome::Skipped,
+            ("teardown", "failed") => Outcome::Errored,
+            _ => return,
+        };
+        let longrepr = &v["longrepr"];
+        let msg = if outcome.is_failure() {
+            longrepr["reprcrash"]["message"]
+                .as_str()
+                .or(longrepr.as_str())
+                .map(|m| m.trim().to_owned())
+        } else {
+            None
+        };
+        let duration = v["duration"].as_f64().map(|s| (s * 1000.0).round() as u64);
+        self.finished(key, outcome, duration, msg, Level::Native, out);
     }
 
     // ------------------------------------------------------------- go -v
@@ -554,6 +664,11 @@ impl Recognizers {
         true
     }
 
+    /// Tests the framework says it ran.
+    pub fn total(&self) -> u64 {
+        self.structured_total.unwrap_or(self.reported_total)
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut out = Vec::new();
@@ -763,6 +878,124 @@ mod tests {
             panic!()
         };
         assert_eq!(test.path, vec!["tests.test_x.TestK".to_string()]);
+    }
+
+    fn stream_fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/fixtures/stream/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn libtest_json_from_cargo_is_native_with_durations_and_messages() {
+        let (r, events) = feed(&stream_fixture("libtest-json.txt"));
+        assert_eq!(r.level, Some(Level::Native));
+        let f = finished(&events);
+        assert_eq!(f.len(), 5, "{f:?}");
+        assert!(f.contains(&("tests::divides".into(), Outcome::Failed)));
+        let slow = events.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                duration_ms,
+                message,
+                ..
+            } if test.name == "slow_integration" => {
+                assert_eq!(
+                    test.file.as_deref(),
+                    Some("unittests src/lib.rs"),
+                    "binary from cargo's Running line"
+                );
+                assert!(message.is_none());
+                *duration_ms
+            }
+            _ => None,
+        });
+        assert_eq!(slow, Some(1500));
+        let msg = events.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                message: Some(m), ..
+            } => Some(m.clone()),
+            _ => None,
+        });
+        assert!(msg.unwrap().contains("left: 16"));
+        assert_eq!(r.total(), 5, "suite totals count");
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, EventKind::TestStarted { .. }))
+            .count();
+        assert_eq!(started, 5);
+    }
+
+    #[test]
+    fn libtest_json_names_from_nextest_and_the_vitest_reporter() {
+        let (_, events) = feed(concat!(
+            r#"{"type":"test","event":"started","name":"calc$tests::adds"}"#,
+            "\n",
+            r#"{"type":"test","event":"failed","name":"calc$tests::adds","exec_time":0.002,"stdout":"boom"}"#,
+            "\n",
+            r#"{"type":"test","event":"ok","name":"calc > divides","file":"src/calc.test.ts","exec_time":0.001}"#,
+            "\n",
+        ));
+        let keys: Vec<(Option<String>, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, .. } => Some((test.file.clone(), test.display())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (Some("calc".into()), "tests::adds".into()),
+                (None, "src/calc.test.ts::calc > divides".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nextest_libtest_json_keys_by_binary() {
+        let (r, events) = feed(&stream_fixture("nextest-libtest-json.txt"));
+        assert_eq!(r.level, Some(Level::Native));
+        let f = finished(&events);
+        assert!(f.len() == 5, "{f:?}");
+        assert!(
+            f.contains(&("tests::divides".into(), Outcome::Failed)),
+            "{f:?}"
+        );
+        let file = events.iter().find_map(|e| match e {
+            EventKind::TestFinished { test, .. } => test.file.clone(),
+            _ => None,
+        });
+        assert_eq!(file.as_deref(), Some("calc::calc"));
+        assert_eq!(r.total(), 5, "echoed text totals do not add up");
+    }
+
+    #[test]
+    fn pytest_reportlog_is_native_and_matches_verbose_keys() {
+        let (r, events) = feed(&stream_fixture("pytest-reportlog.jsonl"));
+        assert_eq!(r.level, Some(Level::Native));
+        let f = finished(&events);
+        assert_eq!(f.len(), 5, "{f:?}");
+        assert!(
+            f.contains(&("tests.test_calc::test_div".into(), Outcome::Failed)),
+            "{f:?}"
+        );
+        let msg = events.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                message: Some(m), ..
+            } => Some(m.clone()),
+            _ => None,
+        });
+        assert!(msg.unwrap().starts_with("assert 16 == 4"));
+        // The same test from pytest -v output is not counted twice.
+        let (_, again) = {
+            let mut r = r;
+            let e = r.line("tests/test_calc.py::test_div FAILED");
+            (r.seen.len(), e)
+        };
+        assert!(again.is_empty());
     }
 
     #[test]

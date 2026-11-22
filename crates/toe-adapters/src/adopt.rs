@@ -22,6 +22,42 @@ pub struct Proposal {
     pub notes: Vec<String>,
 }
 
+/// nextest's libtest JSON: experimental, enabled by an environment variable,
+/// with the format version pinned so a change upstream cannot silently
+/// change what toe reads.
+const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1";
+const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}";
+
+/// `cargo nextest --version` output, if nextest is installed.
+fn nextest_version(root: &Path) -> Option<String> {
+    let o = std::process::Command::new("cargo")
+        .args(["nextest", "--version"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    o.status.success().then(|| {
+        let text = String::from_utf8_lossy(&o.stdout);
+        text.lines().next().unwrap_or("").trim().to_owned()
+    })
+}
+
+/// Version check: libtest JSON output exists from cargo-nextest 0.9.66.
+fn nextest_has_libtest_json(version: &str) -> bool {
+    let Some(v) = version
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+    else {
+        return false;
+    };
+    let n: Vec<u64> = v
+        .split(['.', '-', '+'])
+        .take(3)
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
+    n.len() == 3 && (n[0], n[1], n[2]) >= (0, 9, 66)
+}
+
 struct Framework {
     language: &'static str,
     run: &'static str,
@@ -42,14 +78,28 @@ fn any_file_with_ext(root: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn detect(root: &Path) -> Vec<Framework> {
+/// Installed tool versions `toe adopt` asks about (replaced in tests).
+type Probe = fn(&Path) -> Option<String>;
+
+fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     let mut out = Vec::new();
     if root.join("Cargo.toml").exists() {
-        out.push(Framework {
-            language: "rust",
-            run: "cargo test",
-            select: "cargo test -- {filter}",
-            why: "Cargo.toml; libtest output is recognized live".into(),
+        let nextest = nextest(root);
+        out.push(match nextest.as_deref().filter(|v| nextest_has_libtest_json(v)) {
+            Some(v) => Framework {
+                language: "rust",
+                run: NEXTEST_JSON,
+                select: NEXTEST_JSON_SELECT,
+                why: format!(
+                    "Cargo.toml and {v}; its libtest JSON stream is read live (native; experimental format pinned to 0.1)"
+                ),
+            },
+            None => Framework {
+                language: "rust",
+                run: "cargo test",
+                select: "cargo test -- {filter}",
+                why: "Cargo.toml; libtest output is recognized live (cargo-nextest 0.9.66+ would give the native stream)".into(),
+            },
         });
     }
     if root.join("go.mod").exists() {
@@ -162,7 +212,11 @@ fn existing_command(root: &Path) -> Option<String> {
 }
 
 pub fn propose(root: &Path) -> Proposal {
-    let frameworks = detect(root);
+    propose_with(root, nextest_version)
+}
+
+fn propose_with(root: &Path, nextest: Probe) -> Proposal {
+    let frameworks = detect(root, nextest);
     let existing = existing_command(root);
     let mut p = Proposal {
         languages: frameworks.iter().map(|f| f.language.to_owned()).collect(),
@@ -273,6 +327,11 @@ pub fn to_toml(p: &Proposal) -> String {
             for (lang, recipe, what) in [
                 (
                     "python",
+                    "pytest-reportlog",
+                    "every test live from pytest via PYTEST_ADDOPTS (needs pytest-reportlog)",
+                ),
+                (
+                    "python",
                     "pytest-junit",
                     "per-test results from pytest via PYTEST_ADDOPTS",
                 ),
@@ -287,6 +346,11 @@ pub fn to_toml(p: &Proposal) -> String {
                 }
             }
         }
+        if suite.run.contains("vitest") {
+            s.push_str(
+                "# every test live (native): inject = [\"vitest-stream\"] and add\n#   --reporter=default --reporter=\"$TOE_VITEST_REPORTER\" to run and select\n",
+            );
+        }
     }
     s
 }
@@ -294,6 +358,10 @@ pub fn to_toml(p: &Proposal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn propose(root: &Path) -> Proposal {
+        propose_with(root, |_| None)
+    }
 
     fn dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("toe-adopt-{name}-{}", std::process::id()));
@@ -357,6 +425,42 @@ mod tests {
         assert_eq!(p.suites[0].run, "cargo test");
         assert_eq!(p.suites[1].run, "make test");
         assert!(p.notes[0].contains("quiet"), "{:?}", p.notes);
+    }
+
+    #[test]
+    fn rust_gets_the_native_nextest_stream_when_nextest_is_new_enough() {
+        let d = dir("nextest", &[("Cargo.toml", "[package]\nname = \"x\"")]);
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON);
+        assert!(
+            p.suites[0]
+                .select
+                .as_deref()
+                .unwrap()
+                .ends_with(" {filter}")
+        );
+        let old = propose_with(&d, |_| Some("cargo-nextest 0.9.60".into()));
+        assert_eq!(old.suites[0].run, "cargo test");
+    }
+
+    #[test]
+    fn nextest_libtest_json_needs_0_9_66() {
+        assert!(nextest_has_libtest_json(
+            "cargo-nextest 0.9.66 (abc 2023-12-10)"
+        ));
+        assert!(nextest_has_libtest_json("cargo-nextest 0.9.104"));
+        assert!(nextest_has_libtest_json("cargo-nextest 1.0.0-rc.1"));
+        assert!(!nextest_has_libtest_json("cargo-nextest 0.9.65"));
+        assert!(!nextest_has_libtest_json("cargo-nextest"));
+    }
+
+    #[test]
+    fn vitest_suite_points_to_the_stream_recipe() {
+        let t = to_toml(&propose(&dir(
+            "vitest-hint",
+            &[("package.json", r#"{"devDependencies":{"vitest":"3"}}"#)],
+        )));
+        assert!(t.contains("inject = [\"vitest-stream\"]"), "{t}");
     }
 
     #[test]

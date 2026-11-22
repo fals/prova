@@ -1,0 +1,44 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.80s
+────────────
+ Nextest run ID 3b2ed99d-3445-43a2-99a7-edecc8e1f3a4 with nextest profile: default
+    Starting 5 tests across 1 binary
+        PASS [   0.004s] (1/5) calc tests::adds
+        PASS [   0.004s] (2/5) calc tests::hangs_when_asked
+        PASS [   0.004s] (3/5) calc tests::flaky_clock
+        FAIL [   0.004s] (4/5) calc tests::divides
+  output ───
+
+    running 1 test
+
+    thread 'tests::divides' (1516589) panicked at src/lib.rs:23:9:
+    assertion `left == right` failed
+      left: 16
+     right: 4
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    test tests::divides ... FAILED
+
+    failures:
+
+    failures:
+        tests::divides
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+        PASS [   1.504s] (5/5) calc tests::slow_integration
+{"type":"suite","event":"started","test_count":5}
+{"type":"test","event":"started","name":"calc::calc$tests::hangs_when_asked"}
+{"type":"test","event":"started","name":"calc::calc$tests::adds"}
+{"type":"test","event":"started","name":"calc::calc$tests::divides"}
+{"type":"test","event":"started","name":"calc::calc$tests::slow_integration"}
+{"type":"test","event":"started","name":"calc::calc$tests::flaky_clock"}
+{"type":"test","event":"ok","name":"calc::calc$tests::adds","exec_time":0.003759607}
+{"type":"test","event":"ok","name":"calc::calc$tests::hangs_when_asked","exec_time":0.003847979}
+{"type":"test","event":"ok","name":"calc::calc$tests::flaky_clock","exec_time":0.004195703}
+{"type":"test","event":"failed","name":"calc::calc$tests::divides","exec_time":0.00412732,"stdout":"\nthread 'tests::divides' (1516589) panicked at src/lib.rs:23:9:\nassertion `left == right` failed\n  left: 16\n right: 4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"}
+{"type":"test","event":"ok","name":"calc::calc$tests::slow_integration","exec_time":1.503966949}
+{"type":"suite","event":"failed","passed":4,"failed":1,"ignored":0,"measured":0,"filtered_out":0,"exec_time":1.519897558}
+────────────
+     Summary [   1.504s] 5 tests run: 4 passed, 1 failed, 0 skipped
+        FAIL [   0.004s] (4/5) calc tests::divides
+error: test run failed

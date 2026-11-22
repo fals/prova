@@ -1,13 +1,16 @@
 # toe's own suites. From M1 on, tests run through toe (AGENTS.md, Stage B):
 #   .toe/stable/bin/toe run small
+# small and medium run under cargo-nextest with its libtest JSON stream, so
+# toe sees toe's own tests at full fidelity (native level, per-test
+# durations). The format version is pinned; the stream is experimental.
 [suite.small]
-run = "cargo test --lib --bins"
-select = "cargo test --lib --bins -- {filter}"
+run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1"
+select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}"
 size = "small"
 
 [suite.medium]
-run = "cargo test --tests --no-fail-fast"
-select = "cargo test --tests -- {filter}"
+run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1"
+select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}"
 size = "medium"
 stall_after = "2m"
 

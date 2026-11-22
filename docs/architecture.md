@@ -119,14 +119,15 @@ flowchart BT
     L0["Level 0: opaque<br/>exit code, output tail, process tree"]
     L1["Level 1: result files<br/>JUnit XML or TRX written during the run"]
     L2["Level 2: recognized output<br/>libtest, go test -v, pytest -v, Vitest, VSTest, TAP"]
-    L3["Level 3: native stream<br/>go test -json"]
+    L3["Level 3: native stream<br/>go test -json, nextest / libtest JSON,<br/>pytest-reportlog, toe's Vitest reporter"]
     L0 --> L1 --> L2 --> L3
 ```
 
 - Live levels (2, 3) give the first failure while the run is still going.
 - Result files (1) fill in tests the live output did not show, and never double count.
 - When the framework's own totals exceed what toe saw (quiet output), the summary says so.
-- Opt-in injection (`inject = ["pytest-junit"]`, `["go-nocache"]`) raises the level without editing the project's scripts, and is shown in every summary.
+- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (toe's reporter; add `--reporter="$TOE_VITEST_REPORTER"` to the suite command), `go-nocache`.
+- Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output, and kept as an artifact of the run.
 
 ## Liveness: slow, stalled, killed
 

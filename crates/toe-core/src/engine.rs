@@ -45,6 +45,11 @@ pub trait Observer {
     fn env(&mut self, _run_dir: &Path) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Called every tick while the process runs: events from side streams
+    /// the framework writes to files (opt-in injection), read live.
+    fn poll(&mut self, _now_ms: u64) -> Vec<EventKind> {
+        Vec::new()
+    }
     /// Called after the process exited; may ingest result files.
     fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> ExitReport {
         ExitReport::default()
@@ -249,7 +254,12 @@ impl Supervisor<'_> {
             }
             self.tail.push_back(trimmed.to_owned());
         }
-        for e in observer.on_line(trimmed, now_ms()) {
+        let events = observer.on_line(trimmed, now_ms());
+        self.observed(events, observer);
+    }
+
+    fn observed(&mut self, events: Vec<EventKind>, observer: &dyn Observer) {
+        for e in events {
             self.emit(e);
         }
         let live = observer.live_level();
@@ -407,6 +417,11 @@ fn observe_child(
                 Ok(Chunk::Eof) => open_streams -= 1,
                 Err(_) => break,
             }
+        }
+        let streamed = observer.poll(now_ms());
+        if !streamed.is_empty() {
+            last_activity = Instant::now();
+            sup.observed(streamed, observer);
         }
         if let Some(status) = child.try_wait()? {
             break status;
