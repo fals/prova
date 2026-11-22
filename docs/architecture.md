@@ -231,7 +231,8 @@ erDiagram
 |---|---|
 | A developer machine or agent sandbox | `cargo install`, or the release tarball |
 | A container (devcontainer, CI image) | `COPY --from=ghcr.io/fals/toe:<version> /toe /usr/local/bin/toe` |
-| Pods in a cluster | same image copy; a central `toe serve` is drafted in [PR #49](https://github.com/fals/toe/pull/49) and not merged |
+| CI (GitHub Actions, GitLab) | install or copy the binary; keep `TOE_HOME` in the job and persist it with the CI cache or artifacts |
+| Pods in Kubernetes | same image copy; `TOE_HOME` on a volume with one writer at a time (no server, [ADR 0014](adr/0014-central-store-and-server.md#3-no-server-for-now-local-storage-everywhere-deferred)) |
 
 toe always runs next to the tests, because only there can it watch and stop
 the processes ([ADR 0010](adr/0010-deployment.md)).

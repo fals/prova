@@ -1,6 +1,6 @@
 # 0010: Deployment: static binary, container image as packaging
 
-Status: Proposed. Amended by [0014](0014-central-store-and-server.md): the image also runs `toe serve` in clusters. **Deviates from the README**, which says "always container".
+Status: Proposed. See [0014](0014-central-store-and-server.md) for where history lives in CI, containers and Kubernetes (no server). **Deviates from the README**, which says "always container".
 
 ## Context
 

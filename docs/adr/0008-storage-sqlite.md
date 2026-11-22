@@ -1,6 +1,6 @@
 # 0008: Storage: SQLite single file
 
-Status: Proposed. Location superseded by [0014](0014-central-store-and-server.md): one central store under `TOE_HOME`, one SQLite file per repository, optionally owned by `toe serve`.
+Status: Proposed. Location superseded by [0014](0014-central-store-and-server.md): one central store under `TOE_HOME`, one SQLite file per repository.
 
 ## Context
 
