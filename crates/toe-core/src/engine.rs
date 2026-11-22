@@ -137,13 +137,32 @@ struct Supervisor<'a> {
     tail: VecDeque<String>,
     any_test_failed: bool,
     level: Level,
+    suite: String,
+    default_slow: Duration,
+    /// Running tests: (key, started, slow budget, slow reported).
+    running: BTreeMap<String, (TestKey, Instant, Duration, bool)>,
 }
 
 impl Supervisor<'_> {
-    fn emit(&mut self, kind: EventKind) {
+    fn emit(&mut self, mut kind: EventKind) {
+        // Frameworks that report a start but no duration: measure it.
+        if let EventKind::TestFinished {
+            test,
+            duration_ms: d @ None,
+            ..
+        } = &mut kind
+            && let Some((_, started, _, _)) = self.running.get(&test.display())
+        {
+            *d = Some(started.elapsed().as_millis() as u64);
+        }
         // Guard every test event with the lifecycle (spec/run.qnt).
         let ok = match &kind {
             EventKind::TestStarted { test } => {
+                let budget = self.slow_budget(test);
+                self.running.insert(
+                    test.display(),
+                    (test.clone(), Instant::now(), budget, false),
+                );
                 let n = self.attempts.entry(test.display()).or_insert(0);
                 *n += 1;
                 let key = format!("{}#{}", test.display(), n);
@@ -155,6 +174,7 @@ impl Supervisor<'_> {
                 outcome,
                 ..
             } => {
+                self.running.remove(&test.display());
                 let key = format!("{}#{attempt}", test.display());
                 let ok = self.lifecycle.test_finished(&key, *outcome).is_ok();
                 if ok && outcome.is_failure() {
@@ -177,6 +197,37 @@ impl Supervisor<'_> {
         });
     }
 
+    /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
+    fn slow_budget(&self, test: &TestKey) -> Duration {
+        let id = crate::store::test_id(&self.suite, test);
+        match crate::analysis::stats(self.store, &id, 20) {
+            Ok(Some(s)) if s.p95_ms.is_some() => {
+                Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000))
+            }
+            _ => self.default_slow,
+        }
+    }
+
+    /// Emits `test_slow` once per running test over its budget.
+    fn check_slow(&mut self) {
+        let now = Instant::now();
+        let mut slow = Vec::new();
+        for (key, started, budget, reported) in self.running.values_mut() {
+            let elapsed = now.duration_since(*started);
+            if !*reported && elapsed > *budget {
+                *reported = true;
+                slow.push(EventKind::TestSlow {
+                    test: key.clone(),
+                    elapsed_ms: elapsed.as_millis() as u64,
+                    budget_ms: budget.as_millis() as u64,
+                });
+            }
+        }
+        for e in slow {
+            self.emit(e);
+        }
+    }
+
     fn flush(&mut self) -> Result<()> {
         let events = std::mem::take(&mut self.pending);
         self.store.append_events(&events)
@@ -193,6 +244,11 @@ impl Supervisor<'_> {
         }
         for e in observer.on_line(trimmed, now_ms()) {
             self.emit(e);
+        }
+        let live = observer.live_level();
+        if live > self.level {
+            self.level = live;
+            let _ = self.store.set_level(&self.run, live);
         }
     }
 }
@@ -218,6 +274,12 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         tail: VecDeque::new(),
         any_test_failed: false,
         level: observer.live_level(),
+        suite: row.suite.clone(),
+        default_slow: spec
+            .size
+            .map(crate::config::Size::slow_budget)
+            .unwrap_or(Duration::from_secs(60)),
+        running: BTreeMap::new(),
     };
     store.set_level(run, sup.level)?;
 
@@ -355,6 +417,7 @@ fn observe_child(
         } else if idle < stall_after {
             stalled = false;
         }
+        sup.check_slow();
         if terminating.is_none() && now.duration_since(start) >= kill_after {
             process::terminate_group(pgid);
             let reason = format!(
@@ -495,6 +558,8 @@ pub enum Until {
 #[serde(rename_all = "snake_case")]
 pub enum WaitReason {
     Failure,
+    /// A test exceeded its slow budget and is still running.
+    Slow,
     Stall,
     Done,
     /// `max_wait` elapsed; the run is still going.
@@ -509,6 +574,13 @@ pub struct Failure {
     /// History of this test: seen before, flaky, last passing code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<crate::analysis::FailureContext>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowTest {
+    pub test: String,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -536,6 +608,9 @@ pub struct Summary {
     pub failures: Vec<Failure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stalled_ms: Option<u64>,
+    /// Tests over their slow budget that have not finished.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slow: Vec<SlowTest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -556,6 +631,7 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
     match kind {
         EventKind::RunFinished { .. } => Some(WaitReason::Done),
         EventKind::RunStalled { .. } if until != Until::Done => Some(WaitReason::Stall),
+        EventKind::TestSlow { .. } if until == Until::FirstFailure => Some(WaitReason::Slow),
         EventKind::TestFinished { outcome, .. }
             if until == Until::FirstFailure && outcome.is_failure() =>
         {
@@ -651,6 +727,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
+    let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
     for e in &events {
         match &e.kind {
             EventKind::TestFinished {
@@ -659,9 +736,24 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 message,
                 ..
             } => {
+                slow.remove(&test.display());
                 finals.insert(
                     test.display(),
                     (test.clone(), *outcome, message.clone(), e.seq),
+                );
+            }
+            EventKind::TestSlow {
+                test,
+                elapsed_ms,
+                budget_ms,
+            } => {
+                slow.insert(
+                    test.display(),
+                    SlowTest {
+                        test: test.display(),
+                        elapsed_ms: *elapsed_ms,
+                        budget_ms: *budget_ms,
+                    },
                 );
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
@@ -696,9 +788,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let n_failures = failing.len();
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
-    let want_tail = failed_run
-        || reason == WaitReason::Stall
-        || (reason == WaitReason::Failure && failures.iter().all(|f| f.message.is_none()));
+    // Raw output only when it adds something: a stall, or a failure that
+    // per-test messages do not explain.
+    let explained = !failures.is_empty() && failures.iter().all(|f| f.message.is_some());
+    let want_tail = reason == WaitReason::Stall
+        || ((failed_run || reason == WaitReason::Failure) && !explained);
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
@@ -715,6 +809,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         counts,
         failures,
         stalled_ms,
+        slow: if row.status.is_terminal() {
+            Vec::new()
+        } else {
+            slow.into_values().collect()
+        },
         exit_code: row.exit_code,
         detail: match (row.reason.clone(), n_failures > 20) {
             (Some(r), _) => Some(r),

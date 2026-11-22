@@ -134,6 +134,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Proposed test sizes from observed durations (ADR 0005, 0013).
+    Sizes {
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare per-test results of two runs.
     Diff {
         base: String,
@@ -150,6 +157,19 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // `toe ... | head` closes stdout early; exit quietly like other tools.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        if msg.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        default_hook(info);
+    }));
     let cli = Cli::parse();
     match dispatch(cli.cmd) {
         Ok(code) => ExitCode::from(code),
@@ -410,6 +430,25 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             Ok(exit::PASSED)
         }
+        Cmd::Sizes { suite, json } => {
+            let (store, _, _) = open_here()?;
+            let d = analysis::sizes(&store, suite.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string(&d)?);
+            } else {
+                println!(
+                    "{} tests by observed p95 duration: {} small (<=1s), {} medium (<=30s), {} large",
+                    d.total, d.small, d.medium, d.large
+                );
+                if let Some(w) = &d.warning {
+                    println!("warning: {w}");
+                }
+                for (t, ms) in d.largest.iter().take(10) {
+                    println!("  {ms:>8}ms  {}", render::clean(t));
+                }
+            }
+            Ok(exit::PASSED)
+        }
         Cmd::Diff { base, head, json } => {
             let (store, _, _) = open_here()?;
             let d = analysis::diff(
@@ -489,7 +528,9 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
                 render::summary(&s, json);
                 return Ok(exit_code(&s));
             }
-            WaitReason::Failure | WaitReason::Stall if !json => render::progress(&s, &mut reported),
+            WaitReason::Failure | WaitReason::Stall | WaitReason::Slow if !json => {
+                render::progress(&s, &mut reported)
+            }
             _ => {}
         }
     }
@@ -498,7 +539,7 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
 fn exit_code(s: &Summary) -> u8 {
     match s.reason {
         WaitReason::Running => exit::RUNNING,
-        WaitReason::Stall => exit::STALLED_OR_KILLED,
+        WaitReason::Stall | WaitReason::Slow => exit::STALLED_OR_KILLED,
         WaitReason::Failure => exit::FAILED,
         WaitReason::Done => match (s.outcome, s.status) {
             (Some(Outcome::Passed), _) => exit::PASSED,
