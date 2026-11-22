@@ -1,6 +1,6 @@
 # 0015: Spec-first experiments: the specification is the oracle
 
-Status: Proposed. Amends [0007](0007-experiments.md) (protocol, decision rule) and [0011](0011-formalization-quint-not-lean.md) (Lean is usable by projects).
+Status: Accepted (2026-11-22). Amends [0007](0007-experiments.md) (protocol, decision rule) and [0011](0011-formalization-quint-not-lean.md) (Lean is usable by projects).
 
 ## Context
 
