@@ -22,7 +22,10 @@ fn repo() -> PathBuf {
 }
 
 fn copy_fixture(name: &str) -> PathBuf {
-    copy_fixture_as(name, name)
+    match name.strip_suffix("-native") {
+        Some(base) => copy_fixture_as(base, name),
+        None => copy_fixture_as(name, name),
+    }
 }
 
 fn copy_fixture_as(name: &str, copy: &str) -> PathBuf {
@@ -357,6 +360,81 @@ fn typescript() {
         "npm install --no-audit --no-fund",
         "npm test",
         "divides",
+    );
+}
+
+/// Level 3 through an opt-in recipe, with the project's own command:
+/// every test arrives as a structured event, with its duration.
+fn check_native(
+    lang: &str,
+    fixture: &str,
+    prepare: &str,
+    recipe: &str,
+    cmd: &str,
+    bug: &str,
+    said: &str,
+) {
+    let tag = image(lang);
+    let d = copy_fixture(&format!("{fixture}-native"));
+    // One container: the toe home lives in it.
+    let o = in_container(
+        &tag,
+        &d,
+        prepare,
+        &format!("toe run --json --inject {recipe} -- {cmd}; toe history slow --json"),
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let docs: Vec<serde_json::Value> = out
+        .lines()
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(
+        docs.len() >= 2,
+        "run and history JSON expected: {out}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let s = &docs[docs.len() - 2];
+    assert_bug_found(s, bug);
+    assert_eq!(s["level"], "native", "{s}");
+    let f = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["test"].as_str().unwrap().contains(bug))
+        .unwrap();
+    assert!(f["message"].as_str().unwrap_or("").contains(said), "{s}");
+    // The 1.5 s test carries its own duration, from the stream.
+    let hist = &docs[docs.len() - 1];
+    let p50 = hist["p50_ms"].as_u64().unwrap_or(0);
+    assert!((1400..5000).contains(&p50), "slow test timed: {hist}");
+}
+
+#[test]
+#[ignore = "large: needs docker"]
+fn python_native_stream() {
+    check_native(
+        "python",
+        "python-make",
+        "true",
+        "pytest-reportlog",
+        "make test",
+        "test_div",
+        "assert 16 == 4",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and npm registry access"]
+fn typescript_native_stream() {
+    check_native(
+        "node",
+        "ts-vitest",
+        "npm install --no-audit --no-fund",
+        "vitest-stream",
+        "sh -c 'npx vitest run --reporter=default --reporter=\"$TOE_VITEST_REPORTER\"'",
+        "divides",
+        "expected 16 to be 4",
     );
 }
 
