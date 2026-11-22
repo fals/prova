@@ -27,6 +27,11 @@ module experiment {
   var verdict: Verdict
   var baseSpec: Check
   var candSpec: Check
+  // Content ids: the snapshot recorded for the candidate, the live working
+  // tree, and the content the candidate arm actually ran (0 = not yet run).
+  var recorded: int
+  var workTree: int
+  var measured: int
 
   action init = all {
     protocol' = 0,
@@ -37,6 +42,9 @@ module experiment {
     verdict' = NoVerdict,
     baseSpec' = Unchecked,
     candSpec' = Unchecked,
+    recorded' = 1,
+    workTree' = 1,
+    measured' = 0,
   }
 
   pure def total(b: int, c: int): int = b + c
@@ -49,6 +57,7 @@ module experiment {
     baseTrials' = baseTrials, candTrials' = candTrials,
     fingerprints' = fingerprints, verdict' = verdict,
     baseSpec' = baseSpec, candSpec' = candSpec,
+    recorded' = recorded, workTree' = workTree, measured' = measured,
   }
 
   // Each arm is checked once, before any trial.
@@ -63,6 +72,9 @@ module experiment {
     protocol' = protocol, frozenProtocol' = frozenProtocol,
     baseTrials' = baseTrials, candTrials' = candTrials,
     fingerprints' = fingerprints, verdict' = verdict,
+    recorded' = recorded, workTree' = workTree,
+    // The candidate's oracle runs in its snapshot checkout, not the live tree.
+    measured' = if (arm == Candidate) recorded else measured,
   }
 
   // A candidate that violates the specification is rejected unmeasured.
@@ -74,6 +86,7 @@ module experiment {
     protocol' = protocol, frozenProtocol' = frozenProtocol,
     baseTrials' = baseTrials, candTrials' = candTrials,
     fingerprints' = fingerprints, baseSpec' = baseSpec, candSpec' = candSpec,
+    recorded' = recorded, workTree' = workTree, measured' = measured,
   }
 
   // Trials alternate arms (interleaving); the next arm is the one behind.
@@ -89,6 +102,17 @@ module experiment {
       all { baseTrials' = baseTrials, candTrials' = candTrials + 1 },
     verdict' = NoVerdict,
     protocol' = protocol, frozenProtocol' = frozenProtocol,
+    baseSpec' = baseSpec, candSpec' = candSpec,
+    recorded' = recorded, workTree' = workTree, measured' = recorded,
+  }
+
+  // The live working tree may change at any time, including mid-comparison.
+  action editWorkTree(v: int): bool = all {
+    workTree' = v,
+    recorded' = recorded, measured' = measured,
+    protocol' = protocol, frozenProtocol' = frozenProtocol,
+    baseTrials' = baseTrials, candTrials' = candTrials,
+    fingerprints' = fingerprints, verdict' = verdict,
     baseSpec' = baseSpec, candSpec' = candSpec,
   }
 
@@ -107,16 +131,18 @@ module experiment {
     protocol' = protocol, frozenProtocol' = frozenProtocol,
     baseTrials' = baseTrials, candTrials' = candTrials, fingerprints' = fingerprints,
     baseSpec' = baseSpec, candSpec' = candSpec,
+    recorded' = recorded, workTree' = workTree, measured' = measured,
   }
 
   action step = {
     nondet v = 1.to(3).oneOf()
     nondet fp = FINGERPRINTS.oneOf()
     nondet o = Set(Accept, Reject, Inconclusive).oneOf()
+    nondet w = 1.to(3).oneOf()
     nondet arm = Set(Baseline, Candidate).oneOf()
     // Holds more often than not, so long traces still reach decisions.
     nondet holds = Set(true, true, false).oneOf()
-    any { setProtocol(v), checkSpec(arm, holds), rejectViolation, trial(fp), decide(o) }
+    any { setProtocol(v), checkSpec(arm, holds), rejectViolation, trial(fp), decide(o), editWorkTree(w) }
   }
 
   // ---------------- invariants
@@ -143,6 +169,9 @@ module experiment {
   val mixedMachinesAreInvalid =
     (verdict != NoVerdict and fingerprints.size() > 1) implies verdict == Invalid
 
+  // What ran is what was recorded, whatever the working tree became.
+  val measuredIsRecorded = measured == 0 or measured == recorded
+
   val boundedTrials = baseTrials <= MAX_TRIALS and candTrials <= MAX_TRIALS
 
   val safety = all {
@@ -154,6 +183,7 @@ module experiment {
     trialsNeedTheSpec,
     violatorNeverAccepted,
     violatingBaselineDecidesNothing,
+    measuredIsRecorded,
   }
 
 
@@ -189,4 +219,11 @@ module experiment {
   run violatingBaselineTest =
     init.then(checkSpec(Baseline, false)).then(checkSpec(Candidate, true))
       .then(any { rejectViolation, trial(1), decide(Accept) }).fail()
+
+  // Regression: editing the working tree after recording never changes what
+  // is measured (the bug: the best arm ran whatever the tree held now).
+  run editsDoNotChangeWhatIsMeasuredTest =
+    init.then(checkSpec(Baseline, true)).then(editWorkTree(3)).then(checkSpec(Candidate, true))
+      .then(trial(1)).then(editWorkTree(2)).then(trial(1)).then(trial(1)).then(trial(1))
+      .then(all { assert(measured == recorded and workTree != recorded), decide(Accept) })
 }

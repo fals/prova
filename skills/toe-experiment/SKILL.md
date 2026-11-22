@@ -88,8 +88,11 @@ toe exp run <name> --detach
 toe exp wait <name> --max-wait 30s
 ```
 
-Do not edit files while trials run; toe refuses a candidate whose files
-changed since it was recorded.
+`toe exp candidate` snapshots the working tree (a commit under
+`refs/toe/candidates/`; your branch, index and stash are untouched), and every
+arm runs in its own checkout. Editing files afterwards does not change what is
+measured; record a new candidate to measure the edit. Git-ignored files are not
+in the checkout: rebuild them with the protocol's `--setup`.
 
 ## 4. Act on the verdict
 

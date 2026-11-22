@@ -563,7 +563,21 @@ pub fn add_variant(
     params_: &BTreeMap<String, String>,
 ) -> Result<()> {
     valid_name(name)?;
+    if existing_variant(store, exp, name)? {
+        return refused(format!("variant {name:?} already exists in {exp}"));
+    }
     let root = store.root();
+    // A repository without commits has no HEAD to be the baseline: the
+    // working tree, snapshotted without a parent, is the baseline.
+    let git_ref = match git_ref {
+        Some("HEAD")
+            if git(root, &["rev-parse", "--git-dir"]).is_some()
+                && git(root, &["rev-parse", "--verify", "HEAD^{commit}"]).is_none() =>
+        {
+            None
+        }
+        r => r,
+    };
     let (kind, sha, code) = match git_ref {
         Some(r) => {
             let Some(sha) = git(root, &["rev-parse", "--verify", &format!("{r}^{{commit}}")])
@@ -577,7 +591,17 @@ pub fn add_variant(
                 format!("tree:{}", &tree[..tree.len().min(12)]),
             )
         }
-        None => ("workdir", None, code_identity(root)),
+        // The working tree is recorded as a snapshot commit, so every
+        // comparison runs what was recorded, never the live tree. Outside
+        // git there is nothing to snapshot: the variant keeps running in the
+        // working tree as before. A snapshot is stored as a `ref` variant
+        // (the schema ties a commit to that kind); its `code` keeps the
+        // working-tree identity, `+dirty` included.
+        None => {
+            let sha = snapshot(store, exp, name)?;
+            let kind = if sha.is_some() { "ref" } else { "workdir" };
+            (kind, sha, code_identity(root))
+        }
     };
     let n = store.conn().execute(
         "INSERT OR IGNORE INTO variants (experiment, name, kind, commit_sha, code, params, created_ms)
@@ -588,6 +612,86 @@ pub fn add_variant(
         return refused(format!("variant {name:?} already exists in {exp}"));
     }
     Ok(())
+}
+
+fn existing_variant(store: &Store, exp: &str, name: &str) -> Result<bool> {
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT 1 FROM variants WHERE experiment = ?1 AND name = ?2",
+            params![exp, name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Records the working tree as a commit without touching the user's branch,
+/// HEAD, index or stash: a temporary index holds HEAD plus every non-ignored
+/// file (tracked and untracked), `.toe/` excluded. The commit is kept alive
+/// by `refs/toe/candidates/<exp>/<label>` so `git gc` cannot drop it. `None`
+/// outside a git repository.
+fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
+    let Some(top) = git(store.root(), &["rev-parse", "--show-toplevel"]) else {
+        return Ok(None);
+    };
+    let top = PathBuf::from(top);
+    let index = store
+        .dir()
+        .join(format!("snapshot-index-{}", std::process::id()));
+    let _ = std::fs::remove_file(&index);
+    let run = |args: &[&str]| -> Result<String> {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&top)
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_AUTHOR_NAME", "toe")
+            .env("GIT_AUTHOR_EMAIL", "toe@localhost")
+            .env("GIT_COMMITTER_NAME", "toe")
+            .env("GIT_COMMITTER_EMAIL", "toe@localhost")
+            .stdin(Stdio::null())
+            .output()?;
+        if !o.status.success() {
+            return refused(format!(
+                "could not snapshot the working tree (git {}): {}",
+                args.first().copied().unwrap_or(""),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    let result = (|| {
+        let head = git(&top, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        if head.is_some() {
+            run(&["read-tree", "HEAD"])?;
+        }
+        let mut add = vec!["add", "-A", "--", ".", ":(exclude,glob)**/.toe/**"];
+        // A store kept inside the repository is toe's own, never a candidate.
+        let inside = store
+            .dir()
+            .strip_prefix(&top)
+            .ok()
+            .map(|p| format!(":(exclude){}", p.display()));
+        if let Some(x) = &inside {
+            add.push(x);
+        }
+        run(&add)?;
+        let tree = run(&["write-tree"])?;
+        let msg = format!("toe candidate {exp}/{label}");
+        let mut ct = vec!["commit-tree", &tree, "-m", &msg];
+        if let Some(h) = &head {
+            ct.extend(["-p", h]);
+        }
+        let sha = run(&ct)?;
+        run(&[
+            "update-ref",
+            &format!("refs/toe/candidates/{exp}/{label}"),
+            &sha,
+        ])?;
+        Ok(sha)
+    })();
+    let _ = std::fs::remove_file(&index);
+    result.map(Some)
 }
 
 pub fn variant(store: &Store, exp: &str, name: &str) -> Result<Variant> {
@@ -646,14 +750,8 @@ pub fn start(store: &Store, exp: &str, candidate: &str, against: Option<&str>) -
     if candidate == against {
         return refused(format!("candidate and baseline are both {candidate:?}"));
     }
-    let c = variant(store, exp, candidate)?;
+    variant(store, exp, candidate)?;
     variant(store, exp, &against)?;
-    if c.kind == "workdir" && code_identity(store.root()) != c.code {
-        return refused(format!(
-            "workspace changed since candidate {candidate:?} was recorded ({}); record a new candidate: toe exp candidate {exp}",
-            c.code
-        ));
-    }
     let running: Option<String> = store
         .conn()
         .query_row(
@@ -679,6 +777,20 @@ pub fn start(store: &Store, exp: &str, candidate: &str, against: Option<&str>) -
     )?;
     tx.commit()?;
     Ok(id)
+}
+
+/// Variants of a comparison that run in the live working tree because they
+/// were recorded without a snapshot (older stores, or outside git).
+pub fn live_tree_variants(store: &Store, exp: &str, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| {
+            variant(store, exp, n)
+                .map(|v| v.commit_sha.is_none())
+                .unwrap_or(false)
+        })
+        .map(|n| (*n).to_owned())
+        .collect()
 }
 
 pub fn request_cancel(store: &Store, comparison: &str) -> Result<()> {

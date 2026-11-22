@@ -190,8 +190,14 @@ stateDiagram-v2
     Failed --> [*]
 ```
 
-The baseline is a git ref run in a worktree; the candidate is the working tree
-as recorded (toe refuses a candidate whose files changed since). Statistics:
+Every arm runs in its own detached worktree. A baseline is a git ref; a
+candidate is a snapshot commit of the working tree (tracked and untracked
+files, `.gitignore` respected, `.toe/` excluded) built with a temporary index,
+so the user's branch, index and stash are untouched, and kept alive by
+`refs/toe/candidates/<experiment>/<label>`. What is measured is what was
+recorded, however the tree changes afterwards (`spec/experiment.qnt`,
+`measuredIsRecorded`). Files ignored by git are absent from worktrees: use the
+protocol's `--setup` to rebuild them. Statistics:
 exact Mann-Whitney U, Hodges-Lehmann interval, Holm correction across an
 improvement loop, verified against SciPy. Deterministic metrics (accuracy on a
 fixed dataset, step counts) are valid samples.

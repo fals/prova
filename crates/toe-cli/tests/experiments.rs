@@ -123,7 +123,7 @@ fn same_code_is_not_an_improvement() {
 }
 
 #[test]
-fn protocol_is_frozen_after_the_first_trial_and_workspace_changes_are_caught() {
+fn protocol_is_frozen_after_the_first_trial() {
     let d = repo("frozen", "0.01");
     new_exp(&d, &[]);
     assert!(
@@ -137,12 +137,8 @@ fn protocol_is_frozen_after_the_first_trial_and_workspace_changes_are_caught() {
     );
     std::fs::write(d.join("delay"), "0.005").unwrap();
     toe(&d, &["exp", "candidate", "e"]);
-    std::fs::write(d.join("delay"), "0.007").unwrap(); // edited after recording
-    let stale = toe(&d, &["exp", "run", "e"]);
-    assert_eq!(stale.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("workspace changed"));
-    toe(&d, &["exp", "candidate", "e"]);
-    toe(&d, &["exp", "run", "e", "--candidate", "c2"]);
+    std::fs::write(d.join("delay"), "0.007").unwrap(); // edited after recording: harmless
+    toe(&d, &["exp", "run", "e"]);
     let frozen = toe(&d, &["exp", "protocol", "e", "--min-effect", "0.5%"]);
     assert_eq!(frozen.status.code(), Some(4));
     assert!(String::from_utf8_lossy(&frozen.stderr).contains("protocol frozen"));
@@ -275,4 +271,123 @@ fn the_specification_cannot_move() {
     assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
     let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
     assert!(reason.contains("spec.txt differs"), "{reason}");
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn a_broken_edit_after_an_accept_is_rejected_and_the_best_still_runs_as_recorded() {
+    // Why medium: needs real worktrees and a persisted best across comparisons.
+    let d = spec_repo("snap-broken");
+    std::fs::write(d.join("steps"), "60").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["best"], "c1", "{r}");
+    // A deliberately broken edit, recorded as a new candidate.
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let o = toe(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(
+        r["comparison"]["status"], "decided",
+        "best must hold its recorded spec: {r}"
+    );
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "{r}");
+    assert_eq!(r["best"], "c1");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("violates the specification"), "{reason}");
+}
+
+#[test]
+fn edits_after_recording_do_not_change_what_is_measured() {
+    let d = repo("snap-edit", "0.06");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    std::fs::write(d.join("delay"), "0.5").unwrap(); // edited after recording
+    let o = toe(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    // The live tree is never measured: it still holds the edit.
+    assert_eq!(std::fs::read_to_string(d.join("delay")).unwrap(), "0.5");
+}
+
+#[test]
+fn recording_a_candidate_leaves_the_users_git_state_alone() {
+    let d = repo("snap-state", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.005").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t stash push -q -m mine",
+    );
+    std::fs::write(d.join("delay"), "0.004").unwrap();
+    std::fs::write(d.join("new.txt"), "untracked\n").unwrap();
+    std::fs::write(d.join("staged.txt"), "staged\n").unwrap();
+    sh(&d, "git add staged.txt");
+    let state = |d: &Path| {
+        (
+            git_out(d, &["rev-parse", "HEAD"]),
+            git_out(d, &["symbolic-ref", "HEAD"]),
+            git_out(d, &["stash", "list"]),
+            git_out(d, &["status", "--porcelain=v1"]),
+            git_out(d, &["diff", "--cached"]),
+        )
+    };
+    let before = state(&d);
+    assert!(before.2.contains("mine"), "stash entry exists");
+    assert!(
+        toe(&d, &["exp", "candidate", "e", "--label", "idea"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        state(&d),
+        before,
+        "HEAD, branch, stash, index and tree untouched"
+    );
+    // The snapshot is a commit kept alive by a ref, holds untracked files, no .toe.
+    let sha = git_out(&d, &["rev-parse", "refs/toe/candidates/e/idea"]);
+    let sha = sha.trim();
+    assert_eq!(git_out(&d, &["show", &format!("{sha}:delay")]), "0.004");
+    assert_eq!(
+        git_out(&d, &["show", &format!("{sha}:new.txt")]),
+        "untracked\n"
+    );
+    let files = git_out(&d, &["ls-tree", "-r", "--name-only", sha]);
+    assert!(!files.lines().any(|f| f.starts_with(".toe")), "{files}");
+    assert_eq!(
+        git_out(&d, &["rev-parse", &format!("{sha}^")]).trim(),
+        before.0.trim()
+    );
+}
+
+#[test]
+fn candidates_work_in_a_repository_without_commits() {
+    let d = std::env::temp_dir().join(format!("toe-exp-snap-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("delay"), "0.06").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nsleep $(cat delay)\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    sh(&d, "chmod +x work.sh && git init -q");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
 }
