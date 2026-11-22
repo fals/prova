@@ -1,6 +1,11 @@
-//! Large tests: real fixture projects with real toolchains (ADR 0005).
-//! Opt-in: `cargo test -p toe-cli --test fixtures_large -- --ignored`
-//! (needs go and cargo on PATH).
+//! Large tests: every claimed language, real toolchains, real projects
+//! (fixtures/). Each fixture is run with its own test command and must
+//! show: the real bug found per test (not opaque), and a hang caught as a
+//! stall with no configuration.
+//!
+//! Go and Rust use the host toolchain. Python, TypeScript, Java and C# run
+//! inside official images with toe copied in (`COPY --from`, ADR 0010).
+//! Opt-in: `toe run large` (or `cargo test -p toe-cli --test fixtures_large -- --ignored`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -9,10 +14,12 @@ use std::process::{Command, Output};
 
 const TOE: &str = env!("CARGO_BIN_EXE_toe");
 
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 fn copy_fixture(name: &str) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures")
-        .join(name);
+    let src = repo().join("fixtures").join(name);
     let d = std::env::temp_dir().join(format!("toe-large-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     assert!(
@@ -27,7 +34,49 @@ fn copy_fixture(name: &str) -> PathBuf {
     d
 }
 
-fn toe(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+fn json_last_line(o: &Output) -> serde_json::Value {
+    let out = String::from_utf8_lossy(&o.stdout);
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('{'))
+        .unwrap_or_else(|| {
+            panic!(
+                "no JSON in output:\n{out}\nstderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            )
+        });
+    serde_json::from_str(line).unwrap()
+}
+
+fn assert_bug_found(s: &serde_json::Value, bug: &str) {
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_ne!(s["level"], "opaque", "per-test results expected: {s}");
+    let failing: Vec<&str> = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["test"].as_str().unwrap())
+        .collect();
+    assert!(
+        failing.iter().any(|t| t.contains(bug)),
+        "{bug} not among {failing:?}"
+    );
+    let f = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["test"].as_str().unwrap().contains(bug))
+        .unwrap();
+    assert!(
+        f["message"].is_string() || !s["output_tail"].as_array().unwrap().is_empty(),
+        "failure is explained: {s}"
+    );
+}
+
+// ------------------------------------------------------------- host
+
+fn host(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(TOE);
     c.args(args).current_dir(dir);
     for (k, v) in env {
@@ -36,77 +85,200 @@ fn toe(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     c.output().unwrap()
 }
 
-fn json(o: &Output) -> serde_json::Value {
-    serde_json::from_slice(&o.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)))
-}
-
-fn check_fixture(name: &str, bug: &str) {
+fn check_host(name: &str, cmd: &[&str], bug: &str) {
     let d = copy_fixture(name);
-    let s = json(&toe(&d, &["run", "--json", "--", "make", "test"], &[]));
-    assert_eq!(s["outcome"], "failed");
-    assert_ne!(s["level"], "opaque", "{s}");
-    let failing: Vec<&str> = s["failures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["test"].as_str().unwrap())
-        .collect();
-    assert!(failing.iter().any(|t| t.contains(bug)), "{failing:?}");
+    let mut args = vec!["run", "--json", "--"];
+    args.extend_from_slice(cmd);
+    assert_bug_found(&json_last_line(&host(&d, &args, &[])), bug);
 
-    // A hang is caught as a stall without any per-test configuration.
-    let id = json(&toe(
-        &d,
-        &[
-            "run",
-            "--detach",
-            "--json",
-            "--stall-after",
-            "3s",
-            "--",
-            "make",
-            "test",
-        ],
-        &[("HANG", "1")],
-    ))["run"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let w = toe(
+    let mut args = vec!["run", "--detach", "--json", "--stall-after", "5s", "--"];
+    args.extend_from_slice(cmd);
+    host(&d, &args, &[("HANG", "1")]);
+    let w = host(
         &d,
         &[
             "wait",
-            &id,
+            "last",
             "--until",
             "stall",
             "--max-wait",
-            "120s",
+            "240s",
             "--json",
         ],
         &[],
     );
     assert_eq!(
-        json(&w)["reason"],
+        json_last_line(&w)["reason"],
         "stall",
         "{}",
         String::from_utf8_lossy(&w.stdout)
     );
-    toe(&d, &["cancel", &id], &[]);
-    toe(
+    host(&d, &["cancel", "last"], &[]);
+    host(
         &d,
-        &["wait", &id, "--until", "done", "--max-wait", "30s"],
+        &["wait", "last", "--until", "done", "--max-wait", "60s"],
         &[],
     );
 }
 
 #[test]
 #[ignore = "large: needs go"]
-fn go_fixture_end_to_end() {
-    check_fixture("go-make", "TestDiv");
+fn go() {
+    check_host("go-make", &["make", "test"], "TestDiv");
 }
 
 #[test]
 #[ignore = "large: needs cargo, compiles a crate"]
-fn rust_fixture_end_to_end() {
-    check_fixture("rust-make", "divides");
+fn rust() {
+    check_host("rust-make", &["make", "test"], "divides");
+}
+
+// ------------------------------------------------------------- docker
+
+fn docker(args: &[&str]) -> Output {
+    Command::new("docker").args(args).output().expect("docker")
+}
+
+/// Builds toe:dev from this repository and the language image on top.
+fn image(lang: &str) -> String {
+    let o = docker(&["build", "-q", "-t", "toe:dev", repo().to_str().unwrap()]);
+    assert!(
+        o.status.success(),
+        "toe:dev: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let tag = format!("toe-fixture-{lang}");
+    let file = repo().join(format!("fixtures/docker/{lang}.Dockerfile"));
+    let ctx = repo().join("fixtures/docker");
+    let o = docker(&[
+        "build",
+        "-q",
+        "-t",
+        &tag,
+        "-f",
+        file.to_str().unwrap(),
+        ctx.to_str().unwrap(),
+    ]);
+    assert!(
+        o.status.success(),
+        "{tag}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // Shared, writable package caches across runs.
+    docker(&[
+        "run",
+        "--rm",
+        "-v",
+        "toe-fixture-cache:/cache",
+        &tag,
+        "chmod",
+        "777",
+        "/cache",
+    ]);
+    tag
+}
+
+/// Runs `script` in the language image as the current user, with the
+/// fixture at /w. `prepare` warms dependencies so downloads never look
+/// like a stall.
+fn in_container(tag: &str, dir: &Path, prepare: &str, script: &str) -> Output {
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout).unwrap();
+    let user = format!("{}:{}", uid.trim(), gid.trim());
+    let mount = format!("{}:/w", dir.display());
+    let full = format!(
+        "{prepare} >/tmp/prepare.log 2>&1 || {{ cat /tmp/prepare.log; exit 9; }}; {script}"
+    );
+    docker(&[
+        "run",
+        "--rm",
+        "--user",
+        &user,
+        "-v",
+        &mount,
+        "-w",
+        "/w",
+        "-v",
+        "toe-fixture-cache:/cache",
+        "-e",
+        "HOME=/tmp/home",
+        "-e",
+        "npm_config_cache=/cache/npm",
+        "-e",
+        "MAVEN_OPTS=-Dmaven.repo.local=/cache/m2",
+        "-e",
+        "NUGET_PACKAGES=/cache/nuget",
+        "-e",
+        "DOTNET_CLI_HOME=/tmp/home",
+        "-e",
+        "DOTNET_NOLOGO=1",
+        "-e",
+        "DOTNET_CLI_TELEMETRY_OPTOUT=1",
+        tag,
+        "sh",
+        "-c",
+        &full,
+    ])
+}
+
+fn check_docker(lang: &str, fixture: &str, prepare: &str, cmd: &str, bug: &str) {
+    let tag = image(lang);
+    let d = copy_fixture(fixture);
+    let o = in_container(&tag, &d, prepare, &format!("toe run --json -- {cmd}"));
+    assert_bug_found(&json_last_line(&o), bug);
+
+    let stall = format!(
+        "HANG=1 toe run --detach --stall-after 5s -- {cmd} >/dev/null; \
+         toe wait last --until stall --max-wait 240s --json; \
+         toe cancel last >/dev/null; toe wait last --until done --max-wait 60s >/dev/null"
+    );
+    let w = in_container(&tag, &d, prepare, &stall);
+    assert_eq!(
+        json_last_line(&w)["reason"],
+        "stall",
+        "{}",
+        String::from_utf8_lossy(&w.stdout)
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker"]
+fn python() {
+    check_docker("python", "python-make", "true", "make test", "test_div");
+}
+
+#[test]
+#[ignore = "large: needs docker and npm registry access"]
+fn typescript() {
+    check_docker(
+        "node",
+        "ts-vitest",
+        "npm install --no-audit --no-fund",
+        "npm test",
+        "divides",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and Maven Central access"]
+fn java() {
+    check_docker(
+        "java",
+        "java-maven",
+        "mvn -q -B test-compile",
+        "mvn -q -B test",
+        "divides",
+    );
+}
+
+#[test]
+#[ignore = "large: needs docker and NuGet access"]
+fn csharp() {
+    check_docker(
+        "dotnet",
+        "csharp-dotnet",
+        "dotnet build -nologo -v q",
+        "dotnet test --no-build",
+        "Divides",
+    );
 }

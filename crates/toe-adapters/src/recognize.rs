@@ -18,6 +18,11 @@ pub struct Recognizers {
     /// Final outcome of every test reported so far:
     /// unique key -> (display name, outcome).
     pub seen: BTreeMap<String, (String, Outcome)>,
+    /// Vitest: current test file header, and a failure held for its message.
+    vitest_file: Option<String>,
+    vitest_pending: Option<EventKind>,
+    /// VSTest: collecting the "Error Message:" block of the held failure.
+    dotnet_message: Option<Vec<String>>,
     /// libtest: the test binary currently running ("Running tests/x.rs (...)").
     libtest_binary: Option<String>,
     started: BTreeSet<String>,
@@ -94,6 +99,16 @@ impl Recognizers {
     /// (libtest) or "1 failed, 4 passed in 1.52s" (pytest).
     fn totals(&mut self, line: &str) {
         let t = line.trim().trim_matches('=').trim();
+        if (t.starts_with("Failed!") || t.starts_with("Passed!")) && t.contains("Total:") {
+            if let Some(total) = t
+                .split(',')
+                .find_map(|p| p.trim().strip_prefix("Total:"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                self.reported_total += total;
+            }
+            return;
+        }
         let body = match t.strip_prefix("test result: ") {
             Some(rest) => rest.split_once(". ").map(|(_, b)| b).unwrap_or(""),
             None if t.contains(" in ") && (t.contains(" passed") || t.contains(" failed")) => t,
@@ -119,6 +134,13 @@ impl Recognizers {
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
         self.totals(line);
         let mut out = Vec::new();
+        if self.dotnet_message.is_some() {
+            if self.dotnet_collect(line) {
+                return out;
+            }
+        } else if self.vitest_pending.is_some() && !line.trim_start().starts_with("→ ") {
+            self.flush_vitest(&mut out);
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -135,6 +157,7 @@ impl Recognizers {
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
                 || self.pytest(line, &mut out)
+                || self.dotnet(line, &mut out)
                 || self.vitest(line, &mut out)
                 || self.tap(line, &mut out);
         }
@@ -365,47 +388,177 @@ impl Recognizers {
 
     /// Verbose reporter: " ✓ src/a.test.ts > group > name 2ms", "×" failed,
     /// "↓" skipped.
+    /// Vitest reporters. Verbose: "✓ src/a.test.ts > group > name 2ms".
+    /// Default: a file header "❯ src/a.test.ts (5 tests | 1 failed)" then
+    /// "✓ group > name 1ms", "× group > name", "→ message". Keys match
+    /// Vitest's JUnit report: path [file], name "group > name".
     fn vitest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_start();
+        // The message of the previous failure, if this line carries it.
+        if let Some(msg) = t.strip_prefix("→ ")
+            && let Some(EventKind::TestFinished { message, .. }) = self.vitest_pending.as_mut()
+        {
+            if message.is_none() {
+                *message = Some(msg.trim().to_owned());
+            }
+            return true;
+        }
+        self.flush_vitest(out);
         let (outcome, rest) = if let Some(r) = t.strip_prefix("✓ ") {
             (Outcome::Passed, r)
         } else if let Some(r) = t.strip_prefix("× ").or_else(|| t.strip_prefix("✗ ")) {
             (Outcome::Failed, r)
         } else if let Some(r) = t.strip_prefix("↓ ") {
             (Outcome::Skipped, r)
+        } else if let Some(r) = t.strip_prefix("❯ ") {
+            (Outcome::Passed, r) // only a file header, handled below
         } else {
             return false;
         };
-        let parts: Vec<&str> = rest.split(" > ").collect();
-        if parts.len() < 2 {
-            return false; // file-level summary line, not a test
+        let is_file = |s: &str| {
+            [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"]
+                .iter()
+                .any(|e| s.ends_with(e))
+        };
+        // File header: "src/a.test.ts (5 tests | 1 failed) 12ms"
+        if let Some((f, _)) = rest.split_once(" (")
+            && is_file(f.trim())
+            && !rest.contains(" > ")
+        {
+            self.vitest_file = Some(f.trim().to_owned());
+            return true;
         }
-        let mut last = parts[parts.len() - 1].trim().to_owned();
+        if t.starts_with("❯ ") {
+            return false;
+        }
+        let mut parts: Vec<String> = rest.split(" > ").map(|p| p.trim().to_owned()).collect();
+        let file = if parts.len() > 1 && is_file(&parts[0]) {
+            Some(parts.remove(0))
+        } else if parts.len() > 1 || self.vitest_file.is_some() {
+            self.vitest_file.clone()
+        } else {
+            return false;
+        };
         let mut duration = None;
-        if let Some((name, d)) = last.rsplit_once(' ')
+        if let Some(last) = parts.last_mut()
+            && let Some((name, d)) = last.rsplit_once(' ')
             && let Some(ms) = d.strip_suffix("ms").and_then(|v| v.parse::<f64>().ok())
         {
             duration = Some(ms.round() as u64);
-            last = name.to_owned();
+            *last = name.trim_end().to_owned();
         }
-        let file = Some(parts[0].trim().to_owned());
-        let path = parts[1..parts.len() - 1]
-            .iter()
-            .map(|p| p.trim().to_owned())
-            .collect();
+        let key = TestKey {
+            file: None,
+            path: file.into_iter().collect(),
+            name: parts.join(" > "),
+        };
+        let mut held = Vec::new();
+        self.finished(key, outcome, duration, None, Level::Recognized, &mut held);
+        // Hold failures one line: Vitest prints the message right after.
+        match held.pop() {
+            Some(e) if outcome == Outcome::Failed => self.vitest_pending = Some(e),
+            Some(e) => out.push(e),
+            None => {}
+        }
+        true
+    }
+
+    fn flush_vitest(&mut self, out: &mut Vec<EventKind>) {
+        if let Some(e) = self.vitest_pending.take() {
+            out.push(e);
+        }
+    }
+
+    /// VSTest console ("dotnet test"): "  Failed Ns.Class.Test [3 ms]",
+    /// "  Passed ..." (normal verbosity), then an "Error Message:" block.
+    fn dotnet(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        let t = line.trim_start();
+        let (outcome, rest) = if let Some(r) = t.strip_prefix("Failed ") {
+            (Outcome::Failed, r)
+        } else if let Some(r) = t.strip_prefix("Passed ") {
+            (Outcome::Passed, r)
+        } else if let Some(r) = t.strip_prefix("Skipped ") {
+            (Outcome::Skipped, r)
+        } else {
+            return false;
+        };
+        let Some((name, dur)) = rest
+            .trim_end()
+            .strip_suffix(']')
+            .and_then(|r| r.rsplit_once(" ["))
+        else {
+            return false;
+        };
+        if name.contains(char::is_whitespace) || name.is_empty() {
+            return false;
+        }
+        let ms = dur
+            .strip_suffix(" ms")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .or_else(|| {
+                dur.strip_suffix(" s")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|s| s * 1000.0)
+            })
+            .map(|v| v.round() as u64);
+        self.flush_vitest(out);
+        let mut held = Vec::new();
         self.finished(
-            TestKey {
-                file,
-                path,
-                name: last,
-            },
+            TestKey::new(Vec::new(), name),
             outcome,
-            duration,
+            ms,
             None,
             Level::Recognized,
-            out,
+            &mut held,
         );
+        match held.pop() {
+            // Hold the failure until its error message block has been read.
+            Some(e) if outcome == Outcome::Failed => {
+                self.vitest_pending = Some(e);
+                self.dotnet_message = Some(Vec::new());
+            }
+            Some(e) => out.push(e),
+            None => {}
+        }
         true
+    }
+
+    /// Returns true while the line belongs to the held failure's message.
+    fn dotnet_collect(&mut self, line: &str) -> bool {
+        let t = line.trim();
+        let Some(lines) = self.dotnet_message.as_mut() else {
+            return false;
+        };
+        if t == "Error Message:" {
+            return true;
+        }
+        if t.is_empty()
+            || t == "Stack Trace:"
+            || t.starts_with("Failed ")
+            || t.starts_with("Passed ")
+            || t.starts_with("Failed!")
+        {
+            let msg = lines.join("\n");
+            self.dotnet_message = None;
+            if let Some(EventKind::TestFinished { message, .. }) = self.vitest_pending.as_mut()
+                && !msg.is_empty()
+            {
+                *message = Some(msg);
+            }
+            // "Stack Trace:" ends the message; other lines are processed normally.
+            return t == "Stack Trace:";
+        }
+        if lines.len() < 12 {
+            lines.push(t.to_owned());
+        }
+        true
+    }
+
+    /// Events still held when the output ends.
+    pub fn finish(&mut self) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        self.flush_vitest(&mut out);
+        out
     }
 
     // ------------------------------------------------------------- TAP
@@ -635,11 +788,65 @@ mod tests {
         assert_eq!(
             finished(&ev),
             vec![
-                ("sum::adds".into(), Outcome::Passed),
-                ("sum::subtracts".into(), Outcome::Failed),
-                ("later".into(), Outcome::Skipped),
+                ("src/sum.test.ts::sum > adds".into(), Outcome::Passed),
+                ("src/sum.test.ts::sum > subtracts".into(), Outcome::Failed),
+                ("src/sum.test.ts::later".into(), Outcome::Skipped),
             ]
         );
+    }
+
+    #[test]
+    fn dotnet_vstest_console() {
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        let text = "[xUnit.net 00:00:01.58]     Calc.CalcTests.Divides [FAIL]\n  Failed Calc.CalcTests.Divides [3 ms]\n  Error Message:\n   Assert.Equal() Failure: Values differ\nExpected: 4\nActual:   16\n  Stack Trace:\n     at Calc.CalcTests.Divides() in /w/CalcTests.cs:line 13\n  Passed Calc.CalcTests.Adds [1 ms]\nFailed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5, Duration: 1 s - Calc.Tests.dll (net9.0)";
+        for l in text.lines() {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("Calc.CalcTests.Divides".into(), Outcome::Failed),
+                ("Calc.CalcTests.Adds".into(), Outcome::Passed),
+            ]
+        );
+        let EventKind::TestFinished {
+            message,
+            duration_ms,
+            ..
+        } = &ev[0]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            message.as_deref(),
+            Some("Assert.Equal() Failure: Values differ\nExpected: 4\nActual:   16")
+        );
+        assert_eq!(*duration_ms, Some(3));
+        assert_eq!(r.reported_total, 5);
+    }
+
+    #[test]
+    fn vitest_default_reporter_with_messages() {
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in " ❯ src/calc.test.ts (3 tests | 1 failed) 1507ms\n   ✓ calc > adds 1ms\n   × calc > divides 3ms\n     → expected 16 to be 4\n   ✓ calc > slow  1501ms".lines() {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("src/calc.test.ts::calc > adds".into(), Outcome::Passed),
+                ("src/calc.test.ts::calc > divides".into(), Outcome::Failed),
+                ("src/calc.test.ts::calc > slow".into(), Outcome::Passed),
+            ]
+        );
+        let EventKind::TestFinished { message, .. } = &ev[1] else {
+            panic!()
+        };
+        assert_eq!(message.as_deref(), Some("expected 16 to be 4"));
     }
 
     #[test]
