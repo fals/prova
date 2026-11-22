@@ -31,11 +31,17 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_runs.sql"),
     include_str!("migrations/0002_tests.sql"),
     include_str!("migrations/0003_experiments.sql"),
+    include_str!("migrations/0004_origin.sql"),
 ];
 
 pub struct Store {
     conn: Connection,
+    /// Workspace root: where commands run and result files are searched.
     root: PathBuf,
+    /// Data directory of this repository (ADR 0014).
+    dir: PathBuf,
+    repo: Option<crate::home::Repo>,
+    fallback: bool,
 }
 
 /// A stored run, as read back.
@@ -57,6 +63,8 @@ pub struct RunRow {
     pub supervisor_pid: Option<u32>,
     pub cancel_requested: bool,
     pub fingerprint: Option<String>,
+    /// Where the run happened: host, pod, node, actor (ADR 0014).
+    pub origin: serde_json::Value,
 }
 
 /// Immutable inputs of a new run.
@@ -68,14 +76,30 @@ pub struct NewRun<'a> {
     pub code: &'a str,
     pub env: &'a serde_json::Value,
     pub machine: &'a serde_json::Value,
+    /// Where the run happens: host, pod, node, actor.
+    pub origin: &'a serde_json::Value,
     pub created_ms: u64,
 }
 
 impl Store {
-    /// Opens (creating if needed) the store under `root/.toe`.
+    /// Opens the store of the repository `root` belongs to, in the central
+    /// home (ADR 0014). A store left in `<root>/.toe` by an older toe is
+    /// imported on first use.
     pub fn open(root: &Path) -> Result<Store> {
-        let dir = root.join(".toe");
-        private_dir(&dir)?;
+        let loc = crate::home::locate(root);
+        let mut store = Store::open_dir(root, &loc.dir)?;
+        store.repo = Some(loc.repo.clone());
+        store.fallback = loc.fallback;
+        if !loc.fallback {
+            crate::home::register(&loc.repo, root);
+            store.import_workspace_store()?;
+        }
+        Ok(store)
+    }
+
+    /// Opens a store in an explicit data directory.
+    pub fn open_dir(root: &Path, dir: &Path) -> Result<Store> {
+        private_dir(dir)?;
         let db = dir.join("toe.db");
         if !db.exists() {
             // Commands and output can carry secrets: owner-only (0600).
@@ -92,9 +116,99 @@ impl Store {
         let mut store = Store {
             conn,
             root: root.to_path_buf(),
+            dir: dir.to_path_buf(),
+            repo: None,
+            fallback: false,
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Moves history from a workspace `.toe/toe.db` (toe before ADR 0014)
+    /// into this store, then leaves a note. Run ids are random and test
+    /// ids content hashes, so imports from several worktrees never clash.
+    fn import_workspace_store(&mut self) -> Result<()> {
+        let old_dir = self.root.join(".toe");
+        let old_db = old_dir.join("toe.db");
+        if !old_db.exists() || old_dir == self.dir {
+            return Ok(());
+        }
+        // Bring the old file to the current schema first.
+        drop(Store::open_dir(&self.root, &old_dir)?);
+        const TABLES: &[&str] = &[
+            "events",
+            "attempts",
+            "tests",
+            "runs",
+            "artifacts",
+            "samples",
+            "trials",
+            "decisions",
+            "comparisons",
+            "variants",
+            "experiments",
+        ];
+        // Foreign keys are off for the copy (SQLite cannot defer them
+        // reliably across INSERT OR IGNORE) and verified before commit.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS old",
+            params![old_db.to_string_lossy()],
+        )?;
+        let copied = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            // Events before runs: the 'no events after end' trigger looks
+            // up the run, which must not exist yet while importing.
+            for t in TABLES {
+                tx.execute_batch(&format!(
+                    "INSERT OR IGNORE INTO main.{t} SELECT * FROM old.{t}"
+                ))?;
+            }
+            let mut stmt = tx.prepare("PRAGMA main.foreign_key_check")?;
+            let broken = stmt.query_map([], |_| Ok(()))?.count();
+            drop(stmt);
+            if broken > 0 {
+                return Err(StoreError::Io(std::io::Error::other(format!(
+                    "import of {} left {broken} dangling references; nothing imported",
+                    old_db.display()
+                ))));
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        self.conn
+            .execute_batch("DETACH DATABASE old; PRAGMA foreign_keys = ON")?;
+        copied?;
+        for sub in ["runs", "artifacts", "experiments"] {
+            copy_tree(&old_dir.join(sub), &self.dir.join(sub))?;
+        }
+        for f in ["toe.db", "toe.db-wal", "toe.db-shm"] {
+            let p = old_dir.join(f);
+            if p.exists() {
+                std::fs::rename(&p, old_dir.join(format!("{f}.imported")))?;
+            }
+        }
+        std::fs::write(
+            old_dir.join("MOVED"),
+            format!(
+                "toe history for this workspace now lives in {}\n",
+                self.dir.display()
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn repo(&self) -> Option<&crate::home::Repo> {
+        self.repo.as_ref()
+    }
+
+    /// True when the central home was unusable and data stays in the workspace.
+    pub fn is_fallback(&self) -> bool {
+        self.fallback
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -126,7 +240,7 @@ impl Store {
     }
 
     pub fn run_dir(&self, run: &str) -> PathBuf {
-        self.root.join(".toe").join("runs").join(run)
+        self.dir.join("runs").join(run)
     }
 
     pub fn conn(&self) -> &Connection {
@@ -135,8 +249,8 @@ impl Store {
 
     pub fn create_run(&self, r: &NewRun<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO runs (id, suite, spec, cwd, code, env, machine, status, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8)",
+            "INSERT INTO runs (id, suite, spec, cwd, code, env, machine, status, created_ms, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8, ?9)",
             params![
                 r.id,
                 r.suite,
@@ -145,7 +259,8 @@ impl Store {
                 r.code,
                 r.env.to_string(),
                 r.machine.to_string(),
-                r.created_ms as i64
+                r.created_ms as i64,
+                r.origin.to_string()
             ],
         )?;
         Ok(())
@@ -493,6 +608,23 @@ impl Store {
     }
 }
 
+/// Copies a directory tree, keeping files that already exist.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Ok(());
+    };
+    private_dir(to)?;
+    for e in entries.flatten() {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else if !dst.exists() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// Creates a directory (and parents) readable by the owner only.
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -549,7 +681,7 @@ fn insert_event(conn: &Connection, run: &str, seq: u64, ts: u64, kind: &EventKin
 }
 
 const RUN_SELECT: &str = "SELECT id, suite, spec, cwd, code, status, outcome, level, created_ms,
-    started_ms, ended_ms, exit_code, reason, supervisor_pid, cancel_requested, fingerprint FROM runs";
+    started_ms, ended_ms, exit_code, reason, supervisor_pid, cancel_requested, fingerprint, origin FROM runs";
 
 fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     let spec: String = r.get(2)?;
@@ -572,6 +704,7 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         supervisor_pid: r.get::<_, Option<i64>>(13)?.map(|v| v as u32),
         cancel_requested: r.get::<_, i64>(14)? != 0,
         fingerprint: r.get(15)?,
+        origin: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or_default(),
     })
 }
 
@@ -600,6 +733,7 @@ mod tests {
             code: "nogit",
             env: &v,
             machine: &v,
+            origin: &v,
             created_ms: 1,
         })
         .unwrap();
@@ -617,7 +751,8 @@ mod tests {
 
     #[test]
     fn events_after_end_are_refused_by_the_database() {
-        let s = Store::open(&tmp()).unwrap();
+        let d = tmp();
+        let s = Store::open_dir(&d, &d.join(".toe")).unwrap();
         new_run(&s, "r1");
         assert!(s.mark_started("r1", 1, 2).unwrap());
         s.append_events(&[ev("r1", 1, EventKind::RunStarted { pid: 3 })])
@@ -647,7 +782,8 @@ mod tests {
 
     #[test]
     fn inputs_and_terminal_status_are_immutable() {
-        let s = Store::open(&tmp()).unwrap();
+        let d = tmp();
+        let s = Store::open_dir(&d, &d.join(".toe")).unwrap();
         new_run(&s, "r1");
         assert!(
             s.conn()
@@ -672,8 +808,8 @@ mod tests {
     #[test]
     fn second_open_sees_first_writers_events() {
         let dir = tmp();
-        let a = Store::open(&dir).unwrap();
-        let b = Store::open(&dir).unwrap();
+        let a = Store::open_dir(&dir, &dir.join(".toe")).unwrap();
+        let b = Store::open_dir(&dir, &dir.join(".toe")).unwrap();
         new_run(&a, "r1");
         a.mark_started("r1", 1, 2).unwrap();
         let v0 = b.data_version().unwrap();

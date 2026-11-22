@@ -4,6 +4,7 @@ pub mod analysis;
 pub mod config;
 pub mod engine;
 pub mod experiment;
+pub mod home;
 pub mod identity;
 pub mod ids;
 pub mod lifecycle;

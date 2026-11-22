@@ -102,6 +102,9 @@ enum Cmd {
     /// Show one run, or recent runs.
     Status {
         run: Option<String>,
+        /// Recent runs of every repository known to this toe home.
+        #[arg(long, conflicts_with = "run")]
+        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -135,6 +138,9 @@ enum Cmd {
     Flaky {
         #[arg(long)]
         suite: Option<String>,
+        /// Across every repository known to this toe home.
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value_t = 100)]
         window: usize,
         #[arg(long)]
@@ -183,12 +189,16 @@ enum Cmd {
     ExpWorker {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
         comparison: String,
     },
     #[command(name = "__supervise", hide = true)]
     Supervise {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
         run: String,
     },
 }
@@ -364,17 +374,15 @@ fn protocol_from(a: &ProtocolArgs, command: Vec<String>) -> Result<experiment::P
 
 fn spawn_exp_worker(store: &Store, comparison: &str) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    let dir = store
-        .root()
-        .join(".toe")
-        .join("experiments")
-        .join(comparison);
+    let dir = store.dir().join("experiments").join(comparison);
     toe_core::store::private_dir(&dir)?;
     let log = toe_core::store::private_file(&dir.join("worker.log"))?;
     Ok(std::process::Command::new(std::env::current_exe()?)
         .arg("__exp")
         .arg("--root")
         .arg(store.root())
+        .arg("--dir")
+        .arg(store.dir())
         .arg(comparison)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -766,7 +774,13 @@ fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
     let cwd = std::env::current_dir()?;
     let root = config::find_root(&cwd);
     let store =
-        Store::open(&root).with_context(|| format!("opening store in {}", root.display()))?;
+        Store::open(&root).with_context(|| format!("opening store for {}", root.display()))?;
+    if store.is_fallback() {
+        eprintln!(
+            "toe: warning: toe home not writable (set TOE_HOME); history kept in {}",
+            store.dir().display()
+        );
+    }
     Ok((store, root, cwd))
 }
 
@@ -906,7 +920,26 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             println!("next: toe wait {id} --until done");
             Ok(exit::PASSED)
         }
-        Cmd::Status { run, json } => {
+        Cmd::Status {
+            all: true, json, ..
+        } => {
+            let mut out = Vec::new();
+            for k in toe_core::home::known_repos() {
+                let store = Store::open_dir(Path::new(&k.workspace), &k.dir)?;
+                let runs = store.recent_runs(5)?;
+                if json {
+                    out.push(serde_json::json!({ "repo": k, "runs": runs }));
+                } else if !runs.is_empty() {
+                    println!("== {}  ({})", k.name, k.workspace);
+                    render::runs(&runs, false);
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            Ok(exit::PASSED)
+        }
+        Cmd::Status { run, json, .. } => {
             let (store, _, _) = open_here()?;
             match run {
                 Some(r) => {
@@ -998,8 +1031,37 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         }
         Cmd::Flaky {
             suite,
+            all: true,
             window,
             json,
+        } => {
+            let mut out = Vec::new();
+            for k in toe_core::home::known_repos() {
+                let store = Store::open_dir(Path::new(&k.workspace), &k.dir)?;
+                let list = analysis::flaky(&store, suite.as_deref(), window)?;
+                if json {
+                    out.push(serde_json::json!({ "repo": k, "flaky": list }));
+                } else {
+                    for t in &list {
+                        println!(
+                            "{:20} {:5.1}% fail  {}",
+                            k.name,
+                            t.failure_rate * 100.0,
+                            render::clean(&t.display)
+                        );
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            Ok(exit::PASSED)
+        }
+        Cmd::Flaky {
+            suite,
+            window,
+            json,
+            ..
         } => {
             let (store, _, _) = open_here()?;
             let list = analysis::flaky(&store, suite.as_deref(), window)?;
@@ -1091,13 +1153,17 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             filter,
             json,
         } => adopt(write, verify, filter, json),
-        Cmd::ExpWorker { root, comparison } => {
-            let store = Store::open(&root)?;
+        Cmd::ExpWorker {
+            root,
+            dir,
+            comparison,
+        } => {
+            let store = Store::open_dir(&root, &dir)?;
             experiment::work(&store, &comparison)?;
             Ok(exit::PASSED)
         }
-        Cmd::Supervise { root, run } => {
-            let store = Store::open(&root)?;
+        Cmd::Supervise { root, dir, run } => {
+            let store = Store::open_dir(&root, &dir)?;
             let row = store.run(&run)?;
             let spec: RunSpec = serde_json::from_value(row.spec)?;
             let mut observer = toe_adapters::observer_for(&spec, &root);

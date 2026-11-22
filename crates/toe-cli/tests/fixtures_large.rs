@@ -78,7 +78,7 @@ fn assert_bug_found(s: &serde_json::Value, bug: &str) {
 
 fn host(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(TOE);
-    c.args(args).current_dir(dir);
+    c.args(args).current_dir(dir).env("TOE_HOME", home_of(dir));
     for (k, v) in env {
         c.env(k, v);
     }
@@ -281,4 +281,9 @@ fn csharp() {
         "dotnet test --no-build",
         "Divides",
     );
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

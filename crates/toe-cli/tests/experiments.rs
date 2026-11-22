@@ -12,6 +12,7 @@ fn toe(dir: &Path, args: &[&str]) -> Output {
     Command::new(TOE)
         .args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .output()
         .expect("run toe")
 }
@@ -31,6 +32,7 @@ fn sh(dir: &Path, script: &str) {
         Command::new("sh")
             .args(["-c", script])
             .current_dir(dir)
+            .env("TOE_HOME", home_of(dir))
             .status()
             .unwrap()
             .success(),
@@ -155,4 +157,9 @@ fn crashing_candidate_is_logged_as_crash() {
     let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["status"], "failed");
     assert_eq!(r["decisions"][0]["decision"], "crash");
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

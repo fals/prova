@@ -162,6 +162,33 @@ pub fn normalise_line(line: &str) -> String {
     out.trim().to_owned()
 }
 
+/// Where a run happens (ADR 0014). In Kubernetes, POD_NAME and NODE_NAME
+/// come from the downward API; HOSTNAME is the pod name by default.
+pub fn run_origin() -> Value {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .or_else(|| var("HOSTNAME"))
+        .unwrap_or_default();
+    let in_k8s = var("KUBERNETES_SERVICE_HOST").is_some();
+    let actor = var("TOE_ACTOR")
+        .or_else(|| var("GITHUB_RUN_ID").map(|id| format!("github-actions:{id}")))
+        .or_else(|| var("CI_JOB_ID").map(|id| format!("ci:{id}")))
+        .or_else(|| var("USER"))
+        .unwrap_or_default();
+    let mut m = Map::new();
+    m.insert("host".into(), Value::String(host.clone()));
+    if let Some(p) = var("POD_NAME").or_else(|| in_k8s.then_some(host)) {
+        m.insert("pod".into(), Value::String(p));
+    }
+    if let Some(n) = var("NODE_NAME") {
+        m.insert("node".into(), Value::String(n));
+    }
+    m.insert("actor".into(), Value::String(actor));
+    Value::Object(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

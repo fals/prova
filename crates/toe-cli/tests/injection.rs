@@ -18,6 +18,7 @@ fn toe(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut c = Command::new(TOE);
     c.args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .env_remove("PYTEST_ADDOPTS")
         .env_remove("GOFLAGS");
     for (k, v) in env {
@@ -112,8 +113,15 @@ fn unknown_recipes_are_refused_before_running() {
     let o = toe(&d, &["run", "--inject", "path-shims", "--", "true"], &[]);
     assert_eq!(o.status.code(), Some(4));
     assert!(String::from_utf8_lossy(&o.stderr).contains("known: pytest-junit, go-nocache"));
-    assert!(
-        !d.join(".toe/runs").exists()
-            || std::fs::read_dir(d.join(".toe/runs")).unwrap().count() == 0
+    let status = toe(&d, &["status", "--json"], &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "[]",
+        "no run was created"
     );
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }
