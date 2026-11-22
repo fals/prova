@@ -1,6 +1,6 @@
 # 0003: toe event stream as core contract, JUnit XML as ingest and export
 
-Status: Proposed. Amended by [0013](0013-black-box-adoption.md): adapters are levels of a fidelity ladder, below them sit opaque runs and output recognizers.
+Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): adapters are levels of a fidelity ladder, below them sit opaque runs and output recognizers.
 
 ## Context
 

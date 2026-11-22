@@ -1,6 +1,6 @@
 # 0007: Experiments: pre-registered protocol, trials, verdict
 
-Status: Proposed
+Status: Accepted (2026-11-22). Amended by [0015](0015-spec-first-experiments.md): specification gate, any objective metric
 
 ## Context
 

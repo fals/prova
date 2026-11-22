@@ -1,6 +1,6 @@
 # 0009: Conduit: CLI core plus thin MCP facade
 
-Status: Proposed. **Deviates from the README**, which names MCP as the likely conduit while asking to check its constraints.
+Status: Accepted (2026-11-22). **Deviates from the README**, which names MCP as the likely conduit while asking to check its constraints.
 
 ## Context
 

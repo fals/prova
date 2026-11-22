@@ -1,6 +1,6 @@
 # 0001: Architecture overview
 
-Status: Proposed. Amended by [0014](0014-central-store-and-server.md): the store moves out of the workspace into one toe home; still no daemon or service. Amended by [0013](0013-black-box-adoption.md): `toe.toml` is optional; `toe run -- <command>` is first-class.
+Status: Accepted (2026-11-22). Amended by [0014](0014-central-store-and-server.md): the store moves out of the workspace into one toe home; still no daemon or service. Amended by [0013](0013-black-box-adoption.md): `toe.toml` is optional; `toe run -- <command>` is first-class.
 
 ## Context
 

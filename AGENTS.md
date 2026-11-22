@@ -10,14 +10,11 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 
 ## Current state
 
-- Phase: M0 to M7 built on stacked branches (PRs #37 to #44, merge in order). **Dogfooding Stage B is active**: run tests through toe.
-- Open: ADRs still Proposed; GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
-- ADR 0015 (spec-first experiments) is **Accepted**. ADRs 0001 to 0014 are **Proposed**. Open points awaiting the owner's decision:
-  - 0009 conduit (CLI primary, MCP facade), 0010 deployment (static binary, container as packaging), 0011 formalization (Quint, Lean deferred).
-  - 0013 black-box adoption: environment injection opt-in, PATH shims excluded.
+- Phase: M0 to M7 merged to main. **Dogfooding Stage B is active**: run tests through toe.
+- Open: GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
+- ADRs 0001 to 0015 are **Accepted** (2026-11-22). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
 - [0013](docs/adr/0013-black-box-adoption.md) amends 0001, 0003, 0004, 0005 and 0012: `toe run -- <existing command>` works with zero config, fidelity rises from opaque process to result files to output recognizers to native streams, and test size is observed before it is declared. Where they conflict, 0013 wins.
 - Work is tracked as GitHub milestones M0 to M7 with issues.
-- Until an ADR is Accepted, build only what the milestone in progress needs, and flag any code that depends on an unresolved point.
 
 ## Ground rules
 
