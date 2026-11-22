@@ -175,6 +175,16 @@ fn has_ties(x: &[f64], y: &[f64]) -> bool {
 /// Two-sided Mann-Whitney U test. Exact without ties (n*m <= 10_000),
 /// otherwise normal approximation with tie and continuity correction,
 /// matching `scipy.stats.mannwhitneyu`.
+/// The smallest two-sided p the exact Mann-Whitney test can give for
+/// samples of sizes `n` and `m` (complete separation): 2 / C(n+m, n).
+pub fn min_two_sided_p(n: usize, m: usize) -> f64 {
+    let mut c = 1.0_f64;
+    for i in 0..n.min(m) {
+        c = c * (n + m - i) as f64 / (i + 1) as f64;
+    }
+    (2.0 / c).min(1.0)
+}
+
 pub fn mann_whitney(x: &[f64], y: &[f64]) -> MannWhitney {
     let (n, m) = (x.len(), y.len());
     let mut u: f64 = 0.0;
@@ -368,6 +378,14 @@ mod tests {
     fn normal_helpers() {
         assert!((normal_sf(1.959_963_985) - 0.025).abs() < 1e-6);
         assert!((normal_quantile(0.975) - 1.959_963_985).abs() < 1e-8);
+    }
+
+    #[test]
+    fn exact_test_has_a_floor_for_small_samples() {
+        assert!((min_two_sided_p(5, 5) - 2.0 / 252.0).abs() < 1e-12);
+        assert!((min_two_sided_p(3, 3) - 0.1).abs() < 1e-12);
+        let separated = mann_whitney(&[10.0, 11.0, 12.0, 13.0, 14.0], &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((separated.p - min_two_sided_p(5, 5)).abs() < 1e-12);
     }
 
     #[test]

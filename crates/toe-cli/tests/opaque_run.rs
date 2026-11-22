@@ -369,3 +369,24 @@ fn long_output_is_distilled_into_an_excerpt() {
     let full = stdout(&toe(&d, &["output", k["run"].as_str().unwrap()]));
     assert_eq!(full.lines().count(), 2000, "whole output kept on request");
 }
+
+/// Usability round 3: `r=$(toe run --detach)` must capture just the id, and
+/// toe's own flags typed after `--` are pointed out.
+#[test]
+fn detach_prints_only_the_id_and_misplaced_flags_are_flagged() {
+    let d = workspace("detach-id");
+    let o = toe(&d, &["run", "--detach", "--", "true"]);
+    let id = stdout(&o).trim().to_owned();
+    assert!(
+        !id.is_empty() && !id.contains(char::is_whitespace),
+        "stdout {id:?}"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("next: toe wait {id}")));
+    assert!(
+        toe(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"])
+            .status
+            .success()
+    );
+    let o = toe(&d, &["run", "--", "true", "--detach"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--detach comes after `--`"));
+}
