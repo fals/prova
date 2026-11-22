@@ -1,0 +1,24 @@
+# toe
+
+> toe (test oriented experimentation) is a single Rust CLI that coding agents use to run a project's existing test command with fast, structured feedback: first failure while the suite runs, slow and stalled tests without long timeouts, per-test history (new, seen before, flaky), and statistical performance experiments with a frozen protocol. Run tests only through toe: `toe run <suite> --detach`, then `toe wait <run>` (returns within 30 s), rerun one test with `--select`, check `toe history <test>`, and use `toe exp` for any performance claim. Every command accepts `--json`. Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed, 4 infrastructure, 5 still running.
+
+## Use toe
+
+- [Getting started](docs/getting-started.md): install, adopt an existing project, the test loop, experiments, MCP
+- [Contracts for agents](docs/architecture.md#contracts-for-agents): commands, exit codes, JSON events, configuration
+- [Event schema](schemas/event.v1.json): JSON Schema of the event stream
+- [Skill: test loop](skills/toe-test/SKILL.md): how an agent runs and fixes tests with toe
+- [Skill: adopt a project](skills/toe-adopt/SKILL.md): put an existing test command under toe without editing it
+- [Skill: experiments](skills/toe-experiment/SKILL.md): protocol, candidates, verdicts
+- [Language skills](skills/): toe-rust, toe-go, toe-python, toe-ts, toe-java, toe-csharp
+
+## Understand toe
+
+- [Architecture](docs/architecture.md): components, code map, diagrams of the test loop, liveness, storage, experiments, invariants
+- [Decisions](docs/adr/README.md): ADRs 0001 to 0014
+- [Vision](docs/vision.md): the problem statement
+
+## Work on toe
+
+- [AGENTS.md](AGENTS.md): rules for contributors; toe is tested with toe (`.toe/stable/bin/toe run small|medium|spec|large`)
+- [Fixtures](fixtures/README.md): one project per supported language, used by large tests
