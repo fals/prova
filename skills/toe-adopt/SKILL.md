@@ -45,6 +45,7 @@ project's test scripts, Makefile or CI config to adopt toe.
    the framework's JUnit XML reporter or verbose output. See the
    `toe-<language>` skill for the exact flag.
 
-5. Add `.toe/` to `.gitignore`. Commit `toe.toml`.
+5. `.toe/` must be in `.gitignore` (`toe init` does it). `toe.toml`
+   belongs in version control; commit it when the user's workflow allows.
 
 Then use the `toe-test` skill for the fix loop.

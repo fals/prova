@@ -10,7 +10,8 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 
 ## Current state
 
-- Phase: building. **Dogfooding Stage B is active** (M1 done): run tests through toe.
+- Phase: M0 to M7 built on stacked branches (PRs #37 to #44, merge in order). **Dogfooding Stage B is active**: run tests through toe.
+- Open: ADRs still Proposed; opt-in environment injection (#36) waits for the owner; GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
 - ADRs 0001 to 0013 are **Proposed**. Open points awaiting the owner's decision:
   - 0009 conduit (CLI primary, MCP facade), 0010 deployment (static binary, container as packaging), 0011 formalization (Quint, Lean deferred).
   - 0013 black-box adoption: environment injection opt-in, PATH shims excluded.

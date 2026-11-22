@@ -39,6 +39,10 @@ impl Observer for Ladder {
     /// are logged as recognizer defects (supervisor.log).
     fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
         let mut report = self.files.on_exit(root, started_ms);
+        // Live and file results are matched by display name (best effort:
+        // result files rarely carry the same file attribute).
+        let live_names: std::collections::BTreeSet<String> =
+            self.live.seen.values().map(|(d, _)| d.clone()).collect();
         let mut finals: std::collections::BTreeMap<String, toe_core::model::Outcome> =
             Default::default();
         for e in &report.events {
@@ -46,7 +50,7 @@ impl Observer for Ladder {
                 finals.insert(test.display(), *outcome);
             }
         }
-        for (name, live) in &self.live.seen {
+        for (name, live) in self.live.seen.values() {
             if let Some(file) = finals.get(name)
                 && file.is_failure() != live.is_failure()
             {
@@ -56,15 +60,12 @@ impl Observer for Ladder {
             }
         }
         report.events.retain(|e| match e {
-            EventKind::TestFinished { test, .. } => !self.live.seen.contains_key(&test.display()),
+            EventKind::TestFinished { test, .. } => !live_names.contains(&test.display()),
             _ => true,
         });
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
-        let file_only = finals
-            .keys()
-            .filter(|k| !self.live.seen.contains_key(*k))
-            .count() as u64;
-        let seen = self.live.seen.len() as u64 + file_only;
+        let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
+        let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
         if self.live.reported_total > seen {
             report.events.push(EventKind::RunNote {
                 message: format!(

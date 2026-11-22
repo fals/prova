@@ -15,8 +15,11 @@ const MAX_MESSAGE_LINES: usize = 12;
 pub struct Recognizers {
     /// Highest level seen so far.
     pub level: Option<Level>,
-    /// Final outcome of every test reported so far, by display name.
-    pub seen: BTreeMap<String, Outcome>,
+    /// Final outcome of every test reported so far:
+    /// unique key -> (display name, outcome).
+    pub seen: BTreeMap<String, (String, Outcome)>,
+    /// libtest: the test binary currently running ("Running tests/x.rs (...)").
+    libtest_binary: Option<String>,
     started: BTreeSet<String>,
     /// Captured output per running test (Go), used as failure message.
     go_output: BTreeMap<String, Vec<String>>,
@@ -24,6 +27,10 @@ pub struct Recognizers {
     go_current: Option<String>,
     /// Tests the framework says it ran (from its own summary lines).
     pub reported_total: u64,
+    /// libtest results for a test already seen in this run (the same test
+    /// binary executed twice); they count toward `reported_total`.
+    pub repeats: u64,
+    cache_noted: bool,
 }
 
 fn lift(level: &mut Option<Level>, l: Level) {
@@ -47,7 +54,7 @@ fn message(lines: &[String]) -> Option<String> {
 
 impl Recognizers {
     fn started(&mut self, key: TestKey, out: &mut Vec<EventKind>) {
-        let d = key.display();
+        let d = key.unique();
         if self.started.insert(d) {
             out.push(EventKind::TestStarted { test: key });
         }
@@ -62,11 +69,16 @@ impl Recognizers {
         level: Level,
         out: &mut Vec<EventKind>,
     ) {
-        let d = key.display();
+        let d = key.unique();
         if self.seen.contains_key(&d) {
-            return; // already reported by an earlier line (e.g. pytest summary)
+            // Already reported: a pytest summary line, or (libtest, level
+            // Recognized with a binary known) the same binary run again.
+            if self.libtest_binary.is_some() && key.file == self.libtest_binary {
+                self.repeats += 1;
+            }
+            return;
         }
-        self.seen.insert(d, outcome);
+        self.seen.insert(d, (key.display(), outcome));
         lift(&mut self.level, level);
         out.push(EventKind::TestFinished {
             test: key,
@@ -107,6 +119,16 @@ impl Recognizers {
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
         self.totals(line);
         let mut out = Vec::new();
+        // Go replays cached results without running tests: say so once.
+        if !self.cache_noted
+            && line.contains("(cached)")
+            && (line.starts_with("ok") || line.contains("\"Output\":\"ok"))
+        {
+            self.cache_noted = true;
+            out.push(EventKind::RunNote {
+                message: "go replayed cached test results: these tests did not run again; add -count=1 to the suite command".into(),
+            });
+        }
         if line.starts_with('{') {
             self.go_json(line, &mut out);
         } else {
@@ -170,7 +192,7 @@ impl Recognizers {
                 let prefix = format!("{pkg}\0");
                 let any_failed = self
                     .seen
-                    .iter()
+                    .values()
                     .any(|(d, o)| d.starts_with(&format!("{pkg}::")) && o.is_failure());
                 let lines = self.go_output.remove(&prefix).unwrap_or_default();
                 if !any_failed {
@@ -248,21 +270,34 @@ impl Recognizers {
 
     // ------------------------------------------------------------- libtest
 
+    fn libtest_key(&self, name: &str) -> TestKey {
+        let (path, leaf) = split_rust_path(name);
+        TestKey {
+            file: self.libtest_binary.clone(),
+            path,
+            name: leaf,
+        }
+    }
+
     fn libtest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        // "     Running tests/live.rs (target/debug/deps/live-abc)" or
+        // "   Doc-tests toe_core": tests of different binaries may share names.
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Running ") {
+            self.libtest_binary = Some(rest.split(" (").next().unwrap_or(rest).trim().to_owned());
+            return true;
+        }
+        if let Some(rest) = t.strip_prefix("Doc-tests ") {
+            self.libtest_binary = Some(format!("doctests {}", rest.trim()));
+            return true;
+        }
         // `cargo test --quiet` prints only failures: "path::name --- FAILED"
         if let Some(name) = line.strip_suffix(" --- FAILED")
             && !name.is_empty()
             && !name.contains(char::is_whitespace)
         {
-            let (path, leaf) = split_rust_path(name);
-            self.finished(
-                TestKey::new(path, leaf),
-                Outcome::Failed,
-                None,
-                None,
-                Level::Recognized,
-                out,
-            );
+            let key = self.libtest_key(name);
+            self.finished(key, Outcome::Failed, None, None, Level::Recognized, out);
             return true;
         }
         let Some(rest) = line.strip_prefix("test ") else {
@@ -275,21 +310,13 @@ impl Recognizers {
                 s if s.starts_with("ignored") => Outcome::Skipped,
                 _ => return false,
             };
-            let (path, leaf) = split_rust_path(name.trim());
-            self.finished(
-                TestKey::new(path, leaf),
-                outcome,
-                None,
-                None,
-                Level::Recognized,
-                out,
-            );
+            let key = self.libtest_key(name.trim());
+            self.finished(key, outcome, None, None, Level::Recognized, out);
             return true;
         }
         if let Some(name) = rest.strip_suffix(" has been running for over 60 seconds") {
-            let (path, leaf) = split_rust_path(name.trim());
             out.push(EventKind::TestSlow {
-                test: TestKey::new(path, leaf),
+                test: self.libtest_key(name.trim()),
                 elapsed_ms: 60_000,
                 budget_ms: 60_000,
             });
@@ -391,6 +418,11 @@ impl Recognizers {
         } else {
             return false;
         };
+        // TAP producers number their tests ("ok 3 - name"); requiring the
+        // number keeps Go's "ok  \tpkg\t0.1s" package lines out.
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
         let rest = rest
             .trim_start_matches(|c: char| c.is_ascii_digit())
             .trim_start();
@@ -593,6 +625,26 @@ mod tests {
     }
 
     #[test]
+    fn same_names_in_different_test_binaries_stay_apart() {
+        let (r, ev) = feed(
+            "     Running unittests src/lib.rs (target/debug/deps/a-1)\ntest tests::x ... ok\n     Running tests/it.rs (target/debug/deps/it-2)\ntest tests::x ... FAILED",
+        );
+        assert_eq!(finished(&ev).len(), 2);
+        assert_eq!(r.seen.len(), 2);
+        let EventKind::TestFinished { test, .. } = &ev[1] else {
+            panic!()
+        };
+        assert_eq!(test.file.as_deref(), Some("tests/it.rs"));
+    }
+
+    #[test]
+    fn go_test_cache_is_called_out() {
+        let (_, ev) = feed("ok  \texample.com/calc\t(cached)\nok  \texample.com/other\t(cached)");
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(&ev[0], EventKind::RunNote { message } if message.contains("-count=1")));
+    }
+
+    #[test]
     fn framework_totals_are_counted() {
         let (r, _) = feed(
             "test result: FAILED. 4 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out\ntest result: ok. 3 passed; 0 failed; 0 ignored\n",
@@ -604,6 +656,8 @@ mod tests {
 
     #[test]
     fn unrelated_output_is_ignored() {
+        let (_, ev) = feed("ok  \texample.com/calc\t1.502s\nFAIL\texample.com/calc\t1.5s");
+        assert!(ev.is_empty(), "go package lines are not tests: {ev:?}");
         let (r, ev) = feed(
             "Compiling toe v0.1.0\n{\"not\": \"go\"}\nok\nFAILED\nnote: run with RUST_BACKTRACE=1",
         );

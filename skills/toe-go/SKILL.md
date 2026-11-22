@@ -5,11 +5,13 @@ description: toe setup details for Go projects (go test). Use together with toe-
 
 # toe for Go
 
-- Best fidelity: `go test -json ./...`. toe reads the test2json stream
+- Always add `-count=1`: otherwise Go replays cached results and toe
+  records passes for tests that did not run (flaky tests look stable).
+- Best fidelity: `go test -json -count=1 ./...`. toe reads the test2json stream
   natively: per-test start, result, duration and the failure output.
 - Plain `go test ./...` (often in `make test`) prints only failures;
   `go test -v` prints every test and is recognized live too.
-- Single test: `select = "go test -json -run {filter} ./..."`. `-run` is a
+- Single test: `select = "go test -json -count=1 -run {filter} ./..."`. `-run` is a
   regular expression; anchor it (`^TestDiv$`) when names share prefixes.
 - Subtests appear as `TestParent/sub`; select them with `-run 'TestParent/sub'`.
 - A package that fails to build shows as test `<package>::(package)`, errored.

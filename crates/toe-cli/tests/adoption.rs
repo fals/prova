@@ -67,7 +67,7 @@ fn adopt_proposes_and_writes_without_overwriting() {
     assert!(o.status.success());
     let t = std::fs::read_to_string(d.join("toe.toml")).unwrap();
     assert!(
-        t.contains("run = \"make test\"") && t.contains("go test -json -run {filter}"),
+        t.contains("run = \"make test\"") && t.contains("go test -json -count=1 -run {filter}"),
         "{t}"
     );
     assert_eq!(

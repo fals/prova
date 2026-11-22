@@ -32,9 +32,29 @@ fn headline(s: &Summary) -> String {
 /// Strips terminal control sequences from text that came from the process
 /// under test before it reaches a terminal.
 pub fn clean(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || *c == '\t')
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ params final-byte (CSI), or ESC + one char (e.g. "(B").
+            match chars.next() {
+                Some('[') => {
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                Some('(' | ')') => {
+                    chars.next();
+                }
+                _ => {}
+            }
+        } else if !c.is_control() || c == '\t' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn summary(s: &Summary, json: bool) {
@@ -176,14 +196,18 @@ fn first_lines(m: &str, n: usize) -> String {
 }
 
 fn history_line(h: &serde_json::Value) -> String {
-    let mut parts = vec![format!("{} previous runs", h["previous_runs"])];
+    let n = h["previous_runs"].as_u64().unwrap_or(0);
+    let mut parts = vec![format!(
+        "{n} earlier run{} of this suite",
+        if n == 1 { "" } else { "s" }
+    )];
     match h["last_passed"].as_object() {
         Some(p) => parts.push(format!(
-            "last passed {} at {}",
+            "last green: run {} at {}",
             p["run"].as_str().unwrap_or(""),
             p["code"].as_str().unwrap_or("")
         )),
-        None => parts.push("never passed".into()),
+        None => parts.push("none of them passed".into()),
     }
     let seen = h["same_failure_seen"].as_u64().unwrap_or(0);
     if seen > 0 {
@@ -367,5 +391,16 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
                 clean(d["reason"].as_str().unwrap_or(""))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clean_strips_ansi_sequences() {
+        assert_eq!(
+            super::clean("\u{1b}[31m-   x\u{1b}(B\u{1b}[m done\u{7}"),
+            "-   x done"
+        );
     }
 }

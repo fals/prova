@@ -1,5 +1,7 @@
 # What is toe?
 
+> Status: usable. Install and quickstart: [docs/getting-started.md](docs/getting-started.md). Design: [docs/adr](docs/adr/README.md). Contributing: [AGENTS.md](AGENTS.md).
+
 # Test
 
 I grew tired over the past years how LLMs execute test. LLMs via the harness have a tendence of executing tests with random bash script commands and dump the outcome in a file to analyse after. This implicates two main things. First the lack of scructure on what is executed the params and variables gets lost when iterating over and over, so there's no memory of what is done of what I executed and the outcome of that execution, previous iterations failures and so on. Second the way the test execution is done is not reliable and always constraint to long timeouts instead of fail safe, what leads to long loops, harness MUST be able to see fast problems abort fix and reiterate instead of be bound by time, and record this and be able to recover and analyse iterations.
