@@ -219,6 +219,22 @@ impl Recognizers {
     // ------------------------------------------------------------- libtest
 
     fn libtest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        // `cargo test --quiet` prints only failures: "path::name --- FAILED"
+        if let Some(name) = line.strip_suffix(" --- FAILED")
+            && !name.is_empty()
+            && !name.contains(char::is_whitespace)
+        {
+            let (path, leaf) = split_rust_path(name);
+            self.finished(
+                TestKey::new(path, leaf),
+                Outcome::Failed,
+                None,
+                None,
+                Level::Recognized,
+                out,
+            );
+            return true;
+        }
         let Some(rest) = line.strip_prefix("test ") else {
             return false;
         };
@@ -433,11 +449,12 @@ mod tests {
     #[test]
     fn libtest_human_output() {
         let (_, ev) = feed(
-            "running 3 tests\ntest store::tests::opens ... ok\ntest engine::races ... FAILED\ntest slow ... ignored, needs db\ntest engine::hang has been running for over 60 seconds\ntest result: FAILED. 1 passed; 1 failed",
+            "running 3 tests\nengine::quiet --- FAILED\ntest store::tests::opens ... ok\ntest engine::races ... FAILED\ntest slow ... ignored, needs db\ntest engine::hang has been running for over 60 seconds\ntest result: FAILED. 1 passed; 1 failed",
         );
         assert_eq!(
             finished(&ev),
             vec![
+                ("engine::quiet".into(), Outcome::Failed),
                 ("store::tests::opens".into(), Outcome::Passed),
                 ("engine::races".into(), Outcome::Failed),
                 ("slow".into(), Outcome::Skipped),
