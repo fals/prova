@@ -22,3 +22,9 @@ stall_after = "5m"
 run = "cargo test -p toe-cli --test fixtures_large -- --ignored"
 size = "large"
 stall_after = "3m"
+
+# toe serve in a kind cluster, a fixture Job, a client outside (docker, kind).
+[suite.cluster]
+run = "scripts/kind-e2e.sh"
+size = "large"
+stall_after = "5m"

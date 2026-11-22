@@ -28,6 +28,8 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 const GRACE: Duration = Duration::from_secs(3);
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 const TAIL_LINES: usize = 40;
+/// A replicated run whose client has not synced for this long is aborted.
+pub const SYNC_ORPHAN_MS: u64 = 120_000;
 
 /// Hooks for adapters (toe-adapters depends on toe-core, not the reverse).
 pub trait Observer {
@@ -571,7 +573,7 @@ pub enum Until {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitReason {
     Failure,
@@ -583,24 +585,24 @@ pub enum WaitReason {
     Running,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Failure {
     pub test: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// History of this test: seen before, flaky, last passing code.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<crate::analysis::FailureContext>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SlowTest {
     pub test: String,
     pub elapsed_ms: u64,
     pub budget_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct Counts {
     pub passed: u64,
     pub failed: u64,
@@ -608,44 +610,44 @@ pub struct Counts {
     pub errored: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Summary {
     pub run: String,
     pub suite: String,
     pub command: String,
     pub reason: WaitReason,
     pub status: Status,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
     pub level: Level,
     pub last_seq: u64,
     pub elapsed_ms: u64,
     pub counts: Counts,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<Failure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_ms: Option<u64>,
     /// Tests over their slow budget that have not finished.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slow: Vec<SlowTest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leaked: Vec<u32>,
     /// What toe could not see, and how to fix it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_tail: Vec<String>,
     pub code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     /// Data directory this run was recorded in (ADR 0014).
     pub store: String,
     /// History of the same suite, filled in by the caller when available.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
 }
 
@@ -667,6 +669,22 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
 /// The update is conditional, so a supervisor that just moved the run on
 /// is never overwritten.
 fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
+    // Replicated runs (toe serve) have no local supervisor: they are
+    // orphaned when their client stops syncing.
+    if row.supervisor_pid.is_none()
+        && let Some(last) = store.synced_ms(&row.id)?
+    {
+        if row.status == Status::Running && now_ms().saturating_sub(last) > SYNC_ORPHAN_MS {
+            return store.abort_orphan(
+                &row.id,
+                row.status,
+                None,
+                now_ms(),
+                "client stopped syncing this run",
+            );
+        }
+        return Ok(false);
+    }
     let orphan = match row.status {
         Status::Running => row.supervisor_pid.is_some_and(|p| !process::alive(p)),
         Status::Created => now_ms().saturating_sub(row.created_ms) > 15_000,

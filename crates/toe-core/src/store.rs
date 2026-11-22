@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_tests.sql"),
     include_str!("migrations/0003_experiments.sql"),
     include_str!("migrations/0004_origin.sql"),
+    include_str!("migrations/0005_sync.sql"),
 ];
 
 pub struct Store {
@@ -45,7 +46,7 @@ pub struct Store {
 }
 
 /// A stored run, as read back.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRow {
     pub id: String,
     pub suite: String,
@@ -65,6 +66,28 @@ pub struct RunRow {
     pub fingerprint: Option<String>,
     /// Where the run happened: host, pod, node, actor (ADR 0014).
     pub origin: serde_json::Value,
+}
+
+/// A run as replicated to `toe serve` (ADR 0014 section 3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunSnapshot {
+    pub id: String,
+    pub suite: String,
+    pub spec: serde_json::Value,
+    pub cwd: String,
+    pub code: String,
+    pub env: serde_json::Value,
+    pub machine: serde_json::Value,
+    pub origin: serde_json::Value,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub level: i64,
+    pub created_ms: i64,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub reason: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 /// Immutable inputs of a new run.
@@ -387,6 +410,145 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Everything a server needs to mirror a run: inputs and current state.
+    pub fn snapshot(&self, run: &str) -> Result<RunSnapshot> {
+        self.conn
+            .query_row(
+                "SELECT id, suite, spec, cwd, code, env, machine, origin, status, outcome, level,
+                        created_ms, started_ms, ended_ms, exit_code, reason, fingerprint
+                 FROM runs WHERE id = ?1",
+                params![run],
+                |r| {
+                    let json = |i: usize| -> rusqlite::Result<serde_json::Value> {
+                        Ok(serde_json::from_str(&r.get::<_, String>(i)?).unwrap_or_default())
+                    };
+                    Ok(RunSnapshot {
+                        id: r.get(0)?,
+                        suite: r.get(1)?,
+                        spec: json(2)?,
+                        cwd: r.get(3)?,
+                        code: r.get(4)?,
+                        env: json(5)?,
+                        machine: json(6)?,
+                        origin: json(7)?,
+                        status: r.get(8)?,
+                        outcome: r.get(9)?,
+                        level: r.get(10)?,
+                        created_ms: r.get(11)?,
+                        started_ms: r.get(12)?,
+                        ended_ms: r.get(13)?,
+                        exit_code: r.get(14)?,
+                        reason: r.get(15)?,
+                        fingerprint: r.get(16)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::RunNotFound(run.into()))
+    }
+
+    /// Server side of replication: create the run if new, append events
+    /// it does not have yet, and move it to the client's state. Idempotent:
+    /// replaying the same sync changes nothing. Returns the last seq held.
+    pub fn apply_sync(&self, snap: &RunSnapshot, events: &[Event], now_ms: u64) -> Result<u64> {
+        if events.iter().any(|e| e.run != snap.id) {
+            return Err(StoreError::Io(std::io::Error::other(
+                "event of another run in sync",
+            )));
+        }
+        let exists: bool = self
+            .conn
+            .query_row("SELECT 1 FROM runs WHERE id = ?1", params![snap.id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !exists {
+            self.conn.execute(
+                "INSERT INTO runs (id, suite, spec, cwd, code, env, machine, origin, status, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'created', ?9)",
+                params![
+                    snap.id, snap.suite, snap.spec.to_string(), snap.cwd, snap.code,
+                    snap.env.to_string(), snap.machine.to_string(), snap.origin.to_string(), snap.created_ms
+                ],
+            )?;
+        }
+        let current = run_status(&self.conn, &snap.id)?;
+        if current == Status::Created && snap.status != "created" {
+            // Leave 'created' so events are accepted; the end comes after them.
+            self.conn.execute(
+                "UPDATE runs SET status = 'running', started_ms = COALESCE(?2, ?3) WHERE id = ?1",
+                params![snap.id, snap.started_ms, snap.created_ms],
+            )?;
+        }
+        let held = self.last_seq(&snap.id)?;
+        if !current.is_terminal() {
+            let fresh: Vec<Event> = events.iter().filter(|e| e.seq > held).cloned().collect();
+            self.append_events(&fresh)?;
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE runs SET level = MAX(level, ?2), synced_ms = ?3 WHERE id = ?1",
+            params![snap.id, snap.level, now_ms as i64],
+        )?;
+        let now_status = run_status(&tx, &snap.id)?;
+        if !now_status.is_terminal()
+            && let Some(end) = Status::parse(&snap.status).filter(|s| s.is_terminal())
+        {
+            tx.execute(
+                "UPDATE runs SET status = ?2, outcome = ?3, ended_ms = ?4, exit_code = ?5,
+                                 reason = ?6, fingerprint = ?7
+                 WHERE id = ?1",
+                params![
+                    snap.id,
+                    end.as_str(),
+                    snap.outcome,
+                    snap.ended_ms.unwrap_or(now_ms as i64),
+                    snap.exit_code,
+                    snap.reason,
+                    snap.fingerprint
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.last_seq(&snap.id)
+    }
+
+    /// Client side: highest seq the server acknowledged for a run.
+    pub fn set_synced(&self, run: &str, seq: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET synced_seq = MAX(synced_seq, ?2) WHERE id = ?1",
+            params![run, seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Client side: runs with events the server has not acknowledged.
+    pub fn unsynced_runs(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id FROM runs r
+             WHERE r.synced_seq < (SELECT COALESCE(MAX(seq), 0) FROM events e WHERE e.run_id = r.id)
+                OR (r.synced_seq = 0 AND r.status <> 'created')
+             ORDER BY r.created_ms",
+        )?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// Server side: when the client last synced this run.
+    pub fn synced_ms(&self, run: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT synced_ms FROM runs WHERE id = ?1",
+                params![run],
+                |r| r.get::<_, Option<i64>>(0),
+            )?
+            .map(|v| v as u64))
     }
 
     /// Records a result file copied to `.toe/artifacts/<sha256>`.

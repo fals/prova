@@ -1,7 +1,9 @@
 //! `toe` command line (ADR 0009). Primary conduit for agents and humans.
 
 mod mcp;
+mod remote;
 mod render;
+mod serve;
 mod skills;
 
 use std::path::{Path, PathBuf};
@@ -182,6 +184,28 @@ enum Cmd {
     },
     /// Serve the MCP facade on stdio (tools mirror the CLI).
     Mcp,
+    /// Serve a central store for many machines and pods (ADR 0014).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        listen: String,
+        /// File with one token per line, optionally followed by allowed repo ids.
+        #[arg(long)]
+        tokens_file: Option<PathBuf>,
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// Serve without authentication (local experiments only).
+        #[arg(long)]
+        insecure_no_auth: bool,
+        #[arg(long, default_value_t = 32)]
+        threads: usize,
+    },
+    /// Push runs the server (TOE_SERVER) has not received yet.
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
     /// Experiments: frozen protocol, interleaved trials, statistical verdict.
     #[command(subcommand)]
     Exp(ExpCmd),
@@ -794,7 +818,138 @@ fn duration_arg(v: &Option<String>, name: &str) -> Result<Option<u64>> {
         .transpose()
 }
 
+/// With TOE_SERVER set, reads that the local store cannot answer (a run
+/// recorded elsewhere, history of the whole repository) go to the server.
+fn remote_read(cmd: &Cmd) -> Result<Option<u8>> {
+    let reads = matches!(
+        cmd,
+        Cmd::Wait { .. }
+            | Cmd::Status { .. }
+            | Cmd::Output { .. }
+            | Cmd::Events { .. }
+            | Cmd::History { .. }
+            | Cmd::Flaky { .. }
+    );
+    let Some(remote) = remote::Remote::from_env().filter(|_| reads) else {
+        return Ok(None);
+    };
+    let (store, root, _) = open_here()?;
+    // TOE_REPO reads a repository without a checkout of it (e.g. from a laptop).
+    let repo = std::env::var("TOE_REPO")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| toe_core::home::identify(&root).id);
+    let local =
+        |run: &str| std::env::var_os("TOE_REPO").is_none() && store.resolve_run(run).is_ok();
+    let enc = |s: &str| {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect::<String>()
+    };
+    match cmd {
+        Cmd::Wait {
+            run,
+            until,
+            max_wait,
+            after,
+            json,
+        } if !local(run) => {
+            let max = parse_duration(max_wait).ok_or_else(|| anyhow!("invalid --max-wait"))?;
+            let until = match until {
+                UntilArg::FirstFailure => "first-failure",
+                UntilArg::Stall => "stall",
+                UntilArg::Done => "done",
+            };
+            let s: Summary = remote.get_json(&format!(
+                "/v1/repos/{repo}/runs/{}/wait?until={until}&after={after}&max_wait_ms={}",
+                enc(run),
+                max.as_millis()
+            ))?;
+            render::summary(&s, *json);
+            Ok(Some(exit_code(&s)))
+        }
+        Cmd::Status {
+            run: Some(run),
+            json,
+            ..
+        } if !local(run) => {
+            let s: Summary = remote.get_json(&format!("/v1/repos/{repo}/runs/{}", enc(run)))?;
+            render::summary(&s, *json);
+            Ok(Some(exit_code(&s)))
+        }
+        Cmd::Status {
+            run: None,
+            all: false,
+            json,
+        } => {
+            let rows: Vec<toe_core::store::RunRow> =
+                remote.get_json(&format!("/v1/repos/{repo}/runs?limit=20"))?;
+            render::runs(&rows, *json);
+            Ok(Some(exit::PASSED))
+        }
+        Cmd::Output { run, tail } if !local(run) => {
+            let q = tail.map(|n| format!("?tail={n}")).unwrap_or_default();
+            println!(
+                "{}",
+                remote.get_text(&format!("/v1/repos/{repo}/runs/{}/output{q}", enc(run)))?
+            );
+            Ok(Some(exit::PASSED))
+        }
+        Cmd::Events { run, after, .. } if !local(run) => {
+            print!(
+                "{}",
+                remote.get_text(&format!(
+                    "/v1/repos/{repo}/runs/{}/events?after={after}",
+                    enc(run)
+                ))?
+            );
+            Ok(Some(exit::PASSED))
+        }
+        Cmd::History {
+            test, window, json, ..
+        } => {
+            let s: analysis::TestStats = remote.get_json(&format!(
+                "/v1/repos/{repo}/history?test={}&window={window}",
+                enc(test)
+            ))?;
+            render::test_stats(&s, *json);
+            Ok(Some(exit::PASSED))
+        }
+        Cmd::Flaky {
+            all: false,
+            window,
+            json,
+            ..
+        } => {
+            let list: Vec<analysis::TestStats> =
+                remote.get_json(&format!("/v1/repos/{repo}/flaky?window={window}"))?;
+            if *json {
+                println!("{}", serde_json::to_string(&list)?);
+            } else {
+                for t in &list {
+                    println!(
+                        "{:5.1}% fail  {}",
+                        t.failure_rate * 100.0,
+                        render::clean(&t.display)
+                    );
+                }
+            }
+            Ok(Some(exit::PASSED))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn dispatch(cmd: Cmd) -> Result<u8> {
+    if let Some(code) = remote_read(&cmd)? {
+        return Ok(code);
+    }
     match cmd {
         Cmd::Run {
             suite,
@@ -885,7 +1040,9 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 return Ok(exit::PASSED);
             }
             let code = attached(&store, &id, json);
-            let _ = child.wait();
+            // The result is final; the supervisor may still be delivering
+            // it to a server. Do not make the caller wait for that.
+            let _ = child.try_wait();
             code
         }
         Cmd::Wait {
@@ -1167,7 +1324,59 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let row = store.run(&run)?;
             let spec: RunSpec = serde_json::from_value(row.spec)?;
             let mut observer = toe_adapters::observer_for(&spec, &root);
-            engine::supervise(&store, &run, observer.as_mut())?;
+            // With TOE_SERVER set, replicate while the run happens.
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sync = remote::Remote::from_env()
+                .map(|_| remote::replicate(&root, &dir, run.clone(), done.clone()));
+            let result = engine::supervise(&store, &run, observer.as_mut());
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(h) = sync {
+                let _ = h.join();
+            }
+            result?;
+            Ok(exit::PASSED)
+        }
+        Cmd::Serve {
+            listen,
+            tokens_file,
+            tls_cert,
+            tls_key,
+            insecure_no_auth,
+            threads,
+        } => {
+            let mut text = std::env::var("TOE_SERVE_TOKENS")
+                .unwrap_or_default()
+                .replace(';', "\n");
+            if let Some(f) = tokens_file {
+                text.push('\n');
+                text.push_str(
+                    &std::fs::read_to_string(&f).with_context(|| format!("{}", f.display()))?,
+                );
+            }
+            serve::serve(serve::Config {
+                listen,
+                tokens: serve::parse_tokens(&text)?,
+                insecure_no_auth,
+                tls: tls_cert.zip(tls_key),
+                threads,
+            })?;
+            Ok(exit::PASSED)
+        }
+        Cmd::Sync { json } => {
+            let (store, root, _) = open_here()?;
+            let remote =
+                remote::Remote::from_env().ok_or_else(|| anyhow!("TOE_SERVER is not set"))?;
+            let repo = toe_core::home::identify(&root);
+            let mut sent = Vec::new();
+            for run in store.unsynced_runs()? {
+                remote.sync_run(&store, &repo, &run)?;
+                sent.push(run);
+            }
+            if json {
+                println!("{}", serde_json::json!({ "synced": sent }));
+            } else {
+                println!("synced {} run(s) to {}", sent.len(), remote.base());
+            }
             Ok(exit::PASSED)
         }
     }

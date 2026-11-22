@@ -9,7 +9,7 @@ use crate::model::Outcome;
 use crate::store::{Result, Store};
 
 /// Final outcome of one test in one run, plus whether it needed retries.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TestRun {
     pub run: String,
     pub code: String,
@@ -19,13 +19,13 @@ pub struct TestRun {
     /// Failed at least once, then passed, in the same run.
     pub passed_on_retry: bool,
     pub duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TestStats {
     pub test_id: String,
     pub display: String,
@@ -39,13 +39,13 @@ pub struct TestStats {
     /// Code identities on which the test both passed and failed.
     pub flips_on_same_code: usize,
     pub flaky: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed_size: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p50_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p95_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_passed: Option<(String, String)>,
     /// Newest first.
     pub recent: Vec<TestRun>,
@@ -170,7 +170,7 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
         passed_on_retry: retry,
         flips_on_same_code: flips,
         flaky: retry > 0 || flips > 0,
-        proposed_size: percentile(&durations, 95.0).map(proposed_size),
+        proposed_size: percentile(&durations, 95.0).map(|p| proposed_size(p).to_owned()),
         p50_ms: percentile(&durations, 50.0),
         p95_ms: percentile(&durations, 95.0),
         last_passed,
@@ -247,13 +247,13 @@ pub fn proposed_size(p95_ms: u64) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct SizeReport {
     pub total: usize,
     pub small: usize,
     pub medium: usize,
     pub large: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     /// Slowest tests by p95: (test, ms).
     pub largest: Vec<(String, u64)>,
@@ -298,7 +298,7 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
     Ok(r)
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct RunDiff {
     pub base: String,
     pub head: String,
@@ -369,12 +369,12 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
 }
 
 /// What history says about one failing test in a run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct FailureContext {
     /// Earlier runs where this test failed with the same fingerprint.
     pub seen_before: usize,
     pub flaky: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_passed_code: Option<String>,
     /// The whole suite passed before on exactly this code: the failure is
     /// likely flaky even when per-test history is incomplete.

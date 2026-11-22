@@ -1,0 +1,83 @@
+# toe serve: central store for test and experiment runs in a cluster
+# (ADR 0014 section 3). One replica: it is the single writer of its volume.
+#
+# Tokens: one per line, optionally followed by allowed repository ids:
+#   kubectl -n toe-system create secret generic toe-tokens \
+#     --from-literal=tokens="$(openssl rand -hex 24)"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: toe-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: toe-data
+  namespace: toe-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toe
+  namespace: toe-system
+  labels: { app: toe }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # never two writers on one volume
+  selector:
+    matchLabels: { app: toe }
+  template:
+    metadata:
+      labels: { app: toe }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: toe
+          image: ghcr.io/fals/toe:latest
+          args: ["serve", "--listen", "0.0.0.0:7777", "--tokens-file", "/etc/toe/tokens"]
+          env:
+            - { name: TOE_HOME, value: /data }
+          ports:
+            - { name: http, containerPort: 7777 }
+          readinessProbe:
+            httpGet: { path: /v1/health, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /v1/health, port: http }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tokens, mountPath: /etc/toe, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: toe-data }
+        - name: tokens
+          secret: { secretName: toe-tokens, defaultMode: 0400 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: toe
+  namespace: toe-system
+spec:
+  selector: { app: toe }
+  ports:
+    - { name: http, port: 7777, targetPort: http }

@@ -1,0 +1,26 @@
+# A test run in a pod, recorded in toe serve. The image must contain the
+# project's toolchain plus toe:  COPY --from=ghcr.io/fals/toe /toe /usr/local/bin/toe
+# Copy the token secret into the job's namespace first.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tests
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: tests
+          image: your-project-with-toe:latest
+          workingDir: /w
+          command: ["toe", "run", "--", "make", "test"]
+          env:
+            - { name: TOE_SERVER, value: "http://toe.toe-system.svc:7777" }
+            - name: TOE_TOKEN
+              valueFrom: { secretKeyRef: { name: toe-tokens, key: tokens } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - { name: TOE_ACTOR, value: "ci-tests" }

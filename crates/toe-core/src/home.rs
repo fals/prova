@@ -29,15 +29,15 @@ pub fn toe_home() -> Option<PathBuf> {
 }
 
 /// Which repository a workspace belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Repo {
     /// Stable id: the same for every clone, worktree and pod of a repository.
     pub id: String,
     /// "git" (from the root commit) or "local" (from the path; no history in git).
-    pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub name: String,
 }
@@ -91,7 +91,7 @@ pub fn identify(root: &Path) -> Repo {
             .unwrap_or(name);
         return Repo {
             id: sha256_hex(format!("git:{root_commit}").as_bytes())[..16].to_owned(),
-            kind: "git",
+            kind: "git".into(),
             root_commit: Some(root_commit),
             origin,
             name,
@@ -100,7 +100,7 @@ pub fn identify(root: &Path) -> Repo {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     Repo {
         id: sha256_hex(format!("local:{}", canonical.display()).as_bytes())[..16].to_owned(),
-        kind: "local",
+        kind: "local".into(),
         root_commit: None,
         origin: None,
         name,
@@ -180,11 +180,11 @@ pub fn register(repo: &Repo, root: &Path) {
 }
 
 /// A repository known to this home, with its most recent workspace.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Known {
     pub id: String,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub workspace: String,
     pub dir: PathBuf,
