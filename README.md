@@ -149,4 +149,4 @@ calling a failure new or flaky. Performance claims need `toe exp`.
 
 ## License
 
-Apache-2.0 (as declared in `Cargo.toml`).
+[Apache-2.0](LICENSE)
