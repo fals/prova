@@ -270,3 +270,97 @@ pub fn runs(rows: &[RunRow], json: bool) {
         );
     }
 }
+
+pub fn exp_progress(r: &toe_core::experiment::Report) {
+    if let Some(c) = &r.comparison {
+        eprintln!(
+            "{} vs {}: {}/{} baseline, {}/{} candidate trials",
+            c.candidate,
+            c.baseline,
+            c.baseline_trials,
+            c.target_trials,
+            c.candidate_trials,
+            c.target_trials
+        );
+    }
+}
+
+pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(r).unwrap_or_default());
+        return;
+    }
+    println!(
+        "experiment {}  best={}  protocol {}",
+        r.experiment, r.best, r.protocol_hash
+    );
+    println!("hypothesis: {}", clean(&r.hypothesis));
+    if let Some(c) = &r.comparison {
+        let head = match (c.status.as_str(), c.verdict.as_deref()) {
+            ("decided", Some(v)) => v.to_uppercase(),
+            (s, _) => s.to_uppercase(),
+        };
+        println!(
+            "{head}  {} vs {}  ({} + {} trials, target {} per arm, max {})",
+            c.candidate,
+            c.baseline,
+            c.baseline_trials,
+            c.candidate_trials,
+            c.target_trials,
+            c.max_trials
+        );
+        if let Some(res) = &c.result {
+            if let Some(reason) = res["reason"].as_str() {
+                println!("reason: {}", clean(reason));
+            }
+            let p = &res["primary"];
+            if p.is_object() {
+                println!(
+                    "{}: baseline median {:.3} (MAD {:.3}), candidate median {:.3} (MAD {:.3}), p={:.4} (adjusted {:.4}, {})",
+                    p["metric"].as_str().unwrap_or(""),
+                    p["baseline_median"].as_f64().unwrap_or(f64::NAN),
+                    p["baseline_mad"].as_f64().unwrap_or(f64::NAN),
+                    p["candidate_median"].as_f64().unwrap_or(f64::NAN),
+                    p["candidate_mad"].as_f64().unwrap_or(f64::NAN),
+                    p["p"].as_f64().unwrap_or(f64::NAN),
+                    p["p_adjusted"].as_f64().unwrap_or(f64::NAN),
+                    p["method"].as_str().unwrap_or(""),
+                );
+                let outl = p["outliers_baseline"].as_array().map_or(0, Vec::len)
+                    + p["outliers_candidate"].as_array().map_or(0, Vec::len);
+                if outl > 0 {
+                    println!("outliers flagged (kept): {outl}");
+                }
+            }
+        }
+        let next = match (c.status.as_str(), c.verdict.as_deref()) {
+            ("running", _) => format!("toe exp wait {}", r.experiment),
+            ("decided", Some("accept")) => format!(
+                "keep it; try the next idea, or `toe exp revalidate {}`",
+                r.experiment
+            ),
+            ("decided", _) => format!(
+                "discard it; record another candidate: toe exp candidate {}",
+                r.experiment
+            ),
+            _ => format!("see .toe/experiments/{}/ for trial logs", c.id),
+        };
+        println!("next: {next}");
+    } else {
+        println!(
+            "no comparison yet; next: toe exp candidate {}",
+            r.experiment
+        );
+    }
+    if !r.decisions.is_empty() {
+        println!("decisions:");
+        for d in &r.decisions {
+            println!(
+                "  {:7} {}  {}",
+                d["decision"].as_str().unwrap_or(""),
+                d["candidate"].as_str().unwrap_or(""),
+                clean(d["reason"].as_str().unwrap_or(""))
+            );
+        }
+    }
+}
