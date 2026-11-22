@@ -120,6 +120,25 @@ fn detect(root: &Path) -> Vec<Framework> {
     out
 }
 
+/// Recipe lines of the Makefile `test` target.
+fn make_test_recipe(root: &Path) -> Vec<String> {
+    for mk in ["Makefile", "makefile", "GNUmakefile"] {
+        let text = read(root, mk);
+        let mut lines = text.lines();
+        if lines
+            .by_ref()
+            .any(|l| l.starts_with("test:") || l.starts_with("test :"))
+        {
+            return lines
+                .take_while(|l| l.starts_with('\t'))
+                .map(|l| l.trim().trim_start_matches('@').to_owned())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 /// The project's own entry point for tests, if any.
 fn existing_command(root: &Path) -> Option<String> {
     for mk in ["Makefile", "makefile", "GNUmakefile"] {
@@ -161,15 +180,59 @@ pub fn propose(root: &Path) -> Proposal {
                 why: "project's own test command; framework unknown, add `select` by hand".into(),
             });
         }
-        ([f], _) => p.suites.push(SuiteProposal {
-            name: "default".into(),
-            run: existing.clone().unwrap_or_else(|| f.run.into()),
-            select: Some(f.select.into()),
-            why: match &existing {
-                Some(cmd) => format!("runs `{cmd}` as the project does; selection via {}", f.why),
-                None => f.why.clone(),
-            },
-        }),
+        ([f], _) => {
+            // `make test` that only calls the framework: run the framework
+            // directly at full detail (same tests), keep make as a suite.
+            let recipe = make_test_recipe(root);
+            let base: String = f
+                .run
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let thin = existing.as_deref() == Some("make test")
+                && recipe.len() == 1
+                && (recipe[0].starts_with(&base)
+                    || (f.language == "python" && recipe[0].contains("pytest")));
+            if thin {
+                let quiet = recipe[0]
+                    .split_whitespace()
+                    .any(|w| w == "-q" || w == "--quiet");
+                if quiet {
+                    p.notes.push(format!(
+                        "`make test` runs `{}` in quiet mode: passing tests are invisible there; the default suite runs the same tests verbosely",
+                        recipe[0]
+                    ));
+                }
+                p.suites.push(SuiteProposal {
+                    name: "default".into(),
+                    run: f.run.into(),
+                    select: Some(f.select.into()),
+                    why: format!(
+                        "same tests as `make test` ({}), with per-test detail; {}",
+                        recipe[0], f.why
+                    ),
+                });
+                p.suites.push(SuiteProposal {
+                    name: "make".into(),
+                    run: "make test".into(),
+                    select: None,
+                    why: "the project's own command, exactly as CI runs it".into(),
+                });
+            } else {
+                p.suites.push(SuiteProposal {
+                    name: "default".into(),
+                    run: existing.clone().unwrap_or_else(|| f.run.into()),
+                    select: Some(f.select.into()),
+                    why: match &existing {
+                        Some(cmd) => {
+                            format!("runs `{cmd}` as the project does; selection via {}", f.why)
+                        }
+                        None => f.why.clone(),
+                    },
+                });
+            }
+        }
         (many, _) => {
             if let Some(cmd) = &existing {
                 p.suites.push(SuiteProposal {
@@ -228,7 +291,7 @@ mod tests {
             "go",
             &[
                 ("go.mod", "module x"),
-                ("Makefile", "test:\n\tgo test ./...\n"),
+                ("Makefile", "test: vet\n\tgo vet ./...\n\tgo test ./...\n"),
             ],
         ));
         assert_eq!(p.languages, vec!["go"]);
@@ -243,6 +306,20 @@ mod tests {
             parsed["suite"]["default"]["run"].as_str(),
             Some("make test")
         );
+    }
+
+    #[test]
+    fn thin_make_wrapper_runs_the_framework_verbosely() {
+        let p = propose(&dir(
+            "thin",
+            &[
+                ("Cargo.toml", "[package]"),
+                ("Makefile", "test:\n\tcargo test --quiet\n"),
+            ],
+        ));
+        assert_eq!(p.suites[0].run, "cargo test");
+        assert_eq!(p.suites[1].run, "make test");
+        assert!(p.notes[0].contains("quiet"), "{:?}", p.notes);
     }
 
     #[test]

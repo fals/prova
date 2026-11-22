@@ -177,6 +177,10 @@ pub enum EventKind {
         idle_ms: u64,
         basis: StallBasis,
     },
+    /// Something the agent should know about how much toe could see.
+    RunNote {
+        message: String,
+    },
     RunFinished {
         status: Status,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +201,7 @@ impl EventKind {
             EventKind::TestSlow { .. } => "test_slow",
             EventKind::TestFinished { .. } => "test_finished",
             EventKind::RunStalled { .. } => "run_stalled",
+            EventKind::RunNote { .. } => "run_note",
             EventKind::RunFinished { .. } => "run_finished",
         }
     }

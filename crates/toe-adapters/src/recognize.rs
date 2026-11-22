@@ -22,6 +22,8 @@ pub struct Recognizers {
     go_output: BTreeMap<String, Vec<String>>,
     /// Go -v: test currently printing output.
     go_current: Option<String>,
+    /// Tests the framework says it ran (from its own summary lines).
+    pub reported_total: u64,
 }
 
 fn lift(level: &mut Option<Level>, l: Level) {
@@ -76,7 +78,34 @@ impl Recognizers {
         });
     }
 
+    /// Framework summary lines: "test result: ok. 4 passed; 1 failed; 0 ignored"
+    /// (libtest) or "1 failed, 4 passed in 1.52s" (pytest).
+    fn totals(&mut self, line: &str) {
+        let t = line.trim().trim_matches('=').trim();
+        let body = match t.strip_prefix("test result: ") {
+            Some(rest) => rest.split_once(". ").map(|(_, b)| b).unwrap_or(""),
+            None if t.contains(" in ") && (t.contains(" passed") || t.contains(" failed")) => t,
+            None => return,
+        };
+        let mut n = 0;
+        for part in body.split([';', ',']) {
+            let mut w = part.split_whitespace();
+            if let (Some(num), Some(word)) = (w.next(), w.next())
+                && let Ok(v) = num.parse::<u64>()
+                && [
+                    "passed", "failed", "ignored", "skipped", "error", "errors", "xfailed",
+                    "xpassed",
+                ]
+                .contains(&word)
+            {
+                n += v;
+            }
+        }
+        self.reported_total += n;
+    }
+
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
+        self.totals(line);
         let mut out = Vec::new();
         if line.starts_with('{') {
             self.go_json(line, &mut out);
@@ -84,6 +113,7 @@ impl Recognizers {
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
                 || self.pytest(line, &mut out)
+                || self.vitest(line, &mut out)
                 || self.tap(line, &mut out);
         }
         out
@@ -304,6 +334,53 @@ impl Recognizers {
         true
     }
 
+    // ------------------------------------------------------------- vitest
+
+    /// Verbose reporter: " ✓ src/a.test.ts > group > name 2ms", "×" failed,
+    /// "↓" skipped.
+    fn vitest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        let t = line.trim_start();
+        let (outcome, rest) = if let Some(r) = t.strip_prefix("✓ ") {
+            (Outcome::Passed, r)
+        } else if let Some(r) = t.strip_prefix("× ").or_else(|| t.strip_prefix("✗ ")) {
+            (Outcome::Failed, r)
+        } else if let Some(r) = t.strip_prefix("↓ ") {
+            (Outcome::Skipped, r)
+        } else {
+            return false;
+        };
+        let parts: Vec<&str> = rest.split(" > ").collect();
+        if parts.len() < 2 {
+            return false; // file-level summary line, not a test
+        }
+        let mut last = parts[parts.len() - 1].trim().to_owned();
+        let mut duration = None;
+        if let Some((name, d)) = last.rsplit_once(' ')
+            && let Some(ms) = d.strip_suffix("ms").and_then(|v| v.parse::<f64>().ok())
+        {
+            duration = Some(ms.round() as u64);
+            last = name.to_owned();
+        }
+        let file = Some(parts[0].trim().to_owned());
+        let path = parts[1..parts.len() - 1]
+            .iter()
+            .map(|p| p.trim().to_owned())
+            .collect();
+        self.finished(
+            TestKey {
+                file,
+                path,
+                name: last,
+            },
+            outcome,
+            duration,
+            None,
+            Level::Recognized,
+            out,
+        );
+        true
+    }
+
     // ------------------------------------------------------------- TAP
 
     fn tap(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
@@ -498,6 +575,31 @@ mod tests {
                 ("later".into(), Outcome::Skipped),
             ]
         );
+    }
+
+    #[test]
+    fn vitest_verbose() {
+        let (_, ev) = feed(
+            " ✓ src/sum.test.ts > sum > adds 1ms\n × src/sum.test.ts > sum > subtracts 3ms\n ↓ src/sum.test.ts > later\n ✓ src/sum.test.ts (3 tests) 5ms",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("sum::adds".into(), Outcome::Passed),
+                ("sum::subtracts".into(), Outcome::Failed),
+                ("later".into(), Outcome::Skipped),
+            ]
+        );
+    }
+
+    #[test]
+    fn framework_totals_are_counted() {
+        let (r, _) = feed(
+            "test result: FAILED. 4 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out\ntest result: ok. 3 passed; 0 failed; 0 ignored\n",
+        );
+        assert_eq!(r.reported_total, 10);
+        let (r, _) = feed("========== 1 failed, 4 passed in 1.52s ==========");
+        assert_eq!(r.reported_total, 5);
     }
 
     #[test]

@@ -617,6 +617,9 @@ pub struct Summary {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub leaked: Vec<u32>,
+    /// What toe could not see, and how to fix it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub output_tail: Vec<String>,
     pub code: String,
@@ -728,6 +731,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
     let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
+    let mut notes: Vec<String> = Vec::new();
     for e in &events {
         match &e.kind {
             EventKind::TestFinished {
@@ -759,6 +763,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { .. } => stalled_ms = None,
             EventKind::RunFinished { leaked: l, .. } => leaked = l.clone(),
+            EventKind::RunNote { message } => notes.push(message.clone()),
             _ => {}
         }
     }
@@ -776,13 +781,24 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
+    // Did the same suite (same selection) pass on exactly this code before?
+    let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .ok()
+        .and_then(|s| s.selection);
+    let suite_passed_on_same_code = store
+        .suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?
+        .iter()
+        .any(|r| r.code == row.code && r.outcome == Some(Outcome::Passed));
     let mut failures = Vec::new();
     for (key, _, message, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
         failures.push(Failure {
             test: key.display(),
             message: message.clone(),
-            context: crate::analysis::failure_context(store, &id, run)?,
+            context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
+                c.suite_passed_on_same_code = suite_passed_on_same_code;
+                c
+            }),
         });
     }
     let n_failures = failing.len();
@@ -821,6 +837,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             _ => None,
         },
         leaked,
+        notes,
         output_tail: if want_tail {
             output_tail(store, run, 30)
         } else {
@@ -834,7 +851,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
 
 /// What earlier runs of the same suite say about this one (ADR 0006).
 fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value>> {
-    let prev = store.suite_history(&row.suite, row.created_ms, 200)?;
+    let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .ok()
+        .and_then(|s| s.selection);
+    let prev = store.suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?;
     let Some(last) = prev.first() else {
         return Ok(None);
     };

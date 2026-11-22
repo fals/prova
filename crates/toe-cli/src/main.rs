@@ -1021,6 +1021,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
+                if d.total == 0 {
+                    println!(
+                        "no per-test durations recorded yet: the framework output carries none (e.g. plain `cargo test`); a JUnit report (nextest, pytest --junitxml) or go test -json provides them"
+                    );
+                }
                 for (t, ms) in d.largest.iter().take(10) {
                     println!("  {ms:>8}ms  {}", render::clean(t));
                 }

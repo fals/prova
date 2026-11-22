@@ -82,6 +82,9 @@ pub fn summary(s: &Summary, json: bool) {
             format_duration(std::time::Duration::from_millis(t.budget_ms))
         );
     }
+    for n in &s.notes {
+        println!("note: {}", clean(n));
+    }
     if let Some(d) = &s.detail {
         println!("detail: {d}");
     }
@@ -112,6 +115,8 @@ fn context(f: &toe_core::engine::Failure) -> String {
     }
     if c.flaky {
         parts.push("FLAKY".to_owned());
+    } else if c.suite_passed_on_same_code {
+        parts.push("likely FLAKY: suite passed on this exact code before".to_owned());
     }
     if let Some(code) = &c.last_passed_code {
         parts.push(format!("last passed at {code}"));
