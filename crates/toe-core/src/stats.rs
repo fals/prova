@@ -217,6 +217,15 @@ pub fn mann_whitney(x: &[f64], y: &[f64]) -> MannWhitney {
     }
     let nt = total as f64;
     let sigma = (nm / 12.0 * ((nt + 1.0) - tie_term / (nt * (nt - 1.0)))).sqrt();
+    if sigma == 0.0 {
+        // Every value identical (typical for deterministic metrics such as
+        // accuracy or step counts): no evidence of any difference.
+        return MannWhitney {
+            u,
+            p: 1.0,
+            method: "asymptotic",
+        };
+    }
     let z = (umax - nm / 2.0 - 0.5) / sigma;
     MannWhitney {
         u,
@@ -359,6 +368,16 @@ mod tests {
     fn normal_helpers() {
         assert!((normal_sf(1.959_963_985) - 0.025).abs() < 1e-6);
         assert!((normal_quantile(0.975) - 1.959_963_985).abs() < 1e-8);
+    }
+
+    #[test]
+    fn deterministic_metrics_do_not_break_the_test() {
+        let same = mann_whitney(&[42.0; 5], &[42.0; 5]);
+        assert_eq!(same.p, 1.0);
+        let better = mann_whitney(&[10.0; 5], &[8.0; 5]);
+        assert!(better.p < 0.05, "constant but different arms: {}", better.p);
+        let hl = hodges_lehmann(&[10.0; 5], &[8.0; 5], 0.05);
+        assert_eq!((hl.estimate, hl.lower, hl.upper), (-2.0, -2.0, -2.0));
     }
 
     #[test]

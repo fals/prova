@@ -1,0 +1,15 @@
+    Finished `bench` profile [optimized] target(s) in 0.02s
+     Running benches/primes.rs (target/release/deps/primes-db64e905202f6a85)
+Benchmarking count_primes
+Benchmarking count_primes: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 3.1s, or reduce sample count to 60.
+Benchmarking count_primes: Collecting 100 samples in estimated 3.0631 s (100 iterations)
+Benchmarking count_primes: Analyzing
+count_primes            time:   [30.542 ms 30.598 ms 30.657 ms]
+                        change: [−0.3678% −0.0670% +0.2329%] (p = 0.66 > 0.05)
+                        No change in performance detected.
+Found 13 outliers among 100 measurements (13.00%)
+  7 (7.00%) high mild
+  6 (6.00%) high severe
+

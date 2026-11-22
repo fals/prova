@@ -1,6 +1,6 @@
 # toe
 
-> toe (test oriented experimentation) is a single Rust CLI that coding agents use to run a project's existing test command with fast, structured feedback: first failure while the suite runs, slow and stalled tests without long timeouts, per-test history (new, seen before, flaky), and statistical performance experiments with a frozen protocol. Run tests only through toe: `toe run <suite> --detach`, then `toe wait <run>` (returns within 30 s), rerun one test with `--select`, check `toe history <test>`, and use `toe exp` for any performance claim. Every command accepts `--json`. Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed, 4 infrastructure, 5 still running.
+> toe (test oriented experimentation) is a single Rust CLI that coding agents use to run a project's existing test command with fast, structured feedback: first failure while the suite runs, slow and stalled tests without long timeouts, per-test history (new, seen before, flaky), and statistical performance experiments with a frozen protocol. Run tests only through toe: `toe run <suite> --detach`, then `toe wait <run>` (returns within 30 s), rerun one test with `--select`, check `toe history <test>`, and use `toe exp` for any claim that a change is better (faster, fewer steps, more accurate). For algorithms and protocols, write and check a specification first and pass it to `toe exp new --spec <file> --oracle <cmd>`: violating candidates are rejected unmeasured. Every command accepts `--json`. Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed, 4 infrastructure, 5 still running.
 
 ## Use toe
 
@@ -9,7 +9,8 @@
 - [Event schema](schemas/event.v1.json): JSON Schema of the event stream
 - [Skill: test loop](skills/toe-test/SKILL.md): how an agent runs and fixes tests with toe
 - [Skill: adopt a project](skills/toe-adopt/SKILL.md): put an existing test command under toe without editing it
-- [Skill: experiments](skills/toe-experiment/SKILL.md): protocol, candidates, verdicts
+- [Skill: experiments](skills/toe-experiment/SKILL.md): any objective (time, steps, accuracy), native benchmark tools, protocol, verdicts
+- [Skill: specification first](skills/toe-spec/SKILL.md): formalize a problem in Quint, check it, use it as the oracle that gates experiments
 - [Language skills](skills/): toe-rust, toe-go, toe-python, toe-ts, toe-java, toe-csharp
 
 ## Understand toe

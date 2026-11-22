@@ -1,0 +1,19 @@
+Benchmarking is an experimental feature.
+Breaking changes might not follow SemVer, please pin Vitest's version when using it.
+
+ RUN  v3.2.4 /w
+
+
+ ✓ src/primes.bench.ts > primes 659ms
+     name              hz      min      max     mean      p75      p99     p995     p999     rme  samples
+   · countPrimes  60.9382  15.8532  19.7386  16.4101  16.5439  19.7386  19.7386  19.7386  ±1.72%       31
+
+ BENCH  Summary
+
+  countPrimes - src/primes.bench.ts > primes
+
+npm notice
+npm notice New major version of npm available! 10.9.9 -> 12.2.3
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.3
+npm notice To update run: npm install -g npm@12.2.3
+npm notice

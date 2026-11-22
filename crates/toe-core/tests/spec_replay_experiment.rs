@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
-use toe_core::experiment::{Comparison, Verdict};
+use toe_core::experiment::{Arm, Comparison, Verdict};
 
 fn int(v: &Value) -> u32 {
     v["#bigint"].as_str().unwrap().parse().unwrap()
@@ -20,6 +20,15 @@ fn verdict(v: &Value) -> Option<Verdict> {
         "Inconclusive" => Some(Verdict::Inconclusive),
         "Invalid" => Some(Verdict::Invalid),
         t => panic!("unknown verdict {t}"),
+    }
+}
+
+fn check(v: &Value) -> Option<bool> {
+    match v["tag"].as_str().unwrap() {
+        "Unchecked" => None,
+        "Holds" => Some(true),
+        "Violated" => Some(false),
+        t => panic!("unknown check {t}"),
     }
 }
 
@@ -37,6 +46,20 @@ fn replay(path: &PathBuf) -> usize {
                 c.can_change_protocol(),
                 "{ctx}: engine refuses protocol change"
             ),
+            "checkSpec" => {
+                let arm = match picks["arm"]["value"]["tag"].as_str().unwrap() {
+                    "Baseline" => Arm::Baseline,
+                    _ => Arm::Candidate,
+                };
+                let holds = picks["holds"]["value"].as_bool().unwrap();
+                assert!(c.check_spec(arm, holds), "{ctx}: engine refused spec check");
+            }
+            "rejectViolation" => {
+                assert!(
+                    c.reject_violation().is_some(),
+                    "{ctx}: engine refused rejection"
+                );
+            }
             "trial" => {
                 let fp = int(&picks["fp"]["value"]).to_string();
                 assert!(c.trial(&fp).is_some(), "{ctx}: engine refused trial");
@@ -50,9 +73,22 @@ fn replay(path: &PathBuf) -> usize {
         assert_eq!(c.base, int(&s["baseTrials"]), "{ctx}: baseline trials");
         assert_eq!(c.cand, int(&s["candTrials"]), "{ctx}: candidate trials");
         assert_eq!(c.verdict, verdict(&s["verdict"]), "{ctx}: verdict");
+        assert_eq!(c.base_spec, check(&s["baseSpec"]), "{ctx}: baseline spec");
+        assert_eq!(c.cand_spec, check(&s["candSpec"]), "{ctx}: candidate spec");
         // Disabled actions in the spec must be refused by the engine too.
         let mut probe = c.clone();
         let spec_can_decide = s["verdict"]["tag"] == "NoVerdict" && c.base >= 2 && c.cand >= 2;
+        let spec_can_trial = matches!(
+            s["verdict"]["tag"].as_str(),
+            Some("NoVerdict" | "Inconclusive")
+        ) && s["baseSpec"]["tag"] == "Holds"
+            && s["candSpec"]["tag"] == "Holds"
+            && c.base + c.cand < 8;
+        assert_eq!(
+            c.next_arm().is_some(),
+            spec_can_trial,
+            "{ctx}: trial enabledness"
+        );
         assert_eq!(
             probe.decide(Verdict::Accept).is_some(),
             spec_can_decide,

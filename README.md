@@ -44,9 +44,14 @@ next: fix and rerun, or `toe cancel 3fa9c1d2`
   first failure, a slow test (named) or a stall. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
 - **Memory.** Every attempt is stored with the exact code it ran on: new
   failure, seen before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
-- **Experiments, not anecdotes.** Pre-registered protocol, interleaved trials,
-  Mann-Whitney test and confidence interval, accept/reject verdict, improvement
-  loops. ([experiments](docs/architecture.md#experiments))
+- **Experiments, not anecdotes.** Any objective (time, steps, accuracy),
+  read straight from `go test -bench`, criterion, pytest-benchmark, Vitest,
+  JMH or BenchmarkDotNet. Pre-registered protocol, interleaved trials,
+  Mann-Whitney test and confidence interval, accept/reject verdict.
+  ([experiments](docs/architecture.md#experiments))
+- **Specification first.** State the problem formally (Quint, Lean, any
+  checker), check it, then let it judge: a candidate that violates it is
+  rejected before it is measured. ([skill](skills/toe-spec/SKILL.md))
 - **Built for agents.** Skills for six languages, compact output with the next
   command, JSON everywhere, stable exit codes, MCP tools. ([for agents](#for-agents))
 - **One history per repository.** Clones and worktrees share it; every run
@@ -82,12 +87,15 @@ toe adopt --write                         # proposes toe.toml from what it finds
 toe run default --select test_name        # rerun one test
 ```
 
-Performance question?
+Is the change better?
 
 ```sh
-toe exp new speed --hypothesis "cache cuts latency" --metric wall_ms --min-effect 2% -- ./bench.sh
+toe exp metrics -- go test -run '^$' -bench . -count 3    # what toe can read
+toe exp new speed --hypothesis "sieve beats trial division" \
+  --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- go test -run '^$' -bench . -count 3
 # change the code, then
 toe exp candidate speed && toe exp run speed
+# ACCEPT  c1 vs baseline: BenchmarkCountPrimes.ns_per_op improved +94.9% (CI [+94.5%, +95.9%], p=0.0079)
 ```
 
 More in [Getting started](docs/getting-started.md).
@@ -103,7 +111,7 @@ toe run <suite> --detach        start, get a run id
 toe wait <run>                  first failure, slow test, stall or end (max 30 s)
 toe run <suite> --select <t>    rerun what failed
 toe history <t>                 new failure, pre-existing, or flaky?
-toe exp ...                     any "is it faster?" claim
+toe exp ...                     any "is it better?" claim, gated by the spec
 ```
 
 - **Exit codes:** 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
@@ -113,7 +121,7 @@ toe exp ...                     any "is it faster?" claim
 - **MCP:** `claude mcp add toe -- toe mcp` (tools `run_start`, `run_wait`,
   `run_status`, `run_cancel`, `test_history`). The CLI is the primary
   interface: it is cheaper in context and works in every harness.
-- **Skills:** `toe-adopt`, `toe-test`, `toe-experiment`, plus `toe-rust`,
+- **Skills:** `toe-adopt`, `toe-test`, `toe-experiment`, `toe-spec`, plus `toe-rust`,
   `toe-go`, `toe-python`, `toe-ts`, `toe-java`, `toe-csharp` in [`skills/`](skills/).
 - **Machine-readable docs:** [`llms.txt`](llms.txt) and the
   [contracts](docs/architecture.md#contracts-for-agents).
@@ -136,6 +144,7 @@ calling a failure new or flaky. Performance claims need `toe exp`.
 | "Did I break this?" | guess | new / seen before / flaky / last green commit |
 | What ran, with what | lost in scrollback | recorded: command, code, environment, origin |
 | "It's faster now" | one run | protocol, trials, confidence interval, verdict |
+| "It's correct" | the tests the agent just wrote | a specification fixed first, checked, used as the oracle |
 
 ## Documentation
 

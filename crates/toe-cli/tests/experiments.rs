@@ -163,3 +163,94 @@ fn crashing_candidate_is_logged_as_crash() {
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
 }
+
+/// Repo for a non-speed experiment: the workload reports `steps`; the
+/// specification says the answer must be 42, and the oracle checks it.
+fn spec_repo(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("toe-exp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("steps"), "100").unwrap();
+    std::fs::write(d.join("answer"), "42").unwrap();
+    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$(cat steps)}\"\n",
+    )
+    .unwrap();
+    std::fs::write(d.join(".gitignore"), ".toe/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = toe(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "fewer steps, same answer",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--spec",
+            "spec.txt",
+            "--oracle",
+            "test \"$(cat answer)\" = 42",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    d
+}
+
+#[test]
+fn deterministic_metric_under_a_specification_is_accepted() {
+    let d = spec_repo("spec-accept");
+    std::fs::write(d.join("steps"), "60").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    assert_eq!(
+        r["comparison"]["result"]["primary"]["candidate_median"],
+        60.0
+    );
+}
+
+#[test]
+fn candidate_violating_the_specification_is_rejected_unmeasured() {
+    let d = spec_repo("spec-violation");
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let o = toe(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(1), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "reject");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "never measured");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("violates the specification"), "{reason}");
+}
+
+#[test]
+fn the_specification_cannot_move() {
+    let d = spec_repo("spec-moved");
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("spec.txt"), "answer = anything\n").unwrap();
+    assert!(toe(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("spec.txt differs"), "{reason}");
+}

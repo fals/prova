@@ -1,0 +1,12 @@
+.                                                                        [100%]
+
+-------------------------- benchmark: 1 tests --------------------------
+Name (time in ms)         Min      Max     Mean   Median  StdDev  Rounds
+------------------------------------------------------------------------
+test_count_primes     20.0193  21.5003  20.1415  20.1003  0.2050      50
+------------------------------------------------------------------------
+
+Legend:
+  Outliers: 1 Standard Deviation from Mean; 1.5 IQR (InterQuartile Range) from 1st Quartile and 3rd Quartile.
+  OPS: Operations Per Second, computed as 1 / Mean
+1 passed in 2.05s

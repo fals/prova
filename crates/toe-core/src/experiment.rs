@@ -70,6 +70,28 @@ pub struct Protocol {
     pub guardrails: Vec<Guardrail>,
     pub command: Vec<String>,
     pub kill_after_ms: u64,
+    /// Shell command run once in each variant's directory before any trial
+    /// (e.g. `npm ci`): a baseline worktree has none of the untracked files
+    /// (dependencies, build caches) the working tree has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+    /// The problem's specification (ADR 0015): files frozen by content hash
+    /// with the protocol, so the goal cannot move after registration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specs: Vec<SpecFile>,
+    /// Shell command that must succeed in a variant's directory for that
+    /// variant to satisfy the specification (model checker, conformance
+    /// replay, property tests, proof checker). Runs once per arm, before
+    /// any trial; a violating candidate is rejected unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<String>,
+}
+
+/// A specification file: path relative to the repository root, sha256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecFile {
+    pub path: String,
+    pub sha256: String,
 }
 
 /// Hard floor: below 5 per arm no exact test can reach p < 0.05 with margin.
@@ -149,6 +171,9 @@ pub struct Comparison {
     pub cand: u32,
     pub fingerprints: std::collections::BTreeSet<String>,
     pub verdict: Option<Verdict>,
+    /// Specification check per arm (`None` = not checked yet).
+    pub base_spec: Option<bool>,
+    pub cand_spec: Option<bool>,
 }
 
 impl Comparison {
@@ -160,7 +185,32 @@ impl Comparison {
             cand: 0,
             fingerprints: Default::default(),
             verdict: None,
+            base_spec: None,
+            cand_spec: None,
         }
+    }
+
+    /// Records whether an arm satisfies the specification; allowed once per
+    /// arm, before any trial.
+    pub fn check_spec(&mut self, arm: Arm, holds: bool) -> bool {
+        let slot = match arm {
+            Arm::Baseline => &mut self.base_spec,
+            Arm::Candidate => &mut self.cand_spec,
+        };
+        if self.base + self.cand > 0 || self.verdict.is_some() || slot.is_some() {
+            return false;
+        }
+        *slot = Some(holds);
+        true
+    }
+
+    /// Rejects, unmeasured, a candidate that violates the specification.
+    pub fn reject_violation(&mut self) -> Option<Verdict> {
+        if self.verdict.is_some() || self.base_spec != Some(true) || self.cand_spec != Some(false) {
+            return None;
+        }
+        self.verdict = Some(Verdict::Reject);
+        self.verdict
     }
 
     pub fn can_change_protocol(&self) -> bool {
@@ -170,7 +220,8 @@ impl Comparison {
     /// Next arm to run, interleaved; `None` when no more trials are allowed.
     pub fn next_arm(&self) -> Option<Arm> {
         let open = matches!(self.verdict, None | Some(Verdict::Inconclusive));
-        if !open || self.base + self.cand >= 2 * self.max_trials {
+        let specified = self.base_spec == Some(true) && self.cand_spec == Some(true);
+        if !open || !specified || self.base + self.cand >= 2 * self.max_trials {
             return None;
         }
         Some(if self.base <= self.cand {
@@ -644,19 +695,17 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
     })
 }
 
-/// A metric line on stdout: `{"metric": "name", "value": 1.5, "unit": "ms"}`.
-pub fn parse_metric(line: &str) -> Option<(String, f64, Option<String>)> {
-    let t = line.trim();
-    if !t.starts_with('{') {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(t).ok()?;
-    let name = v["metric"].as_str()?.to_owned();
-    let value = v["value"].as_f64().filter(|x| x.is_finite())?;
-    Some((name, value, v["unit"].as_str().map(str::to_owned)))
-}
+/// Turns a trial's whole output into metrics (name, value, unit); the
+/// benchmark recognizers live in toe-adapters.
+pub type MetricParser = dyn Fn(&str) -> Vec<(String, f64, Option<String>)>;
 
-fn run_trial(dir: &Path, p: &Protocol, v: &Variant, log: &Path) -> Result<TrialResult> {
+fn run_trial(
+    dir: &Path,
+    p: &Protocol,
+    v: &Variant,
+    log: &Path,
+    parse: &MetricParser,
+) -> Result<TrialResult> {
     let mut log = private_file(log)?;
     let mut cmd = Command::new(&p.command[0]);
     cmd.args(&p.command[1..])
@@ -701,13 +750,12 @@ fn run_trial(dir: &Path, p: &Protocol, v: &Variant, log: &Path) -> Result<TrialR
         }
     });
     let limit = Duration::from_millis(p.kill_after_ms);
-    let mut metrics = Vec::new();
+    let mut text = String::new();
     let status = loop {
         while let Ok(line) = rx.try_recv() {
             writeln!(log, "{line}")?;
-            if let Some(m) = parse_metric(&line) {
-                metrics.push(m);
-            }
+            text.push_str(&line);
+            text.push('\n');
         }
         if let Some(s) = child.try_wait()? {
             break Some(s);
@@ -725,14 +773,15 @@ fn run_trial(dir: &Path, p: &Protocol, v: &Variant, log: &Path) -> Result<TrialR
     let until = Instant::now() + Duration::from_secs(1);
     while let Ok(line) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
         writeln!(log, "{line}")?;
-        if let Some(m) = parse_metric(&line) {
-            metrics.push(m);
-        }
+        text.push_str(&line);
+        text.push('\n');
     }
     process::kill_group(pgid); // leftovers must not disturb the next trial
     if let Ok(e) = err_thread.join() {
         log.write_all(&e)?;
+        text.push_str(&String::from_utf8_lossy(&e));
     }
+    let metrics = parse(&text);
     Ok(TrialResult {
         exit_code: status.and_then(|s| s.code()),
         wall_ms,
@@ -747,7 +796,7 @@ fn fingerprint() -> String {
 // ------------------------------------------------------------ worker
 
 /// Body of `toe __exp`: runs trials and decides.
-pub fn work(store: &Store, comparison: &str) -> Result<()> {
+pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()> {
     let (exp, base_name, cand_name): (String, String, String) = store.conn().query_row(
         "SELECT experiment, baseline, candidate FROM comparisons WHERE id = ?1",
         params![comparison],
@@ -777,7 +826,13 @@ pub fn work(store: &Store, comparison: &str) -> Result<()> {
         let i = if arm == Arm::Baseline { 0 } else { 1 };
         let fp = fingerprint();
         let started = now_ms();
-        let r = run_trial(&dirs[i], p, &arms[i].1, &logs.join(format!("{seq}.log")))?;
+        let r = run_trial(
+            &dirs[i],
+            p,
+            &arms[i].1,
+            &logs.join(format!("{seq}.log")),
+            parse,
+        )?;
         let ok = r.exit_code == Some(0);
         let tx = store.conn().unchecked_transaction()?;
         tx.execute(
@@ -806,6 +861,48 @@ pub fn work(store: &Store, comparison: &str) -> Result<()> {
         )? == 1)
     };
 
+    if let Some(setup) = &p.setup {
+        for (i, (arm, _)) in arms.iter().enumerate() {
+            let log = private_file(&logs.join(format!("setup-{}.log", arm.as_str())))?;
+            let ok = Command::new("sh")
+                .arg("-c")
+                .arg(setup)
+                .current_dir(&dirs[i])
+                .stdin(Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                let reason = format!(
+                    "setup `{setup}` failed for {} (see setup-{}.log)",
+                    arm.as_str(),
+                    arm.as_str()
+                );
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
+            }
+        }
+    }
+    let mut c = Comparison::new(p.min_trials, p.max_trials);
+    for (i, (arm, _)) in arms.iter().enumerate() {
+        let verdict = satisfies_spec(p, &dirs[i], &logs, *arm)?;
+        c.check_spec(*arm, verdict.is_ok());
+        if let Err(why) = verdict {
+            if *arm == Arm::Baseline {
+                let reason = format!(
+                    "baseline violates the specification: {why}; measure only implementations that satisfy it"
+                );
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
+            }
+            c.reject_violation();
+            let result = serde_json::json!({
+                "reason": format!("candidate violates the specification: {why}"),
+                "specification": "violated",
+            });
+            return finish(store, &e, comparison, &cand_name, Verdict::Reject, result);
+        }
+    }
     for _ in 0..p.warmup {
         for arm in [Arm::Baseline, Arm::Candidate] {
             if !run_one(arm, true)? {
@@ -819,7 +916,6 @@ pub fn work(store: &Store, comparison: &str) -> Result<()> {
             }
         }
     }
-    let mut c = Comparison::new(p.min_trials, p.max_trials);
     let mut target = p.trials;
     loop {
         while c.base < target || c.cand < target {
@@ -846,6 +942,57 @@ pub fn work(store: &Store, comparison: &str) -> Result<()> {
         let verdict = c.decide(outcome).unwrap_or(Verdict::Invalid);
         return finish(store, &e, comparison, &cand_name, verdict, result);
     }
+}
+
+/// Whether a variant satisfies the protocol's specification: its spec files
+/// are the registered ones, and the oracle succeeds in its directory.
+fn satisfies_spec(
+    p: &Protocol,
+    dir: &Path,
+    logs: &Path,
+    arm: Arm,
+) -> Result<std::result::Result<(), String>> {
+    for f in &p.specs {
+        let found = std::fs::read(dir.join(&f.path)).map(|b| sha256_hex(&b));
+        match found {
+            Ok(h) if h == f.sha256 => {}
+            Ok(_) => {
+                return Ok(Err(format!(
+                    "{} differs from the registered specification",
+                    f.path
+                )));
+            }
+            Err(_) => {
+                return Ok(Err(format!(
+                    "{} is missing (commit the specification before registering it)",
+                    f.path
+                )));
+            }
+        }
+    }
+    let Some(oracle) = &p.oracle else {
+        return Ok(Ok(()));
+    };
+    let name = format!("oracle-{}.log", arm.as_str());
+    let log = private_file(&logs.join(&name))?;
+    let ok = Command::new("sh")
+        .arg("-c")
+        .arg(oracle)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    Ok(if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "oracle `{oracle}` failed (see {})",
+            logs.join(name).display()
+        ))
+    })
 }
 
 fn fingerprint_of(store: &Store, comparison: &str, seq: u32) -> Result<String> {
@@ -1153,6 +1300,12 @@ mod tests {
     #[test]
     fn interleaves_and_refuses_early_verdicts() {
         let mut c = Comparison::new(5, 6);
+        assert_eq!(
+            c.next_arm(),
+            None,
+            "no trial before the specification check"
+        );
+        assert!(c.check_spec(Arm::Baseline, true) && c.check_spec(Arm::Candidate, true));
         let arms: Vec<Arm> = (0..4).map(|_| c.trial("m").unwrap()).collect();
         assert_eq!(
             arms,
@@ -1170,15 +1323,33 @@ mod tests {
     #[test]
     fn mixed_machines_are_invalid_and_max_inconclusive_rejects() {
         let mut c = Comparison::new(5, 5);
+        c.check_spec(Arm::Baseline, true);
+        c.check_spec(Arm::Candidate, true);
         for i in 0..10 {
             c.trial(if i == 3 { "other" } else { "m" });
         }
         assert_eq!(c.decide(Verdict::Accept), Some(Verdict::Invalid));
         let mut c = Comparison::new(5, 5);
+        c.check_spec(Arm::Baseline, true);
+        c.check_spec(Arm::Candidate, true);
         for _ in 0..10 {
             c.trial("m");
         }
         assert_eq!(c.decide(Verdict::Inconclusive), Some(Verdict::Reject));
+    }
+
+    #[test]
+    fn a_spec_violator_is_rejected_unmeasured() {
+        let mut c = Comparison::new(5, 5);
+        assert!(c.check_spec(Arm::Baseline, true));
+        assert!(c.check_spec(Arm::Candidate, false));
+        assert!(!c.check_spec(Arm::Candidate, true), "checked once");
+        assert_eq!(c.next_arm(), None);
+        assert_eq!(c.reject_violation(), Some(Verdict::Reject));
+        let mut b = Comparison::new(5, 5);
+        b.check_spec(Arm::Baseline, false);
+        b.check_spec(Arm::Candidate, true);
+        assert_eq!((b.next_arm(), b.reject_violation()), (None, None));
     }
 
     fn result(improvement_ci: (f64, f64), p: f64) -> MetricResult {
@@ -1241,10 +1412,5 @@ mod tests {
             None,
         );
         assert!(r.improvement < 0.0);
-        assert_eq!(
-            parse_metric(r#"{"metric":"ops","value":12.5,"unit":"ops/s"}"#),
-            Some(("ops".into(), 12.5, Some("ops/s".into())))
-        );
-        assert_eq!(parse_metric("ops 12"), None);
     }
 }
