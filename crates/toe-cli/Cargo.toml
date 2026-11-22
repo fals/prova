@@ -1,0 +1,20 @@
+[package]
+name = "toe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "toe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.9", features = ["derive"] }
+serde_json = "1.0.154"
+toe-adapters = { version = "0.1.0", path = "../toe-adapters" }
+toe-core = { version = "0.1.0", path = "../toe-core" }
+
+[lints]
+workspace = true

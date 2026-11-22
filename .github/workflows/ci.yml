@@ -1,0 +1,46 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast
+
+  spec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm install -g @informalsystems/quint@0.33.1
+      - name: Typecheck and unit-test specs
+        working-directory: spec
+        run: |
+          for f in *.qnt; do quint typecheck "$f"; quint test "$f"; done
+      - name: Model check (random simulation)
+        working-directory: spec
+        run: quint run run.qnt --invariant safety --max-steps 25 --max-samples 20000
+      - name: Fresh traces replayed against the engine
+        run: |
+          scripts/spec-traces.sh "$RUNNER_TEMP/traces" 60
+          TOE_TRACE_DIR="$RUNNER_TEMP/traces" cargo test -p toe-core --test spec_replay

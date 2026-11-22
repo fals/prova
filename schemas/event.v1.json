@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Event",
+  "description": "One observation in a run's ordered event stream.",
+  "type": "object",
+  "properties": {
+    "run": {
+      "type": "string"
+    },
+    "seq": {
+      "description": "Monotonic per run, starting at 1.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "ts_ms": {
+      "description": "Unix time in milliseconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "run_started"
+        },
+        "pid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "pid"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "test_started"
+        },
+        "test": {
+          "$ref": "#/$defs/TestKey"
+        }
+      },
+      "required": [
+        "kind",
+        "test"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "budget_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "test_slow"
+        },
+        "test": {
+          "$ref": "#/$defs/TestKey"
+        }
+      },
+      "required": [
+        "kind",
+        "test",
+        "elapsed_ms",
+        "budget_ms"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "test_finished"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        },
+        "source": {
+          "$ref": "#/$defs/Level"
+        },
+        "test": {
+          "$ref": "#/$defs/TestKey"
+        }
+      },
+      "required": [
+        "kind",
+        "test",
+        "attempt",
+        "outcome",
+        "source"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "basis": {
+          "$ref": "#/$defs/StallBasis"
+        },
+        "idle_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "run_stalled"
+        }
+      },
+      "required": [
+        "kind",
+        "idle_ms",
+        "basis"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "kind": {
+          "type": "string",
+          "const": "run_finished"
+        },
+        "leaked": {
+          "description": "Process ids still alive in the run's process group after it ended.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        }
+      },
+      "required": [
+        "kind",
+        "status"
+      ]
+    }
+  ],
+  "required": [
+    "v",
+    "run",
+    "seq",
+    "ts_ms"
+  ],
+  "$defs": {
+    "Level": {
+      "description": "Fidelity ladder (ADR 0013). Ordered: higher knows more.",
+      "oneOf": [
+        {
+          "description": "Exit code, output and process tree only.",
+          "type": "string",
+          "const": "opaque"
+        },
+        {
+          "description": "Result files (JUnit XML, TRX) written during the run.",
+          "type": "string",
+          "const": "result_files"
+        },
+        {
+          "description": "Known framework lines recognised in live output.",
+          "type": "string",
+          "const": "recognized"
+        },
+        {
+          "description": "The framework's own structured stream.",
+          "type": "string",
+          "const": "native"
+        }
+      ]
+    },
+    "Outcome": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "skipped",
+        "errored"
+      ]
+    },
+    "StallBasis": {
+      "description": "What a stall was detected on (ADR 0004, 0013).",
+      "oneOf": [
+        {
+          "description": "No CPU time, output or new processes in the process tree.",
+          "type": "string",
+          "const": "process_tree"
+        },
+        {
+          "description": "No structured test event.",
+          "type": "string",
+          "const": "test_events"
+        }
+      ]
+    },
+    "Status": {
+      "type": "string",
+      "enum": [
+        "created",
+        "running",
+        "finished",
+        "cancelled",
+        "aborted"
+      ]
+    },
+    "TestKey": {
+      "description": "Identifies a test inside a suite, as reported by the framework.",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "description": "Enclosing suites or classes, outermost first.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}

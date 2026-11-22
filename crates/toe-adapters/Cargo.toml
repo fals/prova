@@ -1,0 +1,12 @@
+[package]
+name = "toe-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toe-core = { version = "0.1.0", path = "../toe-core" }
+
+[lints]
+workspace = true
