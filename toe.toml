@@ -16,7 +16,8 @@ run = "scripts/ci.sh"
 size = "large"
 stall_after = "5m"
 
-# Real fixture projects with real toolchains (go, cargo). Opt-in.
+# Real fixture projects in every claimed language: go and cargo on the host,
+# Python, TypeScript, Java and C# in official images (needs docker). Opt-in.
 [suite.large]
 run = "cargo test -p toe-cli --test fixtures_large -- --ignored"
 size = "large"

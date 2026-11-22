@@ -56,6 +56,7 @@ impl Observer for Ladder {
     /// tests already reported live are not reported twice. Disagreements
     /// are logged as recognizer defects (supervisor.log).
     fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
+        let held = self.live.finish();
         let mut report = self.files.on_exit(root, started_ms);
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
@@ -100,6 +101,9 @@ impl Observer for Ladder {
                 ),
             });
         }
+        // Live events still held by a recognizer (after the file dedupe,
+        // which they must survive).
+        report.events.splice(0..0, held);
         let live = self.live.level;
         report.level = match (report.level, live) {
             (Some(a), Some(b)) => Some(a.max(b)),
