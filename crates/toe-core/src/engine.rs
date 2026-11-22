@@ -39,6 +39,12 @@ pub trait Observer {
     fn on_line(&mut self, _line: &str, _now_ms: u64) -> Vec<EventKind> {
         Vec::new()
     }
+    /// Extra environment for the process under test (opt-in injection).
+    /// `run_dir` is private to this run; files written there are the
+    /// observer's to read in `on_exit`.
+    fn env(&mut self, _run_dir: &Path) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Called after the process exited; may ingest result files.
     fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> ExitReport {
         ExitReport::default()
@@ -293,6 +299,10 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             c
         }
     };
+    let injected = observer.env(&dir);
+    for (k, v) in &injected {
+        cmd.env(k, v);
+    }
     cmd.current_dir(&row.cwd)
         .env("TOE_RUN_ID", run)
         // The selection reaches the shell only as a variable, never as text.
@@ -320,6 +330,13 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
+    sup.emit(EventKind::RunStarted { pid: pgid });
+    if !injected.is_empty() {
+        let vars: Vec<String> = injected.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        sup.emit(EventKind::RunNote {
+            message: format!("injected by toe.toml (opt-in): {}", vars.join("; ")),
+        });
+    }
     let result = observe_child(
         store, run, &spec, started_ms, &mut sup, &mut child, pgid, observer,
     );
@@ -354,7 +371,6 @@ fn observe_child(
     pgid: u32,
     observer: &mut dyn Observer,
 ) -> Result<()> {
-    sup.emit(EventKind::RunStarted { pid: pgid });
     sup.flush()?;
 
     let (tx, rx) = mpsc::channel();

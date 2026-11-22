@@ -68,10 +68,14 @@ The user's existing script is never edited by toe itself.
 
 ### 6. Transparent instrumentation
 
-- **Environment injection** (for example adding a report file through `PYTEST_ADDOPTS`): **opt-in** per suite in `toe.toml`, and only for frameworks with a verified recipe. Not on by default in v1, because it changes the command's behaviour invisibly.
-- **PATH shims** that intercept `go`, `pytest`, `cargo` inside scripts: **not in v1.** They break scripts that parse tool output and make failures hard to attribute.
+- **Environment injection: opt-in** (decided by the owner, implemented in #33). A suite lists recipes in `toe.toml` (`inject = ["pytest-junit"]`), or a bare run passes `toe run --inject <recipe> -- <command>`. Nothing is injected otherwise. Rules:
+  - only recipes verified against the real framework exist; unknown names are refused before the run starts;
+  - a recipe appends to the variable's existing value, never replaces it;
+  - injected variables are stored in the run's inputs and shown as a note in every summary, so the change is never invisible;
+  - reports a recipe produces are written to the run's private directory (`.toe/runs/<id>/inject/`), not the workspace.
 
-Both are open for review.
+  Recipes: `pytest-junit` (`PYTEST_ADDOPTS=--junitxml=...`, per-test results with messages and durations behind `pytest -q`), `go-nocache` (`GOFLAGS=-count=1`, so Go does not replay cached passes).
+- **PATH shims** that intercept `go`, `pytest`, `cargo` inside scripts: **not in v1.** They break scripts that parse tool output and make failures hard to attribute.
 
 ## Consequences
 

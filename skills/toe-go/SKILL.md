@@ -7,6 +7,8 @@ description: toe setup details for Go projects (go test). Use together with toe-
 
 - Always add `-count=1`: otherwise Go replays cached results and toe
   records passes for tests that did not run (flaky tests look stable).
+  When the command is the project's own (`make test`), opt in to
+  `inject = ["go-nocache"]` instead: toe appends `-count=1` to `GOFLAGS`.
 - Best fidelity: `go test -json -count=1 ./...`. toe reads the test2json stream
   natively: per-test start, result, duration and the failure output.
 - Plain `go test ./...` (often in `make test`) prints only failures;

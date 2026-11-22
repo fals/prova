@@ -92,6 +92,10 @@ pub struct SuiteConfig {
     pub results: Vec<String>,
     /// Framework stream adapter, e.g. `go-json` (level 3).
     pub adapter: Option<String>,
+    /// Opt-in environment injection recipes (ADR 0013 section 6), e.g.
+    /// `["pytest-junit"]`. Off unless listed; recorded with every run.
+    #[serde(default)]
+    pub inject: Vec<String>,
 }
 
 /// How to start the process under test.
@@ -127,6 +131,8 @@ pub struct RunSpec {
     pub results: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inject: Vec<String>,
 }
 
 pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(60);
@@ -217,6 +223,7 @@ impl Config {
             kill_after_ms: dur(name, "kill_after", &s.kill_after, DEFAULT_KILL_AFTER)?,
             results: s.results.clone(),
             adapter: s.adapter.clone(),
+            inject: s.inject.clone(),
         })
     }
 }

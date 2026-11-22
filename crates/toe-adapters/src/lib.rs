@@ -1,6 +1,7 @@
 //! Framework adapters and output recognizers (ADR 0003, 0013).
 
 pub mod adopt;
+pub mod inject;
 pub mod junit;
 pub mod recognize;
 pub mod results;
@@ -16,18 +17,35 @@ use toe_core::model::{EventKind, Level};
 pub struct Ladder {
     live: recognize::Recognizers,
     files: results::ResultFiles,
+    inject: Vec<String>,
+    /// Where injected reports are written (the run's private directory).
+    inject_dir: Option<std::path::PathBuf>,
 }
 
 pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
     Box::new(Ladder {
         live: recognize::Recognizers::default(),
         files: results::ResultFiles::new(&spec.results),
+        inject: spec.inject.clone(),
+        inject_dir: None,
     })
 }
 
 impl Observer for Ladder {
     fn live_level(&self) -> Level {
         self.live.level.unwrap_or(Level::Opaque)
+    }
+
+    fn env(&mut self, run_dir: &Path) -> Vec<(String, String)> {
+        if self.inject.is_empty() {
+            return Vec::new();
+        }
+        let dir = run_dir.join("inject");
+        if toe_core::store::private_dir(&dir).is_err() {
+            return Vec::new();
+        }
+        self.inject_dir = Some(dir.clone());
+        inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
 
     fn on_line(&mut self, line: &str, _now_ms: u64) -> Vec<EventKind> {
@@ -39,6 +57,12 @@ impl Observer for Ladder {
     /// are logged as recognizer defects (supervisor.log).
     fn on_exit(&mut self, root: &Path, started_ms: u64) -> ExitReport {
         let mut report = self.files.on_exit(root, started_ms);
+        if let Some(dir) = &self.inject_dir {
+            let injected = self.files.ingest(results::files_in(dir));
+            report.events.extend(injected.events);
+            report.artifacts.extend(injected.artifacts);
+            report.level = report.level.max(injected.level);
+        }
         // Live and file results are matched by display name (best effort:
         // result files rarely carry the same file attribute).
         let live_names: std::collections::BTreeSet<String> =
