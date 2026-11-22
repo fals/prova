@@ -82,6 +82,7 @@ pub fn create_run(store: &Store, req: &NewRunRequest) -> Result<String> {
         code: &code_identity(&req.cwd),
         env: &recorded_env(&req.extra_env),
         machine: &machine_fingerprint(),
+        origin: &crate::identity::run_origin(),
         created_ms: now_ms(),
     })?;
     Ok(id)
@@ -96,6 +97,8 @@ pub fn spawn_supervisor(store: &Store, exe: &Path, run: &str) -> std::io::Result
         .arg("__supervise")
         .arg("--root")
         .arg(store.root())
+        .arg("--dir")
+        .arg(store.dir())
         .arg(run)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -543,7 +546,7 @@ fn keep_artifact(store: &Store, run: &str, kind: &str, path: &Path) -> Result<()
         return Ok(());
     };
     let sha = crate::ids::sha256_hex(&bytes);
-    let dir = store.root().join(".toe").join("artifacts");
+    let dir = store.dir().join("artifacts");
     crate::store::private_dir(&dir)?;
     let dest = dir.join(&sha);
     if !dest.exists() {
@@ -639,6 +642,8 @@ pub struct Summary {
     pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Data directory this run was recorded in (ADR 0014).
+    pub store: String,
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
@@ -832,6 +837,24 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A selection that ran nothing must not look like a pass.
+    let ran = counts.passed + counts.failed + counts.skipped + counts.errored;
+    if let Some(sel) = &selection
+        && row.status == Status::Finished
+        && ran == 0
+        && row.level > Level::Opaque
+    {
+        notes.push(format!(
+            "selection {sel:?} matched no tests: nothing was run, nothing was verified"
+        ));
+    } else if let Some(sel) = &selection
+        && row.status == Status::Finished
+        && ran == 0
+    {
+        notes.push(format!(
+            "selection {sel:?}: no per-test results seen, so toe cannot tell whether any test matched"
+        ));
+    }
     Ok(Summary {
         run: row.id.clone(),
         suite: row.suite.clone(),
@@ -865,6 +888,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         },
         code: row.code.clone(),
         fingerprint: row.fingerprint.clone(),
+        store: store.dir().display().to_string(),
         history: suite_history(store, &row)?,
     })
 }

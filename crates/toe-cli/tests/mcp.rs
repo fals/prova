@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
@@ -15,6 +16,7 @@ fn mcp_client_can_start_and_wait_for_a_run() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_toe"))
         .arg("mcp")
         .current_dir(&d)
+        .env("TOE_HOME", home_of(&d))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -63,4 +65,9 @@ fn mcp_client_can_start_and_wait_for_a_run() {
     assert_eq!(bad["result"]["isError"], true);
     drop(stdin);
     child.wait().unwrap();
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

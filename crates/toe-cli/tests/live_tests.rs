@@ -19,6 +19,7 @@ fn toe(dir: &Path, args: &[&str]) -> Output {
     Command::new(TOE)
         .args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .output()
         .expect("run toe")
 }
@@ -186,4 +187,9 @@ fn wait_on_a_finished_run_reports_done() {
     assert_eq!(s["reason"], "done", "{s}");
     assert_eq!(s["status"], "finished");
     assert_eq!(w.status.code(), Some(1));
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

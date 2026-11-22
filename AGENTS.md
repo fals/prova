@@ -71,7 +71,7 @@ toe run medium           # before opening a PR
 toe history <test>       # before calling a failure new or flaky
 ```
 
-- Use the **stable** toe binary to test the **development** toe. The stable binary is built from the last green `main` and installed with `cargo install --path crates/toe-cli --root .toe/stable` (path ignored by git). Never test toe with the binary you are changing: a bug would hide itself.
+- Use the **stable** toe binary to test the **development** toe. The stable binary is built from the last green `main` and installed with `cargo install --path crates/toe-cli --root .toe/stable` (path ignored by git). Never test toe with the binary you are changing: a bug would hide itself. Tests isolate themselves with `TOE_HOME`; never run the development binary against your real home.
 - Never run raw test commands in Stage B, except to debug toe itself, and say so in your report. A Claude Code hook (`.claude/hooks/require-toe.sh`) blocks direct `cargo test` / `cargo nextest`; other harnesses must follow the rule by hand.
 - Every performance claim (faster, smaller, fewer allocations) requires a toe experiment with a frozen protocol and an `accept` verdict ([0007](docs/adr/0007-experiments.md)). Link the experiment id in the PR. "It looked faster once" is not evidence.
 - If toe gets in the way, that is a toe bug: open an issue labelled `dogfood` with the exact command and run id, then work around it.

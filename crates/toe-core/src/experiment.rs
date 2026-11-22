@@ -618,7 +618,7 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
     let base = match &v.commit_sha {
         None => root.to_path_buf(),
         Some(sha) => {
-            let wt = root.join(".toe").join("worktrees").join(&sha[..12]);
+            let wt = store.dir().join("worktrees").join(&sha[..12]);
             if !wt.exists() {
                 let ok = Command::new("git")
                     .args(["worktree", "add", "--detach", "--force"])
@@ -767,11 +767,7 @@ pub fn work(store: &Store, comparison: &str) -> Result<()> {
         variant_dir(store, &e, &arms[0].1)?,
         variant_dir(store, &e, &arms[1].1)?,
     ];
-    let logs = store
-        .root()
-        .join(".toe")
-        .join("experiments")
-        .join(comparison);
+    let logs = store.dir().join("experiments").join(comparison);
     private_dir(&logs)?;
 
     let counter = std::cell::Cell::new(0u32);
@@ -1022,6 +1018,9 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ComparisonReport>,
     pub decisions: Vec<serde_json::Value>,
+    /// Directory with trial logs of the latest comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1113,6 +1112,14 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     let e = get(store, exp)?; // best may have changed
+    let logs = comparison.as_ref().map(|c| {
+        store
+            .dir()
+            .join("experiments")
+            .join(&c.id)
+            .display()
+            .to_string()
+    });
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
@@ -1120,6 +1127,7 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         best: e.best,
         comparison,
         decisions,
+        logs,
     })
 }
 

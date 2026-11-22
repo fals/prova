@@ -68,7 +68,8 @@ Do not run test commands directly or wrap them in timeouts.
 - Performance claims: `toe exp ...` with a frozen protocol and a verdict.
   Skill: `toe-experiment`.
 - Suites are in `toe.toml`; no `toe.toml` yet? Start with skill
-  `toe-adopt`. History lives in `.toe/` (not committed).
+  `toe-adopt`. History lives in the toe home (`~/.local/share/toe`), shared
+  by all clones and worktrees.
 <!-- toe:end -->
 ";
 

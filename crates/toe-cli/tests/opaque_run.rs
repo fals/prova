@@ -19,6 +19,7 @@ fn toe(dir: &Path, args: &[&str]) -> Output {
     Command::new(TOE)
         .args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .output()
         .expect("run toe")
 }
@@ -278,21 +279,26 @@ fn selection_cannot_inject_shell_commands() {
 fn store_is_private_to_the_owner() {
     use std::os::unix::fs::PermissionsExt;
     let d = workspace("perms");
-    toe(&d, &["run", "--", "true"]);
-    let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(d.join(".toe")), 0o700);
-    assert_eq!(mode(d.join(".toe/toe.db")), 0o600);
-    let run = json(&toe(&d, &["status", "--json"]))[0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(
-        mode(d.join(".toe/runs").join(run).join("output.log")),
-        0o600
+    let s = json(&toe(&d, &["run", "--json", "--", "true"]));
+    let store = PathBuf::from(s["store"].as_str().expect("store path"));
+    assert!(
+        store.starts_with(home_of(&d)),
+        "central home, not the workspace: {store:?}"
     );
+    assert!(!d.join(".toe").exists(), "workspace keeps nothing");
+    let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(store.clone()), 0o700);
+    assert_eq!(mode(store.join("toe.db")), 0o600);
+    let run = s["run"].as_str().unwrap();
+    assert_eq!(mode(store.join("runs").join(run).join("output.log")), 0o600);
     assert_eq!(
         toe(&d, &["status", "%"]).status.code(),
         Some(4),
         "LIKE wildcard must not resolve"
     );
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

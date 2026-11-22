@@ -372,7 +372,10 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
                 "discard it; record another candidate: toe exp candidate {}",
                 r.experiment
             ),
-            _ => format!("see .toe/experiments/{}/ for trial logs", c.id),
+            _ => format!(
+                "read the trial logs in {}",
+                r.logs.as_deref().unwrap_or("the store")
+            ),
         };
         println!("next: {next}");
     } else {

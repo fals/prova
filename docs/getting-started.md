@@ -64,7 +64,14 @@ Example Claude Code config: `claude mcp add toe -- toe mcp`.
 
 ## What toe stores
 
-Everything lives in `<project>/.toe/` (owner-only permissions): the
-SQLite database, captured output and result files. Commands and output
-are stored as given, so treat `.toe/` like a log directory: keep it out of
-version control and do not share it.
+One central home per user (ADR 0014): `~/.local/share/toe` (or `TOE_HOME`),
+with one SQLite file per repository plus a small catalog. Clones and
+worktrees of the same repository (same first commit) share one history; the
+workspace itself keeps nothing. `toe status --all` and `toe flaky --all`
+look across every repository you work on. Every run records where it ran
+(host, pod, node, actor: `TOE_ACTOR`, CI job or user).
+
+Commands and output are stored as given, with owner-only permissions:
+treat the home like a log directory and do not share it. A store left in a
+workspace `.toe/` by an older toe is imported on first use. If the home is
+not writable, toe falls back to `<workspace>/.toe/` and says so.

@@ -18,6 +18,7 @@ fn toe(dir: &Path, args: &[&str]) -> Output {
     Command::new(TOE)
         .args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .output()
         .expect("run toe")
 }
@@ -109,4 +110,9 @@ select = "echo {filter}"
     let blind = toe(&d, &["adopt", "--verify", "blind", "--filter", "parse"]);
     assert_eq!(blind.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&blind.stdout).contains("level opaque"));
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

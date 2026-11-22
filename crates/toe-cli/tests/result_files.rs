@@ -19,6 +19,7 @@ fn toe(dir: &Path, args: &[&str]) -> Output {
     Command::new(TOE)
         .args(args)
         .current_dir(dir)
+        .env("TOE_HOME", home_of(dir))
         .output()
         .expect("run toe")
 }
@@ -108,7 +109,13 @@ fn diff_reports_newly_failing_and_fixed() {
 #[test]
 fn result_files_are_kept_as_artifacts() {
     let d = workspace("artifacts");
-    run(&d, "pass");
-    let n = std::fs::read_dir(d.join(".toe/artifacts")).unwrap().count();
+    let s = run(&d, "pass");
+    let store = PathBuf::from(s["store"].as_str().unwrap());
+    let n = std::fs::read_dir(store.join("artifacts")).unwrap().count();
     assert_eq!(n, 1);
+}
+
+/// Isolated toe home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
 }

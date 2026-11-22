@@ -1,6 +1,6 @@
 # 0014: Central store, partitioned by repository, with an optional server
 
-Status: Proposed. Supersedes the storage location in [0008](0008-storage-sqlite.md); amends [0001](0001-architecture-overview.md) (a long-lived service becomes an optional component) and [0010](0010-deployment.md) (the image also runs that service).
+Status: Accepted (owner, 2026-11-22). Sections 1, 2, 4 and 5 implemented; section 3 (`toe serve`) next. Supersedes the storage location in [0008](0008-storage-sqlite.md); amends [0001](0001-architecture-overview.md) (a long-lived service becomes an optional component) and [0010](0010-deployment.md) (the image also runs that service).
 
 ## Context
 
@@ -20,7 +20,7 @@ toe has a single store per installation (a machine user, or a server), not per f
 
 - **Repository id**: hash of the repository's root commit (`git rev-list --max-parents=0 HEAD`, the oldest if several). Identical for every clone, worktree and pod of the same repository. Outside git: hash of the `origin`-less root path, marked as local-only.
 - Recorded with it: `origin` URL (credentials stripped), display name, and every workspace path it was seen at.
-- Every run, test, attempt, artifact, experiment and trial carries the repository id. Test identity ([0006](0006-identity-history-flakiness.md)) becomes `hash(repository, suite, file, path, name)`.
+- Every run, test, attempt, artifact, experiment and trial belongs to exactly one repository: the repository's own file holds it, so ids stay unchanged ([0006](0006-identity-history-flakiness.md)) and cross-repository views qualify them with the repository id.
 - Each run also records **where it ran**: host, container or pod name, node, workspace path and an **actor** (user, CI job or agent session id). Runs from different worktrees, machines or pods of the same repository share history and stay distinguishable.
 
 ### 2. Local central store (default, no service)
