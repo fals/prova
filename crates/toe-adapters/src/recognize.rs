@@ -27,6 +27,9 @@ pub struct Recognizers {
     go_current: Option<String>,
     /// Tests the framework says it ran (from its own summary lines).
     pub reported_total: u64,
+    /// libtest results for a test already seen in this run (the same test
+    /// binary executed twice); they count toward `reported_total`.
+    pub repeats: u64,
     cache_noted: bool,
 }
 
@@ -68,7 +71,12 @@ impl Recognizers {
     ) {
         let d = key.unique();
         if self.seen.contains_key(&d) {
-            return; // already reported by an earlier line (e.g. pytest summary)
+            // Already reported: a pytest summary line, or (libtest, level
+            // Recognized with a binary known) the same binary run again.
+            if self.libtest_binary.is_some() && key.file == self.libtest_binary {
+                self.repeats += 1;
+            }
+            return;
         }
         self.seen.insert(d, (key.display(), outcome));
         lift(&mut self.level, level);

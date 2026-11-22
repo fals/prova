@@ -65,7 +65,7 @@ impl Observer for Ladder {
         });
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
         let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
-        let seen = self.live.seen.len() as u64 + file_only;
+        let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
         if self.live.reported_total > seen {
             report.events.push(EventKind::RunNote {
                 message: format!(
