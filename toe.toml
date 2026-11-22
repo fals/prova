@@ -15,3 +15,9 @@ stall_after = "2m"
 run = "scripts/ci.sh"
 size = "large"
 stall_after = "5m"
+
+# Real fixture projects with real toolchains (go, cargo). Opt-in.
+[suite.large]
+run = "cargo test -p toe-cli --test fixtures_large -- --ignored"
+size = "large"
+stall_after = "3m"

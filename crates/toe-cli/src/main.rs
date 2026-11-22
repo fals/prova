@@ -1,6 +1,7 @@
 //! `toe` command line (ADR 0009). Primary conduit for agents and humans.
 
 mod render;
+mod skills;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -146,6 +147,26 @@ enum Cmd {
     Diff {
         base: String,
         head: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install toe skills for agents and add a short section to AGENTS.md.
+    Init {
+        /// Also install into .claude/skills (default: when .claude/ or CLAUDE.md exists).
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Detect the test setup and propose toe.toml; verify single-test selection.
+    Adopt {
+        /// Write the proposal to toe.toml (only if none exists).
+        #[arg(long)]
+        write: bool,
+        /// Verify the `select` template of this suite.
+        #[arg(long, requires = "filter")]
+        verify: Option<String>,
+        /// A real test name to select when verifying.
+        #[arg(long)]
+        filter: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -407,6 +428,188 @@ fn exp_start(
             render::exp_progress(&r);
         }
     }
+}
+
+fn write_skills(dir: &Path, names: &[String]) -> Result<usize> {
+    let mut n = 0;
+    for (skill, rel, content) in skills::FILES {
+        if !names.iter().any(|s| s == skill) {
+            continue;
+        }
+        let path = dir.join(skill).join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn init(claude: bool) -> Result<u8> {
+    let cwd = std::env::current_dir()?;
+    let root = config::find_root(&cwd);
+    let proposal = toe_adapters::adopt::propose(&root);
+    let mut names: Vec<String> = skills::WORKFLOW.iter().map(|s| s.to_string()).collect();
+    for lang in &proposal.languages {
+        let skill = format!("toe-{lang}");
+        if skills::FILES.iter().any(|f| f.0 == skill) {
+            names.push(skill);
+        }
+    }
+    let n = write_skills(&root.join(".agents/skills"), &names)?;
+    println!(
+        "installed {} skills ({n} files) into .agents/skills: {}",
+        names.len(),
+        names.join(", ")
+    );
+    if claude || root.join(".claude").is_dir() || root.join("CLAUDE.md").exists() {
+        write_skills(&root.join(".claude/skills"), &names)?;
+        println!("also installed into .claude/skills");
+    }
+    // AGENTS.md: replace our section between markers, or append it.
+    let agents = root.join("AGENTS.md");
+    let text = std::fs::read_to_string(&agents).unwrap_or_default();
+    let new = match (
+        text.find("<!-- toe:begin -->"),
+        text.find("<!-- toe:end -->"),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            let end = b + "<!-- toe:end -->".len();
+            format!(
+                "{}{}{}",
+                &text[..a],
+                skills::AGENTS_SECTION.trim_end(),
+                &text[end..]
+            )
+        }
+        _ if text.is_empty() => skills::AGENTS_SECTION.to_owned(),
+        _ => format!("{}\n\n{}", text.trim_end(), skills::AGENTS_SECTION),
+    };
+    if new != text {
+        std::fs::write(&agents, new)?;
+        println!("updated AGENTS.md (toe section)");
+    }
+    let gi = root.join(".gitignore");
+    let ignore = std::fs::read_to_string(&gi).unwrap_or_default();
+    if !ignore
+        .lines()
+        .any(|l| l.trim() == ".toe/" || l.trim() == ".toe")
+    {
+        let sep = if ignore.is_empty() || ignore.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        std::fs::write(&gi, format!("{ignore}{sep}.toe/\n"))?;
+        println!("added .toe/ to .gitignore");
+    }
+    if !root.join("toe.toml").exists() {
+        println!("next: toe adopt   (proposes toe.toml for this project)");
+    }
+    Ok(exit::PASSED)
+}
+
+/// Runs a spec to the end, without detaching, and returns its summary.
+fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
+    let id = engine::create_run(store, req)?;
+    let mut child = engine::spawn_supervisor(store, &std::env::current_exe()?, &id)?;
+    let mut cursor = 0;
+    loop {
+        let s = engine::wait(store, &id, Until::Done, cursor, Duration::from_secs(30))?;
+        cursor = s.last_seq;
+        if s.reason == WaitReason::Done {
+            let _ = child.wait();
+            return Ok(s);
+        }
+    }
+}
+
+fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool) -> Result<u8> {
+    let (store, root, _) = open_here()?;
+    if let (Some(suite), Some(filter)) = (verify, filter) {
+        let cfg = config::load(&root)?;
+        let spec = cfg.run_spec(&suite, Some(&filter))?;
+        let s = run_to_end(
+            &store,
+            &NewRunRequest {
+                suite: suite.clone(),
+                spec,
+                cwd: root.clone(),
+                extra_env: cfg.env.clone(),
+            },
+        )?;
+        let tests: Vec<String> = store
+            .events_after(&s.run, 0)?
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                toe_core::model::EventKind::TestFinished { test, .. } => Some(test.display()),
+                _ => None,
+            })
+            .collect();
+        let unrelated: Vec<&String> = tests.iter().filter(|t| !t.contains(&filter)).collect();
+        let (ok, why) = if s.level == toe_core::model::Level::Opaque {
+            (false, "cannot verify: run is at level opaque (no per-test results); see the toe-<language> skill to raise the level".to_owned())
+        } else if tests.is_empty() {
+            (
+                false,
+                format!(
+                    "no test ran for filter {filter:?}; the select template does not reach the test"
+                ),
+            )
+        } else if !unrelated.is_empty() {
+            (
+                false,
+                format!(
+                    "{} tests ran that do not match {filter:?} (e.g. {}); select is not selective",
+                    unrelated.len(),
+                    unrelated[0]
+                ),
+            )
+        } else {
+            (
+                true,
+                format!("{} matching test(s) ran and nothing else", tests.len()),
+            )
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "run": s.run, "verified": ok, "reason": why, "tests": tests })
+            );
+        } else {
+            println!(
+                "{} run {}: {why}",
+                if ok { "VERIFIED" } else { "NOT VERIFIED" },
+                s.run
+            );
+        }
+        return Ok(if ok { exit::PASSED } else { exit::FAILED });
+    }
+    let p = toe_adapters::adopt::propose(&root);
+    let toml = toe_adapters::adopt::to_toml(&p);
+    if json {
+        println!("{}", serde_json::json!({ "proposal": p, "toml": toml }));
+    } else {
+        print!("{toml}");
+        for n in &p.notes {
+            println!("# note: {n}");
+        }
+    }
+    if write {
+        let path = root.join("toe.toml");
+        if path.exists() {
+            bail!("toe.toml exists; edit it by hand or remove it first");
+        }
+        if p.suites.is_empty() {
+            bail!("nothing to write");
+        }
+        std::fs::write(&path, &toml)?;
+        if !json {
+            println!("# written to toe.toml");
+        }
+    }
+    Ok(exit::PASSED)
 }
 
 fn exp(cmd: ExpCmd) -> Result<u8> {
@@ -857,6 +1060,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             })
         }
         Cmd::Exp(c) => exp(c),
+        Cmd::Init { claude } => init(claude),
+        Cmd::Adopt {
+            write,
+            verify,
+            filter,
+            json,
+        } => adopt(write, verify, filter, json),
         Cmd::ExpWorker { root, comparison } => {
             let store = Store::open(&root)?;
             experiment::work(&store, &comparison)?;
