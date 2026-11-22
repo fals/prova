@@ -823,7 +823,9 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
 /// is never overwritten.
 fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     let orphan = match row.status {
-        Status::Running => row.supervisor_pid.is_some_and(|p| !process::alive(p)),
+        Status::Running => row
+            .supervisor_pid
+            .is_some_and(|p| !process::supervises(p, &row.id)),
         Status::Created => now_ms().saturating_sub(row.created_ms) > 15_000,
         _ => false,
     };
@@ -902,6 +904,11 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
 }
 
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
+    // A run whose supervisor is gone is recorded as aborted before it is
+    // described: no summary may show a dead run as running.
+    if reap_orphan(store, &store.run(run)?)? {
+        return summarize(store, run, WaitReason::Done, last_seq);
+    }
     let row = store.run(run)?;
     // An event matched, but the run is over by now: report the end.
     let reason = if row.status.is_terminal() && reason != WaitReason::Running {
@@ -1080,6 +1087,7 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .collect();
     Ok(Some(serde_json::json!({
         "previous_runs": prev.len(),
+        "selection": selection,
         "last": { "run": last.id, "outcome": last.outcome, "code": last.code },
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),
         "same_failure_seen": same.len(),

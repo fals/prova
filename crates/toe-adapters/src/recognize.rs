@@ -50,6 +50,12 @@ pub struct Recognizers {
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
+    /// Failure messages, kept as a test's output when nothing richer is
+    /// known (lowest priority).
+    pub failure_fallback: Vec<(TestKey, String)>,
+    /// libtest: the failing test whose "---- name stdout ----" block is
+    /// being collected, and its lines.
+    libtest_block: Option<(TestKey, Vec<String>)>,
     /// Failing tests' full output from structured streams (ADR 0016).
     pub failure_output: Vec<(TestKey, String)>,
     /// libtest results for a test already seen in this run (the same test
@@ -102,6 +108,11 @@ impl Recognizers {
                 self.repeats += 1;
             }
             return;
+        }
+        if outcome.is_failure()
+            && let Some(m) = &message
+        {
+            self.failure_fallback.push((key.clone(), m.clone()));
         }
         self.seen.insert(d, (key.display(), outcome));
         lift(&mut self.level, level);
@@ -541,6 +552,25 @@ impl Recognizers {
     }
 
     fn libtest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        // A failing test's captured output: "---- path::name stdout ----"
+        // up to the next block or the "failures:" list.
+        if let Some(name) = line.strip_prefix("---- ").and_then(|r| {
+            r.strip_suffix(" stdout ----")
+                .or_else(|| r.strip_suffix(" stderr ----"))
+        }) {
+            self.close_libtest_block();
+            self.libtest_block = Some((self.libtest_key(name.trim()), Vec::new()));
+            return true;
+        }
+        if self.libtest_block.is_some() {
+            let t = line.trim();
+            if t == "failures:" || t.starts_with("test result:") {
+                self.close_libtest_block();
+            } else if let Some((_, lines)) = self.libtest_block.as_mut() {
+                lines.push(line.to_owned());
+                return true;
+            }
+        }
         // "     Running tests/live.rs (target/debug/deps/live-abc)" or
         // "   Doc-tests toe_core": tests of different binaries may share names.
         let t = line.trim_start();
@@ -797,8 +827,18 @@ impl Recognizers {
         self.structured_total.unwrap_or(self.reported_total)
     }
 
+    fn close_libtest_block(&mut self) {
+        if let Some((key, lines)) = self.libtest_block.take() {
+            let text = lines.join("\n").trim().to_owned();
+            if !text.is_empty() {
+                self.failure_output.push((key, text));
+            }
+        }
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
+        self.close_libtest_block();
         let mut out = Vec::new();
         self.flush_vitest(&mut out);
         out
@@ -1131,6 +1171,32 @@ mod tests {
         });
         assert_eq!(file.as_deref(), Some("calc::calc"));
         assert_eq!(r.total(), 5, "echoed text totals do not add up");
+    }
+
+    /// Regression (usability round 3): `toe output --test` found nothing for
+    /// failures seen only in libtest's text output.
+    #[test]
+    fn libtest_text_failures_keep_their_stdout_block() {
+        let (mut r, _) = feed(concat!(
+            "     Running unittests src/lib.rs (target/debug/deps/calc-1)\n",
+            "test tests::divides ... FAILED\n",
+            "\nfailures:\n\n",
+            "---- tests::divides stdout ----\n",
+            "thread 'tests::divides' panicked at src/lib.rs:23:9:\n",
+            "  left: 16\n right: 4\n",
+            "\nfailures:\n    tests::divides\n",
+            "test result: FAILED. 4 passed; 1 failed\n",
+        ));
+        r.finish();
+        let (key, text) = r.failure_output.last().unwrap();
+        assert_eq!(
+            (key.name.as_str(), key.file.as_deref()),
+            ("divides", Some("unittests src/lib.rs"))
+        );
+        assert!(
+            text.starts_with("thread 'tests::divides' panicked") && text.ends_with("right: 4"),
+            "{text}"
+        );
     }
 
     #[test]

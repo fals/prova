@@ -69,6 +69,8 @@ enum Cmd {
         #[arg(long)]
         detach: bool,
         /// Report a stall after this long without activity (e.g. 30s).
+        /// Default: the suite's `stall_after`, else by size (small 30s,
+        /// medium 60s, large 5m), else 60s.
         #[arg(long)]
         stall_after: Option<String>,
         /// Kill the run after this long in total (e.g. 30m).
@@ -231,7 +233,10 @@ impl From<BetterArg> for experiment::Better {
 
 #[derive(clap::Args)]
 struct ProtocolArgs {
-    /// Primary metric printed by the workload as {"metric": NAME, "value": N}; `wall_ms` is always recorded.
+    /// Primary metric: a JSON line {"metric": NAME, "value": N} the workload
+    /// prints, or one read from benchmark output (go test -bench, criterion,
+    /// pytest-benchmark, Vitest, JMH, BenchmarkDotNet). `toe exp metrics -- <cmd>`
+    /// lists them; `wall_ms` is always recorded.
     #[arg(long, default_value = "wall_ms")]
     metric: String,
     #[arg(long, value_enum, default_value = "lower")]
@@ -666,11 +671,8 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
     let toml = toe_adapters::adopt::to_toml(&p);
     if json {
         println!("{}", serde_json::json!({ "proposal": p, "toml": toml }));
-    } else {
+    } else if !write {
         print!("{toml}");
-        for n in &p.notes {
-            println!("# note: {n}");
-        }
     }
     if write {
         let path = root.join("toe.toml");
@@ -682,7 +684,12 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         }
         std::fs::write(&path, &toml)?;
         if !json {
-            println!("# written to toe.toml");
+            let names: Vec<&str> = p.suites.iter().map(|s| s.name.as_str()).collect();
+            println!("wrote toe.toml with suite(s) {}", names.join(", "));
+            for n in &p.notes {
+                println!("note: {n}");
+            }
+            println!("next: toe adopt --verify {} --filter <test name>", names[0]);
         }
     }
     Ok(exit::PASSED)
@@ -839,7 +846,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                 }
                 println!(
                     "next: toe exp new <name> --metric <one of these> --better lower|higher -- {}",
-                    command.join(" ")
+                    sh_quote(&command)
                 );
             }
             Ok(if out.status.success() {
@@ -899,6 +906,24 @@ fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
         );
     }
     Ok((store, root, cwd))
+}
+
+/// Arguments as a shell would need them typed (`-run '^$'`), for hints the
+/// agent copies.
+fn sh_quote(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            let plain = !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_./=:,@%+-".contains(c));
+            if plain {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `toe output`: the live spool while the run is going, then what was
@@ -1004,6 +1029,24 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         } => {
             let (store, root, cwd) = open_here()?;
             let cfg = config::load(&root)?;
+            // `toe run -- make test --detach` passes --detach to make.
+            const OWN_FLAGS: &[&str] = &[
+                "--detach",
+                "--json",
+                "--select",
+                "--inject",
+                "--stall-after",
+                "--kill-after",
+                "--keep-output",
+            ];
+            if let Some(f) = command
+                .iter()
+                .find(|a| OWN_FLAGS.contains(&a.split('=').next().unwrap_or(a)))
+            {
+                eprintln!(
+                    "toe: note: {f} comes after `--`, so it goes to the command, not to toe; put toe's flags before `--`"
+                );
+            }
             let (suite_name, mut spec, run_cwd) = if !command.is_empty() {
                 if suite.is_some() || select.is_some() {
                     bail!("give either a suite name or a command after --, not both");
@@ -1078,8 +1121,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if json {
                     println!("{}", serde_json::json!({ "run": id }));
                 } else {
-                    println!("run {id} started");
-                    println!("next: toe wait {id}");
+                    // stdout carries only the id, so `r=$(toe run --detach)`
+                    // works; the human hint goes to stderr.
+                    println!("{id}");
+                    eprintln!("run {id} started");
+                    eprintln!("next: toe wait {id}");
                 }
                 return Ok(exit::PASSED);
             }
@@ -1430,6 +1476,18 @@ fn exit_code(s: &Summary) -> u8 {
             (_, Status::Finished) => exit::FAILED,
             _ => exit::INFRA,
         },
+    }
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    #[test]
+    fn hints_quote_what_a_shell_would_eat() {
+        let a: Vec<String> = ["go", "test", "-run", "^$", "-bench", "X", "it's"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(super::sh_quote(&a), "go test -run '^$' -bench X 'it'\\''s'");
     }
 }
 

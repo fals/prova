@@ -36,6 +36,17 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
+/// Caches that running tests writes into the tree (bytecode and tool
+/// caches). They are not code: a project that forgot to ignore them must
+/// not get a new code identity after every test run.
+const CACHES: &[&str] = &[
+    ":(exclude,glob)**/__pycache__/**",
+    ":(exclude,glob)**/*.pyc",
+    ":(exclude,glob)**/.pytest_cache/**",
+    ":(exclude,glob)**/.mypy_cache/**",
+    ":(exclude,glob)**/.ruff_cache/**",
+];
+
 /// `tree:<12>` for a clean checkout, `tree:<12>+dirty:<12>` with uncommitted
 /// changes, `nogit` outside git. Two runs are "same code" only when equal.
 pub fn code_identity(dir: &Path) -> String {
@@ -44,9 +55,16 @@ pub fn code_identity(dir: &Path) -> String {
     };
     let tree = String::from_utf8_lossy(&tree).trim().to_owned();
     let short = &tree[..tree.len().min(12)];
+    let with_caches_excluded = |args: &[&'static str]| -> Vec<&'static str> {
+        let mut v = args.to_vec();
+        v.push("--");
+        v.push(":/");
+        v.extend_from_slice(CACHES);
+        v
+    };
     let status = git(
         dir,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &with_caches_excluded(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     )
     .unwrap_or_default();
     if status.is_empty() {
@@ -54,8 +72,17 @@ pub fn code_identity(dir: &Path) -> String {
     }
     let mut material = git(dir, &["diff", "HEAD", "--binary"]).unwrap_or_default();
     // Untracked files: hash their content so edits change the identity.
-    let untracked =
-        git(dir, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    let untracked = git(
+        dir,
+        &with_caches_excluded(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--full-name",
+        ]),
+    )
+    .unwrap_or_default();
     let root = git(dir, &["rev-parse", "--show-toplevel"])
         .map(|r| String::from_utf8_lossy(&r).trim().to_owned())
         .unwrap_or_default();

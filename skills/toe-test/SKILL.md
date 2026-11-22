@@ -14,7 +14,7 @@ needs attention.
 1. Start the run detached and wait for the first significant event:
 
    ```
-   toe run <suite> --detach          # prints the run id
+   toe run <suite> --detach          # prints the run id (only), so: r=$(toe run <suite> --detach)
    toe wait <run> --max-wait 30s     # returns on first failure, slow test, stall, or end
    ```
 

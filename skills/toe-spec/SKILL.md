@@ -84,8 +84,7 @@ theorem countPrimes_excludes_n : countPrimes 7 = 3 ∧ countPrimes 8 = 4 := by d
 definition's answers for a range of inputs, and a small program in the
 project's language compares the implementation with them. Core Lean is
 enough for this; mathlib is large and rarely needed. Pin the toolchain in
-`lean-toolchain`. A complete example, gating a Go experiment, is toe's
-`fixtures/go-make/spec/`.
+`lean-toolchain`.
 
 ## 2. Check the specification
 
@@ -118,9 +117,25 @@ the specification. Pick the strongest you can afford:
    action named in `mbt::actionTaken` with the values in `mbt::nondetPicks`,
    and compares the implementation's state with the trace's state after every
    step. See `references/conformance.md` for the trace format and drivers.
-2. **Reference answers** (functions). Tabulate the spec's answers (`quint
-   test` with `assert`s, or a generated table) and check the implementation
-   returns acceptable ones for every input, including edge cases.
+2. **Reference answers** (functions). Get a table of the spec's answers
+   and check the implementation returns acceptable ones for every input,
+   including edge cases. To get the table out of Quint, step through the
+   inputs in a tiny state machine and write it as a trace:
+
+   ```quint
+   var n: int
+   var answer: int
+   action init = all { n' = 0, answer' = countPrimes(0) }
+   action step = all { n' = n + 1, answer' = countPrimes(n + 1) }
+   ```
+
+   ```sh
+   quint run spec/table.qnt --max-steps 3000 --max-samples 1 --n-traces 1 \
+     --mbt --out-itf 'reference_{seq}.itf.json'
+   ```
+
+   Each state of `reference_0.itf.json` holds one `(n, answer)` pair
+   (integers as `{"#bigint": "4"}`); the project's test compares them.
 3. **Property tests** derived from the invariants (proptest, Hypothesis,
    fast-check, jqwik, FsCheck, Go's `testing/quick`).
 4. **Proofs** (Lean): `lake build` is the oracle.

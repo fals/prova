@@ -93,6 +93,13 @@ changed since it was recorded.
 
 ## 4. Act on the verdict
 
+The verdict line gives the relative change, the medians and their ratio
+(`improved +97.3%, median 18.07 -> 0.48 (37.6x)`), the confidence interval
+and p. With few trials the exact rank test has a floor (5 + 5 trials:
+p cannot go below 0.0079); the verdict says when p is at it. `adjusted`
+p accounts for every comparison in the experiment (Holm), so an
+improvement loop does not get lucky by trying many ideas.
+
 - `ACCEPT`: the improvement interval clears the minimum effect. Keep it; it
   becomes the best, and the next idea is compared against it.
 - `REJECT`: worse, no practical effect, a guardrail regressed, or the

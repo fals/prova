@@ -351,11 +351,33 @@ pub fn judge(
         }
     }
     let ci = format!("[{}, {}]", pct(lo), pct(hi));
+    // The change as a ratio of medians ("37.6x"), easier to read than +97%.
+    let (b, c) = (primary.baseline_median, primary.candidate_median);
+    let ratio = if b > 0.0 && c > 0.0 && b.is_finite() && c.is_finite() {
+        format!(
+            ", median {} -> {} ({:.2}x)",
+            short(b),
+            short(c),
+            if b > c { b / c } else { c / b }
+        )
+    } else {
+        String::new()
+    };
+    // With few trials the exact rank test cannot go lower: say so.
+    let floor = crate::stats::min_two_sided_p(primary.n_baseline, primary.n_candidate);
+    let at_floor = if primary.p_adjusted <= floor * (1.0 + 1e-9) {
+        format!(
+            "; {:.4} is the smallest p possible with {} + {} trials",
+            floor, primary.n_baseline, primary.n_candidate
+        )
+    } else {
+        String::new()
+    };
     if primary.p_adjusted < alpha && lo > min_effect {
         (
             Verdict::Accept,
             format!(
-                "{} improved {} (CI {ci}, p={:.4})",
+                "{} improved {}{ratio} (CI {ci}, p={:.4}{at_floor})",
                 primary.metric,
                 pct(primary.improvement),
                 primary.p_adjusted
@@ -365,7 +387,7 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "{} got worse {} (CI {ci}, p={:.4})",
+                "{} got worse {}{ratio} (CI {ci}, p={:.4}{at_floor})",
                 primary.metric,
                 pct(primary.improvement),
                 primary.p_adjusted
@@ -388,6 +410,18 @@ pub fn judge(
                 primary.p_adjusted
             ),
         )
+    }
+}
+
+/// A number with about 4 significant digits, for messages.
+fn short(v: f64) -> String {
+    if v.abs() >= 1000.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.4}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
     }
 }
 

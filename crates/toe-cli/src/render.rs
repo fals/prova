@@ -135,9 +135,10 @@ fn context(f: &toe_core::engine::Failure) -> String {
         return String::new();
     };
     let mut parts = Vec::new();
+    // A test known to be flaky is not a "new failure", whatever its message.
     if c.seen_before > 0 {
         parts.push(format!("seen {}x before", c.seen_before));
-    } else {
+    } else if !c.flaky {
         parts.push("new failure".to_owned());
     }
     if c.flaky {
@@ -204,9 +205,16 @@ fn first_lines(m: &str, n: usize) -> String {
 
 fn history_line(h: &serde_json::Value) -> String {
     let n = h["previous_runs"].as_u64().unwrap_or(0);
+    // Same suite and same selection: a `--select` run is compared only
+    // with runs of the same selection.
     let mut parts = vec![format!(
-        "{n} earlier run{} of this suite",
-        if n == 1 { "" } else { "s" }
+        "{n} earlier run{} of this suite{}",
+        if n == 1 { "" } else { "s" },
+        if h["selection"].is_string() {
+            " with this selection"
+        } else {
+            ""
+        }
     )];
     match h["last_passed"].as_object() {
         Some(p) => parts.push(format!(
@@ -352,15 +360,16 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
             let p = &res["primary"];
             if p.is_object() {
                 println!(
-                    "{}: baseline median {:.3} (MAD {:.3}), candidate median {:.3} (MAD {:.3}), p={:.4} (adjusted {:.4}, {})",
+                    "{}: baseline median {:.3} (MAD {:.3}), candidate median {:.3} (MAD {:.3}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment, Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     p["baseline_median"].as_f64().unwrap_or(f64::NAN),
                     p["baseline_mad"].as_f64().unwrap_or(f64::NAN),
                     p["candidate_median"].as_f64().unwrap_or(f64::NAN),
                     p["candidate_mad"].as_f64().unwrap_or(f64::NAN),
                     p["p"].as_f64().unwrap_or(f64::NAN),
-                    p["p_adjusted"].as_f64().unwrap_or(f64::NAN),
                     p["method"].as_str().unwrap_or(""),
+                    p["p_adjusted"].as_f64().unwrap_or(f64::NAN),
+                    res["comparisons_in_family"].as_u64().unwrap_or(1),
                 );
                 let outl = p["outliers_baseline"].as_array().map_or(0, Vec::len)
                     + p["outliers_candidate"].as_array().map_or(0, Vec::len);
@@ -371,6 +380,21 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
         }
         let next = match (c.status.as_str(), c.verdict.as_deref()) {
             ("running", _) => format!("toe exp wait {}", r.experiment),
+            // A revalidation: the best, again, against the original baseline.
+            ("decided", Some("accept"))
+                if c.baseline == "baseline"
+                    && r.best == c.candidate
+                    && r.decisions
+                        .iter()
+                        .filter(|d| d["candidate"] == c.candidate.as_str())
+                        .count()
+                        > 1 =>
+            {
+                format!(
+                    "revalidated against the original baseline: report experiment {} and this verdict",
+                    r.experiment
+                )
+            }
             ("decided", Some("accept")) => format!(
                 "keep it; try the next idea, or `toe exp revalidate {}`",
                 r.experiment
@@ -414,5 +438,32 @@ mod tests {
             super::clean("\u{1b}[31m-   x\u{1b}(B\u{1b}[m done\u{7}"),
             "-   x done"
         );
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use toe_core::analysis::FailureContext;
+    use toe_core::engine::Failure;
+
+    fn label(seen_before: usize, flaky: bool) -> String {
+        super::context(&Failure {
+            test: "t".into(),
+            message: None,
+            context: Some(FailureContext {
+                seen_before,
+                flaky,
+                last_passed_code: None,
+                suite_passed_on_same_code: false,
+            }),
+        })
+    }
+
+    /// Usability round 3: "[new failure, FLAKY]" contradicted itself.
+    #[test]
+    fn a_flaky_test_is_not_a_new_failure() {
+        assert_eq!(label(0, true), " [FLAKY]");
+        assert_eq!(label(0, false), " [new failure]");
+        assert_eq!(label(2, true), " [seen 2x before, FLAKY]");
     }
 }

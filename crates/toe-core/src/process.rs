@@ -89,6 +89,22 @@ pub fn alive(pid: u32) -> bool {
     })
 }
 
+/// Whether `pid` is the supervisor of `run`. A pid alone is not enough: in
+/// containers and after reboots pids are reused, so a dead supervisor's pid
+/// can belong to an unrelated process. Where `/proc` exists, the process
+/// must be `toe __supervise ... <run>`.
+pub fn supervises(pid: u32, run: &str) -> bool {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmd) => {
+            let args: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+            args.contains(&b"__supervise".as_slice()) && args.contains(&run.as_bytes())
+        }
+        // No such process, or no /proc (not Linux): fall back to the pid.
+        Err(_) if std::path::Path::new("/proc/self").exists() => false,
+        Err(_) => alive(pid),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

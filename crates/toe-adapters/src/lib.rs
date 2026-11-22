@@ -205,9 +205,12 @@ impl Observer for Ladder {
         // Live events still held by a recognizer (after the file dedupe,
         // which they must survive).
         report.events.splice(0..0, held);
-        // Failing tests' output from live streams: richer than a result
-        // file's body, so recorded last (it wins).
-        report.test_outputs.append(&mut self.live.failure_output);
+        // Failing tests' output, lowest priority first (later entries win):
+        // the failure message, a result file's body, then live output.
+        let mut outputs = std::mem::take(&mut self.live.failure_fallback);
+        outputs.append(&mut report.test_outputs);
+        outputs.append(&mut self.live.failure_output);
+        report.test_outputs = outputs;
         let live = self.live.level;
         report.level = match (report.level, live) {
             (Some(a), Some(b)) => Some(a.max(b)),
