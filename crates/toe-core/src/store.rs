@@ -30,6 +30,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_runs.sql"),
     include_str!("migrations/0002_tests.sql"),
+    include_str!("migrations/0003_experiments.sql"),
 ];
 
 pub struct Store {

@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use toe_core::analysis;
 use toe_core::config::{self, CommandSpec, DEFAULT_KILL_AFTER, DEFAULT_STALL_AFTER, RunSpec};
 use toe_core::engine::{self, NewRunRequest, Summary, Until, WaitReason};
+use toe_core::experiment;
 use toe_core::ids::{now_ms, parse_duration};
 use toe_core::model::{Outcome, Status};
 use toe_core::store::Store;
@@ -148,12 +149,383 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Experiments: frozen protocol, interleaved trials, statistical verdict.
+    #[command(subcommand)]
+    Exp(ExpCmd),
+    #[command(name = "__exp", hide = true)]
+    ExpWorker {
+        #[arg(long)]
+        root: PathBuf,
+        comparison: String,
+    },
     #[command(name = "__supervise", hide = true)]
     Supervise {
         #[arg(long)]
         root: PathBuf,
         run: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BetterArg {
+    Lower,
+    Higher,
+}
+
+impl From<BetterArg> for experiment::Better {
+    fn from(b: BetterArg) -> Self {
+        match b {
+            BetterArg::Lower => experiment::Better::Lower,
+            BetterArg::Higher => experiment::Better::Higher,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct ProtocolArgs {
+    /// Primary metric printed by the workload as {"metric": NAME, "value": N}; `wall_ms` is always recorded.
+    #[arg(long, default_value = "wall_ms")]
+    metric: String,
+    #[arg(long, value_enum, default_value = "lower")]
+    better: BetterArg,
+    #[arg(long)]
+    unit: Option<String>,
+    /// Smallest change that matters, e.g. 2% or 0.02.
+    #[arg(long, default_value = "2%")]
+    min_effect: String,
+    #[arg(long, default_value_t = 0.05)]
+    alpha: f64,
+    /// Trials per arm before the first verdict.
+    #[arg(long, default_value_t = 10)]
+    trials: u32,
+    #[arg(long, default_value_t = 5)]
+    min_trials: u32,
+    /// Inconclusive results extend up to this many trials per arm.
+    #[arg(long, default_value_t = 20)]
+    max_trials: u32,
+    #[arg(long, default_value_t = 1)]
+    warmup: u32,
+    /// Metric that must not get worse: NAME or NAME:higher (higher is better).
+    #[arg(long = "guardrail")]
+    guardrails: Vec<String>,
+    /// Kill a single trial after this long.
+    #[arg(long, default_value = "10m")]
+    kill_after: String,
+}
+
+#[derive(Subcommand)]
+enum ExpCmd {
+    /// Create an experiment; the baseline is a git ref (default HEAD).
+    New {
+        name: String,
+        #[arg(long)]
+        hypothesis: String,
+        /// Baseline git ref; `.` means the working tree as it is now.
+        #[arg(long, default_value = "HEAD")]
+        baseline: String,
+        #[command(flatten)]
+        protocol: ProtocolArgs,
+        /// Workload command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Change the protocol (refused after the first trial).
+    Protocol {
+        name: String,
+        #[command(flatten)]
+        protocol: ProtocolArgs,
+    },
+    /// Record a candidate: the working tree now (default) or a git ref.
+    Candidate {
+        name: String,
+        /// Candidate name (default c1, c2, ...).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Parameter passed to the workload as TOE_PARAM_<KEY>.
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
+    /// Run trials of a candidate against the current best and decide.
+    Run {
+        name: String,
+        /// Candidate (default: the latest recorded).
+        #[arg(long)]
+        candidate: Option<String>,
+        /// Compare against this variant instead of the current best.
+        #[arg(long)]
+        against: Option<String>,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-measure the current best against the original baseline.
+    Revalidate {
+        name: String,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for the running comparison, at most --max-wait.
+    Wait {
+        name: String,
+        #[arg(long, default_value = "30s")]
+        max_wait: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the experiment, latest comparison and decision log.
+    Status {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel the running comparison.
+    Cancel { name: String },
+    /// List experiments.
+    List,
+}
+
+fn parse_effect(s: &str) -> Result<f64> {
+    let t = s.trim();
+    let v = match t.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().map(|v| v / 100.0),
+        None => t.parse::<f64>(),
+    };
+    v.map_err(|_| anyhow!("invalid effect {s:?}; use e.g. 2% or 0.02"))
+}
+
+fn protocol_from(a: &ProtocolArgs, command: Vec<String>) -> Result<experiment::Protocol> {
+    let guardrails = a
+        .guardrails
+        .iter()
+        .map(|g| {
+            let (m, better) = match g.split_once(':') {
+                Some((m, "higher")) => (m, experiment::Better::Higher),
+                Some((m, "lower")) => (m, experiment::Better::Lower),
+                Some((_, other)) => {
+                    bail!("guardrail direction must be higher or lower, got {other:?}")
+                }
+                None => (g.as_str(), experiment::Better::Lower),
+            };
+            Ok(experiment::Guardrail {
+                metric: m.to_owned(),
+                better,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(experiment::Protocol {
+        metric: a.metric.clone(),
+        unit: a.unit.clone(),
+        better: a.better.into(),
+        min_effect: parse_effect(&a.min_effect)?,
+        alpha: a.alpha,
+        trials: a.trials,
+        min_trials: a.min_trials,
+        max_trials: a.max_trials,
+        warmup: a.warmup,
+        guardrails,
+        command,
+        kill_after_ms: parse_duration(&a.kill_after)
+            .ok_or_else(|| anyhow!("invalid --kill-after"))?
+            .as_millis() as u64,
+    })
+}
+
+fn spawn_exp_worker(store: &Store, comparison: &str) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let dir = store
+        .root()
+        .join(".toe")
+        .join("experiments")
+        .join(comparison);
+    toe_core::store::private_dir(&dir)?;
+    let log = toe_core::store::private_file(&dir.join("worker.log"))?;
+    Ok(std::process::Command::new(std::env::current_exe()?)
+        .arg("__exp")
+        .arg("--root")
+        .arg(store.root())
+        .arg(comparison)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .process_group(0)
+        .spawn()?)
+}
+
+fn exp_exit(r: &experiment::Report) -> u8 {
+    match r
+        .comparison
+        .as_ref()
+        .map(|c| (c.status.as_str(), c.verdict.as_deref()))
+    {
+        Some(("running", _)) => exit::RUNNING,
+        Some(("decided", Some("accept"))) => exit::PASSED,
+        Some(("decided", _)) => exit::FAILED,
+        Some(("cancelled", _)) => exit::STALLED_OR_KILLED,
+        Some(_) => exit::INFRA,
+        None => exit::PASSED,
+    }
+}
+
+fn exp_start(
+    store: &Store,
+    name: &str,
+    candidate: &str,
+    against: Option<&str>,
+    detach: bool,
+    json: bool,
+) -> Result<u8> {
+    let id = experiment::start(store, name, candidate, against)?;
+    let mut child = spawn_exp_worker(store, &id)?;
+    if detach {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "comparison": id, "experiment": name })
+            );
+        } else {
+            println!(
+                "comparison {id} started: {candidate} vs {}",
+                against.unwrap_or("best")
+            );
+            println!("next: toe exp wait {name}");
+        }
+        return Ok(exit::PASSED);
+    }
+    loop {
+        let r = experiment::wait(store, name, Duration::from_secs(30))?;
+        if exp_exit(&r) != exit::RUNNING {
+            let _ = child.wait();
+            render::experiment(&r, json);
+            return Ok(exp_exit(&r));
+        }
+        if !json {
+            render::exp_progress(&r);
+        }
+    }
+}
+
+fn exp(cmd: ExpCmd) -> Result<u8> {
+    let (store, root, cwd) = open_here()?;
+    match cmd {
+        ExpCmd::New {
+            name,
+            hypothesis,
+            baseline,
+            protocol,
+            command,
+        } => {
+            let p = protocol_from(&protocol, command)?;
+            let base = if baseline == "." {
+                None
+            } else {
+                Some(baseline.as_str())
+            };
+            experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
+            let _ = root;
+            println!(
+                "experiment {name} created (protocol {}), baseline = {baseline}",
+                p.hash()
+            );
+            println!(
+                "next: change the code, then `toe exp candidate {name}` and `toe exp run {name}`"
+            );
+            Ok(exit::PASSED)
+        }
+        ExpCmd::Protocol { name, protocol } => {
+            let current = experiment::get(&store, &name)?;
+            let p = protocol_from(&protocol, current.protocol.command.clone())?;
+            experiment::set_protocol(&store, &name, &p)?;
+            println!("protocol of {name} updated (hash {})", p.hash());
+            Ok(exit::PASSED)
+        }
+        ExpCmd::Candidate {
+            name,
+            label,
+            git_ref,
+            params,
+        } => {
+            experiment::get(&store, &name)?;
+            let label = match label {
+                Some(l) => l,
+                None => format!("c{}", experiment::variants(&store, &name)?.len()),
+            };
+            let mut map = std::collections::BTreeMap::new();
+            for p in params {
+                let (k, v) = p
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("--param needs KEY=VALUE, got {p:?}"))?;
+                map.insert(k.to_owned(), v.to_owned());
+            }
+            experiment::add_variant(&store, &name, &label, git_ref.as_deref(), &map)?;
+            let v = experiment::variant(&store, &name, &label)?;
+            println!("candidate {label} recorded at {}", v.code);
+            println!("next: toe exp run {name} --candidate {label}");
+            Ok(exit::PASSED)
+        }
+        ExpCmd::Run {
+            name,
+            candidate,
+            against,
+            detach,
+            json,
+        } => {
+            let candidate = match candidate {
+                Some(c) => c,
+                None => experiment::variants(&store, &name)?
+                    .last()
+                    .filter(|v| v.name != "baseline")
+                    .map(|v| v.name.clone())
+                    .ok_or_else(|| anyhow!("no candidate yet: toe exp candidate {name}"))?,
+            };
+            exp_start(&store, &name, &candidate, against.as_deref(), detach, json)
+        }
+        ExpCmd::Revalidate { name, detach, json } => {
+            let e = experiment::get(&store, &name)?;
+            if e.best == "baseline" {
+                bail!("nothing to revalidate: no candidate has been kept");
+            }
+            exp_start(&store, &name, &e.best, Some("baseline"), detach, json)
+        }
+        ExpCmd::Wait {
+            name,
+            max_wait,
+            json,
+        } => {
+            let max = parse_duration(&max_wait).ok_or_else(|| anyhow!("invalid --max-wait"))?;
+            let r = experiment::wait(&store, &name, max)?;
+            render::experiment(&r, json);
+            Ok(exp_exit(&r))
+        }
+        ExpCmd::Status { name, json } => {
+            let r = experiment::report(&store, &name)?;
+            render::experiment(&r, json);
+            Ok(exp_exit(&r))
+        }
+        ExpCmd::Cancel { name } => {
+            let id = experiment::latest_comparison(&store, &name)?
+                .ok_or_else(|| anyhow!("no comparison to cancel"))?;
+            experiment::request_cancel(&store, &id)?;
+            println!("cancel requested for comparison {id}; it stops after the current trial");
+            Ok(exit::PASSED)
+        }
+        ExpCmd::List => {
+            for e in experiment::list(&store)? {
+                println!(
+                    "{}  best={}  protocol={}  {}",
+                    e.name,
+                    e.best,
+                    e.protocol_hash,
+                    render::clean(&e.hypothesis)
+                );
+            }
+            Ok(exit::PASSED)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -483,6 +855,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else {
                 exit::FAILED
             })
+        }
+        Cmd::Exp(c) => exp(c),
+        Cmd::ExpWorker { root, comparison } => {
+            let store = Store::open(&root)?;
+            experiment::work(&store, &comparison)?;
+            Ok(exit::PASSED)
         }
         Cmd::Supervise { root, run } => {
             let store = Store::open(&root)?;
