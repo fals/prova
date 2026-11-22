@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t">
+  <title id="t">toe</title>
+  <rect width="64" height="64" rx="15" fill="#1E1B4B"/>
+  <!-- liquid: the experiment -->
+  <path d="M23.8 34H40.2L46.8 45.6Q49 50 44 50H20Q15 50 17.2 45.6Z" fill="#A3E635"/>
+  <!-- flask -->
+  <path d="M26 13H38M29 13V25L17.2 45.6Q15 50 20 50H44Q49 50 46.8 45.6L35 25V13"
+        fill="none" stroke="#F8FAFC" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- check: the test that passes -->
+  <path d="M25.5 41.5L30 45.5L38.5 37" fill="none" stroke="#1E1B4B" stroke-width="3.8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

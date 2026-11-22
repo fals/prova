@@ -1,29 +1,152 @@
-# What is toe?
+<div align="center">
 
-> Status: usable. Install and quickstart: [docs/getting-started.md](docs/getting-started.md). Design: [docs/adr](docs/adr/README.md). Contributing: [AGENTS.md](AGENTS.md).
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+  <img alt="toe" src="docs/assets/logo-light.svg" width="260">
+</picture>
 
-# Test
+**Test oriented experimentation: tests and experiments that coding agents can trust.**
 
-I grew tired over the past years how LLMs execute test. LLMs via the harness have a tendence of executing tests with random bash script commands and dump the outcome in a file to analyse after. This implicates two main things. First the lack of scructure on what is executed the params and variables gets lost when iterating over and over, so there's no memory of what is done of what I executed and the outcome of that execution, previous iterations failures and so on. Second the way the test execution is done is not reliable and always constraint to long timeouts instead of fail safe, what leads to long loops, harness MUST be able to see fast problems abort fix and reiterate instead of be bound by time, and record this and be able to recover and analyse iterations.
+[Getting started](docs/getting-started.md) •
+[For agents](#for-agents) •
+[Architecture](docs/architecture.md) •
+[Decisions](docs/adr/README.md) •
+[Vision](docs/vision.md)
 
-So the best way is a framework and skills for each programing language that will guide the LLM to drive itself to a single point execution that will output from test a know format, probably the most used junit output, and a local memory that will track failures overtime.
+</div>
 
-This should be formalized, a test is a function that will execute in the system under test by the harness with parameters and will output something that can be watched but never 100% dependend on bounded time constraints.
+toe runs your project's own test command, `make test`, `cargo test`, `pytest`,
+anything, and turns it into fast, structured feedback. It reports the first
+failure while the suite is still running, notices a hung test without a giant
+timeout, remembers every run so a failure is known as new, old or flaky, and
+decides performance questions with a frozen protocol and statistics instead
+of one lucky benchmark. It is one binary, built for coding agents and the
+people who run them.
 
-One other problem is the test sizes, LLM models tend to add very broad and big tests that are slow and flake, Google Enginnering practices already show that small, medium and large tests are the way to go.
+```console
+$ toe run --detach -- make test
+run 3fa9c1d2 started
+next: toe wait 3fa9c1d2
 
-# Experiments
+$ toe wait 3fa9c1d2
+run 3fa9c1d2  suite cmd:38dcb90d  `make test`
+FAILING (run still going)  1.2s  level recognized output  code tree:4e1f0c..+dirty:9a2b..
+  FAIL calc::divides [new failure, last passed at tree:4e1f0c..]: expected 4, got 16
+  FAIL calc::flaky_clock [seen 3x before, FLAKY]: clock tick landed on a bad boundary
+next: fix and rerun, or `toe cancel 3fa9c1d2`
+```
 
-This is another problem, when creating a new features or trying to innovate, load testing, improving perfomance that needs benchmarking and memory of before and after af certain part of the system, it does adhoc changes, run only tests and do not record progress outcomes and weights or inputs used, leading to non deterministic way to iterate over a problem the system under test meant to fix.
+## Highlights
 
-For this the solution is pure scientific method to be used, formalization of what is needed to archive, deep research of the problem and do what LLMs are god at, bruteforce, repeat. Is cheap, but with formalization is better.
+- **Zero config on any project.** `toe run -- <your test command>`. Detail
+  rises automatically from exit code, to JUnit/TRX files, to live output, to
+  native streams. ([fidelity ladder](docs/architecture.md#seeing-tests-the-fidelity-ladder))
+- **No long timeouts.** Runs detach; `toe wait` returns within seconds on the
+  first failure, a slow test (named) or a stall. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
+- **Memory.** Every attempt is stored with the exact code it ran on: new
+  failure, seen before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
+- **Experiments, not anecdotes.** Pre-registered protocol, interleaved trials,
+  Mann-Whitney test and confidence interval, accept/reject verdict, improvement
+  loops. ([experiments](docs/architecture.md#experiments))
+- **Built for agents.** Skills for six languages, compact output with the next
+  command, JSON everywhere, stable exit codes, MCP tools. ([for agents](#for-agents))
+- **One history per repository.** Clones and worktrees share it; every run
+  records where it ran. ([storage](docs/architecture.md#storage))
+- **Formally specified.** Run and experiment lifecycles are Quint specs,
+  model-checked and replayed against the Rust code. ([invariants](docs/architecture.md#invariants-and-where-they-are-enforced))
 
-# Lean
+Rust, Go, Python, TypeScript, Java and C# are covered end to end by real
+[fixture projects](fixtures/README.md).
 
-Lean might be a good candidate to formalize what we need in the engine, should research, so we guide LLM via well defined skill for each category test, or experiments or improvment loops, a contract that will be align with any test framework out there.
+## Install
 
-# The system we want to build
+```sh
+cargo install --git https://github.com/fals/toe toe-cli
+```
 
-Toe (Test oriented experimentation) will be writen probably rust as is best. This should be easy to deploy so always container. It should have a proper storage that will support the data contracts we need, and analysis engine that will keep track record of statistics the model will need overtime, a set of skill that will work with most known programing laguages to teach how to implement and use toe in the current system under test and last a fast eventfull conduit that harness will use to communicate with this system, today MCP is the best but we must keep in mind the constraints I refered, if is the best option, for fast feedback.
+In a container image, copy the static binary next to your toolchain:
 
-Reaseach and formalize first, create proper ADRs, after all structure done, I will review and we will build it. You have access to github so you can already setup what we need there.
+```dockerfile
+COPY --from=ghcr.io/fals/toe:latest /toe /usr/local/bin/toe
+```
+
+Release binaries and the image are produced by the release workflow
+(Linux musl x86_64/aarch64, macOS) once releases are published.
+
+## Quickstart
+
+```sh
+cd your-project
+toe run -- make test                      # works right away, history starts now
+toe init                                  # skills for agents, AGENTS.md section
+toe adopt --write                         # proposes toe.toml from what it finds
+toe run default --select test_name        # rerun one test
+```
+
+Performance question?
+
+```sh
+toe exp new speed --hypothesis "cache cuts latency" --metric wall_ms --min-effect 2% -- ./bench.sh
+# change the code, then
+toe exp candidate speed && toe exp run speed
+```
+
+More in [Getting started](docs/getting-started.md).
+
+## For agents
+
+Run `toe init` in a repository: it installs the skills into `.agents/skills`
+(and `.claude/skills`), adds a short section to `AGENTS.md`, and ignores
+toe's files. Then the agent knows the loop:
+
+```text
+toe run <suite> --detach        start, get a run id
+toe wait <run>                  first failure, slow test, stall or end (max 30 s)
+toe run <suite> --select <t>    rerun what failed
+toe history <t>                 new failure, pre-existing, or flaky?
+toe exp ...                     any "is it faster?" claim
+```
+
+- **Exit codes:** 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
+  4 infrastructure, 5 still running.
+- **JSON:** every command takes `--json`; events are JSON Lines with a
+  [schema](schemas/event.v1.json).
+- **MCP:** `claude mcp add toe -- toe mcp` (tools `run_start`, `run_wait`,
+  `run_status`, `run_cancel`, `test_history`). The CLI is the primary
+  interface: it is cheaper in context and works in every harness.
+- **Skills:** `toe-adopt`, `toe-test`, `toe-experiment`, plus `toe-rust`,
+  `toe-go`, `toe-python`, `toe-ts`, `toe-java`, `toe-csharp` in [`skills/`](skills/).
+- **Machine-readable docs:** [`llms.txt`](llms.txt) and the
+  [contracts](docs/architecture.md#contracts-for-agents).
+
+Harness without skills support? Paste this into its instructions:
+
+```markdown
+Run tests only through toe. Start with `toe run <suite> --detach`, then
+`toe wait <run>` (returns within 30 s). Fix the first failure while the run
+continues; rerun one test with `--select`. Check `toe history <test>` before
+calling a failure new or flaky. Performance claims need `toe exp`.
+```
+
+## toe vs running tests directly
+
+| | `cargo test` / `pytest` / `make test` in a shell | through toe |
+|---|---|---|
+| First failure | when the suite ends | while it runs |
+| A hang | the harness timeout, minutes later | a stall event, seconds later |
+| "Did I break this?" | guess | new / seen before / flaky / last green commit |
+| What ran, with what | lost in scrollback | recorded: command, code, environment, origin |
+| "It's faster now" | one run | protocol, trials, confidence interval, verdict |
+
+## Documentation
+
+- [Getting started](docs/getting-started.md): install, adopt a project, the loop
+- [Architecture](docs/architecture.md): components, diagrams, contracts, invariants
+- [Decisions (ADRs)](docs/adr/README.md) and [research](docs/research/)
+- [Vision](docs/vision.md): the problem toe was built to solve
+- [Contributing](AGENTS.md): rules for humans and agents working on toe;
+  toe is tested with toe
+
+## License
+
+Apache-2.0 (as declared in `Cargo.toml`).
