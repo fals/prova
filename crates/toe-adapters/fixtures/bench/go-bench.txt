@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: example.com/calc
+cpu: AMD Ryzen 9 7945HX with Radeon Graphics        
+BenchmarkCountPrimes-32    	      64	  18538883 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCountPrimes-32    	      62	  18783838 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCountPrimes-32    	      63	  18351581 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	example.com/calc	3.568s

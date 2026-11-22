@@ -248,6 +248,19 @@ struct ProtocolArgs {
     /// Kill a single trial after this long.
     #[arg(long, default_value = "10m")]
     kill_after: String,
+    /// Shell command run once in each variant's directory before trials,
+    /// e.g. "npm ci" (the baseline worktree has no installed dependencies).
+    #[arg(long)]
+    setup: Option<String>,
+    /// Specification of the problem (Quint, Lean, TLA+, anything): frozen
+    /// by content hash with the protocol. Repeatable. Commit it first.
+    #[arg(long = "spec")]
+    specs: Vec<PathBuf>,
+    /// Command that must succeed for a variant to satisfy the specification
+    /// (e.g. "quint run spec/x.qnt --invariant safety && make conformance").
+    /// A violating candidate is rejected without being measured.
+    #[arg(long)]
+    oracle: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -324,6 +337,14 @@ enum ExpCmd {
     Cancel { name: String },
     /// List experiments.
     List,
+    /// Run a workload once and show the metrics toe reads from it
+    /// (benchmark tools and JSON metric lines), to choose --metric.
+    Metrics {
+        #[arg(long)]
+        json: bool,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 fn parse_effect(s: &str) -> Result<f64> {
@@ -335,7 +356,26 @@ fn parse_effect(s: &str) -> Result<f64> {
     v.map_err(|_| anyhow!("invalid effect {s:?}; use e.g. 2% or 0.02"))
 }
 
-fn protocol_from(a: &ProtocolArgs, command: Vec<String>) -> Result<experiment::Protocol> {
+fn protocol_from(
+    a: &ProtocolArgs,
+    command: Vec<String>,
+    root: &Path,
+) -> Result<experiment::Protocol> {
+    let specs = a
+        .specs
+        .iter()
+        .map(|f| {
+            let abs = std::fs::canonicalize(f)
+                .with_context(|| format!("specification {}", f.display()))?;
+            let rel = abs
+                .strip_prefix(std::fs::canonicalize(root)?)
+                .map_err(|_| anyhow!("specification {} is outside the repository", f.display()))?;
+            Ok(experiment::SpecFile {
+                path: rel.to_string_lossy().into_owned(),
+                sha256: toe_core::ids::sha256_hex(&std::fs::read(&abs)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let guardrails = a
         .guardrails
         .iter()
@@ -366,6 +406,9 @@ fn protocol_from(a: &ProtocolArgs, command: Vec<String>) -> Result<experiment::P
         warmup: a.warmup,
         guardrails,
         command,
+        setup: a.setup.clone(),
+        specs,
+        oracle: a.oracle.clone(),
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -637,14 +680,13 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             protocol,
             command,
         } => {
-            let p = protocol_from(&protocol, command)?;
+            let p = protocol_from(&protocol, command, &root)?;
             let base = if baseline == "." {
                 None
             } else {
                 Some(baseline.as_str())
             };
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
-            let _ = root;
             println!(
                 "experiment {name} created (protocol {}), baseline = {baseline}",
                 p.hash()
@@ -656,7 +698,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
         }
         ExpCmd::Protocol { name, protocol } => {
             let current = experiment::get(&store, &name)?;
-            let p = protocol_from(&protocol, current.protocol.command.clone())?;
+            let p = protocol_from(&protocol, current.protocol.command.clone(), &root)?;
             experiment::set_protocol(&store, &name, &p)?;
             println!("protocol of {name} updated (hash {})", p.hash());
             Ok(exit::PASSED)
@@ -730,6 +772,45 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             experiment::request_cancel(&store, &id)?;
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)
+        }
+        ExpCmd::Metrics { json, command } => {
+            let start = std::time::Instant::now();
+            let out = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("running {}", command.join(" ")))?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mut metrics = toe_adapters::bench::parse(&text);
+            metrics.push((
+                "wall_ms".into(),
+                start.elapsed().as_secs_f64() * 1000.0,
+                Some("ms".into()),
+            ));
+            if json {
+                let v: Vec<_> = metrics
+                    .iter()
+                    .map(|(n, v, u)| serde_json::json!({ "metric": n, "value": v, "unit": u }))
+                    .collect();
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                for (n, v, u) in &metrics {
+                    println!("{n:40} {v:>16.3} {}", u.as_deref().unwrap_or(""));
+                }
+                println!(
+                    "next: toe exp new <name> --metric <one of these> --better lower|higher -- {}",
+                    command.join(" ")
+                );
+            }
+            Ok(if out.status.success() {
+                exit::PASSED
+            } else {
+                exit::FAILED
+            })
         }
         ExpCmd::List => {
             for e in experiment::list(&store)? {
@@ -1159,7 +1240,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             comparison,
         } => {
             let store = Store::open_dir(&root, &dir)?;
-            experiment::work(&store, &comparison)?;
+            experiment::work(&store, &comparison, &toe_adapters::bench::parse)?;
             Ok(exit::PASSED)
         }
         Cmd::Supervise { root, dir, run } => {

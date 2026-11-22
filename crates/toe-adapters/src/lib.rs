@@ -1,6 +1,7 @@
 //! Framework adapters and output recognizers (ADR 0003, 0013).
 
 pub mod adopt;
+pub mod bench;
 pub mod inject;
 pub mod junit;
 pub mod recognize;
