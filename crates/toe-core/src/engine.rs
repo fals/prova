@@ -40,10 +40,18 @@ pub trait Observer {
         Vec::new()
     }
     /// Called after the process exited; may ingest result files.
-    /// Returns events and the level they reach.
-    fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> (Vec<EventKind>, Level) {
-        (Vec::new(), Level::Opaque)
+    fn on_exit(&mut self, _root: &Path, _started_ms: u64) -> ExitReport {
+        ExitReport::default()
     }
+}
+
+/// What an observer found after the process exited.
+#[derive(Debug, Default)]
+pub struct ExitReport {
+    pub events: Vec<EventKind>,
+    pub level: Option<Level>,
+    /// Files to keep as artifacts: (kind, absolute path).
+    pub artifacts: Vec<(String, PathBuf)>,
 }
 
 /// Observer that sees nothing: a level-0 run.
@@ -76,8 +84,8 @@ pub fn create_run(store: &Store, req: &NewRunRequest) -> Result<String> {
 /// Starts `toe __supervise` for the run as a detached process.
 pub fn spawn_supervisor(store: &Store, exe: &Path, run: &str) -> std::io::Result<Child> {
     let dir = store.run_dir(run);
-    std::fs::create_dir_all(&dir)?;
-    let log = File::create(dir.join("supervisor.log"))?;
+    crate::store::private_dir(&dir)?;
+    let log = crate::store::private_file(&dir.join("supervisor.log"))?;
     Command::new(exe)
         .arg("__supervise")
         .arg("--root")
@@ -198,7 +206,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     }
     let started_ms = now_ms();
     let dir = store.run_dir(run);
-    std::fs::create_dir_all(&dir)?;
+    crate::store::private_dir(&dir)?;
     let mut sup = Supervisor {
         store,
         run: run.to_owned(),
@@ -206,7 +214,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         pending: Vec::new(),
         lifecycle: Lifecycle::at(Status::Running),
         attempts: BTreeMap::new(),
-        output: File::create(dir.join("output.log"))?,
+        output: crate::store::private_file(&dir.join("output.log"))?,
         tail: VecDeque::new(),
         any_test_failed: false,
         level: observer.live_level(),
@@ -227,6 +235,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     };
     cmd.current_dir(&row.cwd)
         .env("TOE_RUN_ID", run)
+        // The selection reaches the shell only as a variable, never as text.
+        .env("TOE_FILTER", spec.selection.as_deref().unwrap_or(""))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,6 +260,40 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
+    let result = observe_child(
+        store, run, &spec, started_ms, &mut sup, &mut child, pgid, observer,
+    );
+    if let Err(e) = &result {
+        // Never leave the process under test running unsupervised.
+        process::kill_group(pgid);
+        let _ = child.wait();
+        let reason = format!("supervisor error: {e}");
+        let _ = store.finish_run(
+            run,
+            sup.seq + 1,
+            now_ms(),
+            Status::Aborted,
+            Some(Outcome::Errored),
+            None,
+            Some(&reason),
+            vec![],
+            None,
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_child(
+    store: &Store,
+    run: &str,
+    spec: &RunSpec,
+    started_ms: u64,
+    sup: &mut Supervisor<'_>,
+    child: &mut Child,
+    pgid: u32,
+    observer: &mut dyn Observer,
+) -> Result<()> {
     sup.emit(EventKind::RunStarted { pid: pgid });
     sup.flush()?;
 
@@ -342,19 +386,24 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             }
         }
     };
-    drain(&mut sup, &mut open_streams, observer);
+    drain(sup, &mut open_streams, observer);
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
     if !leaked.is_empty() {
         process::kill_group(pgid);
-        drain(&mut sup, &mut open_streams, observer);
+        drain(sup, &mut open_streams, observer);
     }
 
-    let (file_events, file_level) = observer.on_exit(Path::new(store.root()), started_ms);
-    for e in file_events {
+    let report = observer.on_exit(Path::new(store.root()), started_ms);
+    for e in report.events {
         sup.emit(e);
     }
-    if file_level > sup.level {
-        sup.level = file_level;
+    if let Some(l) = report.level
+        && l > sup.level
+    {
+        sup.level = l;
+    }
+    for (kind, path) in &report.artifacts {
+        keep_artifact(store, run, kind, path)?;
     }
     store.set_level(run, sup.level)?;
 
@@ -411,6 +460,25 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     )
 }
 
+/// Copies a file into `.toe/artifacts/<sha256>` and records it.
+fn keep_artifact(store: &Store, run: &str, kind: &str, path: &Path) -> Result<()> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let sha = crate::ids::sha256_hex(&bytes);
+    let dir = store.root().join(".toe").join("artifacts");
+    crate::store::private_dir(&dir)?;
+    let dest = dir.join(&sha);
+    if !dest.exists() {
+        crate::store::private_file(&dest)?.write_all(&bytes)?;
+    }
+    let source = path
+        .strip_prefix(store.root())
+        .unwrap_or(path)
+        .to_string_lossy();
+    store.add_artifact(run, kind, &source, &sha)
+}
+
 // ------------------------------------------------------------------ wait
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +506,9 @@ pub struct Failure {
     pub test: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// History of this test: seen before, flaky, last passing code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::analysis::FailureContext>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -495,22 +566,24 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
 }
 
 /// Supervisor gone while the run is not terminal: record it as aborted.
+/// The update is conditional, so a supervisor that just moved the run on
+/// is never overwritten.
 fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     let orphan = match row.status {
         Status::Running => row.supervisor_pid.is_some_and(|p| !process::alive(p)),
         Status::Created => now_ms().saturating_sub(row.created_ms) > 15_000,
         _ => false,
     };
-    if orphan {
-        let next = store.last_seq(&row.id)? + 1;
-        store.abort_orphan(
-            &row.id,
-            next,
-            now_ms(),
-            "supervisor exited without ending the run",
-        )?;
+    if !orphan {
+        return Ok(false);
     }
-    Ok(orphan)
+    store.abort_orphan(
+        &row.id,
+        row.status,
+        row.supervisor_pid,
+        now_ms(),
+        "supervisor exited without ending the run",
+    )
 }
 
 /// Blocks at most `max_wait` for the next significant event after `after`.
@@ -574,8 +647,8 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
     let row = store.run(run)?;
     let events = store.events_after(run, 0)?;
-    let mut counts = Counts::default();
-    let mut failures = Vec::new();
+    // Final outcome per test: the last attempt counts, retries do not.
+    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
     for e in &events {
@@ -586,18 +659,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 message,
                 ..
             } => {
-                match outcome {
-                    Outcome::Passed => counts.passed += 1,
-                    Outcome::Failed => counts.failed += 1,
-                    Outcome::Skipped => counts.skipped += 1,
-                    Outcome::Errored => counts.errored += 1,
-                }
-                if outcome.is_failure() {
-                    failures.push(Failure {
-                        test: test.display(),
-                        message: message.clone(),
-                    });
-                }
+                finals.insert(
+                    test.display(),
+                    (test.clone(), *outcome, message.clone(), e.seq),
+                );
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { .. } => stalled_ms = None,
@@ -605,13 +670,35 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             _ => {}
         }
     }
+    let mut counts = Counts::default();
+    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64)> = Vec::new();
+    for f in finals.values() {
+        match f.1 {
+            Outcome::Passed => counts.passed += 1,
+            Outcome::Failed => counts.failed += 1,
+            Outcome::Skipped => counts.skipped += 1,
+            Outcome::Errored => counts.errored += 1,
+        }
+        if f.1.is_failure() {
+            failing.push(f);
+        }
+    }
+    failing.sort_by_key(|f| f.3); // in the order they happened
+    let mut failures = Vec::new();
+    for (key, _, message, _) in failing.iter().take(20).copied() {
+        let id = crate::store::test_id(&row.suite, key);
+        failures.push(Failure {
+            test: key.display(),
+            message: message.clone(),
+            context: crate::analysis::failure_context(store, &id, run)?,
+        });
+    }
+    let n_failures = failing.len();
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
     let want_tail = failed_run
         || reason == WaitReason::Stall
         || (reason == WaitReason::Failure && failures.iter().all(|f| f.message.is_none()));
-    let n_failures = failures.len();
-    failures.truncate(20);
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();

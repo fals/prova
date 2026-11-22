@@ -250,3 +250,49 @@ fn suite_from_toe_toml_with_selection() {
     let none = toe(&d, &["run", "nope"]);
     assert_eq!(none.status.code(), Some(4));
 }
+
+#[test]
+fn selection_cannot_inject_shell_commands() {
+    let d = workspace("inject");
+    std::fs::write(
+        d.join("toe.toml"),
+        "[suite.t]\nrun = \"echo all\"\nselect = \"echo selected {filter}\"\n",
+    )
+    .unwrap();
+    let o = toe(
+        &d,
+        &["run", "t", "--select", "x; touch PWNED $(touch PWNED2)"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(!d.join("PWNED").exists() && !d.join("PWNED2").exists());
+    let out = toe(&d, &["output", "last"]);
+    assert_eq!(
+        stdout(&out).trim(),
+        "selected x; touch PWNED $(touch PWNED2)"
+    );
+    let leading_dash = toe(&d, &["run", "t", "--select=-rf"]);
+    assert_eq!(leading_dash.status.code(), Some(4));
+}
+
+#[test]
+fn store_is_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = workspace("perms");
+    toe(&d, &["run", "--", "true"]);
+    let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(d.join(".toe")), 0o700);
+    assert_eq!(mode(d.join(".toe/toe.db")), 0o600);
+    let run = json(&toe(&d, &["status", "--json"]))[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        mode(d.join(".toe/runs").join(run).join("output.log")),
+        0o600
+    );
+    assert_eq!(
+        toe(&d, &["status", "%"]).status.code(),
+        Some(4),
+        "LIKE wildcard must not resolve"
+    );
+}

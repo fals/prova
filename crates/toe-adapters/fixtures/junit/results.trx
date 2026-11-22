@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="1" name="run" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Results>
+    <UnitTestResult executionId="a" testId="1" testName="Adds" computerName="h" duration="00:00:01.5000000" outcome="Passed" />
+    <UnitTestResult executionId="b" testId="2" testName="Divides" computerName="h" duration="00:00:00.0100000" outcome="Failed">
+      <Output><ErrorInfo><Message>Assert.AreEqual failed</Message><StackTrace>at Calc.Divides()</StackTrace></ErrorInfo></Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="c" testId="3" testName="Later" computerName="h" duration="00:00:00" outcome="NotExecuted" />
+  </Results>
+</TestRun>

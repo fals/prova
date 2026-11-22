@@ -28,6 +28,14 @@ fn headline(s: &Summary) -> String {
     }
 }
 
+/// Strips terminal control sequences from text that came from the process
+/// under test before it reaches a terminal.
+pub fn clean(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect()
+}
+
 pub fn summary(s: &Summary, json: bool) {
     if json {
         println!("{}", serde_json::to_string(s).unwrap_or_default());
@@ -50,8 +58,13 @@ pub fn summary(s: &Summary, json: bool) {
     }
     for f in &s.failures {
         match &f.message {
-            Some(m) => println!("  FAIL {}: {}", f.test, first_lines(m, 3)),
-            None => println!("  FAIL {}", f.test),
+            Some(m) => println!(
+                "  FAIL {}{}: {}",
+                clean(&f.test),
+                context(f),
+                clean(&first_lines(m, 3))
+            ),
+            None => println!("  FAIL {}{}", clean(&f.test), context(f)),
         }
     }
     if let Some(ms) = s.stalled_ms {
@@ -69,13 +82,78 @@ pub fn summary(s: &Summary, json: bool) {
     if !s.output_tail.is_empty() {
         println!("output (last {} lines):", s.output_tail.len());
         for l in &s.output_tail {
-            println!("  | {l}");
+            println!("  | {}", clean(l));
         }
     }
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
     }
     println!("next: {}", next(s));
+}
+
+fn context(f: &toe_core::engine::Failure) -> String {
+    let Some(c) = &f.context else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if c.seen_before > 0 {
+        parts.push(format!("seen {}x before", c.seen_before));
+    } else {
+        parts.push("new failure".to_owned());
+    }
+    if c.flaky {
+        parts.push("FLAKY".to_owned());
+    }
+    if let Some(code) = &c.last_passed_code {
+        parts.push(format!("last passed at {code}"));
+    }
+    format!(" [{}]", parts.join(", "))
+}
+
+pub fn test_stats(s: &toe_core::analysis::TestStats, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(s).unwrap_or_default());
+        return;
+    }
+    println!(
+        "{}  (suite {}, id {})",
+        clean(&s.display),
+        s.suite,
+        s.test_id
+    );
+    println!(
+        "{} runs, {} failed ({:.0}%), {} transitions, {} passed on retry, {} flips on same code{}",
+        s.runs,
+        s.failures,
+        s.failure_rate * 100.0,
+        s.transitions,
+        s.passed_on_retry,
+        s.flips_on_same_code,
+        if s.flaky { "  => FLAKY" } else { "" }
+    );
+    if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
+        println!("duration p50 {p50}ms  p95 {p95}ms");
+    }
+    for r in s.recent.iter().take(15) {
+        let retry = if r.attempts > 1 {
+            format!(" ({} attempts)", r.attempts)
+        } else {
+            String::new()
+        };
+        let msg = r
+            .message
+            .as_deref()
+            .map(|m| format!("  {}", clean(&first_lines(m, 1))))
+            .unwrap_or_default();
+        println!(
+            "  {}  {:7}  {}{}{}",
+            r.run,
+            r.outcome.as_str(),
+            r.code,
+            retry,
+            msg
+        );
+    }
 }
 
 fn first_lines(m: &str, n: usize) -> String {
@@ -130,11 +208,13 @@ fn next(s: &Summary) -> String {
     }
 }
 
-pub fn progress(s: &Summary) {
+pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) {
     match s.reason {
         WaitReason::Failure => {
-            if let Some(f) = s.failures.last() {
-                eprintln!("FAIL {}", f.test);
+            for f in &s.failures {
+                if reported.insert(f.test.clone()) {
+                    eprintln!("FAIL {}{}", clean(&f.test), context(f));
+                }
             }
         }
         WaitReason::Stall => {
