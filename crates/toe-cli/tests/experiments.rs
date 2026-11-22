@@ -206,7 +206,7 @@ fn spec_repo(name: &str) -> PathBuf {
             "--spec",
             "spec.txt",
             "--oracle",
-            "test \"$(cat answer)\" = 42",
+            "test \"$(cat answer)\" = 42 || { echo \"answer $(cat answer), spec says 42\"; exit 1; }",
             "--",
             "./work.sh",
         ],
@@ -241,6 +241,28 @@ fn candidate_violating_the_specification_is_rejected_unmeasured() {
     assert_eq!(r["comparison"]["candidate_trials"], 0, "never measured");
     let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
     assert!(reason.contains("violates the specification"), "{reason}");
+    assert!(
+        reason.contains("toe exp log e oracle-candidate"),
+        "{reason}"
+    );
+    // The oracle's log is kept in the store; the log directory is gone.
+    let log = toe(&d, &["exp", "log", "e", "oracle-candidate"]);
+    let log = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        log.starts_with("== oracle-candidate\nanswer 41, spec says 42"),
+        "{log}"
+    );
+    let store = home_of(&d);
+    let leftovers = std::process::Command::new("find")
+        .arg(&store)
+        .args(["-path", "*/experiments/*", "-o", "-path", "*/worktrees/*"])
+        .output()
+        .unwrap();
+    assert!(
+        leftovers.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&leftovers.stdout)
+    );
 }
 
 #[test]

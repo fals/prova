@@ -61,8 +61,9 @@ pub trait Observer {
 pub struct ExitReport {
     pub events: Vec<EventKind>,
     pub level: Option<Level>,
-    /// Files to keep as artifacts: (kind, absolute path).
-    pub artifacts: Vec<(String, PathBuf)>,
+    /// Failing tests' own output (stack traces, captured output), kept
+    /// compressed with the run (ADR 0016).
+    pub test_outputs: Vec<(TestKey, String)>,
 }
 
 /// Observer that sees nothing: a level-0 run.
@@ -148,6 +149,7 @@ struct Supervisor<'a> {
     lifecycle: Lifecycle,
     attempts: BTreeMap<String, u32>,
     output: File,
+    distiller: crate::output::Distiller,
     tail: VecDeque<String>,
     any_test_failed: bool,
     level: Level,
@@ -247,6 +249,7 @@ impl Supervisor<'_> {
 
     fn line(&mut self, line: &str, observer: &mut dyn Observer) {
         let _ = self.output.write_all(line.as_bytes());
+        self.distiller.push(line);
         let trimmed = line.trim_end();
         if !trimmed.is_empty() {
             if self.tail.len() == TAIL_LINES {
@@ -288,6 +291,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         lifecycle: Lifecycle::at(Status::Running),
         attempts: BTreeMap::new(),
         output: crate::store::private_file(&dir.join("output.log"))?,
+        distiller: crate::output::Distiller::default(),
         tail: VecDeque::new(),
         any_test_failed: false,
         level: observer.live_level(),
@@ -497,9 +501,6 @@ fn observe_child(
     {
         sup.level = l;
     }
-    for (kind, path) in &report.artifacts {
-        keep_artifact(store, run, kind, path)?;
-    }
     store.set_level(run, sup.level)?;
 
     let exit_code = exit.code();
@@ -539,6 +540,20 @@ fn observe_child(
         });
     }
     sup.flush()?;
+    // Distill before the run becomes terminal: readers of a finished run
+    // find its excerpt (ADR 0016).
+    let dir = store.run_dir(run);
+    let excerpt = std::mem::take(&mut sup.distiller).finish(outcome == Outcome::Passed);
+    let spool = dir.join("output.log");
+    crate::output::keep_run(
+        store,
+        run,
+        &excerpt,
+        spec.keep_output.then_some(spool.as_path()),
+    )?;
+    for (test, text) in &report.test_outputs {
+        crate::output::keep_test(store, run, &crate::store::test_id(&sup.suite, test), text)?;
+    }
     let tail: Vec<String> = sup.tail.iter().cloned().collect();
     let fingerprint = (outcome != Outcome::Passed)
         .then(|| output_fingerprint(&tail[tail.len().saturating_sub(20)..]));
@@ -552,26 +567,11 @@ fn observe_child(
         reason.as_deref(),
         leaked,
         fingerprint.as_deref(),
-    )
-}
-
-/// Copies a file into `.toe/artifacts/<sha256>` and records it.
-fn keep_artifact(store: &Store, run: &str, kind: &str, path: &Path) -> Result<()> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Ok(());
-    };
-    let sha = crate::ids::sha256_hex(&bytes);
-    let dir = store.dir().join("artifacts");
-    crate::store::private_dir(&dir)?;
-    let dest = dir.join(&sha);
-    if !dest.exists() {
-        crate::store::private_file(&dest)?.write_all(&bytes)?;
-    }
-    let source = path
-        .strip_prefix(store.root())
-        .unwrap_or(path)
-        .to_string_lossy();
-    store.add_artifact(run, kind, &source, &sha)
+    )?;
+    // Nothing of the run stays on disk; kept output stays within budget.
+    let _ = std::fs::remove_dir_all(&dir);
+    crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
+    crate::output::sweep(store)
 }
 
 // ------------------------------------------------------------------ wait
@@ -733,8 +733,12 @@ pub fn wait(
     }
 }
 
-/// Last `n` lines of a run's captured output.
+/// Last `n` lines of a run's output: from the live spool, or from the
+/// excerpt kept once the run ended.
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
+    if let Ok(crate::output::Kept::Excerpt(e)) = crate::output::run_excerpt(store, run) {
+        return e.tail(n);
+    }
     let path = store.run_dir(run).join("output.log");
     let Ok(mut f) = File::open(path) else {
         return Vec::new();

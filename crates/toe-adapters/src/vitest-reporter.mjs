@@ -33,12 +33,15 @@ export default class ToeReporter {
     const event = { passed: "ok", failed: "failed", skipped: "ignored" }[result.state];
     if (!event) return;
     const diagnostic = testCase.diagnostic();
-    const message = (result.errors ?? []).map((e) => e.message).join("\n");
+    const errors = result.errors ?? [];
+    const message = errors.map((e) => e.message).join("\n");
+    const stack = errors.map((e) => e.stack).filter(Boolean).join("\n");
     this.write({
       ...this.base(testCase),
       event,
       exec_time: diagnostic ? diagnostic.duration / 1000 : undefined,
       message: message || undefined,
+      stack: stack || undefined,
     });
   }
 }

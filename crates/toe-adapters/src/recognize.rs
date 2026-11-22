@@ -39,6 +39,11 @@ pub struct Recognizers {
     /// replace the text totals, which a runner may echo from inside its
     /// captured output (nextest prints libtest's "test result:" lines).
     pub structured_total: Option<u64>,
+    /// libtest JSON: tests started in the current suite (one test binary)
+    /// and not finished yet.
+    libtest_open: Vec<TestKey>,
+    /// Failing tests' full output from structured streams (ADR 0016).
+    pub failure_output: Vec<(TestKey, String)>,
     /// libtest results for a test already seen in this run (the same test
     /// binary executed twice); they count toward `reported_total`.
     pub repeats: u64,
@@ -216,6 +221,7 @@ impl Recognizers {
                     .remove(&format!("{pkg}\0{t}"))
                     .unwrap_or_default();
                 let msg = if outcome == Outcome::Failed {
+                    self.failure_output.push((key(t), lines.join("\n")));
                     message(&lines)
                 } else {
                     None
@@ -256,7 +262,18 @@ impl Recognizers {
             return;
         };
         if kind == "suite" {
-            if event != "started" {
+            if event == "started" {
+                self.libtest_open.clear();
+            } else {
+                // nextest reports ignored tests as started, then only counts
+                // them in the suite's end event: those still open are them.
+                let ignored = v["ignored"].as_u64().unwrap_or(0) as usize;
+                let open = std::mem::take(&mut self.libtest_open);
+                if !open.is_empty() && open.len() <= ignored {
+                    for key in open {
+                        self.finished(key, Outcome::Skipped, None, None, Level::Native, out);
+                    }
+                }
                 lift(&mut self.level, Level::Native);
                 let n = ["passed", "failed", "ignored", "measured"]
                     .iter()
@@ -286,8 +303,12 @@ impl Recognizers {
             self.libtest_key(name)
         };
         lift(&mut self.level, Level::Native);
+        if event == "started" {
+            self.libtest_open.push(key.clone());
+            return self.started(key, out);
+        }
+        self.libtest_open.retain(|k| k != &key);
         let outcome = match event {
-            "started" => return self.started(key, out),
             "ok" => Outcome::Passed,
             "failed" => Outcome::Failed,
             "ignored" => Outcome::Skipped,
@@ -296,6 +317,14 @@ impl Recognizers {
         let duration = v["exec_time"].as_f64().map(|s| (s * 1000.0).round() as u64);
         let msg = if outcome == Outcome::Failed {
             let text = v["message"].as_str().or(v["stdout"].as_str()).unwrap_or("");
+            let full = match v["stack"].as_str() {
+                Some(stack) => format!("{text}\n{stack}"),
+                None => text.to_owned(),
+            };
+            if !full.trim().is_empty() {
+                self.failure_output
+                    .push((key.clone(), full.trim().to_owned()));
+            }
             message(&text.lines().map(str::to_owned).collect::<Vec<_>>())
         } else {
             None
@@ -331,6 +360,12 @@ impl Recognizers {
             _ => return,
         };
         let longrepr = &v["longrepr"];
+        if outcome.is_failure() {
+            let text = reportlog_text(longrepr);
+            if !text.is_empty() {
+                self.failure_output.push((key.clone(), text));
+            }
+        }
         let msg = if outcome.is_failure() {
             longrepr["reprcrash"]["message"]
                 .as_str()
@@ -720,6 +755,39 @@ impl Recognizers {
     }
 }
 
+/// pytest's failure report as pytest prints it: traceback lines, then the
+/// crash message.
+fn reportlog_text(longrepr: &serde_json::Value) -> String {
+    if let Some(s) = longrepr.as_str() {
+        return s.trim().to_owned();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for entry in longrepr["reprtraceback"]["reprentries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for l in entry["data"]["lines"].as_array().into_iter().flatten() {
+            lines.push(l.as_str().unwrap_or("").to_owned());
+        }
+        if let Some(loc) = entry["data"]["reprfileloc"].as_object() {
+            lines.push(format!(
+                "{}:{}: {}",
+                loc.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                loc.get("lineno").and_then(|v| v.as_u64()).unwrap_or(0),
+                loc.get("message").and_then(|v| v.as_str()).unwrap_or("")
+            ));
+        }
+    }
+    for section in longrepr["sections"].as_array().into_iter().flatten() {
+        if let (Some(title), Some(body)) = (section[0].as_str(), section[1].as_str()) {
+            lines.push(format!("--- {title} ---"));
+            lines.push(body.trim_end().to_owned());
+        }
+    }
+    lines.join("\n").trim().to_owned()
+}
+
 fn split_rust_path(name: &str) -> (Vec<String>, String) {
     match name.rsplit_once("::") {
         Some((p, leaf)) => (vec![p.to_owned()], leaf.to_owned()),
@@ -973,6 +1041,28 @@ mod tests {
     }
 
     #[test]
+    fn nextest_ignored_tests_are_skipped_at_suite_end() {
+        let (_, events) = feed(concat!(
+            r#"{"type":"suite","event":"started","test_count":2}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"cli::large$go"}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"cli::large$rust"}"#,
+            "\n",
+            r#"{"type":"suite","event":"ok","passed":0,"failed":0,"ignored":2,"measured":0,"filtered_out":0}"#,
+            "\n",
+        ));
+        let f = finished(&events);
+        assert_eq!(
+            f,
+            vec![
+                ("go".into(), Outcome::Skipped),
+                ("rust".into(), Outcome::Skipped)
+            ]
+        );
+    }
+
+    #[test]
     fn pytest_reportlog_is_native_and_matches_verbose_keys() {
         let (r, events) = feed(&stream_fixture("pytest-reportlog.jsonl"));
         assert_eq!(r.level, Some(Level::Native));
@@ -989,6 +1079,12 @@ mod tests {
             _ => None,
         });
         assert!(msg.unwrap().starts_with("assert 16 == 4"));
+        let (key, text) = &r.failure_output[0];
+        assert_eq!(key.name, "test_div");
+        assert!(
+            text.contains("def test_div():") && text.contains("AssertionError"),
+            "{text}"
+        );
         // The same test from pytest -v output is not counted twice.
         let (_, again) = {
             let mut r = r;
