@@ -92,12 +92,12 @@ test:
 ```
 
 Parallel jobs saving the same cache overwrite each other (last save wins), and
-SQLite must not be shared by several writers over network storage; see
-[ADR 0014](adr/0014-central-store-and-server.md#3-no-server-for-now-local-storage-everywhere-deferred).
+SQLite must not be shared by several writers over network storage (NFS,
+ReadWriteMany volumes): give each job its own home, or one writer per volume.
 
 ## What toe stores
 
-One central home per user (ADR 0014): `~/.local/share/toe` (or `TOE_HOME`),
+One central home per user: `~/.local/share/toe` (or `TOE_HOME`),
 with one SQLite file per repository plus a small catalog. Clones and
 worktrees of the same repository (same first commit) share one history; the
 workspace itself keeps nothing. `toe status --all` and `toe flaky --all`

@@ -27,4 +27,4 @@ reported as a stall with no configuration.
 
 `docker/` holds one Dockerfile per toolchain image: the official image
 plus `COPY --from=toe:dev /toe /usr/local/bin/toe`, the deployment pattern
-from ADR 0010. Dependencies are cached in the `toe-fixture-cache` volume.
+toe documents for containers. Dependencies are cached in the `toe-fixture-cache` volume.
