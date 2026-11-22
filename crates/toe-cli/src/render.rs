@@ -28,6 +28,14 @@ fn headline(s: &Summary) -> String {
     }
 }
 
+/// Strips terminal control sequences from text that came from the process
+/// under test before it reaches a terminal.
+pub fn clean(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect()
+}
+
 pub fn summary(s: &Summary, json: bool) {
     if json {
         println!("{}", serde_json::to_string(s).unwrap_or_default());
@@ -50,8 +58,8 @@ pub fn summary(s: &Summary, json: bool) {
     }
     for f in &s.failures {
         match &f.message {
-            Some(m) => println!("  FAIL {}: {}", f.test, first_lines(m, 3)),
-            None => println!("  FAIL {}", f.test),
+            Some(m) => println!("  FAIL {}: {}", clean(&f.test), clean(&first_lines(m, 3))),
+            None => println!("  FAIL {}", clean(&f.test)),
         }
     }
     if let Some(ms) = s.stalled_ms {
@@ -69,7 +77,7 @@ pub fn summary(s: &Summary, json: bool) {
     if !s.output_tail.is_empty() {
         println!("output (last {} lines):", s.output_tail.len());
         for l in &s.output_tail {
-            println!("  | {l}");
+            println!("  | {}", clean(l));
         }
     }
     if let Some(h) = &s.history {

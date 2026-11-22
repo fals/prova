@@ -26,6 +26,10 @@ pub enum ConfigError {
     UnknownSuite(String, String),
     #[error("suite {0} has no `select` template; cannot run a single test")]
     NoSelect(String),
+    #[error(
+        "invalid selection {0:?}: must be non-empty, not start with '-', no control characters"
+    )]
+    BadSelection(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -192,11 +196,17 @@ impl Config {
         let s = self.suite(name)?;
         let command = match selection {
             None => s.run.clone(),
-            Some(f) => s
-                .select
-                .as_ref()
-                .ok_or_else(|| ConfigError::NoSelect(name.into()))?
-                .replace("{filter}", f),
+            Some(f) => {
+                if f.is_empty() || f.starts_with('-') || f.chars().any(char::is_control) {
+                    return Err(ConfigError::BadSelection(f.into()));
+                }
+                // The filter is passed in TOE_FILTER and expanded by the shell
+                // as one quoted word; its text never becomes shell syntax.
+                s.select
+                    .as_ref()
+                    .ok_or_else(|| ConfigError::NoSelect(name.into()))?
+                    .replace("{filter}", "\"$TOE_FILTER\"")
+            }
         };
         let default_stall = s.size.map(Size::stall_after).unwrap_or(DEFAULT_STALL_AFTER);
         Ok(RunSpec {
@@ -229,8 +239,13 @@ mod tests {
         let spec = c.run_spec("small", Some("parser")).unwrap();
         assert_eq!(
             spec.command,
-            CommandSpec::Shell("make test TEST=parser".into())
+            CommandSpec::Shell("make test TEST=\"$TOE_FILTER\"".into())
         );
+        assert_eq!(spec.selection.as_deref(), Some("parser"));
+        assert!(matches!(
+            c.run_spec("small", Some("-x")),
+            Err(ConfigError::BadSelection(_))
+        ));
         assert_eq!(spec.stall_after_ms, 30_000);
         assert!(matches!(
             c.run_spec("nope", None),

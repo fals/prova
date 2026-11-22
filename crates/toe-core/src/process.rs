@@ -78,8 +78,15 @@ pub fn kill_group(pgid: u32) {
     signal_group(pgid, Signal::KILL);
 }
 
+/// True unless the process certainly does not exist. A process we may not
+/// signal (EPERM) is alive.
 pub fn alive(pid: u32) -> bool {
-    Pid::from_raw(pid as i32).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+    Pid::from_raw(pid as i32).is_some_and(|p| {
+        !matches!(
+            rustix::process::test_kill_process(p),
+            Err(rustix::io::Errno::SRCH)
+        )
+    })
 }
 
 #[cfg(test)]

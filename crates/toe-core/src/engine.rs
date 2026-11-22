@@ -76,8 +76,8 @@ pub fn create_run(store: &Store, req: &NewRunRequest) -> Result<String> {
 /// Starts `toe __supervise` for the run as a detached process.
 pub fn spawn_supervisor(store: &Store, exe: &Path, run: &str) -> std::io::Result<Child> {
     let dir = store.run_dir(run);
-    std::fs::create_dir_all(&dir)?;
-    let log = File::create(dir.join("supervisor.log"))?;
+    crate::store::private_dir(&dir)?;
+    let log = crate::store::private_file(&dir.join("supervisor.log"))?;
     Command::new(exe)
         .arg("__supervise")
         .arg("--root")
@@ -198,7 +198,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     }
     let started_ms = now_ms();
     let dir = store.run_dir(run);
-    std::fs::create_dir_all(&dir)?;
+    crate::store::private_dir(&dir)?;
     let mut sup = Supervisor {
         store,
         run: run.to_owned(),
@@ -206,7 +206,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         pending: Vec::new(),
         lifecycle: Lifecycle::at(Status::Running),
         attempts: BTreeMap::new(),
-        output: File::create(dir.join("output.log"))?,
+        output: crate::store::private_file(&dir.join("output.log"))?,
         tail: VecDeque::new(),
         any_test_failed: false,
         level: observer.live_level(),
@@ -227,6 +227,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     };
     cmd.current_dir(&row.cwd)
         .env("TOE_RUN_ID", run)
+        // The selection reaches the shell only as a variable, never as text.
+        .env("TOE_FILTER", spec.selection.as_deref().unwrap_or(""))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,6 +252,40 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
+    let result = observe_child(
+        store, run, &spec, started_ms, &mut sup, &mut child, pgid, observer,
+    );
+    if let Err(e) = &result {
+        // Never leave the process under test running unsupervised.
+        process::kill_group(pgid);
+        let _ = child.wait();
+        let reason = format!("supervisor error: {e}");
+        let _ = store.finish_run(
+            run,
+            sup.seq + 1,
+            now_ms(),
+            Status::Aborted,
+            Some(Outcome::Errored),
+            None,
+            Some(&reason),
+            vec![],
+            None,
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_child(
+    store: &Store,
+    run: &str,
+    spec: &RunSpec,
+    started_ms: u64,
+    sup: &mut Supervisor<'_>,
+    child: &mut Child,
+    pgid: u32,
+    observer: &mut dyn Observer,
+) -> Result<()> {
     sup.emit(EventKind::RunStarted { pid: pgid });
     sup.flush()?;
 
@@ -342,11 +378,11 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             }
         }
     };
-    drain(&mut sup, &mut open_streams, observer);
+    drain(sup, &mut open_streams, observer);
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
     if !leaked.is_empty() {
         process::kill_group(pgid);
-        drain(&mut sup, &mut open_streams, observer);
+        drain(sup, &mut open_streams, observer);
     }
 
     let (file_events, file_level) = observer.on_exit(Path::new(store.root()), started_ms);
@@ -495,22 +531,24 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
 }
 
 /// Supervisor gone while the run is not terminal: record it as aborted.
+/// The update is conditional, so a supervisor that just moved the run on
+/// is never overwritten.
 fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     let orphan = match row.status {
         Status::Running => row.supervisor_pid.is_some_and(|p| !process::alive(p)),
         Status::Created => now_ms().saturating_sub(row.created_ms) > 15_000,
         _ => false,
     };
-    if orphan {
-        let next = store.last_seq(&row.id)? + 1;
-        store.abort_orphan(
-            &row.id,
-            next,
-            now_ms(),
-            "supervisor exited without ending the run",
-        )?;
+    if !orphan {
+        return Ok(false);
     }
-    Ok(orphan)
+    store.abort_orphan(
+        &row.id,
+        row.status,
+        row.supervisor_pid,
+        now_ms(),
+        "supervisor exited without ending the run",
+    )
 }
 
 /// Blocks at most `max_wait` for the next significant event after `after`.

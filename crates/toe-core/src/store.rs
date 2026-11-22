@@ -71,8 +71,13 @@ impl Store {
     /// Opens (creating if needed) the store under `root/.toe`.
     pub fn open(root: &Path) -> Result<Store> {
         let dir = root.join(".toe");
-        std::fs::create_dir_all(&dir)?;
-        let conn = Connection::open(dir.join("toe.db"))?;
+        private_dir(&dir)?;
+        let db = dir.join("toe.db");
+        if !db.exists() {
+            // Commands and output can carry secrets: owner-only (0600).
+            drop(private_file(&db)?);
+        }
+        let conn = Connection::open(&db)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         // WAL needs a local filesystem; fall back silently if refused.
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
@@ -266,19 +271,57 @@ impl Store {
         Ok(())
     }
 
-    /// Marks a run whose supervisor disappeared as aborted.
-    pub fn abort_orphan(&self, run: &str, next_seq: u64, now_ms: u64, reason: &str) -> Result<()> {
-        self.finish_run(
+    /// Marks a run whose supervisor disappeared as aborted, but only if it
+    /// is still in `expected` state and its supervisor pid is unchanged
+    /// (no race with a supervisor that just started or finished).
+    pub fn abort_orphan(
+        &self,
+        run: &str,
+        expected: Status,
+        supervisor_pid: Option<u32>,
+        now_ms: u64,
+        reason: &str,
+    ) -> Result<bool> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current: Option<(String, Option<i64>)> = tx
+            .query_row(
+                "SELECT status, supervisor_pid FROM runs WHERE id = ?1",
+                params![run],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let still = current
+            .is_some_and(|(s, p)| s == expected.as_str() && p.map(|v| v as u32) == supervisor_pid);
+        if !still {
+            return Ok(false);
+        }
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?1",
+            params![run],
+            |r| r.get(0),
+        )?;
+        insert_event(
+            &tx,
             run,
-            next_seq,
+            seq as u64,
             now_ms,
-            Status::Aborted,
-            Some(Outcome::Errored),
-            None,
-            Some(reason),
-            vec![],
-            None,
-        )
+            &EventKind::RunFinished {
+                status: Status::Aborted,
+                exit_code: None,
+                reason: Some(reason.to_owned()),
+                leaked: vec![],
+            },
+        )?;
+        tx.execute(
+            "UPDATE runs SET status = 'aborted', outcome = 'errored', ended_ms = ?2, reason = ?3
+             WHERE id = ?1",
+            params![run, now_ms as i64, reason],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn run(&self, run: &str) -> Result<RunRow> {
@@ -303,9 +346,12 @@ impl Store {
                 )
                 .optional()?
         } else {
+            if query.is_empty() || !query.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(StoreError::RunNotFound(query.into()));
+            }
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM runs WHERE id LIKE ?1 || '%' LIMIT 2")?;
+                .prepare("SELECT id FROM runs WHERE substr(id, 1, length(?1)) = ?1 LIMIT 2")?;
             let ids: Vec<String> = stmt
                 .query_map(params![query], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -376,6 +422,26 @@ impl Store {
             .conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
+}
+
+/// Creates a directory (and parents) readable by the owner only.
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// Creates or truncates a file readable by the owner only.
+pub fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
 }
 
 fn run_status(conn: &Connection, run: &str) -> Result<Status> {
@@ -535,7 +601,7 @@ mod tests {
             .unwrap();
         assert_ne!(b.data_version().unwrap(), v0);
         assert_eq!(b.events_after("r1", 0).unwrap().len(), 1);
-        assert_eq!(b.resolve_run("r").unwrap(), "r1");
+        assert_eq!(b.resolve_run("r").ok(), None, "ids are hex");
         assert_eq!(b.resolve_run("last").unwrap(), "r1");
     }
 }

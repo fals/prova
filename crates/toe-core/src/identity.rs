@@ -62,8 +62,17 @@ pub fn code_identity(dir: &Path) -> String {
     for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         material.extend_from_slice(name);
         let path = Path::new(&root).join(String::from_utf8_lossy(name).as_ref());
-        if let Ok(bytes) = std::fs::read(&path) {
-            material.extend_from_slice(sha256_hex(&bytes).as_bytes());
+        // Regular files only (no FIFOs or devices via symlinks), size-capped.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.len() <= 16 * 1024 * 1024 => {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    material.extend_from_slice(sha256_hex(&bytes).as_bytes());
+                }
+            }
+            Ok(m) => material.extend_from_slice(
+                format!("{}:{}", m.len(), m.file_type().is_symlink()).as_bytes(),
+            ),
+            Err(_) => {}
         }
     }
     format!("tree:{short}+dirty:{}", &sha256_hex(&material)[..12])
