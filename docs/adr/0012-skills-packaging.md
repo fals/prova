@@ -1,6 +1,6 @@
 # 0012: Skills: Agent Skills standard, workflow plus language skills
 
-Status: Proposed. Amended by [0013](0013-black-box-adoption.md): `toe-adopt` is the first skill built.
+Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): `toe-adopt` is the first skill built.
 
 ## Context
 

@@ -1,6 +1,6 @@
 # 0006: Test identity, history, flake statistics
 
-Status: Proposed
+Status: Accepted (2026-11-22)
 
 ## Context
 

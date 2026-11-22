@@ -1,6 +1,6 @@
 # 0013: Black-box adoption and fidelity ladder
 
-Status: Proposed. Amends [0001](0001-architecture-overview.md), [0003](0003-event-stream-and-junit.md), [0004](0004-liveness-and-fail-fast.md), [0005](0005-test-sizes.md), [0012](0012-skills-packaging.md).
+Status: Accepted (2026-11-22). Amends [0001](0001-architecture-overview.md), [0003](0003-event-stream-and-junit.md), [0004](0004-liveness-and-fail-fast.md), [0005](0005-test-sizes.md), [0012](0012-skills-packaging.md).
 
 ## Context
 

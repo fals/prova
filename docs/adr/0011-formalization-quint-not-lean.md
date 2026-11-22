@@ -1,6 +1,6 @@
 # 0011: Formalization: Quint spec, Lean deferred
 
-Status: Proposed. **Deviates from the README**, which names Lean as a candidate to research.
+Status: Accepted (2026-11-22). Amended by [0015](0015-spec-first-experiments.md): projects may use Lean as an oracle; toe's own specs stay in Quint. **Deviates from the README**, which names Lean as a candidate to research.
 
 ## Context
 

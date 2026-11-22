@@ -1,6 +1,6 @@
 # 0002: Formal model of test, run, attempt, event
 
-Status: Proposed
+Status: Accepted (2026-11-22)
 
 ## Context
 

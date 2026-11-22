@@ -1,6 +1,6 @@
 # 0010: Deployment: static binary, container image as packaging
 
-Status: Proposed. See [0014](0014-central-store-and-server.md) for where history lives in CI, containers and Kubernetes (no server). **Deviates from the README**, which says "always container".
+Status: Accepted (2026-11-22). See [0014](0014-central-store-and-server.md) for where history lives in CI, containers and Kubernetes (no server). **Deviates from the README**, which says "always container".
 
 ## Context
 
