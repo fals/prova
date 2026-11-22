@@ -12,7 +12,7 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 
 - Phase: M0 to M7 merged to main. **Dogfooding Stage B is active**: run tests through toe.
 - Open: GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
-- ADRs 0001 to 0015 are **Accepted** (2026-11-22). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
+- ADRs 0001 to 0016 are **Accepted** (2026-11-22). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
 - [0013](docs/adr/0013-black-box-adoption.md) amends 0001, 0003, 0004, 0005 and 0012: `toe run -- <existing command>` works with zero config, fidelity rises from opaque process to result files to output recognizers to native streams, and test size is observed before it is declared. Where they conflict, 0013 wins.
 - Work is tracked as GitHub milestones M0 to M7 with issues.
 
@@ -23,7 +23,7 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 3. **Black box first.** toe must work on an existing test command with no changes to the user's project. Never make a feature depend on the user editing their scripts.
 4. **No long waits.** Nothing in toe, its tests, or your own workflow blocks on a long timeout. Detach, then wait for events with a short maximum ([0004](docs/adr/0004-liveness-and-fail-fast.md)).
 5. **Simplest complete thing.** No speculative config, plugin points, or services. One binary, one SQLite file, no daemon ([0001](docs/adr/0001-architecture-overview.md)).
-6. **Never lose data.** Raw output is always kept as an artifact; schema changes always go through migrations.
+6. **Keep what is needed, bounded.** A finished run is rows in SQLite: results, failures with their own output, and a bounded excerpt of the run's output ([0016](docs/adr/0016-distilled-output-no-log-files.md)); no log files pile up. Schema changes always go through migrations.
 
 ## Repository layout (target)
 

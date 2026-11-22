@@ -1,6 +1,6 @@
 # 0016: Distilled output: everything in SQLite, no log files after a run
 
-Status: Proposed. Supersedes the raw-output parts of [0001](0001-architecture-overview.md) (`.toe/` holds raw output artifacts), [0008](0008-storage-sqlite.md) (content-addressed artifact files, `toe gc`) and [0013](0013-black-box-adoption.md) ("raw output and exit code are always kept"), and the AGENTS.md rule "raw output is always kept as an artifact".
+Status: Accepted (2026-11-22). Supersedes the raw-output parts of [0001](0001-architecture-overview.md) (`.toe/` holds raw output artifacts), [0008](0008-storage-sqlite.md) (content-addressed artifact files, `toe gc`) and [0013](0013-black-box-adoption.md) ("raw output and exit code are always kept"), and the AGENTS.md rule "raw output is always kept as an artifact".
 
 ## Context
 
