@@ -3,9 +3,16 @@
 // A run is created with immutable inputs, started, observes test events,
 // and ends exactly once: finished, cancelled, or aborted. Events arriving
 // after the end are rejected and counted, never recorded.
+//
+// Verdict (ADR 0017): a pass must be earned. The run's verdict is decided at
+// the end from all the evidence: the exit code, every test outcome (an open
+// test is closed as errored), and contradictions the framework itself
+// reports (its summary counts more failures than were seen, it says no test
+// ran, or the suite's tests disappeared).
 module runLifecycle {
   type Status = Created | Running | Finished | Cancelled | Aborted
   type Outcome = Passed | Failed | Skipped | Errored
+  type Verdict = Undecided | Pass | Fail | Error
   type Ev =
     | TestStarted(str)
     | TestFinished({ test: str, outcome: Outcome })
@@ -21,6 +28,21 @@ module runLifecycle {
   var inputs: int
   var frozenInputs: int
   var dropped: int
+  var exitCode: int
+  var contradiction: bool
+  var verdict: Verdict
+
+  // Exit codes the process can end with, in the bounded model: success,
+  // failure, could not start (command not found).
+  pure val EXITS = Set(0, 1, 127)
+
+  pure def decide(s: Status, code: int, out: str -> Outcome, contra: bool): Verdict =
+    if (s != Finished) Error
+    else if (code == 126 or code == 127) Error
+    else if (out.keys().exists(t => out.get(t) == Failed or out.get(t) == Errored)) Fail
+    else if (contra) Fail
+    else if (code != 0) Fail
+    else Pass
 
   pure def isTerminal(s: Status): bool =
     s == Finished or s == Cancelled or s == Aborted
@@ -33,6 +55,9 @@ module runLifecycle {
     inputs' = 0,
     frozenInputs' = 0,
     dropped' = 0,
+    exitCode' = 0,
+    contradiction' = false,
+    verdict' = Undecided,
   }
 
   // Inputs may change only while the run is still being created.
@@ -41,6 +66,7 @@ module runLifecycle {
     inputs' = v,
     frozenInputs' = frozenInputs,
     status' = status, log' = log, open' = open, outcomes' = outcomes, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
   action start = all {
@@ -49,6 +75,7 @@ module runLifecycle {
     frozenInputs' = inputs,
     log' = log, open' = open, outcomes' = outcomes,
     inputs' = inputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
   action testStarted(t: str): bool = all {
@@ -59,6 +86,7 @@ module runLifecycle {
     open' = open.union(Set(t)),
     status' = status, outcomes' = outcomes,
     inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
   action testFinished(t: str, o: Outcome): bool = all {
@@ -69,6 +97,25 @@ module runLifecycle {
     outcomes' = outcomes.put(t, o),
     status' = status,
     inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
+  }
+
+  // The process exits (before the run is recorded as ended).
+  action exited(code: int): bool = all {
+    status == Running,
+    exitCode' = code,
+    status' = status, log' = log, open' = open, outcomes' = outcomes,
+    inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    contradiction' = contradiction, verdict' = verdict,
+  }
+
+  // The framework's own report contradicts a pass.
+  action contradicted = all {
+    status == Running,
+    contradiction' = true,
+    status' = status, log' = log, open' = open, outcomes' = outcomes,
+    inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, verdict' = verdict,
   }
 
   // Ending closes every open test as errored, then records the end.
@@ -82,6 +129,8 @@ module runLifecycle {
       log' = log.append(RunEnded(s)),
       status' = s,
       inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+      exitCode' = exitCode, contradiction' = contradiction,
+      verdict' = decide(s, exitCode, closing, contradiction),
     },
   }
 
@@ -93,6 +142,7 @@ module runLifecycle {
     log' = log.append(RunEnded(Cancelled)),
     open' = open, outcomes' = outcomes,
     inputs' = inputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = Error,
   }
 
   // A test event that arrives after the end: rejected, counted.
@@ -101,6 +151,7 @@ module runLifecycle {
     dropped' = dropped + 1,
     status' = status, log' = log, open' = open, outcomes' = outcomes,
     inputs' = inputs, frozenInputs' = frozenInputs,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
   action step = {
@@ -108,7 +159,10 @@ module runLifecycle {
     nondet o = Set(Passed, Failed, Skipped, Errored).oneOf()
     nondet s = Set(Finished, Cancelled, Aborted).oneOf()
     nondet v = 1.to(3).oneOf()
+    nondet code = EXITS.oneOf()
     any {
+      exited(code),
+      contradicted,
       setInputs(v),
       start,
       testStarted(t),
@@ -145,7 +199,27 @@ module runLifecycle {
   // Inputs never change after creation.
   val inputsFrozen = status != Created implies inputs == frozenInputs
 
+  // A pass is earned: the process exited 0, no test failed or errored (an
+  // unfinished test counts as errored), and nothing contradicts it.
+  val passIsEarned =
+    verdict == Pass implies all {
+      status == Finished,
+      exitCode == 0,
+      outcomes.keys().forall(t => outcomes.get(t) != Failed and outcomes.get(t) != Errored),
+      not(contradiction),
+    }
+
+  // A command that could not start is not a test failure.
+  val couldNotStartIsAnError =
+    (status == Finished and (exitCode == 126 or exitCode == 127)) implies verdict == Error
+
+  // The verdict exists exactly when the run ended.
+  val verdictAtEnd = isTerminal(status) iff verdict != Undecided
+
   val safety = all {
+    passIsEarned,
+    couldNotStartIsAnError,
+    verdictAtEnd,
     nothingAfterEnd,
     endMatchesStatus,
     terminalHasNoOpenTests,
@@ -166,4 +240,25 @@ module runLifecycle {
         assert(outcomes.get("a") == Errored),
         late("b", Failed),
       })
+
+  // ADR 0017 case 8: a test that never finished fails the run, exit 0 or not.
+  run unfinishedTestFailsTest =
+    init.then(start).then(testStarted("a")).then(exited(0)).then(end(Finished))
+      .then(all { assert(verdict == Fail), assert(safety), late("a", Passed) })
+
+  // ADR 0017 case 9: the framework's summary beats its exit code.
+  run contradictionFailsTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(contradicted).then(exited(0)).then(end(Finished))
+      .then(all { assert(verdict == Fail), late("a", Passed) })
+
+  // ADR 0017 case 15: a command that could not start is an error.
+  run notFoundIsAnErrorTest =
+    init.then(start).then(exited(127)).then(end(Finished))
+      .then(all { assert(verdict == Error), late("a", Passed) })
+
+  run cleanPassTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(exited(0)).then(end(Finished))
+      .then(all { assert(verdict == Pass), late("a", Passed) })
 }

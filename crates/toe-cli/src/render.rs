@@ -22,7 +22,11 @@ fn headline(s: &Summary) -> String {
         WaitReason::Slow => "SLOW TEST (run still going)".into(),
         WaitReason::Failure => "FAILING (run still going)".into(),
         WaitReason::Done => match (s.status, s.outcome) {
+            (Status::Finished, Some(Outcome::Passed)) if !s.warnings.is_empty() => {
+                "PASSED (unverified: see warnings)".into()
+            }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
+            (Status::Finished, Some(Outcome::Errored)) => "ERRORED".into(),
             (Status::Finished, _) => "FAILED".into(),
             (st, _) => st.as_str().to_uppercase(),
         },
@@ -101,6 +105,9 @@ pub fn summary(s: &Summary, json: bool) {
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
             format_duration(std::time::Duration::from_millis(t.budget_ms))
         );
+    }
+    for w in &s.warnings {
+        println!("warning: {}", clean(w));
     }
     for n in &s.notes {
         println!("note: {}", clean(n));

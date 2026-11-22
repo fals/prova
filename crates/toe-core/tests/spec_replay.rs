@@ -64,7 +64,16 @@ fn replay(path: &PathBuf) -> usize {
             "start" => l.start(),
             "testStarted" => l.test_started(&t()),
             "testFinished" => l.test_finished(&t(), outcome(pick(s, "o"))),
-            "end" => l.end(status(pick(s, "s"))).map(|_| ()),
+            "exited" => l.exited(Some(int(pick(s, "code")) as i32)),
+            "contradicted" => l.contradict(),
+            "end" => {
+                // The spec's exit code defaults to 0 before an `exited` step.
+                if l.exit_code().is_none() {
+                    l.exited(Some(int(&states[i - 1]["exitCode"]) as i32))
+                        .unwrap();
+                }
+                l.end(status(pick(s, "s"))).map(|_| ())
+            }
             "cancelCreated" => l.end(Status::Cancelled).map(|_| ()),
             "late" => match l.test_finished(&t(), outcome(pick(s, "o"))) {
                 Err(_) => Ok(()),
@@ -78,6 +87,19 @@ fn replay(path: &PathBuf) -> usize {
         assert_eq!(l.open(), &spec_open(s), "{ctx}: open tests");
         assert_eq!(l.outcomes(), &spec_outcomes(s), "{ctx}: outcomes");
         assert_eq!(l.dropped(), int(&s["dropped"]), "{ctx}: dropped");
+        let spec_verdict = match tag(&s["verdict"]) {
+            "Undecided" => None,
+            "Pass" => Some(Outcome::Passed),
+            "Fail" => Some(Outcome::Failed),
+            "Error" => Some(Outcome::Errored),
+            v => panic!("{ctx}: unknown verdict {v}"),
+        };
+        let verdict = if l.status() == Status::Cancelled && action == "cancelCreated" {
+            Some(Outcome::Errored)
+        } else {
+            l.verdict()
+        };
+        assert_eq!(verdict, spec_verdict, "{ctx}: verdict");
     }
     states.len()
 }

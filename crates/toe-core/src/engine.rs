@@ -64,6 +64,10 @@ pub struct ExitReport {
     /// Failing tests' own output (stack traces, captured output), kept
     /// compressed with the run (ADR 0016).
     pub test_outputs: Vec<(TestKey, String)>,
+    /// Evidence against a pass (ADR 0017): the run fails, with these reasons.
+    pub contradictions: Vec<String>,
+    /// A pass that verified little (ADR 0017): shown with the pass.
+    pub warnings: Vec<String>,
 }
 
 /// Observer that sees nothing: a level-0 run.
@@ -504,7 +508,7 @@ fn observe_child(
     store.set_level(run, sup.level)?;
 
     let exit_code = exit.code();
-    let (status, reason) = match terminating {
+    let (status, mut reason) = match terminating {
         Some((_, s, r)) => (s, Some(r)),
         None => (
             Status::Finished,
@@ -513,13 +517,105 @@ fn observe_child(
                 .then(|| "terminated by signal".to_owned()),
         ),
     };
-    let outcome = match status {
-        Status::Finished if exit_code == Some(0) && !sup.any_test_failed => Outcome::Passed,
-        Status::Finished if exit_code.is_some() => Outcome::Failed,
-        _ => Outcome::Errored,
-    };
+    // ADR 0017: the verdict is decided from all the evidence.
+    let mut contradictions = report.contradictions;
+    let mut warnings = report.warnings;
+    let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
+    if spec.expects_tests() && status == Status::Finished {
+        if let Some(sel) = &spec.selection
+            && observed == 0
+            && sup.level > Level::Opaque
+        {
+            contradictions.push(format!(
+                "selection {sel:?} matched no test: nothing was verified"
+            ));
+        }
+        if spec.selection.is_none() {
+            sup.flush()?; // this run's results must be in the store to compare
+            let current: Vec<String> = {
+                let mut stmt = store
+                    .conn()
+                    .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+                stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            if let Some((prev, missing, total)) =
+                missing_since_last_pass(store, run, &sup.suite, &current)?
+            {
+                if current.is_empty() && observed == 0 {
+                    contradictions.push(format!(
+                        "the suite's last passing run {prev} ran {total} test(s); this run observed none"
+                    ));
+                } else if !missing.is_empty() {
+                    let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+                    warnings.push(format!(
+                        "{} test(s) from the last passing run {prev} did not run: {}{}",
+                        missing.len(),
+                        names.join(", "),
+                        if missing.len() > names.len() {
+                            ", ..."
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(code @ (126 | 127)) = exit_code {
+        reason = Some(format!(
+            "the command could not start (exit {code}: {}); no test ran",
+            if code == 127 {
+                "command not found"
+            } else {
+                "not executable"
+            }
+        ));
+    }
+    if !contradictions.is_empty() {
+        let _ = sup.lifecycle.contradict();
+        reason.get_or_insert_with(|| contradictions.join("; "));
+        for c in &contradictions {
+            sup.emit(EventKind::RunNote { message: c.clone() });
+        }
+    }
+    let _ = sup.lifecycle.exited(exit_code);
     // Tests still open at the end become errored (spec: end closes open tests).
     let closed = sup.lifecycle.end(status).unwrap_or_default();
+    let outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
+    if outcome == Outcome::Passed {
+        if let Some((line, text)) = sup.distiller.first_crash() {
+            warnings.push(format!(
+                "the output shows an error outside any failing test (line {line}): {}",
+                text.trim().chars().take(160).collect::<String>()
+            ));
+        }
+        for w in &warnings {
+            sup.emit(EventKind::RunWarning { message: w.clone() });
+        }
+    } else if !closed.is_empty() {
+        reason.get_or_insert_with(|| {
+            format!(
+                "{} test(s) did not finish before the run ended",
+                closed.len()
+            )
+        });
+    }
+    let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
+    if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
+        // A failure no test explains: say so, and show the first error.
+        reason = Some(match sup.distiller.first_error() {
+            Some((line, text)) => format!(
+                "no test failed; exit {}; first error at line {line}: {}",
+                exit_code.unwrap_or(-1),
+                text.trim().chars().take(200).collect::<String>()
+            ),
+            None => format!(
+                "no test failed; the command exited {}",
+                exit_code.unwrap_or(-1)
+            ),
+        });
+    }
     for key in closed {
         let (name, attempt) = key.rsplit_once('#').unwrap_or((&key, "1"));
         sup.seq += 1;
@@ -572,6 +668,44 @@ fn observe_child(
     let _ = std::fs::remove_dir_all(&dir);
     crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
     crate::output::sweep(store)
+}
+
+/// Tests of the suite's last passing full run that this run did not record:
+/// (that run, their names, its test count). `None` without such a run.
+fn missing_since_last_pass(
+    store: &Store,
+    run: &str,
+    suite: &str,
+    current: &[String],
+) -> Result<Option<(String, Vec<String>, usize)>> {
+    use rusqlite::OptionalExtension;
+    let prev: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished' AND outcome = 'passed'
+               AND json_extract(spec, '$.selection') IS NULL
+             ORDER BY created_ms DESC LIMIT 1",
+            rusqlite::params![suite, run],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(prev) = prev else { return Ok(None) };
+    let mut stmt = store.conn().prepare(
+        "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+         WHERE a.run_id = ?1 GROUP BY a.test_id ORDER BY t.display",
+    )?;
+    let earlier: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![prev], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if earlier.is_empty() {
+        return Ok(None);
+    }
+    let missing = earlier
+        .iter()
+        .filter(|(id, _)| !current.contains(id))
+        .map(|(_, d)| d.clone())
+        .collect();
+    Ok(Some((prev, missing, earlier.len())))
 }
 
 // ------------------------------------------------------------------ wait
@@ -652,6 +786,12 @@ pub struct Summary {
     /// What toe could not see, and how to fix it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Why a pass verified little (ADR 0017); empty when it is trustworthy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Set once the run ended: `true` only for a pass with no warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub output_tail: Vec<String>,
     pub code: String,
@@ -776,6 +916,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let mut leaked = Vec::new();
     let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for e in &events {
         match &e.kind {
             EventKind::TestFinished {
@@ -808,6 +949,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             EventKind::TestStarted { .. } => stalled_ms = None,
             EventKind::RunFinished { leaked: l, .. } => leaked = l.clone(),
             EventKind::RunNote { message } => notes.push(message.clone()),
+            EventKind::RunWarning { message } => warnings.push(message.clone()),
             _ => {}
         }
     }
@@ -858,15 +1000,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         .unwrap_or_default();
     // A selection that ran nothing must not look like a pass.
     let ran = counts.passed + counts.failed + counts.skipped + counts.errored;
+    // (A selection that matched nothing at level 1+ fails the run, with
+    // its own note; at level 0 toe cannot tell.)
     if let Some(sel) = &selection
-        && row.status == Status::Finished
-        && ran == 0
-        && row.level > Level::Opaque
-    {
-        notes.push(format!(
-            "selection {sel:?} matched no tests: nothing was run, nothing was verified"
-        ));
-    } else if let Some(sel) = &selection
+        && row.level == Level::Opaque
         && row.status == Status::Finished
         && ran == 0
     {
@@ -900,6 +1037,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         },
         leaked,
         notes,
+        verified: row
+            .status
+            .is_terminal()
+            .then(|| row.outcome == Some(Outcome::Passed) && warnings.is_empty()),
+        warnings,
         output_tail: if want_tail {
             output_tail(store, run, 30)
         } else {

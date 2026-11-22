@@ -39,6 +39,14 @@ pub struct Recognizers {
     /// replace the text totals, which a runner may echo from inside its
     /// captured output (nextest prints libtest's "test result:" lines).
     pub structured_total: Option<u64>,
+    /// Failures the framework's own summaries report (ADR 0017).
+    pub reported_failed: u64,
+    /// structured_total's failures (libtest JSON suite events).
+    structured_failed: Option<u64>,
+    /// A framework summary line was seen (its counts are meaningful).
+    pub summary_seen: bool,
+    /// A line in which the framework says that no test ran.
+    pub no_tests_line: Option<String>,
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
@@ -111,21 +119,78 @@ impl Recognizers {
     /// (libtest) or "1 failed, 4 passed in 1.52s" (pytest).
     fn totals(&mut self, line: &str) {
         let t = line.trim().trim_matches('=').trim();
+        self.no_tests(t);
         if (t.starts_with("Failed!") || t.starts_with("Passed!")) && t.contains("Total:") {
-            if let Some(total) = t
-                .split(',')
-                .find_map(|p| p.trim().strip_prefix("Total:"))
-                .and_then(|v| v.trim().parse::<u64>().ok())
+            self.summary_seen = true;
+            let field = |name: &str| {
+                t.split(',')
+                    .find_map(|p| {
+                        p.trim()
+                            .trim_start_matches("Failed!")
+                            .trim_start_matches("Passed!")
+                            .trim()
+                            .trim_start_matches('-')
+                            .trim()
+                            .strip_prefix(name)
+                    })
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            };
+            if let Some(total) = field("Total:") {
+                self.reported_total += total;
+            }
+            self.reported_failed += field("Failed:").unwrap_or(0);
+            return;
+        }
+        // Jest "Tests:       1 failed, 4 passed, 5 total"; Vitest
+        // "Tests  1 failed | 4 passed (5)".
+        if let Some(rest) = t
+            .strip_prefix("Tests:")
+            .or_else(|| t.strip_prefix("Tests "))
+        {
+            let mut seen_any = false;
+            for part in rest.split([',', '|']) {
+                let mut w = part.split_whitespace();
+                if let (Some(num), Some(word)) = (w.next(), w.next())
+                    && let Ok(v) = num.parse::<u64>()
+                {
+                    seen_any = true;
+                    if word == "failed" {
+                        self.reported_failed += v;
+                    }
+                    if word == "total" {
+                        self.reported_total += v;
+                    }
+                }
+            }
+            // Vitest puts the total in parentheses at the end.
+            if let Some(total) = rest
+                .rsplit_once('(')
+                .and_then(|(_, n)| n.trim_end_matches(')').trim().parse::<u64>().ok())
             {
                 self.reported_total += total;
             }
+            self.summary_seen |= seen_any;
             return;
         }
         let body = match t.strip_prefix("test result: ") {
             Some(rest) => rest.split_once(". ").map(|(_, b)| b).unwrap_or(""),
-            None if t.contains(" in ") && (t.contains(" passed") || t.contains(" failed")) => t,
+            None if t.contains(" in ")
+                && [
+                    " passed",
+                    " failed",
+                    " error",
+                    " skipped",
+                    " deselected",
+                    "no tests ran",
+                ]
+                .iter()
+                .any(|w| t.contains(w)) =>
+            {
+                t
+            }
             None => return,
         };
+        self.summary_seen = true;
         let mut n = 0;
         for part in body.split([';', ',']) {
             let mut w = part.split_whitespace();
@@ -138,9 +203,35 @@ impl Recognizers {
                 .contains(&word)
             {
                 n += v;
+                if ["failed", "error", "errors"].contains(&word) {
+                    self.reported_failed += v;
+                }
             }
         }
         self.reported_total += n;
+    }
+
+    /// Framework messages that say no test ran at all.
+    fn no_tests(&mut self, t: &str) {
+        const PHRASES: &[&str] = &[
+            "no tests ran",                              // pytest
+            "/ 0 selected",                              // pytest, everything deselected
+            "collected 0 items",                         // pytest
+            "[no test files]",                           // go
+            "No tests found",                            // jest
+            "No test files found",                       // vitest
+            "No tests to run",                           // maven surefire
+            "No test is available in",                   // vstest
+            "No test matches the given testcase filter", // vstest
+        ];
+        if self.no_tests_line.is_none() && PHRASES.iter().any(|p| t.contains(p)) {
+            self.no_tests_line = Some(t.chars().take(200).collect());
+        }
+    }
+
+    /// Failures the framework reported (structured streams win over text).
+    pub fn failed_reported(&self) -> u64 {
+        self.structured_failed.unwrap_or(self.reported_failed)
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
@@ -280,6 +371,8 @@ impl Recognizers {
                     .filter_map(|k| v[*k].as_u64())
                     .sum::<u64>();
                 *self.structured_total.get_or_insert(0) += n;
+                *self.structured_failed.get_or_insert(0) += v["failed"].as_u64().unwrap_or(0);
+                self.summary_seen = true;
             }
             return;
         }
@@ -1038,6 +1131,39 @@ mod tests {
         });
         assert_eq!(file.as_deref(), Some("calc::calc"));
         assert_eq!(r.total(), 5, "echoed text totals do not add up");
+    }
+
+    #[test]
+    fn framework_failures_and_no_test_messages_are_read() {
+        let (r, _) = feed("test a ... ok\ntest result: FAILED. 1 passed; 3 failed; 0 ignored");
+        assert_eq!(
+            (r.failed_reported(), r.total(), r.summary_seen),
+            (3, 4, true)
+        );
+        let (r, _) = feed("=== 1 failed, 4 passed, 2 errors in 0.5s ===");
+        assert_eq!(r.failed_reported(), 3);
+        let (r, _) = feed("Tests:       1 failed, 4 passed, 5 total");
+        assert_eq!((r.failed_reported(), r.total()), (1, 5));
+        let (r, _) = feed("      Tests  1 failed | 4 passed (5)");
+        assert_eq!((r.failed_reported(), r.total()), (1, 5));
+        let (r, _) = feed("Failed!  - Failed:     2, Passed:     3, Skipped:     0, Total:     5");
+        assert_eq!((r.failed_reported(), r.total()), (2, 5));
+        for line in [
+            "no tests ran in 0.01s",
+            "collected 4 items / 4 deselected / 0 selected",
+            "?   \texample.com/x\t[no test files]",
+            "No tests found, exiting with code 0",
+            "No test files found, exiting with code 1",
+            "[INFO] No tests to run.",
+            "No test is available in /x.dll. Make sure that test discoverer & executors are registered",
+        ] {
+            let (r, _) = feed(line);
+            assert!(r.no_tests_line.is_some(), "{line}");
+        }
+        let (r, _) = feed(
+            "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out",
+        );
+        assert_eq!((r.total(), r.summary_seen), (0, true));
     }
 
     #[test]

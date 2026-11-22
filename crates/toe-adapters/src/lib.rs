@@ -23,6 +23,8 @@ pub struct Ladder {
     inject_dir: Option<std::path::PathBuf>,
     /// Side streams the framework appends to, read live.
     streams: Vec<Stream>,
+    /// "No test ran" is suspicious (ADR 0017), unless the suite says so.
+    expect_tests: bool,
 }
 
 /// A file read like output: from where the last read stopped, whole lines.
@@ -57,6 +59,7 @@ pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
         inject: spec.inject.clone(),
         inject_dir: None,
         streams: Vec::new(),
+        expect_tests: spec.expects_tests(),
     })
 }
 
@@ -152,6 +155,43 @@ impl Observer for Ladder {
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
         let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
         let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
+        // ADR 0017: evidence against a pass, and passes that verified little.
+        let mut outcomes: std::collections::BTreeMap<String, toe_core::model::Outcome> = self
+            .live
+            .seen
+            .values()
+            .map(|(d, o)| (d.clone(), *o))
+            .collect();
+        outcomes.extend(finals.iter().map(|(k, o)| (k.clone(), *o)));
+        let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64;
+        let failed_reported = self.live.failed_reported();
+        if failed_reported > failed_seen {
+            report.contradictions.push(format!(
+                "the framework reported {failed_reported} failed test(s) but toe recorded {failed_seen}: its summary is believed over its exit code"
+            ));
+        }
+        if seen == 0 && self.expect_tests {
+            match &self.live.no_tests_line {
+                Some(line) => report
+                    .contradictions
+                    .push(format!("the framework says no test ran: {line:?}")),
+                None if self.live.summary_seen && self.live.total() == 0 => report
+                    .contradictions
+                    .push("the framework's summary counts 0 tests: nothing ran".into()),
+                None => report
+                    .warnings
+                    .push("no test was observed: this verdict rests on the exit code only".into()),
+            }
+        } else if !outcomes.is_empty()
+            && outcomes
+                .values()
+                .all(|o| *o == toe_core::model::Outcome::Skipped)
+        {
+            report.warnings.push(format!(
+                "all {} observed tests were skipped: nothing was verified",
+                outcomes.len()
+            ));
+        }
         if self.live.total() > seen {
             report.events.push(EventKind::RunNote {
                 message: format!(

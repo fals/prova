@@ -1024,6 +1024,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     adapter: None,
                     inject: Vec::new(),
                     keep_output: false,
+                    expect_tests: None,
                 };
                 (config::implicit_suite(&command, &rel), spec, cwd)
             } else {
@@ -1414,6 +1415,12 @@ fn exit_code(s: &Summary) -> u8 {
         WaitReason::Done => match (s.outcome, s.status) {
             (Some(Outcome::Passed), _) => exit::PASSED,
             (Some(Outcome::Failed), _) => exit::FAILED,
+            // The command could not start: not a test failure (ADR 0017).
+            (Some(Outcome::Errored), Status::Finished)
+                if matches!(s.exit_code, Some(126 | 127)) =>
+            {
+                exit::INFRA
+            }
             (_, Status::Cancelled) => exit::STALLED_OR_KILLED,
             (_, Status::Aborted)
                 if s.detail.as_deref().is_some_and(|d| d.starts_with("killed")) =>
