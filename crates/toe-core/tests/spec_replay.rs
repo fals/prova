@@ -4,6 +4,8 @@
 //! Committed traces live in `tests/traces/`. CI also generates fresh ones and
 //! points `TOE_TRACE_DIR` at them.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 

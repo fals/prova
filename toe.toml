@@ -1,0 +1,17 @@
+# toe's own suites. From M1 on, tests run through toe (AGENTS.md, Stage B):
+#   .toe/stable/bin/toe run small
+[suite.small]
+run = "cargo test --lib --bins"
+select = "cargo test --lib --bins -- {filter}"
+size = "small"
+
+[suite.medium]
+run = "cargo test --tests --no-fail-fast"
+select = "cargo test --tests -- {filter}"
+size = "medium"
+stall_after = "2m"
+
+[suite.spec]
+run = "scripts/ci.sh"
+size = "large"
+stall_after = "5m"

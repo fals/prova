@@ -10,7 +10,7 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 
 ## Current state
 
-- Phase: design done, no code yet.
+- Phase: building. **Dogfooding Stage B is active** (M1 done): run tests through toe.
 - ADRs 0001 to 0013 are **Proposed**. Open points awaiting the owner's decision:
   - 0009 conduit (CLI primary, MCP facade), 0010 deployment (static binary, container as packaging), 0011 formalization (Quint, Lean deferred).
   - 0013 black-box adoption: environment injection opt-in, PATH shims excluded.
@@ -50,9 +50,9 @@ Rust stable, edition 2024, Cargo workspace.
 
 ```
 cargo build
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-quint test spec/run.qnt          # once spec exists
+cargo install --path crates/toe-cli --root .toe/stable   # refresh stable toe from green main
+.toe/stable/bin/toe run small                             # inner loop
+scripts/ci.sh                                             # full local gate (mirror of CI)
 ```
 
 Test commands depend on the dogfooding stage, below.
@@ -146,6 +146,7 @@ Each milestone ends with something an agent can actually use.
 ## Git
 
 - Default branch `main`, protected by convention: changes arrive through PRs, except docs-only commits the owner asks for directly.
+- GitHub Actions cannot currently start jobs on this account (billing). Until fixed, `scripts/ci.sh` is the merge gate; paste its last line in the PR.
 - Commit messages: imperative subject under 72 characters, body explaining why.
 - Model-authored commits end with the `Co-Authored-By` line given by the harness.
 - Never commit `.toe/`, `target/`, secrets, or machine-specific paths.

@@ -1,4 +1,10 @@
 //! toe core: model, lifecycle, store, engine, analysis.
 
+pub mod config;
+pub mod engine;
+pub mod identity;
+pub mod ids;
 pub mod lifecycle;
 pub mod model;
+pub mod process;
+pub mod store;
