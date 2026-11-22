@@ -1,6 +1,6 @@
 # 0001: Architecture overview
 
-Status: Proposed
+Status: Proposed. Amended by [0013](0013-black-box-adoption.md): `toe.toml` is optional; `toe run -- <command>` is first-class.
 
 ## Context
 

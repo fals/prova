@@ -1,6 +1,6 @@
 # 0004: Liveness from events, not wall-clock waits
 
-Status: Proposed
+Status: Proposed. Amended by [0013](0013-black-box-adoption.md): at level 0, stall is defined on process-tree activity.
 
 ## Context
 

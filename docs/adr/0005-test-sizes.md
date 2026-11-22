@@ -1,6 +1,6 @@
 # 0005: Small, medium, large test sizes
 
-Status: Proposed
+Status: Proposed. Amended by [0013](0013-black-box-adoption.md): sizes are observed first; declared sizes are an optional override.
 
 ## Context
 
