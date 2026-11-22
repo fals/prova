@@ -1,0 +1,22 @@
+package calc
+
+// CountPrimes returns the number of primes up to n (sieve of Eratosthenes).
+// Fast, and wrong: it counts n itself when n is prime, but the
+// specification says "below n".
+func CountPrimes(n int) int {
+	if n < 2 {
+		return 0
+	}
+	composite := make([]bool, n+1)
+	count := 0
+	for k := 2; k <= n; k++ {
+		if composite[k] {
+			continue
+		}
+		count++
+		for m := k * k; m <= n; m += k {
+			composite[m] = true
+		}
+	}
+	return count
+}

@@ -1,0 +1,9 @@
+name = "primes"
+defaultTargets = ["Primes", "reference"]
+
+[[lean_lib]]
+name = "Primes"
+
+[[lean_exe]]
+name = "reference"
+root = "Reference"
