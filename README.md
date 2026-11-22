@@ -10,7 +10,6 @@
 [Getting started](docs/getting-started.md) •
 [For agents](#for-agents) •
 [Architecture](docs/architecture.md) •
-[Decisions](docs/adr/README.md) •
 [Vision](docs/vision.md)
 
 </div>
@@ -142,7 +141,6 @@ calling a failure new or flaky. Performance claims need `toe exp`.
 
 - [Getting started](docs/getting-started.md): install, adopt a project, the loop
 - [Architecture](docs/architecture.md): components, diagrams, contracts, invariants
-- [Decisions (ADRs)](docs/adr/README.md) and [research](docs/research/)
 - [Vision](docs/vision.md): the problem toe was built to solve
 - [Contributing](AGENTS.md): rules for humans and agents working on toe;
   toe is tested with toe

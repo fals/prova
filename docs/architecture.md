@@ -1,8 +1,7 @@
 # Architecture
 
 This document explains how toe works, for people and for coding agents.
-It describes `main`. Decisions and their reasons live in the [ADRs](adr/README.md);
-this page links to them instead of repeating them.
+It describes what toe does and why it is built that way.
 
 - [The idea in one picture](#the-idea-in-one-picture)
 - [Components and code map](#components-and-code-map)
@@ -112,7 +111,7 @@ to run.
 ## Seeing tests: the fidelity ladder
 
 toe works on any command with zero configuration and climbs as high as the
-output allows ([ADR 0013](adr/0013-black-box-adoption.md)). Every result says
+output allows. Every result says
 which level it reached, so the agent knows what it can trust.
 
 ```mermaid
@@ -131,7 +130,7 @@ flowchart BT
 
 ## Liveness: slow, stalled, killed
 
-Waiting is bounded; killing is explicit ([ADR 0004](adr/0004-liveness-and-fail-fast.md)).
+Waiting is bounded; killing is explicit.
 
 ```mermaid
 flowchart LR
@@ -162,12 +161,12 @@ of uncommitted changes). Each failure in a summary carries context:
 | `last passed at tree:…` | the last code where this test was green |
 
 `toe history <test>`, `toe flaky`, `toe diff <a> <b>` and `toe sizes` read the
-same data ([ADR 0006](adr/0006-identity-history-flakiness.md)).
+same data.
 
 ## Experiments
 
 For performance claims: a protocol frozen before data, interleaved trials, and a
-verdict ([ADR 0007](adr/0007-experiments.md)).
+verdict.
 
 ```mermaid
 stateDiagram-v2
@@ -193,7 +192,7 @@ improvement loop, verified against SciPy.
 
 ## Storage
 
-One toe home per user ([ADR 0014](adr/0014-central-store-and-server.md)); the
+One toe home per user; the
 project's folder keeps nothing.
 
 ```text
@@ -232,10 +231,10 @@ erDiagram
 | A developer machine or agent sandbox | `cargo install`, or the release tarball |
 | A container (devcontainer, CI image) | `COPY --from=ghcr.io/fals/toe:<version> /toe /usr/local/bin/toe` |
 | CI (GitHub Actions, GitLab) | install or copy the binary; keep `TOE_HOME` in the job and persist it with the CI cache or artifacts |
-| Pods in Kubernetes | same image copy; `TOE_HOME` on a volume with one writer at a time (no server, [ADR 0014](adr/0014-central-store-and-server.md#3-no-server-for-now-local-storage-everywhere-deferred)) |
+| Pods in Kubernetes | same image copy; `TOE_HOME` on a volume with one writer at a time (no server; SQLite must not have several writers over network storage) |
 
 toe always runs next to the tests, because only there can it watch and stop
-the processes ([ADR 0010](adr/0010-deployment.md)).
+the processes.
 
 ## Contracts for agents
 
@@ -288,4 +287,4 @@ Each rule is stated once in a spec and checked again at runtime.
 | Trials and attempts are immutable | — | — | triggers `trials_immutable`, `attempts_immutable` |
 
 CI model-checks both specs and replays generated traces against the Rust state
-machines ([ADR 0011](adr/0011-formalization-quint-not-lean.md)).
+machines.

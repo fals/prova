@@ -15,7 +15,6 @@
 ## Understand toe
 
 - [Architecture](docs/architecture.md): components, code map, diagrams of the test loop, liveness, storage, experiments, invariants
-- [Decisions](docs/adr/README.md): ADRs 0001 to 0014
 - [Vision](docs/vision.md): the problem statement
 
 ## Work on toe
