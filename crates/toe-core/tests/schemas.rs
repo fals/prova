@@ -1,6 +1,8 @@
 //! Committed JSON Schemas must match the Rust contract types.
 //! Regenerate with `TOE_UPDATE_SCHEMAS=1 cargo test --test schemas`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 
 fn check(name: &str, schema: schemars::Schema) {
