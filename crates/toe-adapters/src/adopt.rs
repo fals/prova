@@ -20,6 +20,9 @@ pub struct Proposal {
     pub existing: Option<String>,
     pub suites: Vec<SuiteProposal>,
     pub notes: Vec<String>,
+    /// pytest-reportlog is importable here: Python suites get the native
+    /// stream (`inject = ["pytest-reportlog"]`).
+    pub reportlog: bool,
 }
 
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
@@ -60,6 +63,9 @@ fn nextest_has_libtest_json(version: &str) -> bool {
 
 struct Framework {
     language: &'static str,
+    /// The framework's own command, as a `make test` recipe would call it
+    /// (`cargo test`), whatever `run` became (e.g. nextest).
+    base: &'static str,
     run: &'static str,
     select: &'static str,
     why: String,
@@ -88,6 +94,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         out.push(match nextest.as_deref().filter(|v| nextest_has_libtest_json(v)) {
             Some(v) => Framework {
                 language: "rust",
+            base: "cargo test",
                 run: NEXTEST_JSON,
                 select: NEXTEST_JSON_SELECT,
                 why: format!(
@@ -96,6 +103,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
             },
             None => Framework {
                 language: "rust",
+            base: "cargo test",
                 run: "cargo test",
                 select: "cargo test -- {filter}",
                 why: "Cargo.toml; libtest output is recognized live (cargo-nextest 0.9.66+ would give the native stream)".into(),
@@ -105,6 +113,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if root.join("go.mod").exists() {
         out.push(Framework {
             language: "go",
+            base: "go test",
             run: "go test -json -count=1 ./...",
             select: "go test -json -count=1 -run {filter} ./...",
             why: "go.mod; -json gives the native event stream, -count=1 disables the test cache"
@@ -124,6 +133,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if py {
         out.push(Framework {
             language: "python",
+            base: "pytest",
             run: "python3 -m pytest -v -rfE",
             select: "python3 -m pytest -v -rfE -k {filter}",
             why: "pytest config; -v lines are recognized live".into(),
@@ -133,6 +143,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if pkg.contains("\"vitest\"") {
         out.push(Framework {
             language: "ts",
+            base: "vitest",
             run: "npx vitest run --reporter=verbose",
             select: "npx vitest run --reporter=verbose -t {filter}",
             why: "vitest in package.json".into(),
@@ -140,6 +151,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     } else if pkg.contains("\"jest\"") {
         out.push(Framework {
             language: "ts",
+            base: "jest",
             run: "npx jest --ci",
             select: "npx jest --ci -t {filter}",
             why: "jest in package.json; add jest-junit for per-test results".into(),
@@ -148,6 +160,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if root.join("pom.xml").exists() {
         out.push(Framework {
             language: "java",
+            base: "mvn",
             run: "mvn -q test",
             select: "mvn -q test -Dtest={filter}",
             why: "pom.xml; surefire reports are ingested".into(),
@@ -155,6 +168,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     } else if root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() {
         out.push(Framework {
             language: "java",
+            base: "gradle",
             run: "./gradlew test",
             select: "./gradlew test --tests {filter}",
             why: "Gradle; build/test-results are ingested".into(),
@@ -163,6 +177,7 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if any_file_with_ext(root, "sln") || any_file_with_ext(root, "csproj") {
         out.push(Framework {
             language: "csharp",
+            base: "dotnet test",
             run: "dotnet test --logger trx",
             select: "dotnet test --logger trx --filter FullyQualifiedName~{filter}",
             why: ".NET; TRX results are ingested".into(),
@@ -212,7 +227,20 @@ fn existing_command(root: &Path) -> Option<String> {
 }
 
 pub fn propose(root: &Path) -> Proposal {
-    propose_with(root, nextest_version)
+    let mut p = propose_with(root, nextest_version);
+    p.reportlog = p.languages.iter().any(|l| l == "python") && pytest_reportlog_installed(root);
+    p
+}
+
+fn pytest_reportlog_installed(root: &Path) -> bool {
+    std::process::Command::new("python3")
+        .args(["-c", "import pytest_reportlog"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn propose_with(root: &Path, nextest: Probe) -> Proposal {
@@ -239,16 +267,11 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
             // `make test` that only calls the framework: run the framework
             // directly at full detail (same tests), keep make as a suite.
             let recipe = make_test_recipe(root);
-            let base: String = f
-                .run
-                .split_whitespace()
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" ");
+            // The recipe calls the framework itself (`cargo test --quiet`,
+            // `python3 -m pytest -q`, `npx vitest run`, `./gradlew test`).
             let thin = existing.as_deref() == Some("make test")
                 && recipe.len() == 1
-                && (recipe[0].starts_with(&base)
-                    || (f.language == "python" && recipe[0].contains("pytest")));
+                && recipe[0].contains(f.base);
             if thin {
                 let quiet = recipe[0]
                     .split_whitespace()
@@ -314,6 +337,9 @@ pub fn to_toml(p: &Proposal) -> String {
     let mut s = String::from(
         "# Proposed by `toe adopt`. Verify selection with:\n#   toe adopt --verify <suite> --filter <test name>\n",
     );
+    for n in &p.notes {
+        s.push_str(&format!("# note: {n}\n"));
+    }
     for suite in &p.suites {
         s.push_str(&format!(
             "\n# {}\n[suite.{}]\nrun = {:?}\n",
@@ -321,6 +347,13 @@ pub fn to_toml(p: &Proposal) -> String {
         ));
         if let Some(sel) = &suite.select {
             s.push_str(&format!("select = {sel:?}\n"));
+        }
+        let python = suite.run.contains("pytest")
+            || (p.languages.iter().any(|l| l == "python")
+                && p.existing.as_deref() == Some(suite.run.as_str()));
+        if p.reportlog && python {
+            s.push_str("# pytest-reportlog is installed: every test is read live (native)\ninject = [\"pytest-reportlog\"]\n");
+            continue;
         }
         // The project's own command hides detail; offer the opt-in recipe.
         if p.existing.as_deref() == Some(suite.run.as_str()) {
@@ -441,6 +474,43 @@ mod tests {
         );
         let old = propose_with(&d, |_| Some("cargo-nextest 0.9.60".into()));
         assert_eq!(old.suites[0].run, "cargo test");
+    }
+
+    /// Regression (usability round 3): with nextest installed, a `make test`
+    /// that only runs `cargo test --quiet` was no longer seen as a thin
+    /// wrapper, and adopt proposed the quiet `make test` as the default.
+    #[test]
+    fn thin_make_wrapper_is_seen_through_when_nextest_is_installed() {
+        let d = dir(
+            "thin-nextest",
+            &[
+                ("Cargo.toml", "[package]\nname = \"x\""),
+                ("Makefile", "test:\n\tcargo test --quiet\n"),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].name, "default");
+        assert_eq!(p.suites[0].run, NEXTEST_JSON);
+        assert_eq!(p.suites[1].run, "make test");
+    }
+
+    #[test]
+    fn notes_are_written_and_reportlog_is_used_when_installed() {
+        let mut p = propose(&dir(
+            "reportlog",
+            &[
+                ("pytest.ini", "[pytest]"),
+                ("Makefile", "test:\n\tpython3 -m pytest -q\n"),
+            ],
+        ));
+        p.reportlog = true;
+        let t = to_toml(&p);
+        assert!(t.contains("# note: `make test` runs"), "{t}");
+        assert_eq!(
+            t.matches("\ninject = [\"pytest-reportlog\"]").count(),
+            2,
+            "{t}"
+        );
     }
 
     #[test]
