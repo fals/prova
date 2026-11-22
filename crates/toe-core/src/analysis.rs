@@ -40,6 +40,8 @@ pub struct TestStats {
     pub flips_on_same_code: usize,
     pub flaky: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_size: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub p50_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p95_ms: Option<u64>,
@@ -168,6 +170,7 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
         passed_on_retry: retry,
         flips_on_same_code: flips,
         flaky: retry > 0 || flips > 0,
+        proposed_size: percentile(&durations, 95.0).map(proposed_size),
         p50_ms: percentile(&durations, 50.0),
         p95_ms: percentile(&durations, 95.0),
         last_passed,
@@ -232,6 +235,67 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
     }
     out.sort_by(|a, b| b.failure_rate.total_cmp(&a.failure_rate));
     Ok(out)
+}
+
+/// Size proposal from duration alone. Declared sizes also constrain
+/// resources (ADR 0005); duration is what a black box can observe.
+pub fn proposed_size(p95_ms: u64) -> &'static str {
+    match p95_ms {
+        0..=1000 => "small",
+        1001..=30_000 => "medium",
+        _ => "large",
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SizeReport {
+    pub total: usize,
+    pub small: usize,
+    pub medium: usize,
+    pub large: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// Slowest tests by p95: (test, ms).
+    pub largest: Vec<(String, u64)>,
+}
+
+pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
+    let mut stmt = store.conn().prepare(
+        "SELECT t.display, a.duration_ms FROM attempts a JOIN tests t ON t.id = a.test_id
+         WHERE a.outcome = 'passed' AND a.duration_ms IS NOT NULL AND (?1 IS NULL OR t.suite = ?1)
+         ORDER BY a.ts_ms DESC LIMIT 200000",
+    )?;
+    let mut by_test: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for row in stmt.query_map(params![suite], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (t, d) = row?;
+        let v = by_test.entry(t).or_default();
+        if v.len() < 20 {
+            v.push(d as u64);
+        }
+    }
+    let mut r = SizeReport::default();
+    for (t, mut v) in by_test {
+        v.sort_unstable();
+        let p95 = percentile(&v, 95.0).unwrap_or(0);
+        match proposed_size(p95) {
+            "small" => r.small += 1,
+            "medium" => r.medium += 1,
+            _ => r.large += 1,
+        }
+        r.largest.push((t, p95));
+    }
+    r.total = r.small + r.medium + r.large;
+    r.largest.sort_by_key(|t| std::cmp::Reverse(t.1));
+    r.largest.truncate(20);
+    if r.total >= 10 && (r.small as f64) < 0.6 * r.total as f64 {
+        r.warning = Some(format!(
+            "only {:.0}% of tests are small; aim for most tests to be small (rough guide 80/15/5)",
+            100.0 * r.small as f64 / r.total as f64
+        ));
+    }
+    Ok(r)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

@@ -19,6 +19,7 @@ fn headline(s: &Summary) -> String {
     match s.reason {
         WaitReason::Running => "RUNNING".into(),
         WaitReason::Stall => "STALLED".into(),
+        WaitReason::Slow => "SLOW TEST (run still going)".into(),
         WaitReason::Failure => "FAILING (run still going)".into(),
         WaitReason::Done => match (s.status, s.outcome) {
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
@@ -71,6 +72,14 @@ pub fn summary(s: &Summary, json: bool) {
         println!(
             "stalled: no activity for {}",
             format_duration(std::time::Duration::from_millis(ms))
+        );
+    }
+    for t in &s.slow {
+        println!(
+            "  SLOW {}: running {} (budget {})",
+            clean(&t.test),
+            format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
+            format_duration(std::time::Duration::from_millis(t.budget_ms))
         );
     }
     if let Some(d) = &s.detail {
@@ -199,7 +208,7 @@ fn next(s: &Summary) -> String {
             "fix and rerun, or `toe cancel {}`; `toe wait {} --after {}` to keep watching",
             s.run, s.run, s.last_seq
         ),
-        WaitReason::Stall => format!(
+        WaitReason::Stall | WaitReason::Slow => format!(
             "toe cancel {}  (or `toe wait {} --after {}` if it is expected)",
             s.run, s.run, s.last_seq
         ),
@@ -214,6 +223,13 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
             for f in &s.failures {
                 if reported.insert(f.test.clone()) {
                     eprintln!("FAIL {}{}", clean(&f.test), context(f));
+                }
+            }
+        }
+        WaitReason::Slow => {
+            for t in &s.slow {
+                if reported.insert(format!("slow:{}", t.test)) {
+                    eprintln!("SLOW {} (over {}ms budget)", clean(&t.test), t.budget_ms);
                 }
             }
         }

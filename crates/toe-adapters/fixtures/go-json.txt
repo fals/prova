@@ -1,0 +1,26 @@
+{"Time":"2026-11-22T16:26:49.409467592+01:00","Action":"start","Package":"example.com/gofix"}
+{"Time":"2026-11-22T16:26:49.411168938+01:00","Action":"run","Package":"example.com/gofix","Test":"TestPass"}
+{"Time":"2026-11-22T16:26:49.411212673+01:00","Action":"output","Package":"example.com/gofix","Test":"TestPass","Output":"=== RUN   TestPass\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411227942+01:00","Action":"output","Package":"example.com/gofix","Test":"TestPass","Output":"--- PASS: TestPass (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.41123212+01:00","Action":"pass","Package":"example.com/gofix","Test":"TestPass","Elapsed":0}
+{"Time":"2026-11-22T16:26:49.41123718+01:00","Action":"run","Package":"example.com/gofix","Test":"TestFail"}
+{"Time":"2026-11-22T16:26:49.411240256+01:00","Action":"output","Package":"example.com/gofix","Test":"TestFail","Output":"=== RUN   TestFail\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411248352+01:00","Action":"output","Package":"example.com/gofix","Test":"TestFail","Output":"    x_test.go:6: want 2 got 3\n","OutputType":"error"}
+{"Time":"2026-11-22T16:26:49.41125288+01:00","Action":"output","Package":"example.com/gofix","Test":"TestFail","Output":"--- FAIL: TestFail (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411255836+01:00","Action":"fail","Package":"example.com/gofix","Test":"TestFail","Elapsed":0}
+{"Time":"2026-11-22T16:26:49.411258802+01:00","Action":"run","Package":"example.com/gofix","Test":"TestSub"}
+{"Time":"2026-11-22T16:26:49.411261537+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub","Output":"=== RUN   TestSub\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411264593+01:00","Action":"run","Package":"example.com/gofix","Test":"TestSub/a"}
+{"Time":"2026-11-22T16:26:49.411267449+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub/a","Output":"=== RUN   TestSub/a\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411274262+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub/a","Output":"--- PASS: TestSub/a (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411277779+01:00","Action":"pass","Package":"example.com/gofix","Test":"TestSub/a","Elapsed":0}
+{"Time":"2026-11-22T16:26:49.411281035+01:00","Action":"run","Package":"example.com/gofix","Test":"TestSub/b"}
+{"Time":"2026-11-22T16:26:49.411284021+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub/b","Output":"=== RUN   TestSub/b\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411286946+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub/b","Output":"    x_test.go:9: later\n"}
+{"Time":"2026-11-22T16:26:49.411290604+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub/b","Output":"--- SKIP: TestSub/b (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411293549+01:00","Action":"skip","Package":"example.com/gofix","Test":"TestSub/b","Elapsed":0}
+{"Time":"2026-11-22T16:26:49.411296956+01:00","Action":"output","Package":"example.com/gofix","Test":"TestSub","Output":"--- PASS: TestSub (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411300132+01:00","Action":"pass","Package":"example.com/gofix","Test":"TestSub","Elapsed":0}
+{"Time":"2026-11-22T16:26:49.411302968+01:00","Action":"output","Package":"example.com/gofix","Output":"FAIL\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411544505+01:00","Action":"output","Package":"example.com/gofix","Output":"FAIL\texample.com/gofix\t0.002s\n","OutputType":"frame"}
+{"Time":"2026-11-22T16:26:49.411570265+01:00","Action":"fail","Package":"example.com/gofix","Elapsed":0.002}
