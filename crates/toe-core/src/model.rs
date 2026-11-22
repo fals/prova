@@ -191,6 +191,12 @@ pub enum EventKind {
     RunNote {
         message: String,
     },
+    /// The run passed but verified little (ADR 0017): no test observed,
+    /// every test skipped, tests missing since the last pass, or error
+    /// output outside any test. A run with a warning is not `verified`.
+    RunWarning {
+        message: String,
+    },
     RunFinished {
         status: Status,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +218,7 @@ impl EventKind {
             EventKind::TestFinished { .. } => "test_finished",
             EventKind::RunStalled { .. } => "run_stalled",
             EventKind::RunNote { .. } => "run_note",
+            EventKind::RunWarning { .. } => "run_warning",
             EventKind::RunFinished { .. } => "run_finished",
         }
     }

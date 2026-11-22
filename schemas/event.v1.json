@@ -172,6 +172,23 @@
       ]
     },
     {
+      "description": "The run passed but verified little (ADR 0017): no test observed,\nevery test skipped, tests missing since the last pass, or error\noutput outside any test. A run with a warning is not `verified`.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "run_warning"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "exit_code": {

@@ -25,6 +25,42 @@ pub struct Lifecycle {
     open: BTreeSet<String>,
     outcomes: BTreeMap<String, Outcome>,
     dropped: u64,
+    /// Exit code of the process; `None` until it exits, or when a signal
+    /// ended it.
+    exit_code: Option<i32>,
+    /// The framework's own report contradicts a pass (ADR 0017).
+    contradiction: bool,
+    verdict: Option<Outcome>,
+}
+
+/// The run's verdict (ADR 0017, `decide` in `spec/run.qnt`): a pass must be
+/// earned. `Passed`, `Failed` (a test failed, or the evidence contradicts a
+/// pass, or a non-zero exit) or `Errored` (the run did not finish normally,
+/// the command could not start, or a signal ended it).
+pub fn decide(
+    status: Status,
+    exit_code: Option<i32>,
+    outcomes: &BTreeMap<String, Outcome>,
+    contradiction: bool,
+) -> Outcome {
+    if status != Status::Finished {
+        return Outcome::Errored;
+    }
+    match exit_code {
+        Some(126 | 127) | None => return Outcome::Errored,
+        _ => {}
+    }
+    if outcomes
+        .values()
+        .any(|o| matches!(o, Outcome::Failed | Outcome::Errored))
+        || contradiction
+    {
+        return Outcome::Failed;
+    }
+    if exit_code != Some(0) {
+        return Outcome::Failed;
+    }
+    Outcome::Passed
 }
 
 impl Default for Lifecycle {
@@ -40,6 +76,9 @@ impl Lifecycle {
             open: BTreeSet::new(),
             outcomes: BTreeMap::new(),
             dropped: 0,
+            exit_code: None,
+            contradiction: false,
+            verdict: None,
         }
     }
 
@@ -63,6 +102,34 @@ impl Lifecycle {
     }
     pub fn outcomes(&self) -> &BTreeMap<String, Outcome> {
         &self.outcomes
+    }
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+    pub fn contradicted(&self) -> bool {
+        self.contradiction
+    }
+    /// The verdict, once the run ended.
+    pub fn verdict(&self) -> Option<Outcome> {
+        self.verdict
+    }
+
+    /// The process exited (`None`: a signal ended it).
+    pub fn exited(&mut self, code: Option<i32>) -> Result<(), LifecycleError> {
+        if self.status != Status::Running {
+            return Err(LifecycleError::WrongState(self.status));
+        }
+        self.exit_code = code;
+        Ok(())
+    }
+
+    /// The framework's own report contradicts a pass.
+    pub fn contradict(&mut self) -> Result<(), LifecycleError> {
+        if self.status != Status::Running {
+            return Err(LifecycleError::WrongState(self.status));
+        }
+        self.contradiction = true;
+        Ok(())
     }
 
     pub fn start(&mut self) -> Result<(), LifecycleError> {
@@ -120,6 +187,12 @@ impl Lifecycle {
             self.outcomes.insert(t.clone(), Outcome::Errored);
         }
         self.status = status;
+        self.verdict = Some(decide(
+            status,
+            self.exit_code,
+            &self.outcomes,
+            self.contradiction,
+        ));
         Ok(closed)
     }
 }
@@ -127,6 +200,49 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pass_must_be_earned() {
+        let run = |exit: Option<i32>, tests: &[(&str, Outcome)], unfinished: bool, contra: bool| {
+            let mut l = Lifecycle::new();
+            l.start().unwrap();
+            for (t, o) in tests {
+                l.test_finished(t, *o).unwrap();
+            }
+            if unfinished {
+                l.test_started("hung").unwrap();
+            }
+            if contra {
+                l.contradict().unwrap();
+            }
+            l.exited(exit).unwrap();
+            l.end(Status::Finished).unwrap();
+            l.verdict().unwrap()
+        };
+        let ok = [("a", Outcome::Passed)];
+        assert_eq!(run(Some(0), &ok, false, false), Outcome::Passed);
+        assert_eq!(
+            run(Some(0), &ok, true, false),
+            Outcome::Failed,
+            "unfinished test"
+        );
+        assert_eq!(
+            run(Some(0), &ok, false, true),
+            Outcome::Failed,
+            "framework says otherwise"
+        );
+        assert_eq!(
+            run(Some(0), &[("a", Outcome::Errored)], false, false),
+            Outcome::Failed
+        );
+        assert_eq!(
+            run(Some(127), &[], false, false),
+            Outcome::Errored,
+            "could not start"
+        );
+        assert_eq!(run(None, &ok, false, false), Outcome::Errored, "signal");
+        assert_eq!(run(Some(1), &ok, false, false), Outcome::Failed);
+    }
 
     #[test]
     fn late_result_after_cancel_is_rejected() {
