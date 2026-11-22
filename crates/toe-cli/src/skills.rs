@@ -27,6 +27,31 @@ pub const FILES: &[(&str, &str, &str)] = &[
         "references/pitfalls.md",
         include_str!("../../../skills/toe-rust/references/pitfalls.md"),
     ),
+    (
+        "toe-go",
+        "SKILL.md",
+        include_str!("../../../skills/toe-go/SKILL.md"),
+    ),
+    (
+        "toe-python",
+        "SKILL.md",
+        include_str!("../../../skills/toe-python/SKILL.md"),
+    ),
+    (
+        "toe-ts",
+        "SKILL.md",
+        include_str!("../../../skills/toe-ts/SKILL.md"),
+    ),
+    (
+        "toe-java",
+        "SKILL.md",
+        include_str!("../../../skills/toe-java/SKILL.md"),
+    ),
+    (
+        "toe-csharp",
+        "SKILL.md",
+        include_str!("../../../skills/toe-csharp/SKILL.md"),
+    ),
 ];
 
 /// Workflow skills are always installed; language skills when detected.
@@ -45,3 +70,31 @@ Do not run test commands directly or wrap them in timeouts.
 - Suites are in `toe.toml`; history lives in `.toe/` (not committed).
 <!-- toe:end -->
 ";
+
+#[cfg(test)]
+mod tests {
+    /// Every file under `skills/` must be embedded, and nothing else.
+    #[test]
+    fn all_skill_files_are_embedded() {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, base, out);
+                } else {
+                    out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+        let mut on_disk = Vec::new();
+        walk(&base, &base, &mut on_disk);
+        on_disk.sort();
+        let mut embedded: Vec<String> = super::FILES
+            .iter()
+            .map(|(s, r, _)| format!("{s}/{r}"))
+            .collect();
+        embedded.sort();
+        assert_eq!(embedded, on_disk);
+    }
+}

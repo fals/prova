@@ -376,6 +376,9 @@ pub struct FailureContext {
     pub flaky: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_passed_code: Option<String>,
+    /// The whole suite passed before on exactly this code: the failure is
+    /// likely flaky even when per-test history is incomplete.
+    pub suite_passed_on_same_code: bool,
 }
 
 pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option<FailureContext>> {
@@ -398,6 +401,7 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         seen_before,
         flaky: s.flaky,
         last_passed_code,
+        suite_passed_on_same_code: false,
     }))
 }
 

@@ -430,12 +430,24 @@ impl Store {
     }
 
     /// Previous terminal runs of the same suite, newest first.
-    pub fn suite_history(&self, suite: &str, before_ms: u64, limit: usize) -> Result<Vec<RunRow>> {
+    /// Earlier ended runs of the same suite and the same selection (a run
+    /// of one selected test says nothing about the whole suite).
+    pub fn suite_history(
+        &self,
+        suite: &str,
+        selection: Option<&str>,
+        before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(&format!(
             "{RUN_SELECT} WHERE suite = ?1 AND created_ms < ?2 AND ended_ms IS NOT NULL
+               AND json_extract(spec, '$.selection') IS ?4
              ORDER BY created_ms DESC LIMIT ?3"
         ))?;
-        let rows = stmt.query_map(params![suite, before_ms as i64, limit as i64], row_to_run)?;
+        let rows = stmt.query_map(
+            params![suite, before_ms as i64, limit as i64, selection],
+            row_to_run,
+        )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

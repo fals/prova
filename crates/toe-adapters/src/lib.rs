@@ -59,6 +59,22 @@ impl Observer for Ladder {
             EventKind::TestFinished { test, .. } => !self.live.seen.contains_key(&test.display()),
             _ => true,
         });
+        // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
+        let file_only = finals
+            .keys()
+            .filter(|k| !self.live.seen.contains_key(*k))
+            .count() as u64;
+        let seen = self.live.seen.len() as u64 + file_only;
+        if self.live.reported_total > seen {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "the framework reported {} tests but toe saw {seen} individually (condensed or quiet output): \
+                     passing tests are not recorded, so flaky detection and durations are incomplete. \
+                     Run the framework with verbose output or a JUnit report (`toe adopt` shows how).",
+                    self.live.reported_total
+                ),
+            });
+        }
         let live = self.live.level;
         report.level = match (report.level, live) {
             (Some(a), Some(b)) => Some(a.max(b)),

@@ -23,10 +23,15 @@ needs attention.
 
 2. Read the result. Each failure carries history:
 
-   - `[new failure]` likely your change; `[seen 3x before]` pre-existing.
-   - `FLAKY` the test passed and failed on the same code; do not chase it
-     as your bug, report it.
-   - `last passed at tree:...` the last code where it was green.
+   - `[new failure]`: toe has not seen this failure before. Likely your
+     change, unless the next hint says otherwise.
+   - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
+     same code both passed and failed. Do not chase it as your bug;
+     confirm with `toe history <test>` and report it.
+   - `[seen 3x before]`: pre-existing failure.
+   - `last passed at tree:...`: the last code where it was green.
+   - `note:` lines say what toe could not see (e.g. quiet output hides
+     passing tests). Take them seriously: flaky detection depends on it.
 
    Exit codes: 0 passed, 1 test failure, 3 stall/slow/killed, 4 toe or
    infrastructure error, 5 still running (call `toe wait <run> --after <seq>`).

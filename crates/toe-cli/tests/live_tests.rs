@@ -124,3 +124,44 @@ exit 1"#;
     assert_eq!(s["counts"]["failed"], 1);
     assert_eq!(s["level"], "recognized");
 }
+
+/// Regressions from the M5 usability session (fresh agent, rust fixture).
+#[test]
+fn quiet_output_says_what_toe_could_not_see() {
+    let d = workspace("quiet");
+    let script = "echo '.F.'; echo 'm::b --- FAILED'; echo 'test result: FAILED. 2 passed; 1 failed; 0 ignored'; exit 101";
+    let s = json(&toe(&d, &["run", "--json", "--", "sh", "-c", script]));
+    assert_eq!(s["counts"]["failed"], 1);
+    let note = s["notes"][0].as_str().expect("note about hidden tests");
+    assert!(note.contains("reported 3 tests but toe saw 1"), "{note}");
+}
+
+#[test]
+fn failure_on_code_where_the_suite_passed_is_flagged_likely_flaky() {
+    let d = workspace("same-code");
+    std::fs::write(d.join("state"), "pass").unwrap();
+    let script = "if [ \"$(cat state)\" = pass ]; then echo 'test m::a ... ok'; else echo 'test m::a ... FAILED'; exit 1; fi";
+    toe(&d, &["run", "--json", "--", "sh", "-c", script]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let s = json(&toe(&d, &["run", "--json", "--", "sh", "-c", script]));
+    assert_eq!(
+        s["failures"][0]["context"]["suite_passed_on_same_code"], true,
+        "{s}"
+    );
+}
+
+#[test]
+fn selected_runs_do_not_count_as_suite_history() {
+    let d = workspace("selected");
+    std::fs::write(
+        d.join("toe.toml"),
+        "[suite.s]\nrun = \"echo 'test m::a ... FAILED'; exit 1\"\nselect = \"printf 'test m::%s ... ok\\n' {filter}\"\n",
+    )
+    .unwrap();
+    toe(&d, &["run", "s", "--select", "b"]); // passes: one selected test
+    let s = json(&toe(&d, &["run", "s", "--json"]));
+    assert!(
+        s["history"].is_null(),
+        "the selected run is not suite history: {s}"
+    );
+}

@@ -1,5 +1,6 @@
 //! `toe` command line (ADR 0009). Primary conduit for agents and humans.
 
+mod mcp;
 mod render;
 mod skills;
 
@@ -170,6 +171,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Serve the MCP facade on stdio (tools mirror the CLI).
+    Mcp,
     /// Experiments: frozen protocol, interleaved trials, statistical verdict.
     #[command(subcommand)]
     Exp(ExpCmd),
@@ -1018,6 +1021,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
+                if d.total == 0 {
+                    println!(
+                        "no per-test durations recorded yet: the framework output carries none (e.g. plain `cargo test`); a JUnit report (nextest, pytest --junitxml) or go test -json provides them"
+                    );
+                }
                 for (t, ms) in d.largest.iter().take(10) {
                     println!("  {ms:>8}ms  {}", render::clean(t));
                 }
@@ -1060,6 +1068,10 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             })
         }
         Cmd::Exp(c) => exp(c),
+        Cmd::Mcp => {
+            mcp::serve()?;
+            Ok(exit::PASSED)
+        }
         Cmd::Init { claude } => init(claude),
         Cmd::Adopt {
             write,

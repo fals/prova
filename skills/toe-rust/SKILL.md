@@ -7,6 +7,12 @@ description: toe setup details for Rust projects (cargo test, cargo-nextest). Us
 
 - `cargo test` output is recognized live (level `recognized output`):
   `test path::name ... ok|FAILED|ignored`. Nothing to configure.
+- `cargo test --quiet` (often inside `make test`) prints only failures:
+  toe then cannot record passing tests, so flaky detection is blind.
+  `toe adopt` proposes running `cargo test` directly as the default suite
+  and keeps `make test` as a separate suite.
+- Plain `cargo test` reports no per-test durations; `toe sizes` and slow
+  budgets need nextest's JUnit report (below).
 - Single test: `select = "cargo test -- {filter}"` (substring match on the
   test path). Add `--exact` only if names are fully qualified.
 - cargo-nextest: JUnit output is ingested automatically when enabled in
