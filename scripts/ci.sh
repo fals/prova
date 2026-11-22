@@ -12,6 +12,6 @@ done
 tmp=$(mktemp -d)
 scripts/spec-traces.sh "$tmp/run" 60 "" run
 scripts/spec-traces.sh "$tmp/exp" 60 "" experiment
-TOE_TRACE_DIR="$tmp/run" cargo test -q -p toe-core --test spec_replay
-TOE_TRACE_DIR_EXP="$tmp/exp" cargo test -q -p toe-core --test spec_replay_experiment
+TOE_TRACE_DIR="$tmp/run" cargo test -p toe-core --test spec_replay
+TOE_TRACE_DIR_EXP="$tmp/exp" cargo test -p toe-core --test spec_replay_experiment
 echo "ci: all green"
