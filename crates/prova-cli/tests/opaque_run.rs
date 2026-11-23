@@ -170,7 +170,8 @@ fn a_busy_child_in_its_own_group_is_not_a_stall() {
     let id = detach(
         &d,
         &["--stall-after", "1s"],
-        "setsid sh -c 'end=$((SECONDS + 5)); while [ $SECONDS -lt $end ]; do :; done' & wait",
+        // POSIX sh (dash has no $SECONDS); `setsid -w` waits if it forks.
+        "setsid -w sh -c 'end=$(($(date +%s) + 5)); while [ $(date +%s) -lt $end ]; do :; done' & wait",
     );
     let _cancel = CancelOnDrop(&d, id.clone());
     let w = prova(
