@@ -976,25 +976,29 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 elapsed_ms,
                 budget_ms,
             } => {
-                slow.insert(
-                    test.unique(),
-                    SlowTest {
-                        test: test.display(),
-                        // How long it has been running now, not when the
-                        // slow event fired (round 5: "running 1.0s" at 2.8s).
-                        elapsed_ms: started_at
-                            .get(&test.unique())
-                            .map(|t| now_ms().saturating_sub(*t))
-                            .unwrap_or(0)
-                            .max(*elapsed_ms),
-                        budget_ms: *budget_ms,
-                    },
+                // How long it has been running now: what the slow event said
+                // plus the time since (a runner's own SLOW line may be the
+                // first sign of the test, so its start time can be late),
+                // keeping the largest budget seen (round 6).
+                let now = now_ms();
+                let elapsed = (elapsed_ms + now.saturating_sub(e.ts_ms)).max(
+                    started_at
+                        .get(&test.unique())
+                        .map(|t| now.saturating_sub(*t))
+                        .unwrap_or(0),
                 );
+                let entry = slow.entry(test.unique()).or_insert(SlowTest {
+                    test: test.display(),
+                    elapsed_ms: 0,
+                    budget_ms: 0,
+                });
+                entry.elapsed_ms = entry.elapsed_ms.max(elapsed);
+                entry.budget_ms = entry.budget_ms.max(*budget_ms);
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { test } => {
                 stalled_ms = None;
-                started_at.insert(test.unique(), e.ts_ms);
+                started_at.entry(test.unique()).or_insert(e.ts_ms);
                 if !running.iter().any(|(u, _)| *u == test.unique()) {
                     running.push((test.unique(), test.display()));
                 }

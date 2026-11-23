@@ -68,7 +68,7 @@ fn history_is_shared_by_suites_that_run_the_same_test() {
     // In `default` it is the same test: known flaky, not new.
     let out = run(&d, "default", "fail");
     assert!(
-        out.contains("FAIL calc::x [seen") && out.contains("FLAKY"),
+        out.contains("FAIL calc::x [failed") && out.contains("FLAKY"),
         "{out}"
     );
     assert!(
@@ -168,6 +168,9 @@ fn quiet_and_text_runs_join_the_full_history() {
             && !out.contains("first time seen"),
         "text run knows the json pass: {out}"
     );
+    // Two names, one test: history answers instead of asking (round 6).
+    let h = prova(&d, &["history", "TestDiv"]);
+    assert!(h.status.success(), "{}", text(&h));
 }
 
 /// Round 5: a test cut off by a cancel kept a garbled duplicate identity,
@@ -196,4 +199,67 @@ fn a_cut_off_test_keeps_its_identity_and_is_shown_as_unfinished() {
     assert!(!s.contains("FLAKY"), "{s}");
     let h = prova(&d, &["history", "TestA"]);
     assert!(h.status.success(), "one test, not ambiguous: {}", text(&h));
+}
+
+/// Round 6: a test killed by a cancel reports FAIL; that failure is no
+/// evidence about the code, so it is neither labelled nor counted.
+#[test]
+fn failures_of_a_cancelled_run_are_no_evidence() {
+    let d = workspace("cancelfail");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"if [ -f hang ]; then echo 'test calc::x ... FAILED'; sleep 30; else echo 'test calc::x ... ok'; fi\"\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["run", "t"]).status.success());
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "t", "--detach"]))
+        .trim()
+        .to_owned();
+    prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "5s"],
+    );
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    let s = text(&prova(
+        &d,
+        &["wait", &id, "--until", "done", "--max-wait", "10s"],
+    ));
+    assert!(
+        s.contains("[run cancelled or aborted: no evidence about the code]"),
+        "{s}"
+    );
+    assert!(!s.contains("FLAKY"), "{s}");
+    assert!(!text(&prova(&d, &["flaky"])).contains("calc::x"));
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(h.contains("1 finished runs, 0 failed"), "{h}");
+}
+
+/// Round 6: `prova flaky` agreed with history only within one suite.
+#[test]
+fn flaky_lists_a_test_that_flipped_across_suites() {
+    let d = workspace("flakyacross");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "default", "fail");
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(f.contains("calc::x"), "{f}");
+}
+
+/// Round 6: confirming a flaky test is one command, not a shell loop.
+#[test]
+fn repeat_tallies_each_test() {
+    let d = workspace("repeat");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"n=$(cat n 2>/dev/null || echo 0); echo $((n+1)) > n; if [ $((n % 2)) = 1 ]; then echo 'test calc::x ... FAILED'; exit 1; else echo 'test calc::x ... ok'; fi\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "t", "--repeat", "3"]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = text(&o);
+    assert!(
+        out.contains("3 run(s) of the same code") && out.contains("FLAKY calc::x: failed 1 of 3"),
+        "{out}"
+    );
 }

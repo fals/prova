@@ -67,8 +67,9 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 /// Results are the same test when their full names match and their files
 /// match or one is unknown (quiet `cargo test` names no binary), or when
 /// one side knows only the bare name (`go test` text output names no
-/// package). Results from cancelled or aborted runs count, except the
-/// tests those runs cut off; `current` is included too.
+/// package). From a cancelled or aborted run only passes and skips count:
+/// its failures may be the cancel itself (a killed test reports FAIL), so
+/// they are no evidence about the code (round 6); `current` is included.
 pub fn test_runs(store: &Store, test_id: &str, limit: usize) -> Result<Vec<TestRun>> {
     test_runs_with(store, test_id, limit, None)
 }
@@ -92,12 +93,12 @@ pub fn test_runs_with(
              WHERE r.id IN (
                  SELECT a3.run_id FROM attempts a3 JOIN runs r3 ON r3.id = a3.run_id
                  WHERE a3.test_id IN (SELECT id FROM same)
-                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome <> 'errored')))
+                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome IN ('passed', 'skipped'))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
-           AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
+           AND (r.status = 'finished' OR r.id = ?3 OR a.outcome IN ('passed', 'skipped'))
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
     let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
@@ -247,6 +248,22 @@ pub fn find_tests(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Ids of every test that shares one history with `test_id` (ADR 0018).
+pub fn shared_ids(store: &Store, test_id: &str) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT t2.id FROM tests t1 JOIN tests t2
+           ON (t2.display = t1.display
+               AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
+            OR (t2.name = t1.name
+               AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+         WHERE t1.id = ?1",
+    )?;
+    let ids = stmt
+        .query_map(params![test_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
 /// Of several test ids, the one with the most recent attempt.
 pub fn most_recent(store: &Store, candidates: &[(String, String, String)]) -> Result<String> {
     let mut best = (
@@ -269,10 +286,10 @@ pub fn most_recent(store: &Store, candidates: &[(String, String, String)]) -> Re
 /// Flaky tests among those seen in the last `runs` runs of any suite.
 pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<TestStats>> {
     let mut stmt = store.conn().prepare(
+        // Any test that failed somewhere: its history is shared across
+        // suites (ADR 0018), so a flip between suites counts (round 6).
         "SELECT DISTINCT t.id FROM tests t JOIN attempts a ON a.test_id = t.id
-         WHERE (?1 IS NULL OR t.suite = ?1)
-         GROUP BY t.id HAVING SUM(a.outcome IN ('failed','errored')) > 0
-            AND SUM(a.outcome = 'passed') > 0",
+         WHERE (?1 IS NULL OR t.suite = ?1) AND a.outcome IN ('failed','errored')",
     )?;
     let ids: Vec<String> = stmt
         .query_map(params![suite], |r| r.get(0))?
@@ -436,6 +453,9 @@ pub struct FailureContext {
     pub failed_before: usize,
     /// It passed in an earlier finished run.
     pub passed_before: bool,
+    /// This run was cancelled or aborted: its failures are no evidence
+    /// about the code (a killed test reports FAIL), so no label applies.
+    pub run_cut_short: bool,
     pub flaky: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_passed_code: Option<String>,
@@ -453,6 +473,10 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
     let flaky = stats(store, test_id, 50)?.is_some_and(|h| h.flaky);
     let this = s.recent.iter().find(|r| r.run == run);
     let first_seen = !s.recent.iter().any(|r| r.run != run);
+    let run_cut_short = matches!(
+        store.run(run)?.status,
+        crate::model::Status::Cancelled | crate::model::Status::Aborted
+    );
     let fp = this.and_then(|r| r.fingerprint.clone());
     let seen_before = s
         .recent
@@ -475,6 +499,7 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         seen_before,
         failed_before,
         passed_before,
+        run_cut_short,
         flaky,
         last_passed_code,
         suite_passed_on_same_code: false,

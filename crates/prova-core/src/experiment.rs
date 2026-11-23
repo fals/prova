@@ -354,14 +354,26 @@ pub fn judge(
     // The change as a ratio of medians ("37.6x"), easier to read than +97%.
     let (b, c) = (primary.baseline_median, primary.candidate_median);
     let ratio = if b > 0.0 && c > 0.0 && b.is_finite() && c.is_finite() {
+        let better = match primary.better {
+            Better::Lower => c < b,
+            Better::Higher => c > b,
+        };
         format!(
-            ", median {} -> {} ({:.2}x)",
+            ", median {} -> {} ({:.2}x {})",
             short(b),
             short(c),
-            if b > c { b / c } else { c / b }
+            if b > c { b / c } else { c / b },
+            if better { "better" } else { "worse" }
         )
     } else {
         String::new()
+    };
+    // The p in the reason is adjusted when the experiment has several
+    // comparisons (Holm): say so (round 6).
+    let pname = if (primary.p_adjusted - primary.p).abs() > 1e-12 {
+        "adjusted p"
+    } else {
+        "p"
     };
     // With few trials the exact rank test cannot go lower: say so.
     let floor = crate::stats::min_two_sided_p(primary.n_baseline, primary.n_candidate);
@@ -377,7 +389,7 @@ pub fn judge(
         (
             Verdict::Accept,
             format!(
-                "{} improved {}{ratio} (CI {ci}, p={:.4}{at_floor})",
+                "{} improved {}{ratio} (CI {ci}, {pname}={:.4}{at_floor})",
                 primary.metric,
                 pct(primary.improvement),
                 primary.p_adjusted
@@ -387,7 +399,7 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "{} got worse by {}{ratio} (CI {ci}, p={:.4}{at_floor})",
+                "{} got worse by {}{ratio} (CI {ci}, {pname}={:.4}{at_floor})",
                 primary.metric,
                 pct(-primary.improvement).trim_start_matches('+').to_owned(),
                 primary.p_adjusted
@@ -405,7 +417,7 @@ pub fn judge(
         (
             Verdict::Inconclusive,
             format!(
-                "CI {ci} straddles the ±{} threshold (p={:.4})",
+                "CI {ci} straddles the ±{} threshold ({pname}={:.4})",
                 pct(min_effect).trim_start_matches('+'),
                 primary.p_adjusted
             ),
@@ -1425,6 +1437,16 @@ pub struct ComparisonReport {
     pub max_trials: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+}
+
+/// Comparisons of an experiment that reached a verdict (its Holm family).
+pub fn decided_comparisons(store: &Store, exp: &str) -> Result<usize> {
+    let n: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM comparisons WHERE experiment = ?1 AND status = 'decided'",
+        params![exp],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
 }
 
 pub fn latest_comparison(store: &Store, exp: &str) -> Result<Option<String>> {

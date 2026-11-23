@@ -68,14 +68,18 @@ enum Cmd {
         /// Return the run id immediately; follow with `prova wait`.
         #[arg(long, conflicts_with = "until")]
         detach: bool,
-        /// Start the run and wait for this in one command (ADR 0019):
+        /// Start the run and wait for this in one command:
         /// `done` (the result), `first-failure`, or `stall`.
         #[arg(long, value_enum)]
         until: Option<UntilArg>,
         /// With --until: wait at most this long (default 9m for `done`,
         /// 30s otherwise); then exit 5 with the command to continue.
-        #[arg(long, requires = "until")]
+        #[arg(long)]
         max_wait: Option<String>,
+        /// Run it N times in a row and report each test's tally (is it
+        /// flaky?), within one --max-wait budget (default 9m).
+        #[arg(long, conflicts_with_all = ["detach", "until"])]
+        repeat: Option<u32>,
         /// Report a stall after this long without activity (e.g. 30s).
         /// Default: the suite's `stall_after`, else by size (small 30s,
         /// medium 60s, large 5m), else 60s.
@@ -104,7 +108,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "first-failure")]
         until: UntilArg,
         /// Default: 9m for `--until done` (under the usual 10-minute limit of
-        /// one tool call), 30s otherwise (ADR 0019).
+        /// one tool call), 30s otherwise.
         #[arg(long)]
         max_wait: Option<String>,
         /// Only consider events after this sequence number.
@@ -542,6 +546,24 @@ fn exp_start(
             live.join(", ")
         );
     }
+    // Holm: each decided comparison raises the bar for the next one, and few
+    // trials have a floor; say when ACCEPT has become impossible (round 6).
+    let e = experiment::get(store, name)?;
+    let decided = experiment::decided_comparisons(store, name)? as i64;
+    let floor = prova_core::stats::min_two_sided_p(
+        e.protocol.max_trials as usize,
+        e.protocol.max_trials as usize,
+    );
+    if floor * (decided as f64 + 1.0) >= e.protocol.alpha {
+        eprintln!(
+            "warning: this is comparison {} of experiment {name}; with at most {} + {} trials the adjusted p cannot go below {:.4} (alpha {}), so this comparison cannot be accepted; start a new experiment with more --max-trials",
+            decided + 1,
+            e.protocol.max_trials,
+            e.protocol.max_trials,
+            floor * (decided as f64 + 1.0),
+            e.protocol.alpha
+        );
+    }
     let mut child = spawn_exp_worker(store, &id)?;
     if detach {
         if json {
@@ -689,7 +711,12 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 _ => None,
             })
             .collect();
-        let unrelated: Vec<&String> = tests.iter().filter(|t| !t.contains(&filter)).collect();
+        // The filter is the framework's own syntax: a Go regex (`^TestAdd$`)
+        // is anchored to the test name, not to prova's full name (round 6).
+        let plain = filter.trim_start_matches('^').trim_end_matches('$');
+        let matches =
+            |t: &str| t.contains(plain) || t.rsplit("::").next().is_some_and(|leaf| leaf == plain);
+        let unrelated: Vec<&String> = tests.iter().filter(|t| !matches(t)).collect();
         let (ok, why) = if s.level == prova_core::model::Level::Opaque {
             (false, "cannot verify: run is at level opaque (no per-test results); see the prova-<language> skill to raise the level".to_owned())
         } else if tests.is_empty() {
@@ -1155,6 +1182,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             keep_output,
             until,
             max_wait,
+            repeat,
             json,
             command,
         } => {
@@ -1236,15 +1264,16 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             spec.keep_output |= keep_output;
             prova_adapters::inject::validate(&spec.inject).map_err(|e| anyhow!(e))?;
-            let id = engine::create_run(
-                &store,
-                &NewRunRequest {
-                    suite: suite_name,
-                    spec,
-                    cwd: run_cwd,
-                    extra_env: cfg.env.clone(),
-                },
-            )?;
+            let request = NewRunRequest {
+                suite: suite_name,
+                spec,
+                cwd: run_cwd,
+                extra_env: cfg.env.clone(),
+            };
+            if let Some(n) = repeat {
+                return repeat_runs(&store, &request, n, max_wait.as_deref(), json);
+            }
+            let id = engine::create_run(&store, &request)?;
             let exe = std::env::current_exe()?;
             let mut child =
                 engine::spawn_supervisor(&store, &exe, &id).context("starting supervisor")?;
@@ -1402,6 +1431,15 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 ([one], _) => one.0.clone(),
                 ([], [one]) => one.0.clone(),
                 (_, [_, ..]) if displays.len() == 1 => analysis::most_recent(&store, &found)?,
+                // Several names, one test: they share one history (round 6).
+                (_, [first, ..])
+                    if {
+                        let shared = analysis::shared_ids(&store, &first.0)?;
+                        found.iter().all(|f| shared.contains(&f.0))
+                    } =>
+                {
+                    analysis::most_recent(&store, &found)?
+                }
                 (_, []) => {
                     bail!("no test matching {test:?}; tests are recorded from level 1 runs on")
                 }
@@ -1564,6 +1602,115 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
 }
 
 /// Attached run: wait loops until the end, reporting significant events.
+/// `prova run --repeat N`: the same run N times in a row, each to its end,
+/// then each test's tally, so confirming a flaky test needs no shell loop
+/// (round 6). One budget for all of them; when it ends, the command to run
+/// the remaining repeats is printed.
+fn repeat_runs(
+    store: &Store,
+    request: &NewRunRequest,
+    n: u32,
+    max_wait: Option<&str>,
+    json: bool,
+) -> Result<u8> {
+    let budget = wait_budget(UntilArg::Done, max_wait)?;
+    let start = std::time::Instant::now();
+    let exe = std::env::current_exe()?;
+    let mut tally: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+    let mut runs = Vec::new();
+    let mut any_failed = false;
+    for i in 1..=n {
+        let left = budget.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let id = engine::create_run(store, request)?;
+        let mut child =
+            engine::spawn_supervisor(store, &exe, &id).context("starting supervisor")?;
+        let s = wait_until(store, &id, UntilArg::Done, 0, left)?;
+        let _ = child.wait();
+        if s.reason != WaitReason::Done {
+            if !json {
+                println!("run {i}/{n} {id}: still running when the budget ended");
+                println!(
+                    "next: prova wait {id} --until done, then run the remaining {} repeat(s)",
+                    n - i
+                );
+            }
+            return Ok(exit::RUNNING);
+        }
+        any_failed |= s.outcome != Some(Outcome::Passed);
+        for e in store.events_after(&id, 0)? {
+            if let prova_core::model::EventKind::TestFinished { test, outcome, .. } = e.kind {
+                let t = tally.entry(test.display()).or_default();
+                if outcome.is_failure() {
+                    t.1 += 1;
+                } else if outcome == Outcome::Passed {
+                    t.0 += 1;
+                }
+            }
+        }
+        if !json {
+            let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            eprintln!(
+                "run {i}/{n} {id}: {}{}",
+                s.outcome.map(|o| o.as_str()).unwrap_or("?"),
+                if failing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", failing.join(", "))
+                }
+            );
+        }
+        runs.push(serde_json::json!({ "run": id, "outcome": s.outcome }));
+    }
+    let done = runs.len() as u32;
+    let mixed: Vec<(&String, &(u32, u32))> = tally
+        .iter()
+        .filter(|(_, (p, f))| *p > 0 && *f > 0)
+        .collect();
+    let always: Vec<&String> = tally
+        .iter()
+        .filter(|(_, (p, f))| *p == 0 && *f > 0)
+        .map(|(t, _)| t)
+        .collect();
+    if json {
+        let tests: Vec<_> = tally
+            .iter()
+            .map(|(t, (p, f))| serde_json::json!({ "test": t, "passed": p, "failed": f }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "runs": runs, "repeats": done, "tests": tests })
+        );
+    } else {
+        println!("{done} run(s) of the same code:");
+        for (t, (p, f)) in &mixed {
+            println!("  FLAKY {}: failed {f} of {}", render::clean(t), p + f);
+        }
+        for t in &always {
+            println!("  FAIL {}: failed every time", render::clean(t));
+        }
+        if mixed.is_empty() && always.is_empty() {
+            println!("  every test passed every time");
+        }
+        if done < n {
+            println!(
+                "budget ended after {done} of {n}; next: run the remaining {} with --repeat {}",
+                n - done,
+                n - done
+            );
+        }
+    }
+    Ok(if any_failed {
+        exit::FAILED
+    } else if done < n {
+        exit::RUNNING
+    } else {
+        exit::PASSED
+    })
+}
+
 /// Waits for `until` within `budget` (ADR 0019). Short waits for the first
 /// failure return as they are; a wait for the result or a stall shows
 /// progress on stderr for the person watching: every new failure, slow
@@ -1597,8 +1744,11 @@ fn wait_until(
         cursor = s.last_seq;
         match s.reason {
             WaitReason::Done => return Ok(s),
-            WaitReason::Stall if matches!(until, UntilArg::Stall) => return Ok(s),
-            WaitReason::Failure | WaitReason::Stall | WaitReason::Slow => {
+            // A stall ends any long wait: waiting out the budget on a hung
+            // run helps nobody (round 6); the summary says to cancel.
+            // (Not once a cancel was asked for: then the end is coming.)
+            WaitReason::Stall if !store.cancel_requested(id)? => return Ok(s),
+            WaitReason::Failure | WaitReason::Slow | WaitReason::Stall => {
                 render::progress(&s, &mut reported)
             }
             WaitReason::Running => {}
