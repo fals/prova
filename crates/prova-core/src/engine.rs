@@ -186,6 +186,8 @@ struct Supervisor<'a> {
     level: Level,
     suite: String,
     default_slow: Duration,
+    /// CPU ticks of waited-for children when the command started.
+    cpu_start: u64,
     /// The framework's own test count, when it printed one.
     framework_total: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
@@ -390,6 +392,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         terminating: false,
         partial: Default::default(),
         framework_total: None,
+        cpu_start: 0,
     };
     store.set_level(run, sup.level)?;
 
@@ -412,7 +415,13 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     cmd.current_dir(&row.cwd)
         .env("PROVA_RUN_ID", run)
         // The selection reaches the shell only as a variable, never as text.
-        .env("PROVA_FILTER", spec.selection.as_deref().unwrap_or(""))
+        .env(
+            "PROVA_FILTER",
+            spec.selection
+                .as_deref()
+                .map(|f| crate::config::framework_filter(&spec.command.display(), f))
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -436,6 +445,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
+    sup.cpu_start = process::cpu_ticks().1;
     sup.emit(EventKind::RunStarted { pid: pgid });
     if !injected.is_empty() {
         // Short: the temporary paths are noise in every summary (round 9).
@@ -605,6 +615,15 @@ fn observe_child(
     }
 
     let report = observer.on_exit(Path::new(store.root()), started_ms);
+    let from_files = report.events.iter().any(|e| {
+        matches!(
+            e,
+            EventKind::TestFinished {
+                source: Level::ResultFiles,
+                ..
+            }
+        )
+    });
     for e in report.events {
         sup.emit(e);
     }
@@ -730,6 +749,117 @@ fn observe_child(
                 "{why}: these results did not come from running the tests now (printed or stale output?)"
             ));
         }
+        // A test skipped now that last passed, in any suite, did not run: the
+        // suite's own last pass may not exist (round 10: `@Disabled` on a failing
+        // test passed in an ad-hoc `mvn test`).
+        if status == Status::Finished && spec.selection.is_none() {
+            sup.flush()?;
+            let skipped: Vec<(String, String)> = {
+                let mut stmt = store.conn().prepare(
+                    "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                  WHERE a.run_id = ?1 AND a.outcome = 'skipped'",
+                )?;
+                stmt.query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let mut was_passing = Vec::new();
+            for (id, display) in skipped {
+                if warnings.iter().any(|w| w.contains(&display)) {
+                    continue;
+                }
+                let last = crate::analysis::stats(store, &id, 20)?.and_then(|st| {
+                    st.recent
+                        .iter()
+                        .find(|r| r.run != run && r.outcome != Outcome::Skipped)
+                        .map(|r| (r.outcome, r.run.clone()))
+                });
+                if let Some((Outcome::Passed, r)) = last {
+                    was_passing.push(format!("{display} (passed in run {r})"));
+                }
+            }
+            if !was_passing.is_empty() {
+                warnings.push(format!(
+                    "{} test(s) that passed before were skipped now, so they verified nothing: {}",
+                    was_passing.len(),
+                    was_passing
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        // Passing tests from a command that used no CPU at all: printed, not run
+        // (round 10: `echo "--- PASS: TestDiv"` passed in a Java project). Any
+        // real test framework uses at least a clock tick.
+        if status == Status::Finished
+            && process::cpu_ticks().1 == sup.cpu_start
+            && cfg!(target_os = "linux")
+        {
+            let passed: i64 = store.conn().query_row(
+                "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND outcome = 'passed'",
+                rusqlite::params![run],
+                |r| r.get(0),
+            )?;
+            if passed > 0 {
+                warnings.push(format!(
+                "{passed} test(s) passed, but the command used no CPU time at all: the results were printed, not produced by running tests"
+            ));
+            }
+        }
+        // Result files are shared by every process in the checkout: another run
+        // going at the same time may have written them (round 10: a run that
+        // ran no test reported another run's 5 passes).
+        if status == Status::Finished && from_files {
+            let overlapping: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT id FROM runs WHERE id <> ?1 AND started_ms IS NOT NULL AND started_ms <= ?2
+                   AND (ended_ms IS NULL OR ended_ms >= ?3)
+                   AND cwd = (SELECT cwd FROM runs WHERE id = ?1) LIMIT 1",
+                rusqlite::params![run, now_ms() as i64, started_ms as i64],
+                |r| r.get(0),
+            )
+            .ok();
+            if let Some(other) = overlapping {
+                warnings.push(format!(
+                "run {other} ran in this checkout at the same time, and this run's results come from result files that either may have written"
+            ));
+            }
+        }
+        // Every duration equal, to the millisecond, to an earlier run's: the
+        // same result files read again (round 10: stale reports refreshed
+        // with `touch`, in a run longer than any test).
+        let mine: Vec<(String, i64)> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT test_id, duration_ms FROM attempts WHERE run_id = ?1 AND duration_ms > 0 ORDER BY test_id, attempt",
+            )?;
+            stmt.query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if mine.len() >= 2 {
+            let mut stmt = store.conn().prepare(
+                "SELECT DISTINCT run_id FROM attempts WHERE test_id = ?1 AND duration_ms = ?2 AND run_id <> ?3",
+            )?;
+            let others: Vec<String> = stmt
+                .query_map(rusqlite::params![mine[0].0, mine[0].1, run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut theirs_stmt = store.conn().prepare(
+                "SELECT test_id, duration_ms FROM attempts WHERE run_id = ?1 AND duration_ms > 0 ORDER BY test_id, attempt",
+            )?;
+            for other in others {
+                let theirs: Vec<(String, i64)> = theirs_stmt
+                    .query_map(rusqlite::params![other], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                if theirs == mine {
+                    warnings.push(format!(
+                        "every test's duration equals run {other}'s to the millisecond: these are the same results read again (stale result files?), not a new run"
+                    ));
+                    break;
+                }
+            }
+        }
     }
     // A run cut short where prova saw no test running (result files come
     // only at the end, or quiet output): name the tests of the last passing
@@ -853,6 +983,34 @@ fn observe_child(
     )?;
     for (test, text) in &report.test_outputs {
         crate::output::keep_test(store, run, &crate::store::test_id(&sup.suite, test), text)?;
+    }
+    // A run failed only by tests that passed on a rerun: say so (round 10:
+    // `-Dsurefire.rerunFailingTestsCount` gave FAILED with nothing failing).
+    if outcome == Outcome::Failed && reason.is_none() {
+        sup.flush()?;
+        let rerun: Vec<String> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                  WHERE a.run_id = ?1 GROUP BY a.test_id
+                 HAVING SUM(a.outcome IN ('failed','errored')) > 0
+                    AND MAX(CASE WHEN a.outcome = 'passed' THEN a.attempt END) = MAX(a.attempt)",
+            )?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let still_failing: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM (SELECT a.test_id FROM attempts a WHERE a.run_id = ?1 GROUP BY a.test_id
+               HAVING MAX(CASE WHEN a.outcome IN ('failed','errored') THEN a.attempt END) = MAX(a.attempt))",
+            rusqlite::params![run],
+            |r| r.get(0),
+        )?;
+        if !rerun.is_empty() && still_failing == 0 {
+            reason = Some(format!(
+                "{} test(s) failed and then passed on a rerun, which counts as a failure (flaky, not green): {}",
+                rerun.len(),
+                rerun.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     let tail: Vec<String> = sup.tail.iter().cloned().collect();
     let fingerprint = (outcome != Outcome::Passed)
@@ -1338,6 +1496,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A stalled selection: the selected test is the suspect (round 10).
+    if !row.status.is_terminal()
+        && stalled_ms.is_some()
+        && running.is_empty()
+        && let Some(sel) = &selection
+    {
+        notes.push(format!(
+            "the run selected {sel:?}: the hung test is the one it matches"
+        ));
+    }
     // A stalled run where no test is seen running: name the suspects, the
     // tests of the last passing run that have not reported yet (round 8).
     if !row.status.is_terminal()
@@ -1436,7 +1604,13 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     let Some(last) = prev.first() else {
         return Ok(None);
     };
-    let last_passed = prev.iter().find(|r| r.outcome == Some(Outcome::Passed));
+    // "Last green" is a verified pass only (round 10: echoed and stale
+    // passes were named).
+    let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
+    let thin = store.unverified(&ids)?;
+    let last_passed = prev
+        .iter()
+        .find(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id));
     // Only finished runs are evidence of "the same failure" (round 8: a
     // cancelled hang was counted as seen before).
     let same = row
@@ -1467,5 +1641,22 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
         "same_code_outcomes": same_code_outcomes,
+        // The same code may have passed in another suite (round 10: "none
+        // of them passed" read as a regression).
+        "passed_elsewhere": if last_passed.is_none() {
+            store
+                .conn()
+                .query_row(
+                    "SELECT id, suite FROM runs r WHERE code = ?1 AND suite <> ?2 AND status = 'finished'
+                       AND outcome = 'passed'
+                       AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
+                     ORDER BY created_ms DESC LIMIT 1",
+                    rusqlite::params![row.code, row.suite],
+                    |r| Ok(serde_json::json!({ "run": r.get::<_, String>(0)?, "suite": r.get::<_, String>(1)? })),
+                )
+                .ok()
+        } else {
+            None
+        },
     })))
 }

@@ -533,13 +533,13 @@ fn a_change_scope_limits_what_a_candidate_may_touch() {
         &d,
         "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm other",
     );
-    new_exp(&d, &["--change", "delay"]);
+    new_exp(&d, &["--change", "delay", "--change-only"]);
     std::fs::write(d.join("other"), "2").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
     assert!(
-        reason.contains("outside the protocol's --change scope, e.g. other"),
+        reason.contains("outside the protocol's --change-only scope, e.g. other"),
         "{r}"
     );
 }
@@ -772,6 +772,94 @@ fn trials_do_not_see_prova_home() {
             "0",
             "--oracle",
             "[ -z \"$PROVA_HOME\" ]",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("x"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "decided", "{r}");
+}
+
+/// Round 10: `--change` replaced the default scope; now it adds to it.
+#[test]
+fn change_allows_a_build_file_on_top_of_the_default_scope() {
+    let d = repo("change-adds", "0.01");
+    std::fs::write(d.join("Makefile"), "all:\n").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm mk",
+    );
+    new_exp(&d, &["--change", "Makefile"]);
+    std::fs::write(d.join("Makefile"), "all:\n\ttrue\n").unwrap();
+    std::fs::write(d.join("delay"), "0.012").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
+    assert!(!reason.contains("out of scope"), "{r}");
+}
+
+/// Round 10 red team: a top-level `random.py` shadowed the standard library
+/// for the oracle; it is a file that decides the verdict.
+#[test]
+fn a_module_shadowing_the_python_standard_library_is_out_of_scope() {
+    let d = repo("stdlib", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("random.py"), "def randrange(a, b): return a\n").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("out of scope") && reason.contains("random.py"),
+        "{r}"
+    );
+}
+
+/// Round 10: a comparison that failed at its oracle froze the protocol, so
+/// fixing the oracle needed a new experiment.
+#[test]
+fn the_protocol_freezes_at_the_first_trial_not_at_a_failed_oracle() {
+    let d = repo("freeze", "0.01");
+    new_exp(&d, &["--oracle", "false"]);
+    std::fs::write(d.join("delay"), "0.012").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    prova(&d, &["exp", "run", "e"]);
+    let o = prova(&d, &["exp", "protocol", "e", "--oracle", "true"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Round 10 red team: Python's user site-packages crossed arms; trials run
+/// without it.
+#[test]
+fn trials_run_without_the_python_user_site() {
+    let d = std::env::temp_dir().join(format!("prova-exp-usersite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\n[ \"$PYTHONNOUSERSITE\" = 1 ] && [ -n \"$PYTHONPYCACHEPREFIX\" ] || exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
+    )
+    .unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "t",
+            "--trials",
+            "5",
+            "--warmup",
+            "0",
             "--",
             "./work.sh",
         ],

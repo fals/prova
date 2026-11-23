@@ -47,6 +47,9 @@ pub struct Recognizers {
     pub summary_seen: bool,
     /// A line in which the framework says that no test ran.
     pub no_tests_line: Option<String>,
+    /// A line where the build tool says the build failed or a test process
+    /// crashed (Maven `BUILD FAILURE`, Surefire's crashed fork).
+    pub build_failed_line: Option<String>,
     /// `go test` package result lines in text output ("ok  \tpkg", "FAIL\tpkg").
     pub go_package_lines: u64,
     /// `=== RUN` lines: `go test -v`, which shows passing tests too.
@@ -149,6 +152,7 @@ impl Recognizers {
     fn totals(&mut self, line: &str) {
         let t = line.trim().trim_matches('=').trim();
         self.no_tests(t);
+        self.build_failed(t);
         if (t.starts_with("Failed!") || t.starts_with("Passed!")) && t.contains("Total:") {
             self.summary_seen = true;
             let field = |name: &str| {
@@ -241,6 +245,19 @@ impl Recognizers {
     }
 
     /// Framework messages that say no test ran at all.
+    fn build_failed(&mut self, t: &str) {
+        const PHRASES: &[&str] = &[
+            "BUILD FAILURE",                                            // maven
+            "Crashed tests:",                                           // surefire
+            "The forked VM terminated without properly saying goodbye", // surefire
+            "There was an error in the forked process",                 // surefire
+            "Build failures were ignored",                              // maven -fn
+        ];
+        if self.build_failed_line.is_none() && PHRASES.iter().any(|p| t.contains(p)) {
+            self.build_failed_line = Some(t.chars().take(200).collect());
+        }
+    }
+
     fn no_tests(&mut self, t: &str) {
         const PHRASES: &[&str] = &[
             "no tests ran",                              // pytest

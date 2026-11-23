@@ -225,7 +225,7 @@ fn context(f: &prova_core::engine::Failure) -> String {
     }
     if c.failing_now {
         // Whatever its past: it fails every time now (round 9).
-        parts.push("failing in each of its last 3 runs".to_owned());
+        parts.push("failing now: more failures in a row than its flakiness explains".to_owned());
     } else if c.flaky {
         parts.push("FLAKY".to_owned());
     } else if c.suite_passed_on_same_code {
@@ -254,7 +254,7 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         }
     );
     println!(
-        "{} finished runs, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s){}",
+        "{} runs with a result, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s){}",
         s.runs,
         s.failures,
         s.failure_rate * 100.0,
@@ -343,7 +343,14 @@ fn history_line(h: &serde_json::Value) -> String {
             p["code"].as_str().unwrap_or("")
         )),
         // "None of them passed" about zero runs reads as a verdict (round 9).
-        None if n > 0 => parts.push("none of them passed".into()),
+        None if n > 0 => parts.push(match h["passed_elsewhere"].as_object() {
+            Some(o) => format!(
+                "none of them passed, but this code passed in suite {} (run {})",
+                o["suite"].as_str().unwrap_or("?"),
+                o["run"].as_str().unwrap_or("?")
+            ),
+            None => "none of them passed".into(),
+        }),
         None => {}
     }
     let seen = h["same_failure_seen"].as_u64().unwrap_or(0);
@@ -389,10 +396,16 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
         ),
         WaitReason::Done if s.outcome == Some(Outcome::Passed) => "done".into(),
         WaitReason::Done if all_known_flaky(s) => {
+            // The test's own name, not a placeholder (round 10).
+            let t = s
+                .failures
+                .first()
+                .map(|f| clean(&f.test))
+                .unwrap_or_default();
             let confirm = if s.suite.starts_with("cmd:") {
-                "`prova history <test>`".to_owned()
+                format!("`prova history {t}`")
             } else {
-                format!("`prova run {} --select <test> --repeat 5`", s.suite)
+                format!("`prova run {} --select '{t}' --repeat 5`", s.suite)
             };
             format!(
                 "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
@@ -404,7 +417,9 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
 
 /// Every failure shown is a test history already knows as flaky.
 fn all_known_flaky(s: &Summary) -> bool {
-    !s.failures.is_empty()
+    // Not when the run failed for another reason too (a crash, round 10).
+    s.detail.is_none()
+        && !s.failures.is_empty()
         && s.failures.len() == s.counts.failed as usize + s.counts.errored as usize
         && s.failures.iter().all(|f| {
             f.context
@@ -745,11 +760,16 @@ pub fn protocol_line(p: &prova_core::experiment::Protocol) -> String {
         let names: Vec<&str> = p.specs.iter().map(|f| f.path.as_str()).collect();
         s.push_str(&format!("; spec {}", names.join(", ")));
     }
-    if p.scope.is_empty() {
+    if p.scope_only {
+        s.push_str(&format!(
+            "; candidates may change only {}",
+            p.scope.join(", ")
+        ));
+    } else if p.scope.is_empty() {
         s.push_str("; candidates may not change tests, benchmarks or build files");
     } else {
         s.push_str(&format!(
-            "; candidates may change only {}",
+            "; candidates may not change tests, benchmarks or build files, except {}",
             p.scope.join(", ")
         ));
     }

@@ -51,8 +51,10 @@ needs attention.
      its usual time, the suite's default, or the test runner's own
      warning). A stall ends any wait, including a plain `prova run -- ...`:
      cancel it.
-   - `failing in each of its last 3 runs`: a test once flaky that now fails
-     every time. Treat it as a real failure.
+   - `failing now: more failures in a row than its flakiness explains`: a
+     test once flaky that has failed too many times in a row for its usual
+     failure rate (3 for a rare flake, about 7 for a coin flip). Treat it as
+     a real failure.
    - `note: N known flaky test(s) passed this time`: the run is green, but
      those passes prove little. Say so when you report the suite green.
    - `last passed at tree:...`: the last code where it was green.
@@ -68,13 +70,17 @@ needs attention.
    - `PASSED (unverified: ...)` with `warning:` lines: the command
      succeeded but proved little: no test was observed, every test was
      skipped, tests from the last passing run did not run or were skipped
-     (`#[ignore]`, `skip`), a test reports (or always took) longer than the
-     whole run (echoed or stale results), or the output shows a crash
-     outside any test. `prova status` lists such a run as `passed?`. Do not report "tests pass" on an
+     (`#[ignore]`, `@Disabled`, `skip`; also when they passed in another
+     suite or command), a test reports (or always took) longer than the
+     whole run, the results equal an earlier run's to the millisecond
+     (stale files), the command used no CPU at all (results printed, not
+     run), another run in the same directory may have written the result
+     files, or the output shows a crash outside any test. Such a run is no
+     evidence about any test's history. `prova status` lists such a run as `passed?`. Do not report "tests pass" on an
      unverified run; read the warnings and make the suite run its tests.
      In `--json`, `verified` is `true` only for a clean pass.
-   - A run fails, even with exit 0, when the framework itself says it
-     failed or ran nothing (`detail:` names the reason), when a test never
+   - A run fails, even with exit 0, when the framework or build tool says it
+     failed (`BUILD FAILURE`, a crashed test JVM) or ran nothing (`detail:` names the reason), when a test never
      finished, or when the suite's tests vanished since its last pass.
 
    Exit codes: 0 passed, 1 test failure, 3 stall/slow/killed, 4 prova or

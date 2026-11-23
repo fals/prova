@@ -158,6 +158,17 @@ or `conftest.py`, that makes the oracle exit 0 without checking anything).
 An oracle that prints no test is judged by its exit code only, and the
 verdict says so: `holds on both arms by exit code only`.
 
+**Keep the candidate's code out of the oracle's process.** Code under test
+that runs in the same process as the checks can rewrite them (patch the test
+runner, flip results). The strongest oracle runs the implementation in a
+child process that prints its answers, and compares them in a process that
+never imports the candidate's code (a small driver per language, the frozen
+reference table, a diff).
+
+The oracle runs in a checkout whose tracked files are read-only: it must not
+rewrite them (`go generate` into the tree fails); generate into a temporary
+directory instead.
+
 Wrap it as one command, e.g. `make conformance`, and add a prova suite so
 `prova run conformance` works in the test loop:
 

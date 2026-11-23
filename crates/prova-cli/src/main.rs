@@ -280,7 +280,7 @@ struct ProtocolChange {
     specs: Vec<PathBuf>,
     #[arg(long)]
     oracle: Option<String>,
-    /// Replaces the paths a candidate may change (glob, repeatable).
+    /// Replaces the extra paths a candidate may change (glob, repeatable).
     #[arg(long = "change")]
     scope: Vec<String>,
 }
@@ -331,11 +331,15 @@ struct ProtocolArgs {
     /// A violating candidate is rejected without being measured.
     #[arg(long)]
     oracle: Option<String>,
-    /// Paths a candidate may change (glob: `*` within a directory, `**`
-    /// across; repeatable), e.g. `--change primes.go`. Without it, a
-    /// candidate may change anything but tests, benchmarks and build files.
+    /// Also allow a candidate to change these paths (glob: `*` within a
+    /// directory, `**` across; repeatable), e.g. `--change go.mod`. By
+    /// default a candidate may change anything but tests, benchmarks, build
+    /// and runner files.
     #[arg(long = "change")]
     scope: Vec<String>,
+    /// With --change: the candidate may change only those paths.
+    #[arg(long = "change-only", requires = "scope")]
+    scope_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -509,6 +513,7 @@ fn protocol_from(
         specs,
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
+        scope_only: a.scope_only,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -1028,6 +1033,16 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
         ExpCmd::Cancel { name } => {
             let id = experiment::latest_comparison(&store, &name)?
                 .ok_or_else(|| anyhow!("no comparison to cancel"))?;
+            // Nothing to stop when the latest comparison already ended
+            // (round 10 said it would stop "after the current trial").
+            let status = experiment::report(&store, &name)?
+                .comparison
+                .map(|c| c.status)
+                .unwrap_or_default();
+            if status != "running" {
+                println!("nothing to cancel: comparison {id} already {status}");
+                return Ok(exit::PASSED);
+            }
             experiment::request_cancel(&store, &id)?;
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)

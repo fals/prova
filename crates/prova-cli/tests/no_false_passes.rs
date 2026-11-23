@@ -25,8 +25,13 @@ fn prova(dir: &Path, args: &[&str]) -> Output {
         .expect("run prova")
 }
 
+/// A little real work before the output: prova does not believe test
+/// results printed by a command that used no CPU at all (round 10).
+const WORK: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; ";
+
 fn run_sh(dir: &Path, script: &str) -> (Option<i32>, serde_json::Value) {
-    let o = prova(dir, &["run", "--json", "--", "sh", "-c", script]);
+    let script = format!("{WORK}{script}");
+    let o = prova(dir, &["run", "--json", "--", "sh", "-c", &script]);
     let out = String::from_utf8_lossy(&o.stdout);
     let last = out
         .lines()
@@ -174,7 +179,7 @@ fn tests_that_disappear_are_noticed() {
     )
     .unwrap();
     let run = |script: &str| {
-        std::fs::write(d.join("t.sh"), script).unwrap();
+        std::fs::write(d.join("t.sh"), format!("{WORK}{script}")).unwrap();
         let o = prova(&d, &["run", "t", "--json"]);
         let out = String::from_utf8_lossy(&o.stdout).into_owned();
         serde_json::from_str::<serde_json::Value>(
@@ -199,5 +204,113 @@ fn tests_that_disappear_are_noticed() {
     assert_eq!(
         (lint["outcome"].as_str(), lint["verified"].as_bool()),
         (Some("passed"), Some(true))
+    );
+}
+
+/// Round 10: test results from a command that did no work were believed
+/// (a `--- PASS` line echoed in a Java project).
+#[test]
+fn results_printed_without_any_work_are_unverified() {
+    let d = workspace("nowork");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "echo 'test calc::divides ... ok'",
+        ],
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let s: serde_json::Value =
+        serde_json::from_str(out.lines().rev().find(|l| l.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(
+        s["warnings"].to_string().contains("used no CPU time"),
+        "{s}"
+    );
+}
+
+/// Round 10: `mvn -fn` (and a crashed fork) end with exit 0 but say the
+/// build failed.
+#[test]
+fn a_build_that_says_it_failed_fails() {
+    let d = workspace("buildfail");
+    let (code, s) = run_sh(
+        &d,
+        "echo 'test a ... ok'; echo '[INFO] BUILD FAILURE'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert!(
+        s["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the build says it failed"),
+        "{s}"
+    );
+}
+
+/// Round 10: a Go module with a `cmd/` package and no tests there failed a
+/// green `make test` ("[no test files]" read as "no test ran").
+#[test]
+fn a_package_without_tests_next_to_an_ok_one_is_not_a_failure() {
+    let d = workspace("nogotests");
+    let (code, s) = run_sh(
+        &d,
+        "printf 'ok  \\texample.com/calc\\t0.01s\\n?   \\texample.com/calc/cmd/x\\t[no test files]\\n'",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("passed"), Some(0)),
+        "{s}"
+    );
+    assert_eq!(s["verified"], false, "only the exit code backs it: {s}");
+}
+
+/// Round 10: stale result files refreshed with `touch`, in a run longer
+/// than any test: the same results, to the millisecond, read again.
+#[test]
+fn results_identical_to_an_earlier_run_are_unverified() {
+    let d = workspace("samefiles");
+    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"a\" time=\"0.013\"/><testcase classname=\"s\" name=\"b\" time=\"0.027\"/></testsuite>";
+    std::fs::write(d.join("j.xml"), junit).unwrap();
+    let script =
+        format!("{WORK}mkdir -p build/test-results; cp j.xml build/test-results/junit.xml");
+    let (_, first) = run_sh(&d, &script);
+    assert_eq!(first["verified"], true, "{first}");
+    let (_, again) = run_sh(&d, &script);
+    assert_eq!(again["verified"], false, "{again}");
+    assert!(
+        again["warnings"]
+            .to_string()
+            .contains("same results read again"),
+        "{again}"
+    );
+}
+
+/// Round 10: a run that failed only because a test needed a rerun said
+/// nothing about why.
+#[test]
+fn a_run_failed_by_a_rerun_pass_says_so() {
+    let d = workspace("rerun");
+    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"c\" time=\"0.002\"><flakyFailure message=\"race\"/></testcase></testsuite>";
+    std::fs::write(d.join("j.xml"), junit).unwrap();
+    let (_, s) = run_sh(
+        &d,
+        "mkdir -p build/test-results; cp j.xml build/test-results/junit.xml",
+    );
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert!(
+        s["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("passed on a rerun"),
+        "{s}"
     );
 }

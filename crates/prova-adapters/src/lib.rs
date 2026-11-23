@@ -204,8 +204,23 @@ impl Observer for Ladder {
                 "the framework reported {failed_reported} failed test(s) but prova recorded {failed_seen}: its summary is believed over its exit code"
             ));
         }
+        // The build itself says it failed or crashed, whatever the exit code
+        // (round 10: `mvn -fn`, a forked JVM that died, a crashed class).
+        if let Some(line) = &self.live.build_failed_line {
+            report
+                .contradictions
+                .push(format!("the build says it failed: {line:?}"));
+        }
         if seen == 0 && self.expect_tests {
             match &self.live.no_tests_line {
+                // One package without test files is normal when others
+                // printed `ok` (round 10: a `cmd/` dir failed a green run).
+                Some(line) if line.contains("[no test files]") && self.live.go_package_lines > 0 => {
+                    report.warnings.push(format!(
+                        "go reported {} package(s) as ok but showed no test (no -v or -json): only the exit code backs this pass",
+                        self.live.go_package_lines
+                    ))
+                }
                 Some(line) => report
                     .contradictions
                     .push(format!("the framework says no test ran: {line:?}")),

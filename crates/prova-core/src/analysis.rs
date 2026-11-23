@@ -97,7 +97,11 @@ pub fn test_runs_with(
              WHERE r.id IN (
                  SELECT a3.run_id FROM attempts a3 JOIN runs r3 ON r3.id = a3.run_id
                  WHERE a3.test_id IN (SELECT id FROM same)
-                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome <> 'errored')))
+                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome <> 'errored')
+                   -- an unverified run (stale, echoed or impossible results)
+                   -- is no evidence about any test (round 10: it made a real
+                   -- bug look flaky)
+                   AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
@@ -204,11 +208,27 @@ fn stats_with(
     // A test that failed its last 3 runs in a row is failing now, whatever
     // its past: "known flaky" must not hide a real break (round 9: an
     // environment-dependent test, once flipped, was dismissed for good).
-    let failing_now = counted.len() >= 3
-        && counted
-            .iter()
-            .take(3)
-            .all(|r| r.outcome.is_failure() && !r.passed_on_retry);
+    //
+    // How long a streak must be depends on how often the test fails: a coin
+    // flip fails 3 times in a row 1 run in 8 (round 10). The streak must be
+    // one the test's own failure rate makes unlikely by chance (under 1%).
+    let streak = counted
+        .iter()
+        .take_while(|r| r.outcome.is_failure() && !r.passed_on_retry)
+        .count();
+    // Its failure rate before the streak: the streak must not explain itself.
+    let before = &counted[streak.min(counted.len())..];
+    let rate = if before.is_empty() {
+        0.0
+    } else {
+        before.iter().filter(|r| r.outcome.is_failure()).count() as f64 / before.len() as f64
+    };
+    let needed = if rate <= 0.0 || rate >= 1.0 {
+        3
+    } else {
+        ((0.01f64).ln() / rate.ln()).ceil().max(3.0) as usize
+    };
+    let failing_now = streak >= needed;
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
