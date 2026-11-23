@@ -36,7 +36,7 @@ needs attention.
      baseline.
    - `[new failure]`: the test passed before and fails now. Likely your
      change, unless the next hint says otherwise.
-   - `[has not passed yet]`, `[failed Nx before, with another message]`:
+   - `[has not passed yet]`, `[failed Nx before]`:
      it was already failing before; not caused by your change alone.
    - `UNFINISHED`: the test was still running when the run ended (cancel,
      kill); it says nothing about the code. `ERROR`: the test errored
@@ -44,7 +44,11 @@ needs attention.
    - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
      same code both passed and failed. Do not chase it as your bug;
      confirm with `prova history <test>` and report it.
-   - `[seen 3x before]`: pre-existing failure.
+   - `[run cancelled or aborted: no evidence about the code]`: the run did
+     not finish (cancel, `--kill-after`, a dead supervisor); its failures
+     are often the cancel itself and count nowhere.
+   - `SLOW`: over the test's budget, 3x its usual time (or the suite's size
+     default when it has no history yet). A stall ends any wait: cancel.
    - `last passed at tree:...`: the last code where it was green.
    - `note:` lines say what prova could not see (e.g. quiet output hides
      passing tests). Take them seriously: flaky detection depends on it.
@@ -73,7 +77,10 @@ needs attention.
    `prova cancel <run>`. On `SLOW` or `STALLED`, decide: cancel, or keep
    waiting if expected.
 
-4. Rerun only what failed: `prova run <suite> --select <test name>`.
+4. Rerun only what failed: `prova run <suite> --select <test name>`. To
+   check whether a test is flaky, run it several times in one command:
+   `prova run <suite> --select <test> --repeat 5` prints each test's tally
+   (`FLAKY ...: failed 2 of 5`).
 
 5. When green, run the whole suite once more. Before calling a failure
    new or flaky, check `prova history <test>`.

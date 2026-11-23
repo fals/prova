@@ -45,6 +45,10 @@ const CACHES: &[&str] = &[
     ":(exclude,glob)**/.pytest_cache/**",
     ":(exclude,glob)**/.mypy_cache/**",
     ":(exclude,glob)**/.ruff_cache/**",
+    // prova's own config and folder are not the code under test: adding
+    // prova.toml must not make the same code look like a new version.
+    ":(exclude,top)prova.toml",
+    ":(exclude,top,glob).prova/**",
 ];
 
 /// `tree:<12>` for a clean checkout, `tree:<12>+dirty:<12>` with uncommitted

@@ -121,3 +121,25 @@ select = "echo {filter}"
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
 }
+
+/// Round 6: an anchored filter (`^TestAdd$`, as Go wants it) names the
+/// test, not prova's full name; verify must accept it.
+#[test]
+fn verify_accepts_an_anchored_filter() {
+    let d = std::env::temp_dir().join(format!("prova-verify-anchor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"echo 'test pkg::a ... ok'; echo 'test pkg::b ... ok'\"\nselect = \"echo 'test pkg::b ... ok'\"\n",
+    )
+    .unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_prova"))
+        .args(["adopt", "--verify", "t", "--filter", "^b$"])
+        .current_dir(&d)
+        .env("PROVA_HOME", d.join("home"))
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.starts_with("VERIFIED"), "{out}");
+}

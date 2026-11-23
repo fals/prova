@@ -136,6 +136,10 @@ the specification. Pick the strongest you can afford:
 
    Each state of `reference_0.itf.json` holds one `(n, answer)` pair
    (integers as `{"#bigint": "4"}`); the project's test compares them.
+   The simulator is slow (a few dozen states per second for a naive
+   reference): keep the table to the hundreds of inputs where edge cases
+   live, and check larger inputs in the test against an independent,
+   obviously-right implementation.
 3. **Property tests** derived from the invariants (proptest, Hypothesis,
    fast-check, jqwik, FsCheck, Go's `testing/quick`).
 4. **Proofs** (Lean): `lake build` is the oracle.

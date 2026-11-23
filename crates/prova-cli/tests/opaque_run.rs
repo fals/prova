@@ -469,3 +469,44 @@ fn a_long_wait_shows_failures_as_they_happen() {
     assert!(err.contains("FAIL a"), "the failure, before the end: {err}");
     assert!(stdout(&o).contains("FAILED") && !stdout(&o).contains("waiting up to"));
 }
+
+/// Round 6: a stalled run ends a wait for the result at once, with the
+/// advice to cancel, instead of waiting out the budget.
+#[test]
+fn a_stall_ends_a_wait_for_the_result() {
+    let d = workspace("stallend");
+    let started = std::time::Instant::now();
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--stall-after",
+            "1s",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "returned on the stall"
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("STALLED") && stdout(&o).contains("prova cancel"),
+        "{}",
+        stdout(&o)
+    );
+    let id = stdout(&o)
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    prova(&d, &["cancel", &id]);
+}

@@ -92,10 +92,25 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         }
         _ => String::new(),
     };
+    // Errored includes tests cut off by the end of the run: say how many.
+    let unfinished = s
+        .failures
+        .iter()
+        .filter(|f| {
+            f.message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("test did not finish"))
+        })
+        .count();
+    let errored = if unfinished > 0 {
+        format!("{} errored ({unfinished} unfinished)", c.errored)
+    } else {
+        format!("{} errored", c.errored)
+    };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {} errored, {} skipped{counted}",
-            c.passed, c.failed, c.errored, c.skipped
+            "tests: {} passed, {} failed, {errored}, {} skipped{counted}",
+            c.passed, c.failed, c.skipped
         );
     }
     for f in &s.failures {
@@ -128,7 +143,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     for t in &s.slow {
         println!(
-            "  SLOW {}: running {} (budget {})",
+            "  SLOW {}: running {} (budget {}: 3x its usual time, else the suite's size default)",
             clean(&t.test),
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
             format_duration(std::time::Duration::from_millis(t.budget_ms))
@@ -165,17 +180,17 @@ fn context(f: &prova_core::engine::Failure) -> String {
     let mut parts = Vec::new();
     // A test known to be flaky is not a "new failure", whatever its message;
     // a test with no earlier result anywhere is neither new nor old yet.
-    // "New" needs an earlier pass; an earlier failure with another message
-    // is still an earlier failure (round 5).
+    // A cancelled or aborted run proves nothing about the code (round 6).
+    if c.run_cut_short {
+        return " [run cancelled or aborted: no evidence about the code]".to_owned();
+    }
+    // "New" needs an earlier pass. Earlier failures are counted whatever
+    // their message: the same failure is often captured with more or less
+    // detail by different runners (round 6).
     if c.first_seen {
         parts.push("first time seen: no history yet".to_owned());
-    } else if c.seen_before > 0 {
-        parts.push(format!("seen {}x before", c.seen_before));
     } else if c.failed_before > 0 {
-        parts.push(format!(
-            "failed {}x before, with another message",
-            c.failed_before
-        ));
+        parts.push(format!("failed {}x before", c.failed_before));
     } else if c.passed_before && !c.flaky {
         parts.push("new failure".to_owned());
     } else if !c.flaky {
@@ -338,7 +353,11 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
         WaitReason::Slow => {
             for t in &s.slow {
                 if reported.insert(format!("slow:{}", t.test)) {
-                    eprintln!("SLOW {} (over {}ms budget)", clean(&t.test), t.budget_ms);
+                    eprintln!(
+                        "SLOW {} (over its {} budget: 3x its usual time, else the suite's size default)",
+                        clean(&t.test),
+                        format_duration(std::time::Duration::from_millis(t.budget_ms))
+                    );
                 }
             }
         }
@@ -448,8 +467,10 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
                     + p["outliers_candidate"].as_array().map_or(0, Vec::len);
                 if outl > 0 {
                     println!(
-                        "outliers flagged (kept): baseline {}, candidate {}",
+                        "outliers flagged (kept): {} {}, {} {}",
+                        c.baseline,
                         p["outliers_baseline"].as_array().map_or(0, Vec::len),
+                        c.candidate,
                         p["outliers_candidate"].as_array().map_or(0, Vec::len)
                     );
                 }
@@ -533,6 +554,7 @@ mod label_tests {
                 seen_before,
                 failed_before: seen_before,
                 passed_before: true,
+                run_cut_short: false,
                 flaky,
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
@@ -545,7 +567,7 @@ mod label_tests {
     fn a_flaky_test_is_not_a_new_failure() {
         assert_eq!(label(0, true), " [FLAKY]");
         assert_eq!(label(0, false), " [new failure]");
-        assert_eq!(label(2, true), " [seen 2x before, FLAKY]");
+        assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
             test: "t".into(),
             outcome: prova_core::model::Outcome::Failed,
@@ -553,6 +575,7 @@ mod label_tests {
             context: Some(FailureContext {
                 failed_before: 0,
                 passed_before: false,
+                run_cut_short: false,
                 first_seen: true,
                 seen_before: 0,
                 flaky: false,
@@ -571,6 +594,7 @@ mod label_tests {
                 seen_before: 0,
                 failed_before: 0,
                 passed_before: false,
+                run_cut_short: false,
                 flaky: false,
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
