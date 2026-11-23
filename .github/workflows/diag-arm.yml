@@ -21,9 +21,16 @@ jobs:
           systemctl show 'actions.runner*' -p TasksMax -p TasksCurrent 2>&1 | head
       - run: cargo build -q -p prova-cli --tests
       - name: The test, watched
+        shell: bash {0}
         run: |
+          set -x
           cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
-          ( for i in $(seq 1 90); do echo "t=$i pids=$(cat $cg/pids.current 2>/dev/null)/$(cat $cg/pids.max 2>/dev/null) procs=$(ps -e --no-headers | wc -l) load=$(cut -d' ' -f1 /proc/loadavg)"; sleep 1; done ) &
-          b=$(ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$')
-          timeout 90 target/debug/deps/$b a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture; echo "test rc=$?"
-          ps -eo pid,pgid,stat,etime,args | grep -v "ps -eo" | tail -15
+          ( for i in $(seq 1 60); do echo "t=$i pids=$(cat $cg/pids.current 2>/dev/null) procs=$(ps -e --no-headers | wc -l)"; sleep 1; done ) &
+          ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$'
+          b=$(ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$' | head -1)
+          echo "pgid of this shell: $(ps -o pgid= -p $$) sid: $(ps -o sid= -p $$)"
+          timeout 90 target/debug/deps/$b a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture > out.txt 2>&1
+          echo "test rc=$?"
+          cat out.txt
+          ps -eo pid,pgid,sid,stat,etime,args | tail -25
+          exit 0
