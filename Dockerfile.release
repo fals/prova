@@ -1,0 +1,7 @@
+# The release image: the static prova binary built by the release workflow
+# for each platform, nothing else (ADR 0010). Copy it into your own image:
+#   COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
+FROM scratch
+ARG TARGETARCH
+COPY ${TARGETARCH}/prova /prova
+ENTRYPOINT ["/prova"]

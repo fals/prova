@@ -49,3 +49,33 @@ jobs:
           scripts/spec-traces.sh "$RUNNER_TEMP/exp" 60 "" experiment
           PROVA_TRACE_DIR="$RUNNER_TEMP/run" cargo test -p prova-core --test spec_replay
           PROVA_TRACE_DIR_EXP="$RUNNER_TEMP/exp" cargo test -p prova-core --test spec_replay_experiment
+
+  # The release path, on every change: a static Linux binary, its package,
+  # the release image and the install script (tags publish them).
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p prova-cli --target x86_64-unknown-linux-musl
+      - name: Package as the release does
+        run: |
+          name=prova-x86_64-unknown-linux-musl
+          mkdir -p dist "$name" image/amd64
+          cp target/x86_64-unknown-linux-musl/release/prova README.md LICENSE "$name"/
+          tar czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cp "$name/prova" image/amd64/
+      - name: Install script against the package
+        run: |
+          PROVA_BASE_URL="file://$PWD/dist" PROVA_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/prova" --version
+      - name: Release image
+        run: |
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 -t prova:release image
+          docker run --rm prova:release --version

@@ -60,8 +60,10 @@ Rust, Go, Python, TypeScript, Java and C# are covered end to end by real
 
 ## Install
 
+Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):
+
 ```sh
-cargo install --git https://github.com/fals/prova prova-cli
+curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 ```
 
 In a container image, copy the static binary next to your toolchain:
@@ -70,8 +72,10 @@ In a container image, copy the static binary next to your toolchain:
 COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
 ```
 
-Release binaries and the image are produced by the release workflow
-(Linux musl x86_64/aarch64, macOS) once releases are published.
+Release tarballs with checksums are on the
+[releases page](https://github.com/fals/prova/releases); from source:
+`cargo install --git https://github.com/fals/prova prova-cli`. More in
+[Getting started](docs/getting-started.md#install).
 
 ## Quickstart
 

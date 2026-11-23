@@ -2,17 +2,33 @@
 
 ## Install
 
-One static binary, no daemon. Pick one:
+One static binary, no daemon. On Linux (x86_64, aarch64) or macOS (Apple
+silicon, Intel):
 
-```
-cargo install --git https://github.com/fals/prova prova-cli      # from source
-COPY --from=ghcr.io/fals/prova:<version> /prova /usr/local/bin/prova   # in a Dockerfile
+```sh
+curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 ```
 
-Release tarballs (Linux musl x86_64/aarch64, macOS) are attached to each
-GitHub release with SHA-256 checksums. The container image holds only the
-binary; copy it into the image where your tests run (devcontainer, CI,
-agent sandbox). prova must run where the project's toolchain is.
+The script downloads the latest release for your platform, checks its
+SHA-256 checksum and installs `prova` into `~/.local/bin`
+(`PROVA_INSTALL_DIR` to change it, `PROVA_VERSION=v0.1.0` to pin a version).
+The tarballs and checksums are also attached to each
+[GitHub release](https://github.com/fals/prova/releases).
+
+In a container, copy the binary from the image into the image where your
+tests run (devcontainer, CI, agent sandbox); prova must run where the
+project's toolchain is:
+
+```dockerfile
+COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
+```
+
+From source: `cargo install --git https://github.com/fals/prova prova-cli`.
+
+Experiments isolate each arm in a sandbox when
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
+installed; without it they still run, and every verdict says the arms were
+not isolated.
 
 ## Five minutes on an existing project
 
