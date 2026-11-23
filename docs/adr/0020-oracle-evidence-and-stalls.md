@@ -1,6 +1,6 @@
 # 0020: The oracle shows its work; a stall ends every wait
 
-Status: Proposed (2026-11-23). Amends [0015](0015-spec-first-experiments.md) (what makes an oracle hold), [0019](0019-one-command-per-intent.md) (which waits a stall ends) and [0018](0018-honest-history-and-live-nextest.md) (tests killed by a cancel).
+Status: Accepted (2026-11-23). Amends [0015](0015-spec-first-experiments.md) (what makes an oracle hold), [0019](0019-one-command-per-intent.md) (which waits a stall ends) and [0018](0018-honest-history-and-live-nextest.md) (tests killed by a cancel).
 
 ## Context
 
