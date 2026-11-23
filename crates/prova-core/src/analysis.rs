@@ -101,7 +101,8 @@ pub fn test_runs_with(
                    -- an unverified run (stale, echoed or impossible results)
                    -- is no evidence about any test (round 10: it made a real
                    -- bug look flaky)
-                   AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'))))
+                   AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
+                                                  AND w.payload LIKE '%; no evidence about the tests%'))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)

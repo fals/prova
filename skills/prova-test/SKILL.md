@@ -51,6 +51,8 @@ needs attention.
      its usual time, the suite's default, or the test runner's own
      warning). A stall ends any wait, including a plain `prova run -- ...`:
      cancel it.
+   - `failed, then passed on a retry`: the run passes (a test's last
+     attempt decides) but unverified: the test is flaky.
    - `failing now: more failures in a row than its flakiness explains`: a
      test once flaky that has failed too many times in a row for its usual
      failure rate (3 for a rare flake, about 7 for a coin flip). Treat it as

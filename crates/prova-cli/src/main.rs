@@ -1634,6 +1634,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         } => {
             let (store, _, _) = open_here()?;
             let found = analysis::find_tests(&store, &test, suite.as_deref())?;
+            // Exact names win over partial ones (round 10: 16 matches for a
+            // name that is exact in every suite, next to an old renamed one).
+            let found: Vec<_> = {
+                let exact: Vec<_> = found.iter().filter(|t| t.1 == test).cloned().collect();
+                if exact.is_empty() { found } else { exact }
+            };
             let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
             // Same name in several suites: take the one that ran most recently.
             let displays: std::collections::BTreeSet<&str> =

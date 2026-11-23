@@ -278,7 +278,7 @@ fn a_package_without_tests_next_to_an_ok_one_is_not_a_failure() {
 #[test]
 fn results_identical_to_an_earlier_run_are_unverified() {
     let d = workspace("samefiles");
-    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"a\" time=\"0.013\"/><testcase classname=\"s\" name=\"b\" time=\"0.027\"/></testsuite>";
+    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"a\" time=\"0.130\"/><testcase classname=\"s\" name=\"b\" time=\"0.270\"/></testsuite>";
     std::fs::write(d.join("j.xml"), junit).unwrap();
     let script =
         format!("{WORK}mkdir -p build/test-results; cp j.xml build/test-results/junit.xml");
@@ -294,23 +294,25 @@ fn results_identical_to_an_earlier_run_are_unverified() {
     );
 }
 
-/// Round 10: a run that failed only because a test needed a rerun said
-/// nothing about why.
+/// ADR 0024: a test that passed only on a retry: the run passes (its last
+/// attempt decides) but unverified, with the reason.
 #[test]
-fn a_run_failed_by_a_rerun_pass_says_so() {
+fn a_retry_pass_is_an_unverified_pass() {
     let d = workspace("rerun");
     let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"c\" time=\"0.002\"><flakyFailure message=\"race\"/></testcase></testsuite>";
     std::fs::write(d.join("j.xml"), junit).unwrap();
-    let (_, s) = run_sh(
+    let (code, s) = run_sh(
         &d,
         "mkdir -p build/test-results; cp j.xml build/test-results/junit.xml",
     );
-    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("passed"), Some(0)),
+        "{s}"
+    );
+    assert_eq!(s["verified"], false, "{s}");
     assert!(
-        s["detail"]
-            .as_str()
-            .unwrap_or("")
-            .contains("passed on a rerun"),
+        s["warnings"].to_string().contains("passed on a retry"),
         "{s}"
     );
 }

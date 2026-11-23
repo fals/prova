@@ -233,7 +233,16 @@ impl Comparison {
         if !open || !specified || self.base + self.cand >= 2 * self.max_trials {
             return None;
         }
-        Some(if self.base <= self.cand {
+        // ABBA (spec/experiment.qnt, ADR 0024): even pairs start with the
+        // baseline, odd ones with the candidate, so a drift within a pair
+        // (boost clocks, warm caches) favours neither arm (round 10: an
+        // unchanged candidate was accepted once under load).
+        let baseline = if self.base == self.cand {
+            self.base.is_multiple_of(2)
+        } else {
+            self.base < self.cand
+        };
+        Some(if baseline {
             Arm::Baseline
         } else {
             Arm::Candidate
@@ -968,9 +977,8 @@ fn run_trial(
     count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
-    let mut cmd = Command::new(&p.command[0]);
-    cmd.args(&p.command[1..])
-        .current_dir(dir)
+    let mut cmd = sandboxed(dir, &p.command[0], &p.command[1..]);
+    cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1251,9 +1259,7 @@ fn work_comparison(
     if let Some(setup) = &p.setup {
         for (i, (arm, _)) in arms.iter().enumerate() {
             let log = private_file(&logs.join(format!("setup-{}.log", arm.as_str())))?;
-            let ok = Command::new("sh")
-                .arg("-c")
-                .arg(setup)
+            let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()])
                 .env_remove("PROVA_HOME")
                 .env("PYTHONNOUSERSITE", "1")
                 .env("PYTHONPYCACHEPREFIX", pycache_dir(&dirs[i]))
@@ -1471,6 +1477,12 @@ fn work_comparison(
         }
         let verdict = c.decide(outcome).unwrap_or(Verdict::Invalid);
         let mut result = result;
+        // Say how isolated the arms were (ADR 0024).
+        result["sandbox"] = serde_json::json!(if sandbox_available() {
+            "bubblewrap: each arm could write only its own checkout, its private state and the shared toolchain caches"
+        } else {
+            "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files"
+        });
         // Say that the specification was checked, not only when it failed
         // (ADR 0018): both arms satisfied it before any trial ran.
         if let Some(oracle) = &p.oracle {
@@ -1869,12 +1881,87 @@ pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String
     ))
 }
 
+/// Whether trials can run in a bubblewrap sandbox here (ADR 0024).
+pub fn sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && Command::new("bwrap")
+                .args([
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--unshare-pid",
+                    "true",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+    })
+}
+
+/// A command for one arm, sandboxed when bubblewrap works (ADR 0024): the
+/// whole filesystem read-only except the arm's own checkout, its private
+/// state (caches, bytecode), a private /tmp and the toolchain caches builds
+/// must write; its own process namespace, which dies with prova. The other
+/// arm's checkout, prova's store and the user's files cannot be changed.
+fn sandboxed(dir: &Path, program: &str, args: &[String]) -> Command {
+    if !sandbox_available() {
+        let mut c = Command::new(program);
+        c.args(args);
+        return c;
+    }
+    let state = pycache_dir(dir);
+    let _ = std::fs::create_dir_all(&state);
+    let mut c = Command::new("bwrap");
+    c.args([
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+    ]);
+    c.arg("--bind").arg(dir).arg(dir);
+    c.arg("--bind").arg(&state).arg(&state);
+    // Toolchain caches a build writes (dependency locks, compiled objects):
+    // shared between arms, a remaining channel (ADR 0024).
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for sub in [
+            ".cache", ".cargo", ".m2", ".nuget", ".npm", "go", ".gradle", ".dotnet",
+        ] {
+            let p = home.join(sub);
+            if p.is_dir() {
+                c.arg("--bind").arg(&p).arg(&p);
+            }
+        }
+    }
+    c.args(["--unshare-pid", "--die-with-parent", "--new-session", "--"]);
+    c.arg(program).args(args);
+    c.env("TMPDIR", "/tmp");
+    c
+}
+
 /// A private bytecode cache per checkout, outside both: Python reads
 /// `.pyc` files only from there, so one planted in a checkout's ignored
 /// `__pycache__` is never used (round 10).
 fn pycache_dir(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
-    std::env::temp_dir().join(format!("prova-pycache-{}", &key[..16]))
+    // Outside /tmp: the sandbox gives each command a private /tmp.
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("prova-arm-{}", &key[..16]))
 }
 
 fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
@@ -1968,9 +2055,7 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    let ok = Command::new("sh")
-        .arg("-c")
-        .arg(oracle)
+    let ok = sandboxed(dir, "sh", &["-c".to_owned(), oracle.clone()])
         .env_remove("PROVA_HOME")
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
@@ -2465,9 +2550,10 @@ mod tests {
         );
         assert!(c.check_spec(Arm::Baseline, true) && c.check_spec(Arm::Candidate, true));
         let arms: Vec<Arm> = (0..4).map(|_| c.trial("m").unwrap()).collect();
+        // ABBA: pairs alternate which arm goes first (ADR 0024).
         assert_eq!(
             arms,
-            vec![Arm::Baseline, Arm::Candidate, Arm::Baseline, Arm::Candidate]
+            vec![Arm::Baseline, Arm::Candidate, Arm::Candidate, Arm::Baseline]
         );
         assert!(!c.can_change_protocol());
         assert_eq!(c.decide(Verdict::Accept), None, "peeking refused");

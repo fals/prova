@@ -31,7 +31,10 @@ fn json(o: &Output) -> serde_json::Value {
 
 /// A fake test suite: writes JUnit XML whose `b` test outcome comes from
 /// the file `state` (pass or fail), so one command can pass and fail.
+// A little real work first: results from a command that used no CPU are no
+// evidence (round 10).
 const SCRIPT: &str = r#"
+b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done
 mkdir -p build/test-results
 if [ "$(cat state)" = pass ]; then B='<testcase classname="suite" name="b" time="0.010"/>'; code=0
 else B='<testcase classname="suite" name="b" time="0.010"><failure message="b broke at 0x1f">trace</failure></testcase>'; code=1; fi

@@ -206,6 +206,15 @@ impl Observer for Ladder {
         }
         // The build itself says it failed or crashed, whatever the exit code
         // (round 10: `mvn -fn`, a forked JVM that died, a crashed class).
+        // nextest counts a test that exited 0 early as passed; its captured
+        // output shows libtest never reported it (round 9).
+        report.not_passed = self.live.harness_died.clone();
+        if let Some(t) = self.live.harness_died.first() {
+            report.contradictions.push(format!(
+                "{} test(s) passed by exit code but their test harness never reported a result (a test that exits the process early?), e.g. {t}",
+                self.live.harness_died.len()
+            ));
+        }
         if let Some(line) = &self.live.build_failed_line {
             report
                 .contradictions

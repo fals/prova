@@ -133,6 +133,11 @@ improvement loop does not get lucky by trying many ideas.
   "..."` sets the best back (recorded in the decision log), so later
   candidates are not compared against it.
 
+Where bubblewrap is installed, each arm runs sandboxed (`sandbox:` line in
+the verdict): it can write only its own checkout, a private state directory,
+a private `/tmp` and the shared toolchain caches. Without it, the verdict says
+the arms were not isolated. Trials run in ABBA order.
+
 prova guards the verdict against changed tests and benchmarks, a skipped
 oracle, forged extra lines, leaked processes, code that rewrites tracked
 files at run time (both checkouts are read-only and checked after every

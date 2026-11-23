@@ -568,6 +568,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
             }
+            if let Some(sb) = res["sandbox"].as_str() {
+                println!("sandbox: {}", clean(sb));
+            }
             let p = &res["primary"];
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {

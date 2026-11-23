@@ -60,6 +60,12 @@ pub struct Recognizers {
     pub vitest_stream: bool,
     /// nextest: a FAIL line held while its captured output follows.
     nextest_pending: Option<(TestKey, Option<u64>, Vec<String>)>,
+    /// A passing test's captured output (`--success-output final`): did
+    /// libtest start, and did it report a result?
+    nextest_pass_output: Option<(String, bool, bool)>,
+    /// Tests nextest passed whose harness never reported a result: the
+    /// test process exited early with code 0 (round 9: `exit(0)`).
+    pub harness_died: Vec<String>,
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
@@ -287,6 +293,21 @@ impl Recognizers {
         // (its echoed libtest summary must not count as the run's totals).
         // JSON events (nextest's own, at the end of each binary) are never
         // part of a test's captured output.
+        // A passing test's own output: libtest says "running 1 test" first
+        // and "test result:" last; an `exit(0)` inside the test skips it.
+        if let Some((_, running, result)) = self.nextest_pass_output.as_mut()
+            && nextest_status(line).is_none()
+            && !line.starts_with('{')
+        {
+            let t = line.trim();
+            if t.starts_with("running 1 test") {
+                *running = true;
+            } else if t.starts_with("test result:") {
+                *result = true;
+            } else if t.starts_with("Summary [") {
+                self.close_pass_output();
+            }
+        }
         if self.nextest_pending.is_some() && !line.starts_with('{') {
             if nextest_status(line).is_none()
                 && !line.trim_start().starts_with("────")
@@ -911,10 +932,20 @@ impl Recognizers {
 
     /// nextest's human status lines, printed live (ADR 0018):
     /// `PASS [   0.004s] (1/5) calc tests::adds`, `SLOW [> 60.000s] ...`.
+    fn close_pass_output(&mut self) {
+        if let Some((name, running, result)) = self.nextest_pass_output.take()
+            && running
+            && !result
+        {
+            self.harness_died.push(name);
+        }
+    }
+
     fn nextest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let Some((status, dur, binary, test)) = nextest_status(line) else {
             return false;
         };
+        self.close_pass_output();
         let (path, name) = split_rust_path(test);
         let key = TestKey {
             file: Some(nextest_binary(binary)),
@@ -941,6 +972,7 @@ impl Recognizers {
                 }
             }
             "PASS" | "LEAK" => {
+                self.nextest_pass_output = Some((key.display(), false, false));
                 self.finished(key, Outcome::Passed, ms, None, Level::Recognized, out)
             }
             "SKIP" => self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out),
@@ -994,6 +1026,7 @@ impl Recognizers {
 
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
+        self.close_pass_output();
         self.close_libtest_block();
         let mut out = Vec::new();
         self.flush_nextest(&mut out);
@@ -1852,5 +1885,28 @@ mod passed_tests_tests {
             ev.iter().any(|e| matches!(e, EventKind::TestFinished { test, outcome: Outcome::Failed, .. } if test.name.contains("div (line 7)"))),
             "{ev:?}"
         );
+    }
+
+    /// Round 9: a test calling `exit(0)` passed under nextest; with its
+    /// captured output shown, libtest never reports its result.
+    #[test]
+    fn a_passing_test_whose_harness_never_reported_is_caught() {
+        use super::Recognizers;
+        let mut r = Recognizers::default();
+        for l in [
+            "        PASS [   0.003s] (1/2) calc tests::adds",
+            "  output ───",
+            "    running 1 test",
+            "    test tests::adds ... ok",
+            "    test result: ok. 1 passed; 0 failed; 0 ignored",
+            "        PASS [   0.004s] (2/2) calc tests::divides",
+            "  output ───",
+            "    running 1 test",
+            "     Summary [   0.004s] 2 tests run: 2 passed",
+        ] {
+            r.line(l);
+        }
+        r.finish();
+        assert_eq!(r.harness_died, vec!["tests::divides".to_owned()]);
     }
 }

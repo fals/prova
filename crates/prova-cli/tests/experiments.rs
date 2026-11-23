@@ -600,7 +600,7 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ -f leak ] && setsid sleep 30 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\n[ -f leak ] && setsid sleep 37.125 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -629,12 +629,32 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::write(d.join("leak"), "").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_eq!(r["comparison"]["status"], "failed", "{r}");
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("left process") && reason.contains("sleep"),
-        "{reason}"
-    );
+    let sandboxed = r["comparison"]["result"]["sandbox"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("bubblewrap"));
+    if sandboxed {
+        // ADR 0024: the process dies with the trial's sandbox; nothing runs on.
+        // The namespace is torn down asynchronously: wait (bounded) for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let left = loop {
+            let o = Command::new("pgrep")
+                .args(["-fx", "sleep 37.125"])
+                .output()
+                .unwrap();
+            if o.stdout.is_empty() || std::time::Instant::now() > deadline {
+                break o.stdout;
+            }
+            std::thread::yield_now();
+        };
+        assert!(left.is_empty(), "left running: {r}");
+    } else {
+        assert_eq!(r["comparison"]["status"], "failed", "{r}");
+        let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("left process") && reason.contains("sleep"),
+            "{reason}"
+        );
+    }
 }
 
 /// Round 8: a spec edited but not committed was frozen as edited, and every
