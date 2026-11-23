@@ -1,8 +1,8 @@
 //! Process-group observation and control (ADR 0004, 0013 section 3).
 //!
 //! The process under test leads its own process group. Activity of the
-//! whole group (CPU time, process set) is sampled from `/proc` on Linux;
-//! elsewhere only output counts as activity.
+//! whole group (CPU time, process set) is sampled from `/proc` on Linux
+//! and from `ps` elsewhere (macOS).
 
 use std::collections::BTreeSet;
 
@@ -44,23 +44,63 @@ pub fn sample_group(pgid: u32) -> GroupSample {
     s
 }
 
+/// Without `/proc` (macOS), `ps` lists every process with its group, state
+/// and CPU time; a failed `ps` gives an empty sample (only output then
+/// counts as activity).
 #[cfg(not(target_os = "linux"))]
-pub fn sample_group(_pgid: u32) -> GroupSample {
-    GroupSample::default()
+pub fn sample_group(pgid: u32) -> GroupSample {
+    ps(&[
+        "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "time=",
+    ])
+    .map(|out| parse_ps(&out, pgid))
+    .unwrap_or_default()
+}
+
+/// Whether this OS gives machine-wide CPU counters and orphan reaping:
+/// without them, experiments cannot see load from other processes, arms
+/// stopped from outside, or processes a trial left behind.
+pub const MACHINE_COUNTERS: bool = cfg!(target_os = "linux");
+
+/// Members of group `pgid` in `ps -o pid=,pgid=,stat=,time=` output; CPU
+/// time (`[[H:]M:]S.cc`) in ticks of 10 ms, as on Linux. Zombies are out.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps(out: &str, pgid: u32) -> GroupSample {
+    let mut s = GroupSample::default();
+    for line in out.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [pid, group, stat, time] = f[..] else {
+            continue;
+        };
+        let (Ok(pid), Ok(group)) = (pid.parse::<u32>(), group.parse::<u32>()) else {
+            continue;
+        };
+        if group != pgid || stat.starts_with('Z') {
+            continue;
+        }
+        s.cpu_ticks += ps_ticks(time).unwrap_or(0);
+        s.pids.insert(pid);
+    }
+    s
 }
 
 /// Returns (pgrp, utime + stime, is_zombie) from `/proc/<pid>/stat`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_stat(stat: &str) -> Option<(u32, u64, bool)> {
     // The command name may contain spaces and parentheses; fields resume
     // after the last ')'.
     let rest = &stat[stat.rfind(')')? + 2..];
     let f: Vec<&str> = rest.split_whitespace().collect();
-    // rest[0] = state (field 3), pgrp = field 5, utime = 14, stime = 15
+    // rest[0] = state (field 3), pgrp = field 5, utime = 14, stime = 15,
+    // cutime = 16, cstime = 17: the CPU of children a member already
+    // reaped counts too (a shell loop of short-lived commands looked idle
+    // and stalled, because each command was gone before a sample saw it).
     let state = f.first()?;
     let pgrp = f.get(2)?.parse().ok()?;
-    let utime: u64 = f.get(11)?.parse().ok()?;
-    let stime: u64 = f.get(12)?.parse().ok()?;
-    Some((pgrp, utime + stime, *state == "Z" || *state == "X"))
+    let mut ticks = 0;
+    for i in 11..=14 {
+        ticks += f.get(i)?.parse::<u64>().ok()?;
+    }
+    Some((pgrp, ticks, *state == "Z" || *state == "X"))
 }
 
 pub fn signal_group(pgid: u32, sig: Signal) {
@@ -68,6 +108,39 @@ pub fn signal_group(pgid: u32, sig: Signal) {
         // ESRCH (group already gone) is the expected race; ignore it.
         let _ = rustix::process::kill_process_group(pid, sig);
     }
+}
+
+/// Whether `pid` was started for `run`: prova gives every command it runs
+/// `PROVA_RUN_ID=<run>`, and children inherit it. A stored process group id
+/// can be reused by an unrelated group once the run's group is empty, so
+/// nothing is killed by stored id alone.
+#[cfg(target_os = "linux")]
+pub fn belongs_to_run(pid: u32, run: &str) -> bool {
+    let want = format!("PROVA_RUN_ID={run}");
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == want.as_bytes()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn belongs_to_run(pid: u32, run: &str) -> bool {
+    let want = format!("PROVA_RUN_ID={run}");
+    ps(&["-wwE", "-p", &pid.to_string(), "-o", "command="])
+        .is_some_and(|out| out.split_whitespace().any(|v| v == want))
+}
+
+/// SIGKILL each process of group `pgid` that belongs to `run`; returns how
+/// many were signalled.
+pub fn kill_run_processes(pgid: u32, run: &str) -> usize {
+    let mut n = 0;
+    for pid in sample_group(pgid).pids {
+        if belongs_to_run(pid, run)
+            && let Some(p) = Pid::from_raw(pid as i32)
+        {
+            let _ = rustix::process::kill_process(p, Signal::KILL);
+            n += 1;
+        }
+    }
+    n
 }
 
 pub fn terminate_group(pgid: u32) {
@@ -99,10 +172,68 @@ pub fn supervises(pid: u32, run: &str) -> bool {
             let args: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
             args.contains(&b"__supervise".as_slice()) && args.contains(&run.as_bytes())
         }
-        // No such process, or no /proc (not Linux): fall back to the pid.
         Err(_) if std::path::Path::new("/proc/self").exists() => false,
-        Err(_) => alive(pid),
+        // No /proc (macOS): ask `ps` for the command line; the pid alone
+        // only if `ps` cannot run at all.
+        Err(_) => match ps(&["-p", &pid.to_string(), "-o", "command="]) {
+            Some(cmd) => {
+                let args: Vec<&str> = cmd.split_whitespace().collect();
+                args.contains(&"__supervise") && args.contains(&run)
+            }
+            None => alive(pid) && ps(&["-p", "1", "-o", "pid="]).is_none(),
+        },
     }
+}
+
+/// `ps` with these arguments: its output, or None when it fails or finds
+/// nothing.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn ps(args: &[&str]) -> Option<String> {
+    let o = std::process::Command::new("ps")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    (!out.trim().is_empty()).then_some(out)
+}
+
+/// CPU time in `ps` format (`[[H:]M:]S.cc`) as ticks of 10 ms.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn ps_ticks(time: &str) -> Option<u64> {
+    let mut secs = 0.0;
+    for part in time.trim().split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some((secs * 100.0).round() as u64)
+}
+
+/// Members still in group `pgid`, as `pid name`: what a workload left
+/// running in its own group, found before the group is killed (round 11
+/// on arm64: a background process that had not yet called setsid when its
+/// shell exited was killed with the group and never reported).
+pub fn left_in_group(pgid: u32) -> Vec<String> {
+    sample_group(pgid)
+        .pids
+        .into_iter()
+        .map(|p| format!("{p} {}", process_name(p)))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_name(pid: u32) -> String {
+    ps(&["-p", &pid.to_string(), "-o", "comm="])
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// Makes this process the reaper of its orphaned descendants, so a process
@@ -191,21 +322,30 @@ pub fn cpu_ticks() -> (u64, u64) {
             )
         })
         .unwrap_or(0);
-    let children = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|s| {
-            let rest = &s[s.rfind(')')? + 2..];
-            let f: Vec<&str> = rest.split_whitespace().collect();
-            // cutime, cstime are fields 16 and 17 (index 13 and 14 here)
-            Some(f.get(13)?.parse::<u64>().ok()? + f.get(14)?.parse::<u64>().ok()?)
-        })
-        .unwrap_or(0);
-    (busy, children)
+    (busy, children_ticks().unwrap_or(0))
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn cpu_ticks() -> (u64, u64) {
     (0, 0)
+}
+
+/// CPU ticks of this process's waited-for children, when the OS says.
+#[cfg(target_os = "linux")]
+pub fn children_ticks() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = &s[s.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // cutime, cstime are fields 16 and 17 (index 13 and 14 here)
+    Some(f.get(13)?.parse::<u64>().ok()? + f.get(14)?.parse::<u64>().ok()?)
+}
+
+/// macOS has no unprivileged way to read children's CPU time without
+/// `getrusage` (unsafe FFI): not measured, so checks built on it are
+/// skipped rather than guessed (`ps -S` did not include them).
+#[cfg(not(target_os = "linux"))]
+pub fn children_ticks() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -217,11 +357,22 @@ mod tests {
         let line =
             "1234 (my (weird) cmd) S 1 4321 4321 0 -1 4194304 100 0 0 0 7 5 0 0 20 0 1 0 1 1 1";
         assert_eq!(parse_stat(line), Some((4321, 12, false)));
+        let reaped = "7 (sh) S 1 7 7 0 -1 0 0 0 0 0 1 1 30 20 20 0 1 0 1 1 1";
+        assert_eq!(parse_stat(reaped), Some((7, 52, false)));
         let zombie = "9 (x) Z 1 9 9 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 1 1 1";
         assert_eq!(parse_stat(zombie), Some((9, 2, true)));
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_ps_output() {
+        let out = "  101   100 S      0:01.25\n  102   100 Z      0:00.50\n  103   100 R+  1:02:03.04\n  104   200 S      9:59.99\ngarbage\n";
+        let s = parse_ps(out, 100);
+        assert_eq!(s.pids, [101, 103].into_iter().collect());
+        assert_eq!(s.cpu_ticks, 125 + 372_304);
+        assert_eq!(ps_ticks(" 0:00.07\n"), Some(7));
+        assert_eq!(ps_ticks("x"), None);
+    }
+
     #[test]
     fn own_process_group_is_visible() {
         let pgid = rustix::process::getpgrp().as_raw_nonzero().get() as u32;

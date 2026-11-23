@@ -194,7 +194,8 @@ struct Supervisor<'a> {
     suite: String,
     default_slow: Duration,
     /// CPU ticks of waited-for children when the command started.
-    cpu_start: u64,
+    /// Children's CPU ticks at the start, when the OS reports them.
+    cpu_start: Option<u64>,
     /// The framework's own test count, when it printed one.
     framework_total: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
@@ -403,7 +404,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         terminating: false,
         partial: Default::default(),
         framework_total: None,
-        cpu_start: 0,
+        cpu_start: None,
     };
     store.set_level(run, sup.level)?;
 
@@ -456,7 +457,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
-    sup.cpu_start = process::cpu_ticks().1;
+    sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
     if !injected.is_empty() {
         // Short: the temporary paths are noise in every summary (round 9).
@@ -850,8 +851,8 @@ fn observe_child(
         // (round 10: `echo "--- PASS: TestDiv"` passed in a Java project). Any
         // real test framework uses at least a clock tick.
         if status == Status::Finished
-            && process::cpu_ticks().1 == sup.cpu_start
-            && cfg!(target_os = "linux")
+            && sup.cpu_start.is_some()
+            && process::children_ticks() == sup.cpu_start
         {
             let passed: i64 = store.conn().query_row(
                 "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND outcome = 'passed'",
@@ -1122,9 +1123,13 @@ fn missing_since(
             "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished'
                AND (?3 = 0 OR outcome = 'passed')
                AND json_extract(spec, '$.selection') IS NULL
-               -- only a verified pass is a baseline (round 9: a forged pass
-               -- became the reference and failed honest runs after it)
-               AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id = runs.id AND e.kind = 'run_warning'))
+               -- a pass whose results are discredited is no baseline (round 9:
+               -- a forged pass became the reference and failed honest runs
+               -- after it); other warnings do not stop a run from becoming
+               -- the reference, or one removed test would be reported on
+               -- every run after it
+               AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id = runs.id AND e.kind = 'run_warning'
+                                            AND e.payload LIKE '%; no evidence about the tests%'))
                -- a reference that saw passing tests: quiet output shows only
                -- failures, and named the wrong suspect (round 9)
                AND EXISTS (SELECT 1 FROM attempts a WHERE a.run_id = runs.id AND a.outcome = 'passed')
@@ -1310,9 +1315,9 @@ fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     )
 }
 
-/// Kills the process group of a run's command if any of it is still alive
-/// (the command was started in its own group, whose id is its pid). Returns
-/// how many processes were found.
+/// Kills what is left of a run's command: the members of its process group
+/// (whose id is the command's pid) that carry the run's id. Returns how
+/// many were killed.
 pub fn kill_leftovers(store: &Store, run: &str) -> Result<usize> {
     use rusqlite::OptionalExtension;
     let payload: Option<String> = store
@@ -1329,11 +1334,9 @@ pub fn kill_leftovers(store: &Store, run: &str) -> Result<usize> {
     else {
         return Ok(0);
     };
-    let left = process::sample_group(pgid as u32).pids.len();
-    if left > 0 {
-        process::kill_group(pgid as u32);
-    }
-    Ok(left)
+    // Long after the run, the group id may belong to someone else: kill
+    // only what carries this run's id.
+    Ok(process::kill_run_processes(pgid as u32, run))
 }
 
 /// Blocks at most `max_wait` for the next significant event after `after`.

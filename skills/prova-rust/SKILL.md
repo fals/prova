@@ -1,19 +1,22 @@
 ---
 name: prova-rust
-description: prova setup details for Rust projects (cargo test, cargo-nextest). Use together with prova-adopt or prova-test in a Rust codebase.
+description: Gives the cargo test and cargo-nextest settings that let prova see every Rust test (libtest JSON stream, doctests, JUnit report, --quiet output, size-split suites, criterion). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a Rust codebase.
 ---
 
 # prova for Rust
 
 - Best: cargo-nextest 0.9.66+ with its libtest JSON stream (level
-  `native`: every test live, with its duration and output). `prova adopt`
+  `native stream`: every test live, with its duration and output). `prova adopt`
   proposes it when it finds nextest:
 
   ```toml
   [suite.default]
-  run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1"
-  select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}"
+  run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc || exit 1; exit $s"
+  select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
   ```
+
+  (The doctest tail is added for a crate with a library; without one, `run`
+  ends at `--success-output final`.)
 
   The format is experimental upstream; `--message-format-version 0.1` pins
   it. nextest writes that JSON only when a test binary ends, so prova also
@@ -35,7 +38,8 @@ description: prova setup details for Rust projects (cargo test, cargo-nextest). 
   `prova adopt` proposes running `cargo test` directly as the default suite
   and keeps `make test` as a separate suite.
 - Plain `cargo test` reports no per-test durations; `prova sizes` and slow
-  budgets need nextest's JUnit report (below).
+  budgets need nextest (its libtest JSON stream above, or its JUnit report
+  below).
 - Single test: `select = "cargo test -- {filter}"` (substring match on the
   test path). Add `--exact` only if names are fully qualified.
 - cargo-nextest: JUnit output is ingested automatically when enabled in
@@ -65,4 +69,5 @@ description: prova setup details for Rust projects (cargo test, cargo-nextest). 
 - Benchmarks for `prova exp`: criterion output is read directly
   (`name.time_ns`); otherwise print `{"metric": ..., "value": ...}`.
 
-See `references/pitfalls.md` for common problems.
+Common problems (long first build, fail-fast, fixed ports, `#[ignore]`):
+[references/pitfalls.md](references/pitfalls.md).

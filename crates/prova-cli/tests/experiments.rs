@@ -83,9 +83,9 @@ fn new_exp(d: &Path, extra: &[&str]) {
 
 #[test]
 fn faster_candidate_is_accepted_and_becomes_best() {
-    let d = repo("accept", "0.06");
+    let d = repo("accept", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
     let r = json(&o);
@@ -365,9 +365,10 @@ fn a_broken_edit_after_an_accept_is_rejected_and_the_best_still_runs_as_recorded
 
 #[test]
 fn edits_after_recording_do_not_change_what_is_measured() {
-    let d = repo("snap-edit", "0.06");
+    // A gap far above process start-up jitter (shared macOS runners).
+    let d = repo("snap-edit", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     std::fs::write(d.join("delay"), "0.5").unwrap(); // edited after recording
     let o = prova(&d, &["exp", "run", "e", "--json"]);
@@ -433,7 +434,7 @@ fn candidates_work_in_a_repository_without_commits() {
     let d = std::env::temp_dir().join(format!("prova-exp-snap-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("delay"), "0.06").unwrap();
+    std::fs::write(d.join("delay"), "0.3").unwrap();
     std::fs::write(
         d.join("work.sh"),
         "#!/bin/sh\nsleep $(cat delay)\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
@@ -441,7 +442,7 @@ fn candidates_work_in_a_repository_without_commits() {
     .unwrap();
     sh(&d, "chmod +x work.sh && git init -q");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
@@ -600,7 +601,7 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ -f leak ] && setsid sleep 37.125 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\ncommand -v setsid >/dev/null && S=setsid\nif [ -f leak ]; then $S sleep 37.125 >/dev/null 2>&1 < /dev/null & fi\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -651,7 +652,8 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
         assert_eq!(r["comparison"]["status"], "failed", "{r}");
         let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
         assert!(
-            reason.contains("left process") && reason.contains("sleep"),
+            // The leftover may not have exec'd `sleep` yet (sh, setsid).
+            reason.contains("left process"),
             "{reason}"
         );
     }
@@ -690,9 +692,9 @@ fn an_uncommitted_spec_is_refused_at_creation() {
 /// decision log says so.
 #[test]
 fn the_best_can_be_reset_with_a_reason() {
-    let d = repo("reset-best", "0.06");
+    let d = repo("reset-best", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.01").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["best"], "c1", "{r}");

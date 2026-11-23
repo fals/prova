@@ -1075,11 +1075,21 @@ fn run_trial(
         text.push_str(&line);
         text.push('\n');
     }
+    let in_group = process::left_in_group(pgid);
     process::kill_group(pgid); // leftovers must not disturb the next trial
     // A process that left the group (setsid) was reparented to this worker,
     // a child subreaper: it would run on during the other arm's trials and
     // skew them (round 8). Kill it, and report it.
-    let leaked = process::reap_orphans();
+    let mut leaked = in_group;
+    for l in process::reap_orphans() {
+        // A group member may still be dying when orphans are reaped.
+        if !leaked
+            .iter()
+            .any(|x| x.split(' ').next() == l.split(' ').next())
+        {
+            leaked.push(l);
+        }
+    }
     let cpu_after = process::cpu_ticks();
     let foreign_ms = (cpu_after.0.saturating_sub(cpu_before.0) as f64
         - cpu_after.1.saturating_sub(cpu_before.1) as f64)
@@ -1548,12 +1558,17 @@ fn work_comparison(
                 ));
             }
         }
+        if !process::MACHINE_COUNTERS {
+            caveats.push(
+                "this OS gives prova no CPU counters for the machine or for finished children, and no subreaper: load from other processes, an arm stopped from outside, and processes that left a trial's or oracle's process group were not checked".into(),
+            );
+        }
         if !caveats.is_empty() {
             result["caveats"] = serde_json::json!(caveats);
         }
         // Say how isolated the arms were (ADR 0024).
         result["sandbox"] = serde_json::json!(if sandbox_available() {
-            "bubblewrap: each arm could write only its own checkout, its private state and the shared toolchain caches"
+            "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it"
         } else {
             "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files"
         });

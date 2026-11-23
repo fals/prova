@@ -2,7 +2,6 @@
 
 The original problem statement for prova, as written by its author. The [README](../README.md) summarises what prova does today.
 
-
 ## Test
 
 Over the past years I grew tired of how LLMs execute tests. Through the harness, LLMs tend to execute tests with random bash commands and dump the outcome in a file to analyse afterwards. This implies two main things. First, there is no structure in what is executed: the parameters and variables get lost when iterating over and over, so there is no memory of what was done, of what I executed and its outcome, of the failures of previous iterations, and so on. Second, the way tests are executed is not reliable and is always constrained by long timeouts instead of failing safe, which leads to long loops. The harness MUST be able to see problems fast, abort, fix and reiterate instead of being bound by time, and it must record all this so it can recover and analyse the iterations.
@@ -19,7 +18,7 @@ This is another problem. When creating new features or trying to innovate, load 
 
 For this the solution is to use the pure scientific method: formalize what we need to achieve, research the problem deeply, and do what LLMs are good at: brute force, repeat. It is cheap, but with formalization it is better.
 
-## Lean
+## Formal Methods
 
 Lean might be a good candidate to formalize what we need in the engine; this needs research. Then we guide the LLM through a well-defined skill for each category: tests, experiments or improvement loops, with a contract that aligns with any test framework out there.
 

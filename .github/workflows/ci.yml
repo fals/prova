@@ -10,7 +10,12 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # Every platform a release ships for runs the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +25,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # A step limit, unlike cancelling, keeps the log: a hung test is then
+      # named by libtest's "has been running for over 60 seconds".
       - run: cargo test --no-fail-fast
+        timeout-minutes: 8
 
   spec:
     runs-on: ubuntu-latest
@@ -33,6 +41,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: npm install -g @informalsystems/quint@0.33.1
+      # quint fetches its Rust evaluator from GitHub on first use; a timeout
+      # there failed the job once. Keep it cached, and retry the fetch.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.quint
+          key: quint-evaluator-0.33.1-${{ runner.os }}-${{ runner.arch }}
+      - name: Fetch the Quint evaluator
+        working-directory: spec
+        run: |
+          for i in 1 2 3 4; do
+            quint test run.qnt --match no-such-test && exit 0
+            sleep $((i * 10))
+          done
+          exit 1
       - name: Typecheck and unit-test specs
         working-directory: spec
         run: |
@@ -49,3 +71,35 @@ jobs:
           scripts/spec-traces.sh "$RUNNER_TEMP/exp" 60 "" experiment
           PROVA_TRACE_DIR="$RUNNER_TEMP/run" cargo test -p prova-core --test spec_replay
           PROVA_TRACE_DIR_EXP="$RUNNER_TEMP/exp" cargo test -p prova-core --test spec_replay_experiment
+
+  # The release path, on every change: a static Linux binary, its package,
+  # the release image and the install script (tags publish them).
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p prova-cli --target x86_64-unknown-linux-musl
+      - name: Package as the release does
+        run: |
+          name=prova-x86_64-unknown-linux-musl
+          mkdir -p dist "$name" image/amd64
+          cp target/x86_64-unknown-linux-musl/release/prova README.md LICENSE "$name"/
+          tar czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cp "$name/prova" image/amd64/
+      - name: Install script against the package
+        run: |
+          PROVA_BASE_URL="file://$PWD/dist" PROVA_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/prova" --version
+      - name: Smoke test of the installed binary
+        run: scripts/smoke.sh "$RUNNER_TEMP/bin/prova"
+      - name: Release image
+        run: |
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 -t prova:release image
+          docker run --rm prova:release --version

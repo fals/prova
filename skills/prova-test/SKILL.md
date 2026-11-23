@@ -1,6 +1,6 @@
 ---
 name: prova-test
-description: Run and fix tests through prova with fast feedback and memory of past runs. Use whenever running, debugging or fixing tests in a project that has prova.toml or a .prova directory, instead of running test commands directly.
+description: Runs and fixes tests through prova with fast feedback and memory of past runs. Use whenever running, debugging or fixing tests in a project that has prova.toml or a prova section in AGENTS.md, instead of running test commands directly.
 ---
 
 # Test loop with prova
@@ -13,7 +13,7 @@ needs attention.
 
 1. One command per intent. Start the run and wait for what you need:
 
-   ```
+   ```sh
    prova run <suite> --until first-failure   # returns on the first failure, a slow test, a stall, or the end (30 s budget)
    prova run <suite> --until done            # the result (budget 9 min, under a tool call's usual limit)
    ```
@@ -28,70 +28,34 @@ needs attention.
    Use `--detach` only to do other work meanwhile; then
    `prova wait <run>` (or `--until done`).
 
-2. Read the result. Each failure carries history:
+2. Read the result. Each failure carries a label; these change what you do
+   next:
 
-   - `[first time seen: no history yet]`: prova has never seen this test
-     before (a new project, or a new test). It cannot tell whether your
-     change caused it: run the suite once before changing code to get a
-     baseline.
    - `[new failure]`: the test passed before and fails now. Likely your
-     change, unless the next hint says otherwise.
-   - `[has not passed yet]`, `[failed Nx before]`:
-     it was already failing before; not caused by your change alone.
-   - `UNFINISHED`: the test was still running when the run ended (cancel,
-     kill); it says nothing about the code. `ERROR`: the test errored
-     rather than failing an assertion.
-   - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
-     same code both passed and failed. Do not chase it as your bug;
-     confirm with `prova history <test>` and report it.
-   - `[run cancelled or aborted: no evidence about the code]`: the run did
-     not finish (cancel, `--kill-after`, a dead supervisor); its failures
-     are often the cancel itself and count nowhere.
-   - `SLOW`: over the test's budget; the line says where it came from (3x
-     its usual time, the suite's default, or the test runner's own
-     warning). A stall ends any wait, including a plain `prova run -- ...`:
-     cancel it.
-   - `environment-dependent, not flaky`: the test passed on this code only
-     with different environment variables (named); find which one matters.
-   - `prova forget <run> --reason "..."` takes a run whose results were not
-     real out of every test's history (and the flaky labels it caused).
-   - `failed, then passed on a retry`: the run passes (a test's last
-     attempt decides) but unverified: the test is flaky.
-   - `failing now: more failures in a row than its flakiness explains`: a
-     test once flaky that has failed too many times in a row for its usual
-     failure rate (3 for a rare flake, about 7 for a coin flip). Treat it as
-     a real failure.
-   - `note: N known flaky test(s) passed this time`: the run is green, but
-     those passes prove little. Say so when you report the suite green.
-   - `last passed at tree:...`: the last code where it was green.
+     change.
+   - `[first time seen: no history yet]`: prova cannot tell whether your
+     change caused it. Run the suite once before changing code to get a
+     baseline.
+   - `[has not passed yet]`, `[failed Nx before]`: already failing before
+     your change.
+   - `FLAKY` or `likely FLAKY`: the same code both passed and failed. Do not
+     chase it as your bug; confirm with `prova history <test>` and report it.
+   - `SLOW`, or a stall: cancel, or keep waiting if it is expected.
+   - `UNFINISHED`, `[run cancelled or aborted: ...]`: the run did not
+     finish; no evidence about the code.
+   - `PASSED (unverified: ...)` with `warning:` lines: the command succeeded
+     but proved little (no test observed, tests skipped, stale results). Do
+     not report "tests pass"; read the warnings and make the suite run its
+     tests.
    - `note:` lines say what prova could not see (e.g. quiet output hides
      passing tests). Take them seriously: flaky detection depends on it.
-   - A test's history is shared by every suite that runs it (`make`,
-     `default`, an ad-hoc `prova run -- ...`). Cancelled or aborted runs never
-     count as evidence: cancelling a hung test does not make it flaky.
-   - `running now:` names the tests still running when a run stalls or a
-     test is slow; `framework counted N` gives the framework's own count
-     when its output hid individual tests.
 
-   - `PASSED (unverified: ...)` with `warning:` lines: the command
-     succeeded but proved little: no test was observed, every test was
-     skipped, tests from the last passing run did not run or were skipped
-     (`#[ignore]`, `@Disabled`, `skip`; also when they passed in another
-     suite or command), a test reports (or always took) longer than the
-     whole run, the results equal an earlier run's to the millisecond
-     (stale files), the command used no CPU at all (results printed, not
-     run), another run in the same directory may have written the result
-     files, or the output shows a crash outside any test. Such a run is no
-     evidence about any test's history. `prova status` lists such a run as `passed?`. Do not report "tests pass" on an
-     unverified run; read the warnings and make the suite run its tests.
-     In `--json`, `verified` is `true` only for a clean pass.
-   - A run fails, even with exit 0, when the framework or build tool says it
-     failed (`BUILD FAILURE`, a crashed test JVM) or ran nothing (`detail:` names the reason), when a test never
-     finished, or when the suite's tests vanished since its last pass.
+   Every other label and warning is explained in
+   [references/results.md](references/results.md).
 
-   Exit codes: 0 passed, 1 test failure, 3 stall/slow/killed, 4 prova or
-   infrastructure error (also: the test command could not start), 5 still
-   running (call `prova wait <run> --after <seq>`).
+   Exit codes: 0 passed, 1 test failure, 2 usage error, 3 stall/slow/killed,
+   4 prova or infrastructure error (also: the test command could not start),
+   5 still running (run the printed `next:` command).
 
 3. React immediately: fix the first failure while the run continues, or
    `prova cancel <run>`. On `SLOW` or `STALLED`, decide: cancel, or keep

@@ -1,6 +1,6 @@
 ---
 name: prova-go
-description: prova setup details for Go projects (go test). Use together with prova-adopt or prova-test in a Go codebase.
+description: Gives the go test flags and prova.toml settings that let prova see every Go test (test2json stream, -count=1 against cached results, -run filters, subtests). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a Go codebase.
 ---
 
 # prova for Go

@@ -1,6 +1,6 @@
 ---
 name: prova-java
-description: prova setup details for Java and Kotlin projects (Maven, Gradle, JUnit). Use together with prova-adopt or prova-test in a JVM codebase.
+description: Gives the Maven and Gradle settings that let prova see every JVM test (Surefire and Gradle XML reports, -Dtest and --tests filters, up-to-date skips, JUnit). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a Java or Kotlin codebase.
 ---
 
 # prova for Java and Kotlin

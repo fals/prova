@@ -2,17 +2,38 @@
 
 ## Install
 
-One static binary, no daemon. Pick one:
+One static binary, no daemon. On Linux (x86_64, aarch64) or macOS (Apple
+silicon, Intel):
 
-```
-cargo install --git https://github.com/fals/prova prova-cli      # from source
-COPY --from=ghcr.io/fals/prova:<version> /prova /usr/local/bin/prova   # in a Dockerfile
+```sh
+curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 ```
 
-Release tarballs (Linux musl x86_64/aarch64, macOS) are attached to each
-GitHub release with SHA-256 checksums. The container image holds only the
-binary; copy it into the image where your tests run (devcontainer, CI,
-agent sandbox). prova must run where the project's toolchain is.
+The script downloads the latest release for your platform, checks its
+SHA-256 checksum and installs `prova` into `~/.local/bin`
+(`PROVA_INSTALL_DIR` to change it, `PROVA_VERSION=v0.1.0` to pin a version).
+The tarballs and checksums are also attached to each
+[GitHub release](https://github.com/fals/prova/releases).
+
+In a container, copy the binary from the image into the image where your
+tests run (devcontainer, CI, agent sandbox); prova must run where the
+project's toolchain is:
+
+```dockerfile
+COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
+```
+
+From source: `cargo install --git https://github.com/fals/prova prova-cli`.
+
+On macOS, prova watches test processes through `ps` instead of `/proc`.
+Two checks need counters macOS does not give: a pass whose command used
+no CPU at all is not flagged there, and experiments run without a
+sandbox or CPU counters (every verdict says which checks did not run).
+
+Experiments isolate each arm in a sandbox when
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
+installed; without it they still run, and every verdict says the arms were
+not isolated.
 
 ## Five minutes on an existing project
 
@@ -31,7 +52,12 @@ prova run default --until first-failure   # first failure, slow test, stall, or 
 prova run default --until done            # the result; `next:` continues if it takes longer
 prova run default --select <test>
 prova history <test>            # new failure, flaky, or pre-existing?
+prova output <run>              # the kept excerpt; --test <name> for one failing test's output
+prova run default --repeat 5    # is it flaky? each test's tally over 5 runs
 ```
+
+A run whose results were not real (a broken fixture, a stale report) can be
+taken out of every test's history: `prova forget <run> --reason "..."`.
 
 Hidden detail behind the project's own command (`pytest -q`, Go's test
 cache)? Opt in per suite, never by default:
@@ -63,19 +89,53 @@ prova exp new speed --hypothesis "sieve beats trial division" \
   --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- go test -run '^$' -bench . -count 3
 # change code (uncommitted; baseline is HEAD)
 prova exp candidate speed
-prova exp run speed             # interleaved trials, Mann-Whitney + Hodges-Lehmann CI, verdict
+prova exp run speed             # ABBA trials, Mann-Whitney + Hodges-Lehmann CI, verdict
+prova exp log speed             # what failed: a trial, the setup, the oracle
 ```
 
 Native benchmark output is read directly (`go test -bench`, criterion,
 pytest-benchmark, Vitest bench, JMH, BenchmarkDotNet); anything else prints
 `{"metric": "accuracy", "value": 0.93}` lines. Use `--better higher` for
-accuracy or throughput, `--setup "npm ci"` when the baseline checkout needs
-dependencies installed.
+accuracy or throughput, `--setup "npm ci"` when the checkouts need
+dependencies installed: it runs once in each variant's checkout (the
+baseline's and the candidate's snapshots), with network.
+
+By default a candidate may change anything but tests, benchmarks, build and
+runner files. When the change needs one of those (a new dependency in
+`go.mod`), allow it with `--change go.mod` (a glob, repeatable);
+`--change-only` limits the candidate to those paths. Trials and the oracle
+run without network (loopback only) when the arms are sandboxed; pass
+`--allow-network` when the workload or the oracle needs it.
+
+An ACCEPT makes the candidate the new best only if it beats the current
+best. To go back after one that turned out wrong:
+`prova exp best speed baseline --reason "..."`.
 
 ## Specification first
 
 For algorithms and protocols, state what a correct answer is before writing
-code, check that statement, and let it judge (skill `prova-spec`):
+code, check that statement, and let it judge (skill `prova-spec`).
+
+Why: an agent that writes the code, the tests and the success criterion in
+one go can always declare success, and a faster wrong answer looks like a
+win. A specification written and checked first is a judge the candidate
+cannot edit: prova freezes it by content hash and rejects any candidate
+that violates it before measuring anything.
+
+prova runs any checker as the oracle; it embeds none. Which one to use:
+
+| Tool | What it is | Use it when | Needs |
+|---|---|---|---|
+| [Quint](https://quint.sh) (Informal Systems) | [TLA+](https://lamport.azurewebsites.net/tla/tla.html)'s logic (Lamport's Temporal Logic of Actions: state, actions, invariants) in a typed syntax close to code, with a simulator, a test runner and traces to replay against the implementation | the default: state machines, protocols, allocators, reference answers | Node; `npm i -g @informalsystems/quint` (prova's CI uses 0.33.1) |
+| TLA+ | the original language, with the TLC and [Apalache](https://apalache-mc.org) model checkers | the project already has TLA+ specifications | Java |
+| [Lean](https://lean-lang.org) | a proof assistant: an executable definition plus theorems checked at build time | a property needs a proof for every input, not a bounded check | [elan](https://github.com/leanprover/elan); `lake build` is the oracle |
+| A frozen labelled dataset | the expected output for each input | accuracy objectives (classification, ranking, extraction) | nothing |
+
+Quint's simulator (`quint run`) samples behaviours at random; `quint verify`
+checks exhaustively through Apalache and needs Java. prova's own run and
+experiment lifecycles are Quint specifications in `spec/`, replayed against
+the Rust engine ([ADR 0011](adr/0011-formalization-quint-not-lean.md),
+[ADR 0015](adr/0015-spec-first-experiments.md)).
 
 ```
 quint run spec/ipam.qnt --invariant safety        # the specification holds

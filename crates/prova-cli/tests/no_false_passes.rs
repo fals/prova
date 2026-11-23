@@ -209,6 +209,8 @@ fn tests_that_disappear_are_noticed() {
 
 /// Round 10: test results from a command that did no work were believed
 /// (a `--- PASS` line echoed in a Java project).
+// Needs the children's CPU time, which macOS does not give (getting started).
+#[cfg(target_os = "linux")]
 #[test]
 fn results_printed_without_any_work_are_unverified() {
     let d = workspace("nowork");

@@ -13,9 +13,19 @@ pub const FILES: &[(&str, &str, &str)] = &[
         include_str!("../../../skills/prova-test/SKILL.md"),
     ),
     (
+        "prova-test",
+        "references/results.md",
+        include_str!("../../../skills/prova-test/references/results.md"),
+    ),
+    (
         "prova-experiment",
         "SKILL.md",
         include_str!("../../../skills/prova-experiment/SKILL.md"),
+    ),
+    (
+        "prova-experiment",
+        "references/integrity.md",
+        include_str!("../../../skills/prova-experiment/references/integrity.md"),
     ),
     (
         "prova-spec",
@@ -26,6 +36,11 @@ pub const FILES: &[(&str, &str, &str)] = &[
         "prova-spec",
         "references/conformance.md",
         include_str!("../../../skills/prova-spec/references/conformance.md"),
+    ),
+    (
+        "prova-spec",
+        "references/lean.md",
+        include_str!("../../../skills/prova-spec/references/lean.md"),
     ),
     (
         "prova-spec",
