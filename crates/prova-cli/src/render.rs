@@ -81,7 +81,18 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     if let Some(c) = s.exit_code {
         line.push_str(&format!("  exit {c}"));
     }
-    line.push_str(&format!("  level {}  code {}", level_name(s.level), s.code));
+    // While running, the level is what prova has seen so far: result files
+    // and late streams can raise it at the end (round 7).
+    let so_far = if s.status.is_terminal() {
+        ""
+    } else {
+        " so far"
+    };
+    line.push_str(&format!(
+        "  level{so_far} {}  code {}",
+        level_name(s.level),
+        s.code
+    ));
     println!("{line}");
     let c = &s.counts;
     let seen = c.passed + c.failed + c.skipped + c.errored;
@@ -103,7 +114,10 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         })
         .count();
     let errored = if unfinished > 0 {
-        format!("{} errored ({unfinished} unfinished)", c.errored)
+        format!(
+            "{} errored, {unfinished} unfinished",
+            c.errored.saturating_sub(unfinished as u64)
+        )
     } else {
         format!("{} errored", c.errored)
     };
@@ -143,14 +157,27 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     for t in &s.slow {
         println!(
-            "  SLOW {}: running {} (budget {}: 3x its usual time, else the suite's size default)",
+            "  SLOW {}: running {} (budget {}: {})",
             clean(&t.test),
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
-            format_duration(std::time::Duration::from_millis(t.budget_ms))
+            format_duration(std::time::Duration::from_millis(t.budget_ms)),
+            t.budget_from.describe()
         );
     }
     for w in &s.warnings {
         println!("warning: {}", clean(w));
+    }
+    if !s.flaky_passed.is_empty() {
+        println!(
+            "note: {} known flaky test(s) passed this time, which proves little: {}",
+            s.flaky_passed.len(),
+            s.flaky_passed
+                .iter()
+                .take(5)
+                .map(|t| clean(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     for n in &s.notes {
         println!("note: {}", clean(n));
@@ -236,7 +263,22 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
         println!("duration p50 {p50}ms  p95 {p95}ms");
     }
-    for r in s.recent.iter().take(15) {
+    // Skips (another test's `--select` run) say nothing about this test:
+    // count them instead of listing them (round 7).
+    let skipped = s
+        .recent
+        .iter()
+        .filter(|r| r.outcome == Outcome::Skipped)
+        .count();
+    let shown: Vec<_> = s
+        .recent
+        .iter()
+        .filter(|r| r.outcome != Outcome::Skipped)
+        .collect();
+    if skipped > 0 {
+        println!("  ({skipped} skipped attempts not listed, e.g. runs that selected other tests)");
+    }
+    for r in shown.iter().take(15) {
         let retry = if r.attempts > 1 {
             format!(" ({} attempts)", r.attempts)
         } else {
@@ -256,6 +298,9 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
             msg
         );
     }
+    if shown.len() > 15 {
+        println!("  ... {} more (`--json` lists all)", shown.len() - 15);
+    }
 }
 
 fn first_lines(m: &str, n: usize) -> String {
@@ -273,7 +318,8 @@ fn history_line(h: &serde_json::Value) -> String {
         if h["selection"].is_string() {
             " with this selection"
         } else {
-            ""
+            // Runs with --select are compared only with each other.
+            " (full runs)"
         }
     )];
     match h["last_passed"].as_object() {
@@ -354,9 +400,10 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
             for t in &s.slow {
                 if reported.insert(format!("slow:{}", t.test)) {
                     eprintln!(
-                        "SLOW {} (over its {} budget: 3x its usual time, else the suite's size default)",
+                        "SLOW {} (over its {} budget: {})",
                         clean(&t.test),
-                        format_duration(std::time::Duration::from_millis(t.budget_ms))
+                        format_duration(std::time::Duration::from_millis(t.budget_ms)),
+                        t.budget_from.describe()
                     );
                 }
             }
@@ -390,8 +437,13 @@ pub fn runs(rows: &[RunRow], json: bool) {
             }
             _ => "-".into(),
         };
+        // A `--select` run is not a full run of the suite: say so (round 7).
+        let sel = r.spec["selection"]
+            .as_str()
+            .map(|x| format!("  --select {}", clean(x)))
+            .unwrap_or_default();
         println!(
-            "{}  {:9}  {:7}  {:>7}  {}",
+            "{}  {:9}  {:7}  {:>7}  {}{sel}",
             r.id,
             r.status.as_str(),
             outcome,
@@ -448,16 +500,17 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
                 println!("specification: {}", clean(spec));
             }
             let p = &res["primary"];
+            let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {:.3} (MAD {:.3}), {} median {:.3} (MAD {:.3}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment, Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment, Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
-                    p["baseline_median"].as_f64().unwrap_or(f64::NAN),
-                    p["baseline_mad"].as_f64().unwrap_or(f64::NAN),
+                    num("baseline_median"),
+                    num("baseline_mad"),
                     c.candidate,
-                    p["candidate_median"].as_f64().unwrap_or(f64::NAN),
-                    p["candidate_mad"].as_f64().unwrap_or(f64::NAN),
+                    num("candidate_median"),
+                    num("candidate_mad"),
                     p["p"].as_f64().unwrap_or(f64::NAN),
                     p["method"].as_str().unwrap_or(""),
                     p["p_adjusted"].as_f64().unwrap_or(f64::NAN),
@@ -516,11 +569,22 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
         );
     }
     if !r.decisions.is_empty() {
-        println!("decisions:");
-        for d in &r.decisions {
+        // The latest few: the log grows with every candidate (round 7).
+        let skip = r.decisions.len().saturating_sub(5);
+        if skip > 0 {
+            println!("decisions ({skip} earlier not shown; `--json` has all):");
+        } else {
+            println!("decisions:");
+        }
+        for d in r.decisions.iter().skip(skip) {
             println!(
                 "  {:7} {}  {}",
-                d["decision"].as_str().unwrap_or(""),
+                // Stored as `crash` (a contract); it means the comparison
+                // could not run to a verdict, whatever the cause.
+                match d["decision"].as_str().unwrap_or("") {
+                    "crash" => "failed",
+                    other => other,
+                },
                 d["candidate"].as_str().unwrap_or(""),
                 clean(d["reason"].as_str().unwrap_or(""))
             );

@@ -263,3 +263,56 @@ fn repeat_tallies_each_test() {
         "{out}"
     );
 }
+
+/// Round 7: a green run hid a known flaky test that passed by luck, and
+/// `prova diff` listed that pass as "fixed".
+#[test]
+fn a_known_flaky_pass_is_named_and_not_called_fixed() {
+    let d = workspace("flakypass");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let failed = text(&prova(&d, &["status", "last", "--json"]));
+    let failed: serde_json::Value = serde_json::from_str(&failed).unwrap();
+    let out = run(&d, "make", "pass");
+    assert!(
+        out.contains("note: 1 known flaky test(s) passed this time, which proves little: calc::x"),
+        "{out}"
+    );
+    let diff = text(&prova(
+        &d,
+        &["diff", failed["run"].as_str().unwrap(), "last"],
+    ));
+    assert!(
+        diff.contains("changed, but known flaky (1):") && !diff.contains("fixed"),
+        "{diff}"
+    );
+}
+
+/// Round 7: nextest reports a test it killed on cancel as failed; a test
+/// that "fails" while the run is being cancelled did not finish.
+#[test]
+fn a_test_killed_by_the_cancel_is_unfinished_not_failed() {
+    let d = workspace("killedfail");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.go]\nrun = \"trap 'echo \\\"--- FAIL: TestA (9.00s)\\\"; exit 1' TERM; echo '=== RUN   TestA'; sleep 30 & wait\"\n",
+    )
+    .unwrap();
+    let id = text(&prova(&d, &["run", "go", "--detach"]))
+        .trim()
+        .to_owned();
+    prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "2s"],
+    );
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    let s = text(&prova(
+        &d,
+        &["wait", &id, "--until", "done", "--max-wait", "10s"],
+    ));
+    assert!(
+        s.contains("UNFINISHED TestA") && !s.contains("FAIL TestA"),
+        "{s}"
+    );
+}

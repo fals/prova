@@ -47,8 +47,12 @@ needs attention.
    - `[run cancelled or aborted: no evidence about the code]`: the run did
      not finish (cancel, `--kill-after`, a dead supervisor); its failures
      are often the cancel itself and count nowhere.
-   - `SLOW`: over the test's budget, 3x its usual time (or the suite's size
-     default when it has no history yet). A stall ends any wait: cancel.
+   - `SLOW`: over the test's budget; the line says where it came from (3x
+     its usual time, the suite's default, or the test runner's own
+     warning). A stall ends any wait, including a plain `prova run -- ...`:
+     cancel it.
+   - `note: N known flaky test(s) passed this time`: the run is green, but
+     those passes prove little. Say so when you report the suite green.
    - `last passed at tree:...`: the last code where it was green.
    - `note:` lines say what prova could not see (e.g. quiet output hides
      passing tests). Take them seriously: flaky detection depends on it.
@@ -80,7 +84,9 @@ needs attention.
 4. Rerun only what failed: `prova run <suite> --select <test name>`. To
    check whether a test is flaky, run it several times in one command:
    `prova run <suite> --select <test> --repeat 5` prints each test's tally
-   (`FLAKY ...: failed 2 of 5`).
+   (`FLAKY ...: failed 2 of 5`). `--repeat` runs each run to its end within
+   one budget (9 min, or `--max-wait`); `--until done` may be added, other
+   `--until` values may not.
 
 5. When green, run the whole suite once more. Before calling a failure
    new or flaky, check `prova history <test>`.
@@ -92,7 +98,9 @@ needs attention.
   (stack trace, captured output); `prova output <run>` prints the run's kept
   excerpt (first lines, error blocks, last lines). While the run is still
   going, `prova output <run>` shows everything printed so far.
-- `prova diff <run-a> <run-b>` newly failing, fixed, slower tests.
+- `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
+  flaky test that changed is listed apart (`changed, but known flaky`), never
+  as fixed.
 - `prova flaky` known flaky tests. `prova sizes` tests by observed duration.
 
 ## Writing tests

@@ -17,7 +17,9 @@ use crate::config::{CommandSpec, RunSpec};
 use crate::identity::{code_identity, machine_fingerprint, output_fingerprint, recorded_env};
 use crate::ids::{new_run_id, now_ms};
 use crate::lifecycle::Lifecycle;
-use crate::model::{EVENT_VERSION, Event, EventKind, Level, Outcome, StallBasis, Status, TestKey};
+use crate::model::{
+    BudgetFrom, EVENT_VERSION, Event, EventKind, Level, Outcome, StallBasis, Status, TestKey,
+};
 use crate::process;
 use crate::store::{NewRun, RunRow, Store, StoreError};
 
@@ -159,12 +161,24 @@ struct Supervisor<'a> {
     level: Level,
     suite: String,
     default_slow: Duration,
+    /// The run is being cancelled or killed: a test that "fails" now was
+    /// killed by it, and says nothing about the code (round 7).
+    terminating: bool,
     /// Running tests: (key, started, slow budget, slow reported).
-    running: BTreeMap<String, (TestKey, Instant, Duration, bool)>,
+    running: BTreeMap<String, (TestKey, Instant, (Duration, BudgetFrom), bool)>,
 }
 
 impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
+        if self.terminating
+            && let EventKind::TestFinished {
+                outcome, message, ..
+            } = &mut kind
+            && outcome.is_failure()
+        {
+            *outcome = Outcome::Errored;
+            *message = Some("test did not finish before the run ended (killed by it)".into());
+        }
         // Frameworks that report a start but no duration: measure it.
         if let EventKind::TestFinished {
             test,
@@ -216,13 +230,14 @@ impl Supervisor<'_> {
     }
 
     /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
-    fn slow_budget(&self, test: &TestKey) -> Duration {
+    fn slow_budget(&self, test: &TestKey) -> (Duration, BudgetFrom) {
         let id = crate::store::test_id(&self.suite, test);
         match crate::analysis::stats(self.store, &id, 20) {
-            Ok(Some(s)) if s.p95_ms.is_some() => {
-                Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000))
-            }
-            _ => self.default_slow,
+            Ok(Some(s)) if s.p95_ms.is_some() => (
+                Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000)),
+                BudgetFrom::History,
+            ),
+            _ => (self.default_slow, BudgetFrom::Default),
         }
     }
 
@@ -230,7 +245,7 @@ impl Supervisor<'_> {
     fn check_slow(&mut self) {
         let now = Instant::now();
         let mut slow = Vec::new();
-        for (key, started, budget, reported) in self.running.values_mut() {
+        for (key, started, (budget, from), reported) in self.running.values_mut() {
             let elapsed = now.duration_since(*started);
             if !*reported && elapsed > *budget {
                 *reported = true;
@@ -238,6 +253,7 @@ impl Supervisor<'_> {
                     test: key.clone(),
                     elapsed_ms: elapsed.as_millis() as u64,
                     budget_ms: budget.as_millis() as u64,
+                    budget_from: *from,
                 });
             }
         }
@@ -305,6 +321,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             .map(crate::config::Size::slow_budget)
             .unwrap_or(Duration::from_secs(60)),
         running: BTreeMap::new(),
+        terminating: false,
     };
     store.set_level(run, sup.level)?;
 
@@ -444,6 +461,7 @@ fn observe_child(
             sample = s;
             if terminating.is_none() && store.cancel_requested(run)? {
                 process::terminate_group(pgid);
+                sup.terminating = true;
                 terminating = Some((now, Status::Cancelled, "cancelled".into()));
             }
         }
@@ -460,6 +478,7 @@ fn observe_child(
         sup.check_slow();
         if terminating.is_none() && now.duration_since(start) >= kill_after {
             process::terminate_group(pgid);
+            sup.terminating = true;
             let reason = format!(
                 "killed: exceeded kill_after {}",
                 crate::ids::format_duration(kill_after)
@@ -758,6 +777,7 @@ pub struct SlowTest {
     pub test: String,
     pub elapsed_ms: u64,
     pub budget_ms: u64,
+    pub budget_from: BudgetFrom,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -816,6 +836,9 @@ pub struct Summary {
     pub fingerprint: Option<String>,
     /// Data directory this run was recorded in (ADR 0014).
     pub store: String,
+    /// Known flaky tests (ADR 0018) that passed in this run: luck, not proof.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flaky_passed: Vec<String>,
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
@@ -975,6 +998,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 test,
                 elapsed_ms,
                 budget_ms,
+                budget_from,
             } => {
                 // How long it has been running now: what the slow event said
                 // plus the time since (a runner's own SLOW line may be the
@@ -991,9 +1015,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     test: test.display(),
                     elapsed_ms: 0,
                     budget_ms: 0,
+                    budget_from: *budget_from,
                 });
                 entry.elapsed_ms = entry.elapsed_ms.max(elapsed);
-                entry.budget_ms = entry.budget_ms.max(*budget_ms);
+                if *budget_ms >= entry.budget_ms {
+                    entry.budget_ms = *budget_ms;
+                    entry.budget_from = *budget_from;
+                }
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { test } => {
@@ -1049,6 +1077,23 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         });
     }
     let n_failures = failing.len();
+    // A pass of a known flaky test proves little: say so, or a green run
+    // reads as a reliably green suite (round 7).
+    let mut flaky_passed = Vec::new();
+    if row.status == Status::Finished {
+        let passed: std::collections::BTreeSet<String> = finals
+            .values()
+            .filter(|(_, o, _, _)| *o == Outcome::Passed)
+            .map(|(k, _, _, _)| k.display())
+            .collect();
+        if !passed.is_empty() {
+            for f in crate::analysis::flaky(store, None, 50)? {
+                if passed.contains(&f.display) && !flaky_passed.contains(&f.display) {
+                    flaky_passed.push(f.display);
+                }
+            }
+        }
+    }
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
     // Raw output only when it adds something: a stall, or a failure that
@@ -1109,6 +1154,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             .is_terminal()
             .then(|| row.outcome == Some(Outcome::Passed) && warnings.is_empty()),
         warnings,
+        flaky_passed,
         output_tail: if want_tail {
             output_tail(store, run, 30)
         } else {

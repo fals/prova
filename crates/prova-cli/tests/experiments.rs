@@ -163,6 +163,13 @@ fn home_of(dir: &Path) -> PathBuf {
 /// Repo for a non-speed experiment: the workload reports `steps`; the
 /// specification says the answer must be 42, and the oracle checks it.
 fn spec_repo(name: &str) -> PathBuf {
+    spec_repo_with(
+        name,
+        "test \"$(cat answer)\" = 42 || { echo \"answer $(cat answer), spec says 42\"; exit 1; }",
+    )
+}
+
+fn spec_repo_with(name: &str, oracle: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -202,7 +209,7 @@ fn spec_repo(name: &str) -> PathBuf {
             "--spec",
             "spec.txt",
             "--oracle",
-            "test \"$(cat answer)\" = 42 || { echo \"answer $(cat answer), spec says 42\"; exit 1; }",
+            oracle,
             "--",
             "./work.sh",
         ],
@@ -224,7 +231,51 @@ fn deterministic_metric_under_a_specification_is_accepted() {
     );
     // ADR 0018: the verdict says the oracle ran and held on both arms.
     let spec = r["comparison"]["result"]["specification"].as_str().unwrap();
-    assert!(spec.starts_with("holds on both arms (oracle `"), "{spec}");
+    assert!(spec.starts_with("holds on both arms"), "{spec}");
+    // A silent oracle is judged by its exit code only, and says so.
+    assert!(spec.contains("exit code only"), "{spec}");
+    // Its log is kept even though it passed, so the verdict can be audited.
+    assert!(
+        prova(&d, &["exp", "log", "e", "oracle-candidate"])
+            .status
+            .success()
+    );
+}
+
+/// Round 7: a candidate added code that made the oracle exit 0 without
+/// running its checks, and was accepted with "holds on both arms".
+#[test]
+fn an_oracle_whose_checks_were_skipped_does_not_hold() {
+    let d = spec_repo_with(
+        "spec-skipped",
+        "[ -f skip ] && exit 0; test \"$(cat answer)\" = 42 && echo 'test spec::answer ... ok'",
+    );
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    std::fs::write(d.join("skip"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "never measured");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("violates the specification") && reason.contains("spec::answer"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_oracle_that_shows_its_tests_holds_with_their_count() {
+    let d = spec_repo_with(
+        "spec-counted",
+        "test \"$(cat answer)\" = 42 && echo 'test spec::answer ... ok'",
+    );
+    std::fs::write(d.join("steps"), "60").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    let spec = r["comparison"]["result"]["specification"].as_str().unwrap();
+    assert!(spec.contains("the same 1 test(s) passed on each"), "{spec}");
 }
 
 #[test]
@@ -418,4 +469,34 @@ fn a_protocol_change_keeps_what_it_does_not_name() {
     assert_eq!(p["trials"], 5);
     assert!(p["oracle"].as_str().unwrap().contains("cat answer"));
     assert_eq!(p["specs"].as_array().unwrap().len(), 2);
+}
+
+/// Round 7: a prova home inside the repository, ignored by git, made the
+/// candidate snapshot fail (`git add` refuses to name an ignored path).
+#[test]
+fn a_store_ignored_inside_the_repository_does_not_block_candidates() {
+    let d = repo("home-inside", "0.01");
+    std::fs::write(d.join(".gitignore"), ".prova/\n.ph/\n").unwrap();
+    let inside = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_prova"))
+            .args(args)
+            .current_dir(&d)
+            .env("PROVA_HOME", d.join(".ph"))
+            .output()
+            .unwrap()
+    };
+    let o = inside(&[
+        "exp",
+        "new",
+        "e",
+        "--hypothesis",
+        "h",
+        "--metric",
+        "mem_kb",
+        "--",
+        "./work.sh",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = inside(&["exp", "candidate", "e"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }

@@ -143,3 +143,25 @@ fn verify_accepts_an_anchored_filter() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.starts_with("VERIFIED"), "{out}");
 }
+
+/// Round 7: Vitest `-t` reports the tests it did not select as skipped;
+/// they did not run, and selection works.
+#[test]
+fn verify_ignores_tests_the_filter_skipped() {
+    let d = std::env::temp_dir().join(format!("prova-verify-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"echo 'test pkg::a ... ok'; echo 'test pkg::b ... ok'\"\nselect = \"echo 'test pkg::a ... ignored'; echo 'test pkg::b ... ok'\"\n",
+    )
+    .unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_prova"))
+        .args(["adopt", "--verify", "t", "--filter", "b"])
+        .current_dir(&d)
+        .env("PROVA_HOME", d.join("home"))
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.starts_with("VERIFIED"), "{out}");
+}

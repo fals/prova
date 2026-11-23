@@ -97,8 +97,25 @@ fn history_marks_flips_on_same_code_and_retry_passes_as_flaky() {
 #[test]
 fn diff_reports_newly_failing_and_fixed() {
     let d = workspace("diff");
-    let a = run(&d, "pass")["run"].as_str().unwrap().to_owned();
-    let b = run(&d, "fail")["run"].as_str().unwrap().to_owned();
+    // A real change of code between the runs (a commit each): the flip is a
+    // fix, not flakiness on the same code.
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(&d)
+            .status()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    let committed = |state: &str| {
+        std::fs::write(d.join("state"), state).unwrap();
+        git(&["add", "state"]);
+        git(&["commit", "-qm", state]);
+        run(&d, state)["run"].as_str().unwrap().to_owned()
+    };
+    let a = committed("pass");
+    let b = committed("fail");
     let o = prova(&d, &["diff", &a, &b, "--json"]);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(json(&o)["newly_failing"][0], "suite::b");
