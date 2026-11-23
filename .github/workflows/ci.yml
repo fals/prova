@@ -1,8 +1,22 @@
 name: ci
+# Documentation alone does not run CI. Skills are compiled into the
+# binary, so a change under skills/ still does.
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "fixtures/**/*.md"
+      - "llms.txt"
+      - "LICENSE"
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "fixtures/**/*.md"
+      - "llms.txt"
+      - "LICENSE"
 
 concurrency:
   group: ci-${{ github.ref }}

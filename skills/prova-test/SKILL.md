@@ -81,11 +81,26 @@ needs attention.
 - `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
   flaky test that changed is listed apart (`changed, but known flaky`), never
   as fixed.
-- `prova flaky` known flaky tests. `prova sizes` tests by observed duration.
+- `prova flaky` known flaky tests. `prova sizes` how many tests of each size.
 
 ## Writing tests
 
-Write the smallest test that can fail for the right reason: one process,
-no network, no disk, no sleep (small). Use medium (localhost, temp files,
-subprocesses) or large only with a one-line reason. Never use sleep to
-wait for something; wait on a condition with a bound.
+Write the smallest test that can fail for the right reason. A test's size
+is what it is allowed to use, never how long it takes (Software Engineering
+at Google, ch. 11; ADR 0025):
+
+| Size | Processes | Network | Also |
+|---|---|---|---|
+| small | one (the test's own) | none | no disk, no sleep, no blocking calls |
+| medium | several, one machine | `localhost` only | a local database, temp files |
+| large | any | other hosts | full-system, end-to-end |
+
+- A fast test that starts a database or a server is medium, not small.
+  A slow pure computation is small.
+- Size is not scope. "Unit", "integration" and "end-to-end" say how much
+  code a test covers; size says what it runs on. A unit test that talks to
+  a local database is medium; an integration test of two in-process
+  components is small.
+- Use medium or large only with a one-line reason the test needs it.
+- Never use sleep to wait for something; wait on a condition with a
+  bound.

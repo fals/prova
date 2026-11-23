@@ -52,8 +52,11 @@ description: Gives the cargo test and cargo-nextest settings that let prova see 
 
   It lands in `target/nextest/default/junit.xml` and includes retries as
   attempts, which feeds prova's flaky detection.
-- Sizes: unit tests next to the code are small; `tests/*.rs` that spawn
-  processes or touch the filesystem are medium. Split suites accordingly:
+- Sizes are what a test uses, not where it lives or how long it takes:
+  one process and no network is small; spawning a process, a temp dir or
+  `localhost` is medium; another host is large. `tests/*.rs` files are
+  integration tests by scope, often small by size. When the small ones
+  are the `--lib --bins` tests, split suites accordingly:
 
   ```toml
   [suite.small]

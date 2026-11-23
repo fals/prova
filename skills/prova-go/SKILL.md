@@ -18,7 +18,11 @@ description: Gives the go test flags and prova.toml settings that let prova see 
 - Subtests appear as `TestParent/sub`; select them with `-run 'TestParent/sub'`.
 - A package that fails to build shows as test `<package>::(package)`, errored.
 - Fail fast: add `-failfast` to `select` for the fix loop.
-- Sizes: tests that need a network or files belong in a separate suite,
-  e.g. behind a build tag: `run = "go test -json -tags integration ./..."`.
+- Sizes are what a test uses, not how long it takes: a test that starts a
+  server or a database, opens a socket or runs a subprocess is medium
+  (large if it reaches another host). Keep those in a separate suite, e.g.
+  behind a build tag: `run = "go test -json -tags integration ./..."`.
+  `httptest` servers run in the test's own process but listen on a
+  socket: medium.
 - Never rely on `-timeout` to catch hangs; prova reports slow tests by name
   and stalls on its own.

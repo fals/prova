@@ -20,5 +20,7 @@ description: Gives the Maven and Gradle settings that let prova see every JVM te
   reported, the hung one among them.
 - Gradle may skip tests as up to date; add `--rerun-tasks` (or
   `cleanTest`) to the suite so every run really runs.
-- Keep integration tests (Failsafe, `integrationTest` task) as a separate
-  medium or large suite.
+- Keep tests that start servers, containers or databases (often the
+  Failsafe or `integrationTest` ones) as a separate medium suite, or large
+  if they reach other hosts. Size is what a test uses, not its name or
+  duration.
