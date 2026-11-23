@@ -41,20 +41,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: npm install -g @informalsystems/quint@0.33.1
-      # quint fetches its Rust evaluator from GitHub on first use; a timeout
-      # there failed the job once. Keep it cached, and retry the fetch.
-      - uses: actions/cache@v4
-        with:
-          path: ~/.quint
-          key: quint-evaluator-0.33.1-${{ runner.os }}-${{ runner.arch }}
-      - name: Fetch the Quint evaluator
-        working-directory: spec
+      # quint downloads its Rust evaluator through GitHub's API without a
+      # token, so runners share the anonymous rate limit and the spec job
+      # failed on "rate limit exceeded". Fetch it with the workflow's token
+      # into the directory quint looks in first; quint then never downloads.
+      - name: Install the Quint evaluator
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          for i in 1 2 3 4; do
-            quint test run.qnt --match no-such-test && exit 0
-            sleep $((i * 10))
-          done
-          exit 1
+          v=$(grep -o "QUINT_EVALUATOR_VERSION = '[^']*'" "$(npm root -g)/@informalsystems/quint/dist/src/rust/binaryManager.js" | cut -d"'" -f2)
+          dir="$HOME/.quint/rust-evaluator-$v"
+          mkdir -p "$dir"
+          gh release download "evaluator/$v" -R quint-co/quint -p 'quint_evaluator-x86_64-unknown-linux-gnu.tar.gz' -O - | tar xz -C "$dir"
+          test -x "$dir/quint_evaluator"
       - name: Typecheck and unit-test specs
         working-directory: spec
         run: |
