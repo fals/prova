@@ -394,3 +394,28 @@ fn candidates_work_in_a_repository_without_commits() {
     let r = json(&toe(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
 }
+
+/// Round 5: `toe exp protocol --spec X` reset the metric, the effect and the
+/// trials to their defaults and dropped the oracle, silently.
+#[test]
+fn a_protocol_change_keeps_what_it_does_not_name() {
+    let d = spec_repo("protocol-merge");
+    std::fs::write(d.join("extra.txt"), "x").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm extra",
+    );
+    let o = toe(&d, &["exp", "protocol", "e", "--spec", "extra.txt"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let shown = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        shown.contains("metric steps") && shown.contains("oracle `"),
+        "{shown}"
+    );
+    let r = json(&toe(&d, &["exp", "status", "e", "--json"]));
+    let p = &r["protocol"];
+    assert_eq!(p["metric"], "steps");
+    assert_eq!(p["trials"], 5);
+    assert!(p["oracle"].as_str().unwrap().contains("cat answer"));
+    assert_eq!(p["specs"].as_array().unwrap().len(), 2);
+}

@@ -387,9 +387,9 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "{} got worse {}{ratio} (CI {ci}, p={:.4}{at_floor})",
+                "{} got worse by {}{ratio} (CI {ci}, p={:.4}{at_floor})",
                 primary.metric,
-                pct(primary.improvement),
+                pct(-primary.improvement).trim_start_matches('+').to_owned(),
                 primary.p_adjusted
             ),
         )
@@ -1400,6 +1400,8 @@ pub struct Report {
     pub experiment: String,
     pub hypothesis: String,
     pub protocol_hash: String,
+    /// The frozen protocol itself, so nothing about it is hidden.
+    pub protocol: Protocol,
     pub best: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ComparisonReport>,
@@ -1511,6 +1513,7 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         experiment: e.name,
         hypothesis: e.hypothesis,
         protocol_hash: e.protocol_hash,
+        protocol: e.protocol,
         best: e.best,
         comparison,
         decisions,

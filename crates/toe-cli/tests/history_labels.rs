@@ -128,3 +128,70 @@ fn quiet_counts_never_contradict() {
     );
     assert!(!out.contains("no test was observed"), "{out}");
 }
+
+/// Round 5: quiet `cargo test` names no binary and `go test` text names no
+/// package; their results are still the same tests as the full streams'.
+#[test]
+fn quiet_and_text_runs_join_the_full_history() {
+    let d = workspace("join");
+    std::fs::write(
+        d.join("toe.toml"),
+        concat!(
+            "[suite.rust_full]\nrun = \"echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; sh r.sh\"\n",
+            "[suite.rust_quiet]\nrun = \"sh r.sh\"\n",
+            "[suite.go_json]\nrun = \"sh g.sh\"\n",
+            "[suite.go_text]\nrun = \"echo '--- FAIL: TestDiv (0.00s)'; printf 'FAIL\\\\texample.com/calc\\\\t0.01s\\\\n'; exit 1\"\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("r.sh"), "if [ \"$(cat state)\" = pass ]; then echo 'test tests::x ... ok'; else echo 'test tests::x ... FAILED'; exit 1; fi").unwrap();
+    std::fs::write(
+        d.join("g.sh"),
+        "echo '{\"Action\":\"run\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\"}'; echo '{\"Action\":\"pass\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\",\"Elapsed\":0}'",
+    )
+    .unwrap();
+    std::fs::write(d.join("state"), "pass").unwrap();
+    toe(&d, &["run", "rust_full"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let out = text(&toe(&d, &["run", "rust_quiet"]));
+    assert!(
+        out.contains("FAIL tests::x [")
+            && out.contains("last passed at")
+            && !out.contains("first time seen"),
+        "quiet run knows the earlier pass: {out}"
+    );
+    toe(&d, &["run", "go_json"]);
+    let out = text(&toe(&d, &["run", "go_text"]));
+    assert!(
+        out.contains("TestDiv [")
+            && out.contains("last passed at")
+            && !out.contains("first time seen"),
+        "text run knows the json pass: {out}"
+    );
+}
+
+/// Round 5: a test cut off by a cancel kept a garbled duplicate identity,
+/// which `toe history` could not tell apart; it is shown as unfinished.
+#[test]
+fn a_cut_off_test_keeps_its_identity_and_is_shown_as_unfinished() {
+    let d = workspace("cutoff");
+    std::fs::write(
+        d.join("toe.toml"),
+        "[suite.go]\nrun = \"echo '=== RUN   TestA'; sleep 30\"\n",
+    )
+    .unwrap();
+    let id = text(&toe(&d, &["run", "go", "--detach"])).trim().to_owned();
+    toe(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "2s"],
+    );
+    assert!(toe(&d, &["cancel", &id]).status.success());
+    let s = text(&toe(
+        &d,
+        &["wait", &id, "--until", "done", "--max-wait", "10s"],
+    ));
+    assert!(s.contains("UNFINISHED TestA"), "{s}");
+    assert!(!s.contains("FLAKY"), "{s}");
+    let h = toe(&d, &["history", "TestA"]);
+    assert!(h.status.success(), "one test, not ambiguous: {}", text(&h));
+}

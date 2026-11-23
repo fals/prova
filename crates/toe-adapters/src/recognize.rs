@@ -47,6 +47,12 @@ pub struct Recognizers {
     pub summary_seen: bool,
     /// A line in which the framework says that no test ran.
     pub no_tests_line: Option<String>,
+    /// `go test` package result lines in text output ("ok  \tpkg", "FAIL\tpkg").
+    pub go_package_lines: u64,
+    /// A native stream reports pytest / Vitest (opt-in recipe): their
+    /// human output is then ignored, so one source decides each test.
+    pub pytest_stream: bool,
+    pub vitest_stream: bool,
     /// nextest: a FAIL line held while its captured output follows.
     nextest_pending: Option<(TestKey, Option<u64>, Vec<String>)>,
     /// libtest JSON: tests started in the current suite (one test binary)
@@ -88,6 +94,11 @@ fn message(lines: &[String]) -> Option<String> {
 impl Recognizers {
     fn started(&mut self, key: TestKey, out: &mut Vec<EventKind>) {
         let d = key.unique();
+        // A stream can report a start after another source reported the end
+        // (pytest -v text before its reportlog line): never restart a test.
+        if self.seen.contains_key(&d) {
+            return;
+        }
         if self.started.insert(d) {
             out.push(EventKind::TestStarted { test: key });
         }
@@ -251,7 +262,9 @@ impl Recognizers {
         let mut out = Vec::new();
         // nextest: output captured under a FAIL line belongs to that test
         // (its echoed libtest summary must not count as the run's totals).
-        if self.nextest_pending.is_some() {
+        // JSON events (nextest's own, at the end of each binary) are never
+        // part of a test's captured output.
+        if self.nextest_pending.is_some() && !line.starts_with('{') {
             if nextest_status(line).is_none()
                 && !line.trim_start().starts_with("────")
                 && !line.trim_start().starts_with("Summary [")
@@ -273,6 +286,9 @@ impl Recognizers {
             }
         } else if self.vitest_pending.is_some() && !line.trim_start().starts_with("→ ") {
             self.flush_vitest(&mut out);
+        }
+        if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
+            self.go_package_lines += 1;
         }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
@@ -297,9 +313,9 @@ impl Recognizers {
         } else {
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
-                || self.pytest(line, &mut out)
+                || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)
-                || self.vitest(line, &mut out)
+                || (!self.vitest_stream && self.vitest(line, &mut out))
                 || self.tap(line, &mut out);
         }
         out
@@ -610,6 +626,14 @@ impl Recognizers {
             self.finished(key, Outcome::Failed, None, None, Level::Recognized, out);
             return true;
         }
+        // `cargo test --quiet` prints progress dots with no newline, so a
+        // later "test ..." message can follow them on the same line.
+        let line = match line.find("test ") {
+            Some(i) if i > 0 && line[..i].chars().all(|c| matches!(c, '.' | 'F' | 'i')) => {
+                &line[i..]
+            }
+            _ => line,
+        };
         let Some(rest) = line.strip_prefix("test ") else {
             return false;
         };
@@ -1439,6 +1463,23 @@ mod tests {
         });
         assert!(msg.unwrap().contains("left: 16"));
         assert_eq!(r.total(), 0, "echoed libtest totals are not the run's");
+        // A JSON line inside a held FAIL block is an event, not output.
+        r.line("        FAIL [   0.002s] (5/6) calc tests::later");
+        r.line("    thread 'tests::later' panicked at src/lib.rs:9:9:");
+        let ev = r.line(r#"{"type":"test","event":"ok","name":"calc$tests::from_json"}"#);
+        assert!(
+            ev.iter().any(
+                |e| matches!(e, EventKind::TestFinished { test, .. } if test.name == "from_json")
+            ),
+            "the JSON line was read as an event: {ev:?}"
+        );
+        r.line("        PASS [   0.001s] (6/6) calc tests::last");
+        let later = r
+            .failure_output
+            .iter()
+            .find(|(k, _)| k.name == "later")
+            .unwrap();
+        assert!(!later.1.contains("from_json"), "{}", later.1);
         // The JSON at the end of the binary: same keys, no new results.
         let ev = r.line(r#"{"type":"test","event":"failed","name":"calc::calc$tests::divides","exec_time":0.004,"stdout":"x"}"#);
         assert!(
@@ -1466,6 +1507,44 @@ mod tests {
         );
         assert_eq!(nextest_binary("toe-cli::live"), "live");
         assert_eq!(nextest_binary("toe-cli::bin/toe"), "toe");
+    }
+
+    /// Round 5: in quiet mode libtest's 60 s warning followed the progress
+    /// dots on one line and was missed, so a hang was never named.
+    #[test]
+    fn quiet_progress_dots_do_not_hide_the_slow_warning() {
+        let (_, ev) = feed("....test tests::hangs_when_asked has been running for over 60 seconds");
+        assert!(
+            matches!(
+                &ev[..],
+                [EventKind::TestSlow {
+                    elapsed_ms: 60000,
+                    ..
+                }]
+            ),
+            "{ev:?}"
+        );
+    }
+
+    /// Round 5: pytest -v printed "PASSED" before the reportlog stream's
+    /// setup line was read; the late start restarted a finished test, which
+    /// then went "slow".
+    #[test]
+    fn a_late_start_never_restarts_a_finished_test() {
+        let mut r = Recognizers::default();
+        r.line("tests/test_calc.py::test_add PASSED");
+        let ev = r.line(r#"{"nodeid": "tests/test_calc.py::test_add", "when": "setup", "outcome": "passed", "duration": 0.0, "$report_type": "TestReport"}"#);
+        assert!(ev.is_empty(), "{ev:?}");
+        let mut streamed = Recognizers {
+            pytest_stream: true,
+            ..Recognizers::default()
+        };
+        assert!(
+            streamed
+                .line("tests/test_calc.py::test_add PASSED")
+                .is_empty(),
+            "the stream decides"
+        );
     }
 
     #[test]

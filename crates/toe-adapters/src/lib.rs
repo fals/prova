@@ -89,6 +89,8 @@ impl Observer for Ladder {
                 partial: String::new(),
             })
             .collect();
+        self.live.pytest_stream = self.inject.iter().any(|r| r == "pytest-reportlog");
+        self.live.vitest_stream = self.inject.iter().any(|r| r == "vitest-stream");
         self.inject_dir = Some(dir.clone());
         inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
@@ -152,6 +154,19 @@ impl Observer for Ladder {
             EventKind::TestFinished { test, .. } => !live_names.contains(&test.display()),
             _ => true,
         });
+        // `go test` without -v or -json prints failures only (round 5).
+        if self.live.go_package_lines > 0
+            && !self
+                .live
+                .seen
+                .values()
+                .any(|(_, o)| *o == toe_core::model::Outcome::Passed)
+            && finals.is_empty()
+        {
+            report.events.push(EventKind::RunNote {
+                message: "`go test` without -v or -json prints only failures: passing tests are not recorded, so flaky detection is blind; run `go test -json` (toe adopt proposes it)".into(),
+            });
+        }
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
         let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
         let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;

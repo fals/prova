@@ -63,9 +63,12 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 }
 
 /// Per-run results of a test, newest first, at most `limit` runs.
-/// One test's results, newest first, over every suite that ran it (ADR 0018:
-/// the same file and full name are the same test). Only runs that finished
-/// count; `current`, a run still going or just ended, is included too.
+/// One test's results, newest first, over every suite that ran it (ADR 0018).
+/// Results are the same test when their full names match and their files
+/// match or one is unknown (quiet `cargo test` names no binary), or when
+/// one side knows only the bare name (`go test` text output names no
+/// package). Results from cancelled or aborted runs count, except the
+/// tests those runs cut off; `current` is included too.
 pub fn test_runs(store: &Store, test_id: &str, limit: usize) -> Result<Vec<TestRun>> {
     test_runs_with(store, test_id, limit, None)
 }
@@ -79,16 +82,22 @@ pub fn test_runs_with(
     let mut stmt = store.conn().prepare(
         "WITH same AS (
              SELECT t2.id FROM tests t1 JOIN tests t2
-               ON COALESCE(t2.file, '') = COALESCE(t1.file, '') AND t2.display = t1.display
+               ON (t2.display = t1.display
+                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
+                OR (t2.name = t1.name
+                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
              WHERE t1.id = ?1),
          counted AS (
              SELECT r.id, r.created_ms FROM runs r
-             WHERE (r.status = 'finished' OR r.id = ?3)
-               AND r.id IN (SELECT run_id FROM attempts WHERE test_id IN (SELECT id FROM same)))
+             WHERE r.id IN (
+                 SELECT a3.run_id FROM attempts a3 JOIN runs r3 ON r3.id = a3.run_id
+                 WHERE a3.test_id IN (SELECT id FROM same)
+                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome <> 'errored')))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
+           AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
     let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
@@ -160,7 +169,10 @@ fn stats_with(
     let suites: Vec<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
-               ON COALESCE(t2.file, '') = COALESCE(t1.file, '') AND t2.display = t1.display
+               ON (t2.display = t1.display
+                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
+                OR (t2.name = t1.name
+                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
              WHERE t1.id = ?1 ORDER BY t2.suite",
         )?;
         stmt.query_map(params![test_id], |r| r.get(0))?
@@ -420,6 +432,10 @@ pub struct FailureContext {
     pub first_seen: bool,
     /// Earlier runs where this test failed with the same fingerprint.
     pub seen_before: usize,
+    /// Earlier runs where it failed, whatever the message.
+    pub failed_before: usize,
+    /// It passed in an earlier finished run.
+    pub passed_before: bool,
     pub flaky: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_passed_code: Option<String>,
@@ -432,6 +448,9 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
     let Some(s) = stats_with(store, test_id, 50, Some(run))? else {
         return Ok(None);
     };
+    // Flakiness from evidence only: a run still going, or cut off, adds
+    // none (round 5: a cancelled hang was labelled FLAKY).
+    let flaky = stats(store, test_id, 50)?.is_some_and(|h| h.flaky);
     let this = s.recent.iter().find(|r| r.run == run);
     let first_seen = !s.recent.iter().any(|r| r.run != run);
     let fp = this.and_then(|r| r.fingerprint.clone());
@@ -445,10 +464,18 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         .iter()
         .find(|r| r.run != run && r.outcome == Outcome::Passed)
         .map(|r| r.code.clone());
+    let failed_before = s
+        .recent
+        .iter()
+        .filter(|r| r.run != run && r.outcome.is_failure())
+        .count();
+    let passed_before = last_passed_code.is_some();
     Ok(Some(FailureContext {
         first_seen,
         seen_before,
-        flaky: s.flaky,
+        failed_before,
+        passed_before,
+        flaky,
         last_passed_code,
         suite_passed_on_same_code: false,
     }))
