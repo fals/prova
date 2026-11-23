@@ -65,13 +65,14 @@ prova exp new <name> --hypothesis "<what you expect and why>" \
   the baseline worktree has no installed dependencies or build caches.
 - `--spec spec/x.qnt --oracle "make conformance"`: see section 5.
 - `--kill-after 2m` bounds one trial.
-- `--change primes.go` (repeatable, globs) names the files a candidate may
-  change. Without it, a candidate may change anything except the files that
-  decide the verdict: tests, benchmarks, build and runner files (`*_test.go`,
-  `test_*.py`, `*.bench.ts`, `src/test/**`, `Makefile`, `*.sh`, ...). A
-  candidate that touches them is rejected unmeasured; if the change truly
-  needs one (a new dependency in `Cargo.toml`), say so in a new experiment
-  with `--change`.
+- By default a candidate may change anything except the files that decide
+  the verdict: tests, benchmarks, build and runner files (`*_test.go`,
+  `test_*.py`, `conftest.py`, `pytest.ini`, `*.bench.ts`, `src/test/**`,
+  `Makefile`, `*.sh`, ...), and top-level Python files that shadow the
+  standard library (`random.py`). A candidate that touches them is rejected
+  unmeasured. `--change go.mod` (repeatable, globs) also allows those paths;
+  `--change primes.go --change-only` allows nothing else. `prova exp
+  protocol <name> --change ...` works until the first trial.
 - Specification files must be committed: `exp new` refuses a `--spec` file
   that differs from the baseline.
 - The protocol freezes at the first trial. To change it, start a new
@@ -123,6 +124,11 @@ improvement loop does not get lucky by trying many ideas.
   (`--tail 40` for the end of each log).
 - An ACCEPT of 1000x or more carries a warning: check for caching across
   iterations or a smaller workload before believing it.
+- A comparison is also void when a variant's median moved 2x or more from
+  its own earlier comparisons in the experiment (something disturbed it),
+  or when the machine was much busier during one arm's trials.
+- Only a win over the current best changes the best: an ACCEPT `--against
+  baseline` says the best stays.
 - An ACCEPT found wrong afterwards: `prova exp best <name> baseline --reason
   "..."` sets the best back (recorded in the decision log), so later
   candidates are not compared against it.

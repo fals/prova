@@ -164,6 +164,11 @@ fn looks_like_crash(line: &str) -> bool {
         "core dumped",
         "ModuleNotFoundError",
         "ImportError",
+        // Maven and Surefire (round 10: the crash lines were elided)
+        "BUILD FAILURE",
+        "Crashed tests:",
+        "The forked VM terminated",
+        "COMPILATION ERROR",
     ];
     STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
 }

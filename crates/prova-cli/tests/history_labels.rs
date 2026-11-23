@@ -28,8 +28,10 @@ fn text(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// Prints one libtest line whose outcome comes from the file `state`.
-const SCRIPT: &str = "if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi";
+/// Prints one libtest line whose outcome comes from the file `state`, after
+/// a little real work: prova does not believe results printed by a command
+/// that used no CPU at all (round 10).
+const SCRIPT: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi";
 
 fn suites(d: &Path) {
     std::fs::write(
@@ -84,7 +86,7 @@ fn cancelled_runs_do_not_make_a_test_flaky() {
     let d = workspace("cancel");
     std::fs::write(
         d.join("prova.toml"),
-        "[suite.go]\nrun = \"echo '=== RUN   TestA'; if [ -f hang ]; then sleep 30; fi; echo '--- PASS: TestA (0.00s)'\"\n",
+        "[suite.go]\nrun = \"b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo '=== RUN   TestA'; if [ -f hang ]; then sleep 30; fi; echo '--- PASS: TestA (0.00s)'\"\n",
     )
     .unwrap();
     assert!(prova(&d, &["run", "go"]).status.success());
@@ -104,7 +106,7 @@ fn cancelled_runs_do_not_make_a_test_flaky() {
     let flaky = text(&prova(&d, &["flaky"]));
     assert!(!flaky.contains("TestA"), "{flaky}");
     let h = text(&prova(&d, &["history", "TestA"]));
-    assert!(h.contains("1 finished runs, 0 failed"), "{h}");
+    assert!(h.contains("1 runs with a result, 0 failed"), "{h}");
 }
 
 #[test]
@@ -144,10 +146,10 @@ fn quiet_and_text_runs_join_the_full_history() {
         ),
     )
     .unwrap();
-    std::fs::write(d.join("r.sh"), "if [ \"$(cat state)\" = pass ]; then echo 'test tests::x ... ok'; else echo 'test tests::x ... FAILED'; exit 1; fi").unwrap();
+    std::fs::write(d.join("r.sh"), "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; if [ \"$(cat state)\" = pass ]; then echo 'test tests::x ... ok'; else echo 'test tests::x ... FAILED'; exit 1; fi").unwrap();
     std::fs::write(
         d.join("g.sh"),
-        "echo '{\"Action\":\"run\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\"}'; echo '{\"Action\":\"pass\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\",\"Elapsed\":0}'",
+        "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo '{\"Action\":\"run\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\"}'; echo '{\"Action\":\"pass\",\"Package\":\"example.com/calc\",\"Test\":\"TestDiv\",\"Elapsed\":0}'",
     )
     .unwrap();
     std::fs::write(d.join("state"), "pass").unwrap();
@@ -364,7 +366,7 @@ fn a_test_skipped_since_the_last_pass_makes_the_pass_unverified() {
     let d = workspace("ignored");
     std::fs::write(
         d.join("prova.toml"),
-        "[suite.t]\nrun = \"echo 'test calc::a ... ok'; if [ -f ign ]; then echo 'test calc::b ... ignored'; else echo 'test calc::b ... ok'; fi\"\n",
+        "[suite.t]\nrun = \"b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test calc::a ... ok'; if [ -f ign ]; then echo 'test calc::b ... ignored'; else echo 'test calc::b ... ok'; fi\"\n",
     )
     .unwrap();
     assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
@@ -382,7 +384,7 @@ fn a_test_skipped_since_the_last_pass_makes_the_pass_unverified() {
 fn results_faster_than_the_test_ever_ran_are_unverified() {
     let d = workspace("echoed");
     // The test reports its own 0.6 s; faked, the line comes at once.
-    std::fs::write(d.join("r.sh"), "[ -f fake ] || sleep 0.6\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":0.6}'\n").unwrap();
+    std::fs::write(d.join("r.sh"), "[ -f fake ] || { b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 0.6; }\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":0.6}'\n").unwrap();
     std::fs::write(d.join("prova.toml"), "[suite.t]\nrun = \"sh r.sh\"\n").unwrap();
     for _ in 0..2 {
         assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
@@ -421,3 +423,76 @@ fn status_marks_an_unverified_pass() {
     let s = text(&prova(&d, &["status"]));
     assert!(s.contains("passed?"), "{s}");
 }
+
+/// Round 10: an unverified pass (stale or echoed results) counted in the
+/// test's history and made a real, deterministic failure "FLAKY".
+#[test]
+fn an_unverified_pass_is_no_evidence_about_a_test() {
+    let d = workspace("thinpass");
+    suites(&d);
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    // A pass printed without any work: unverified.
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.make]\nrun = \"echo 'test calc::x ... ok'\"\n",
+    )
+    .unwrap();
+    assert!(text(&prova(&d, &["run", "make"])).contains("unverified"));
+    suites(&d);
+    let out = run(&d, "make", "fail");
+    assert!(
+        !out.contains("FLAKY") && !out.contains("only known flaky"),
+        "{out}"
+    );
+}
+
+/// Round 10: a coin-flip test fails 3 times in a row 1 run in 8; that is
+/// still flaky, not "failing now".
+#[test]
+fn a_short_streak_of_a_frequent_flake_is_still_flaky() {
+    let d = workspace("coinflip");
+    suites(&d);
+    for st in ["pass", "fail", "pass", "fail", "fail"] {
+        run(&d, "make", st);
+    }
+    let out = run(&d, "make", "fail");
+    assert!(
+        out.contains("FLAKY") && !out.contains("failing now"),
+        "{out}"
+    );
+}
+
+/// Round 10: `@Disabled` on a test that passed before gave a clean pass in
+/// an ad-hoc run (its own command had no earlier pass to compare with).
+#[test]
+fn a_test_skipped_now_that_passed_in_another_command_is_unverified() {
+    let d = workspace("skipadhoc");
+    prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("{WORK_SH}echo 'test calc::d ... ok'"),
+        ],
+    );
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::d ... ignored'"),
+        ],
+    );
+    let out = text(&o);
+    assert!(
+        out.contains("unverified") && out.contains("calc::d"),
+        "{out}"
+    );
+}
+
+const WORK_SH: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; ";

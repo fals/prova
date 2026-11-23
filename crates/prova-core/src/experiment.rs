@@ -90,6 +90,10 @@ pub struct Protocol {
     /// (`HARNESS_FILES`), which decide the verdict (round 8).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
+    /// `scope` is the whole of what a candidate may change; otherwise it adds
+    /// to the default (round 10: allowing go.mod narrowed it to go.mod).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scope_only: bool,
 }
 
 /// A specification file: path relative to the repository root, sha256.
@@ -345,7 +349,15 @@ pub fn judge(
     min_effect: f64,
     alpha: f64,
 ) -> (Verdict, String) {
-    let pct = |v: f64| format!("{:+.1}%", v * 100.0);
+    // Near ±100% one decimal hides the rest: 540 ns of 18 ms is +99.997%,
+    // not "+100.0%" (round 10).
+    let pct = |v: f64| {
+        if v.abs() >= 0.995 && v.abs() < 1.0 {
+            format!("{:+.3}%", v * 100.0)
+        } else {
+            format!("{:+.1}%", v * 100.0)
+        }
+    };
     let (lo, hi) = primary.improvement_ci;
     for g in guardrails {
         let (glo, _) = (-g.improvement_ci.1, -g.improvement_ci.0); // worsening interval
@@ -446,7 +458,7 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "no practical effect: CI {ci} inside ±{}",
+                "no practical effect, neither better nor worse beyond ±{0}: CI {ci} inside ±{0}",
                 pct(min_effect).trim_start_matches('+')
             ),
         )
@@ -862,10 +874,6 @@ pub fn start(store: &Store, exp: &str, candidate: &str, against: Option<&str>) -
     let id = new_run_id();
     let tx = store.conn().unchecked_transaction()?;
     tx.execute(
-        "UPDATE experiments SET frozen = 1 WHERE name = ?1",
-        params![exp],
-    )?;
-    tx.execute(
         "INSERT INTO comparisons (id, experiment, baseline, candidate, status, created_ms) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
         params![id, exp, against, candidate, now_ms() as i64],
     )?;
@@ -968,6 +976,8 @@ fn run_trial(
         .stderr(Stdio::piped())
         // The workload must not reach prova's own store (round 9).
         .env_remove("PROVA_HOME")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
         .process_group(0);
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
@@ -1206,6 +1216,12 @@ fn work_comparison(
         }
         let ok = r.exit_code == Some(0) && r.leaked.is_empty();
         let tx = store.conn().unchecked_transaction()?;
+        // The protocol freezes at the first trial, not when a comparison
+        // starts: one that failed at its oracle measured nothing (round 10).
+        tx.execute(
+            "UPDATE experiments SET frozen = 1 WHERE name = ?1",
+            params![exp],
+        )?;
         tx.execute(
             "INSERT INTO trials (comparison, seq, arm, warmup, state, exit_code, fingerprint, started_ms, ended_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1239,6 +1255,8 @@ fn work_comparison(
                 .arg("-c")
                 .arg(setup)
                 .env_remove("PROVA_HOME")
+                .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONPYCACHEPREFIX", pycache_dir(&dirs[i]))
                 .current_dir(&dirs[i])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -1290,14 +1308,14 @@ fn work_comparison(
             .unwrap_or_default();
         let outside = out_of_scope(p, &changed);
         if let Some(first) = outside.first() {
-            let why = if p.scope.is_empty() {
+            let why = if p.scope_only {
                 format!(
-                    "candidate changes {} file(s) that decide the verdict (tests, benchmarks, build files), e.g. {first}; if the change needs them, allow it with `--change <path>` in a new experiment",
+                    "candidate changes {} file(s) outside the protocol's --change-only scope, e.g. {first}",
                     outside.len()
                 )
             } else {
                 format!(
-                    "candidate changes {} file(s) outside the protocol's --change scope, e.g. {first}",
+                    "candidate changes {} file(s) that decide the verdict (tests, benchmarks, build and runner files), e.g. {first}; if the change needs them, allow them with `--change <path>` (`prova exp protocol` before the first trial, or a new experiment)",
                     outside.len()
                 )
             };
@@ -1416,6 +1434,20 @@ fn work_comparison(
         } {
             return end_failed(store, &exp, comparison, &cand_name, &reason);
         }
+        // Each arm against its own earlier measurements: a variant whose
+        // median moved 2x or more since its earlier comparisons was disturbed
+        // (round 10: the other arm was slowed through Python's user site
+        // and a planted .pyc), or its workload changed.
+        if let Some(reason) = drifted(
+            store,
+            &exp,
+            comparison,
+            &p.metric,
+            [&arms[0].0, &arms[1].0],
+            [&base_name_for(store, comparison)?, &cand_name],
+        )? {
+            return end_failed(store, &exp, comparison, &cand_name, &reason);
+        }
         // Each arm's workload must report the metric as often per trial as
         // the other: extra lines are forged output (a candidate's code can
         // print benchmark lines), missing ones a changed workload (round 8).
@@ -1490,6 +1522,11 @@ pub const HARNESS_FILES: &[&str] = &[
     "prova.toml",
     "**/package.json",
     "**/pytest.ini",
+    "**/.pytest.ini",
+    // Python startup hooks that run in every interpreter (round 10)
+    "**/sitecustomize.py",
+    "**/usercustomize.py",
+    "**/*.pth",
     "**/pyproject.toml",
     "**/setup.cfg",
     "**/tox.ini",
@@ -1503,6 +1540,219 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/jest.config.*",
     "**/*.sh",
 ];
+
+/// Python's standard library top-level modules: a file or package of that
+/// name in the checkout shadows the real one for code run from it (round
+/// 10: a `random.py` made the oracle's random sample constant).
+const PYTHON_STDLIB: &[&str] = &[
+    "abc",
+    "annotationlib",
+    "antigravity",
+    "argparse",
+    "array",
+    "ast",
+    "asyncio",
+    "atexit",
+    "base64",
+    "bdb",
+    "binascii",
+    "bisect",
+    "builtins",
+    "bz2",
+    "cProfile",
+    "calendar",
+    "cmath",
+    "cmd",
+    "code",
+    "codecs",
+    "codeop",
+    "collections",
+    "colorsys",
+    "compileall",
+    "compression",
+    "concurrent",
+    "configparser",
+    "contextlib",
+    "contextvars",
+    "copy",
+    "copyreg",
+    "csv",
+    "ctypes",
+    "curses",
+    "dataclasses",
+    "datetime",
+    "dbm",
+    "decimal",
+    "difflib",
+    "dis",
+    "doctest",
+    "email",
+    "encodings",
+    "ensurepip",
+    "enum",
+    "errno",
+    "faulthandler",
+    "fcntl",
+    "filecmp",
+    "fileinput",
+    "fnmatch",
+    "fractions",
+    "ftplib",
+    "functools",
+    "gc",
+    "genericpath",
+    "getopt",
+    "getpass",
+    "gettext",
+    "glob",
+    "graphlib",
+    "grp",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "idlelib",
+    "imaplib",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "keyword",
+    "linecache",
+    "locale",
+    "logging",
+    "lzma",
+    "mailbox",
+    "marshal",
+    "math",
+    "mimetypes",
+    "mmap",
+    "modulefinder",
+    "msvcrt",
+    "multiprocessing",
+    "netrc",
+    "nt",
+    "ntpath",
+    "nturl2path",
+    "numbers",
+    "opcode",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pdb",
+    "pickle",
+    "pickletools",
+    "pkgutil",
+    "platform",
+    "plistlib",
+    "poplib",
+    "posix",
+    "posixpath",
+    "pprint",
+    "profile",
+    "profiling",
+    "pstats",
+    "pty",
+    "pwd",
+    "py_compile",
+    "pyclbr",
+    "pydoc",
+    "pydoc_data",
+    "pyexpat",
+    "queue",
+    "quopri",
+    "random",
+    "re",
+    "readline",
+    "reprlib",
+    "resource",
+    "rlcompleter",
+    "runpy",
+    "sched",
+    "secrets",
+    "select",
+    "selectors",
+    "shelve",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "smtplib",
+    "socket",
+    "socketserver",
+    "sqlite3",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "stringprep",
+    "struct",
+    "subprocess",
+    "symtable",
+    "sys",
+    "sysconfig",
+    "syslog",
+    "tabnanny",
+    "tarfile",
+    "tempfile",
+    "termios",
+    "textwrap",
+    "this",
+    "threading",
+    "time",
+    "timeit",
+    "tkinter",
+    "token",
+    "tokenize",
+    "tomllib",
+    "trace",
+    "traceback",
+    "tracemalloc",
+    "tty",
+    "turtle",
+    "turtledemo",
+    "types",
+    "typing",
+    "unicodedata",
+    "unittest",
+    "urllib",
+    "uuid",
+    "venv",
+    "warnings",
+    "wave",
+    "weakref",
+    "webbrowser",
+    "winreg",
+    "winsound",
+    "wsgiref",
+    "xml",
+    "xmlrpc",
+    "zipapp",
+    "zipfile",
+    "zipimport",
+    "zlib",
+    "zoneinfo",
+];
+
+/// A file that decides the verdict rather than implements the change.
+fn harness_file(path: &str) -> bool {
+    if HARNESS_FILES.iter().any(|g| glob_match(g, path)) {
+        return true;
+    }
+    // Only at the top of the checkout, where `python -m` and pytest put it
+    // first on sys.path; `pkg/types.py` shadows nothing.
+    let module = match path.split('/').collect::<Vec<_>>().as_slice() {
+        [file] => file.strip_suffix(".py").unwrap_or(""),
+        [dir, "__init__.py"] => dir,
+        _ => return false,
+    };
+    PYTHON_STDLIB.contains(&module)
+}
 
 /// Matches a path against a glob: `*` within one segment, `**` any number
 /// of segments.
@@ -1535,10 +1785,11 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
     changed
         .iter()
         .filter(|f| {
-            if p.scope.is_empty() {
-                HARNESS_FILES.iter().any(|g| glob_match(g, f))
+            let allowed = p.scope.iter().any(|g| glob_match(g, f));
+            if p.scope_only {
+                !allowed
             } else {
-                !p.scope.iter().any(|g| glob_match(g, f))
+                !allowed && harness_file(f)
             }
         })
         .cloned()
@@ -1593,12 +1844,86 @@ pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String
     if wall < 1000.0 || (b - c).abs() <= 0.5f64.max(0.5 * b.max(c)) {
         return None;
     }
+    // Aimed load is on every trial of one arm; a busy machine's load comes
+    // and goes (round 10: parallel docker builds voided an honest run). Only
+    // a complete separation counts: every trial of the busier arm saw more
+    // than every trial of the other (under 1% by chance with 5 + 5).
+    let rates = |v: &[(f64, f64)]| -> Vec<f64> {
+        v.iter()
+            .filter(|(_, w)| *w > 0.0)
+            .map(|(ms, w)| ms / w)
+            .collect()
+    };
+    let (rb, rc) = (rates(base), rates(cand));
+    let (hi, lo) = if b > c { (&rb, &rc) } else { (&rc, &rb) };
+    let separated = hi.iter().cloned().fold(f64::INFINITY, f64::min)
+        > lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !separated {
+        return None;
+    }
     let busier = if b > c { "baseline" } else { "candidate" };
     Some(format!(
         "the machine was busier during the {busier}'s trials: other processes kept {:.1} cores busy there, {:.1} during the other arm's; something outside the trials disturbed one arm, so the comparison is void (rerun on a quiet machine)",
         b.max(c),
         b.min(c)
     ))
+}
+
+/// A private bytecode cache per checkout, outside both: Python reads
+/// `.pyc` files only from there, so one planted in a checkout's ignored
+/// `__pycache__` is never used (round 10).
+fn pycache_dir(dir: &Path) -> PathBuf {
+    let key = sha256_hex(dir.to_string_lossy().as_bytes());
+    std::env::temp_dir().join(format!("prova-pycache-{}", &key[..16]))
+}
+
+fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
+    Ok(store.conn().query_row(
+        "SELECT baseline FROM comparisons WHERE id = ?1",
+        params![comparison],
+        |r| r.get(0),
+    )?)
+}
+
+/// A variant whose median in this comparison is 2x away from its median in
+/// earlier decided comparisons of the experiment.
+fn drifted(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    metric: &str,
+    arms: [&Arm; 2],
+    names: [&str; 2],
+) -> Result<Option<String>> {
+    let (now_b, now_c) = samples(store, comparison, metric)?;
+    for (i, now) in [now_b, now_c].into_iter().enumerate() {
+        let mut stmt = store.conn().prepare(
+            "SELECT s.value FROM samples s
+               JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
+               JOIN comparisons c ON c.id = s.comparison
+              WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
+                AND t.warmup = 0 AND t.state = 'complete'
+                AND ((t.arm = 'baseline' AND c.baseline = ?4) OR (t.arm = 'candidate' AND c.candidate = ?4))",
+        )?;
+        let before: Vec<f64> = stmt
+            .query_map(params![exp, comparison, metric, names[i]], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if before.len() < 5 || now.is_empty() {
+            continue;
+        }
+        let (m0, m1) = (stats::median(&before), stats::median(&now));
+        if m0 > 0.0 && m1 > 0.0 && (m1 / m0).max(m0 / m1) >= 2.0 {
+            return Ok(Some(format!(
+                "the {} ({}) measured {} now but {} in this experiment's earlier comparisons ({:.1}x): something disturbed it or its workload changed, so the comparison is void",
+                arms[i].as_str(),
+                names[i],
+                short(m1),
+                short(m0),
+                (m1 / m0).max(m0 / m1)
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// `git status` of tracked files in a checkout (empty outside git).
@@ -1647,6 +1972,8 @@ fn satisfies_spec(
         .arg("-c")
         .arg(oracle)
         .env_remove("PROVA_HOME")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -1654,11 +1981,28 @@ fn satisfies_spec(
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
+    // A process the oracle leaves behind would run into the trials and be
+    // blamed on them (round 10: a daemon from the candidate's oracle was
+    // reported as the baseline trial's leak).
+    let left = process::reap_orphans();
+    if let Some(l) = left.first() {
+        return Ok(Err(format!(
+            "the oracle left process {l} running after it ended; it would disturb the trials"
+        )));
+    }
     Ok(if ok {
         Ok(())
     } else {
+        // The checkouts' tracked files are read-only: an oracle that writes
+        // one (go generate) fails for that, not for the spec (round 10).
+        let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
+        let hint = if text.contains("ermission denied") || text.contains("Read-only file system") {
+            "; its log shows a write was refused: during experiments the checkouts' tracked files are read-only, so an oracle must not rewrite them (generate into a temporary directory instead)"
+        } else {
+            ""
+        };
         Err(format!(
-            "oracle `{oracle}` failed (`prova exp log <experiment> {}`)",
+            "oracle `{oracle}` failed (`prova exp log <experiment> {}`){hint}",
             name.trim_end_matches(".log")
         ))
     })
@@ -1840,6 +2184,16 @@ fn finish(
     if kept_before && base == "baseline" {
         reason = format!("revalidation: {reason}");
     }
+    // Beating a reference other than the current best does not displace
+    // the best (round 10: a candidate accepted `--against baseline` replaced
+    // a much faster best).
+    let becomes_best = verdict == Verdict::Accept && (base == e.best || e.best == candidate);
+    if verdict == Verdict::Accept && !becomes_best {
+        reason.push_str(&format!(
+            "; the best stays {}: this was compared with {base}, not with the best",
+            e.best
+        ));
+    }
     let tx = store.conn().unchecked_transaction()?;
     tx.execute(
         "UPDATE comparisons SET status = 'decided', verdict = ?2, result = ?3, ended_ms = ?4 WHERE id = ?1",
@@ -1854,7 +2208,7 @@ fn finish(
         "INSERT INTO decisions (experiment, comparison, candidate, decision, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![e.name, comparison, candidate, decision, reason, now_ms() as i64],
     )?;
-    if verdict == Verdict::Accept {
+    if becomes_best {
         tx.execute(
             "UPDATE experiments SET best = ?2 WHERE name = ?1",
             params![e.name, candidate],
@@ -2076,6 +2430,22 @@ mod load_tests {
         let busy = vec![(6000.0, 2000.0); 5];
         let busy2 = vec![(5000.0, 1800.0); 5];
         assert!(super::load_imbalance(&busy, &busy2).is_none());
+        // Load that comes and goes, even if one arm's median is higher.
+        let a = [
+            (100.0, 2000.0),
+            (9000.0, 2000.0),
+            (8000.0, 2000.0),
+            (200.0, 2000.0),
+            (7000.0, 2000.0),
+        ];
+        let b = [
+            (150.0, 2000.0),
+            (300.0, 2000.0),
+            (8500.0, 2000.0),
+            (100.0, 2000.0),
+            (250.0, 2000.0),
+        ];
+        assert!(super::load_imbalance(&a, &b).is_none());
         // Short trials: too coarse to judge.
         assert!(super::load_imbalance(&[(10.0, 20.0); 5], &[(60.0, 20.0); 5]).is_none());
     }

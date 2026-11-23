@@ -203,6 +203,27 @@ fn dur(
     }
 }
 
+/// A test named the way prova prints it (`calc.CalcTest::divides`,
+/// `example.com/calc::TestAdd`), written in the syntax of the select
+/// command's framework (round 10: Maven got prova's name unchanged and ran
+/// nothing). Framework syntax already given passes through unchanged.
+pub fn framework_filter(command: &str, filter: &str) -> String {
+    let Some((head, leaf)) = filter.rsplit_once("::") else {
+        return filter.to_owned();
+    };
+    if command.contains("-Dtest=") {
+        // Surefire: Class#method (package-qualified class is fine).
+        format!("{head}#{leaf}")
+    } else if command.contains("FullyQualifiedName") {
+        format!("{head}.{leaf}")
+    } else if command.contains(" -run ") || command.contains(" -k ") || command.contains(" -t ") {
+        // go test -run, pytest -k, vitest -t: the test's own name.
+        leaf.to_owned()
+    } else {
+        filter.to_owned()
+    }
+}
+
 impl Config {
     pub fn suite(&self, name: &str) -> Result<&SuiteConfig, ConfigError> {
         self.suite.get(name).ok_or_else(|| {
@@ -264,6 +285,39 @@ impl Config {
             keep_output: false,
             expect_tests: s.expect_tests,
         })
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    #[test]
+    fn prova_names_become_framework_filters() {
+        use super::framework_filter as f;
+        assert_eq!(
+            f(
+                "mvn -q test -Dtest=\"$PROVA_FILTER\"",
+                "calc.CalcTest::divides"
+            ),
+            "calc.CalcTest#divides"
+        );
+        assert_eq!(
+            f(
+                "dotnet test --filter FullyQualifiedName~x",
+                "Calc.CalcTests::Adds"
+            ),
+            "Calc.CalcTests.Adds"
+        );
+        assert_eq!(
+            f(
+                "go test -json -run \"$PROVA_FILTER\" ./...",
+                "example.com/calc::TestAdd"
+            ),
+            "TestAdd"
+        );
+        assert_eq!(
+            f("mvn -q test -Dtest=\"$PROVA_FILTER\"", "CalcTest#divides"),
+            "CalcTest#divides"
+        );
     }
 }
 
