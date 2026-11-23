@@ -80,6 +80,8 @@ jobs:
         run: |
           PROVA_BASE_URL="file://$PWD/dist" PROVA_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
           "$RUNNER_TEMP/bin/prova" --version
+      - name: Smoke test of the installed binary
+        run: scripts/smoke.sh "$RUNNER_TEMP/bin/prova"
       - name: Release image
         run: |
           docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 -t prova:release image

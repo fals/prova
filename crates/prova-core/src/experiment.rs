@@ -1548,12 +1548,17 @@ fn work_comparison(
                 ));
             }
         }
+        if !process::MACHINE_COUNTERS {
+            caveats.push(
+                "this OS gives prova no machine-wide CPU counters: load from other processes, an arm stopped from outside and processes a trial left behind were not checked".into(),
+            );
+        }
         if !caveats.is_empty() {
             result["caveats"] = serde_json::json!(caveats);
         }
         // Say how isolated the arms were (ADR 0024).
         result["sandbox"] = serde_json::json!(if sandbox_available() {
-            "bubblewrap: each arm could write only its own checkout, its private state and the shared toolchain caches"
+            "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it"
         } else {
             "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files"
         });

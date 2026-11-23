@@ -37,9 +37,21 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked -p prova-cli --target ${{ matrix.target }}
+      # The shipped binary, end to end, on its own platform (Intel macOS
+      # through Rosetta on the Apple silicon runner).
       - name: Smoke test
-        if: ${{ !(matrix.target == 'x86_64-apple-darwin') }}
-        run: target/${{ matrix.target }}/release/prova --version
+        run: |
+          bin=target/${{ matrix.target }}/release/prova
+          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
+            arch -x86_64 /bin/sh scripts/smoke.sh "$bin"
+          else
+            scripts/smoke.sh "$bin"
+          fi
+      - name: Static binary
+        if: contains(matrix.target, 'linux')
+        run: |
+          file target/${{ matrix.target }}/release/prova
+          file target/${{ matrix.target }}/release/prova | grep -q "statically linked"
       - name: Package
         run: |
           name=prova-${{ matrix.target }}
@@ -47,6 +59,11 @@ jobs:
           cp target/${{ matrix.target }}/release/prova README.md LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Install script on this platform
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          PROVA_BASE_URL="file://$PWD" PROVA_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/prova" --version
       - uses: actions/upload-artifact@v4
         with:
           name: prova-${{ matrix.target }}

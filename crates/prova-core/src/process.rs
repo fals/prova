@@ -1,8 +1,8 @@
 //! Process-group observation and control (ADR 0004, 0013 section 3).
 //!
 //! The process under test leads its own process group. Activity of the
-//! whole group (CPU time, process set) is sampled from `/proc` on Linux;
-//! elsewhere only output counts as activity.
+//! whole group (CPU time, process set) is sampled from `/proc` on Linux
+//! and from `ps` elsewhere (macOS).
 
 use std::collections::BTreeSet;
 
@@ -44,9 +44,53 @@ pub fn sample_group(pgid: u32) -> GroupSample {
     s
 }
 
+/// Without `/proc` (macOS), `ps` lists every process with its group, state
+/// and CPU time; a failed `ps` gives an empty sample (only output then
+/// counts as activity).
 #[cfg(not(target_os = "linux"))]
-pub fn sample_group(_pgid: u32) -> GroupSample {
-    GroupSample::default()
+pub fn sample_group(pgid: u32) -> GroupSample {
+    std::process::Command::new("ps")
+        .args([
+            "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "time=",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout), pgid))
+        .unwrap_or_default()
+}
+
+/// Whether this OS gives machine-wide CPU counters and orphan reaping:
+/// without them, experiments cannot see load from other processes, arms
+/// stopped from outside, or processes a trial left behind.
+pub const MACHINE_COUNTERS: bool = cfg!(target_os = "linux");
+
+/// Members of group `pgid` in `ps -o pid=,pgid=,stat=,time=` output; CPU
+/// time (`[[H:]M:]S.cc`) in ticks of 10 ms, as on Linux. Zombies are out.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps(out: &str, pgid: u32) -> GroupSample {
+    let mut s = GroupSample::default();
+    for line in out.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [pid, group, stat, time] = f[..] else {
+            continue;
+        };
+        let (Ok(pid), Ok(group)) = (pid.parse::<u32>(), group.parse::<u32>()) else {
+            continue;
+        };
+        if group != pgid || stat.starts_with('Z') {
+            continue;
+        }
+        let mut secs = 0.0;
+        for part in time.split(':') {
+            secs = secs * 60.0 + part.parse::<f64>().unwrap_or(0.0);
+        }
+        s.cpu_ticks += (secs * 100.0).round() as u64;
+        s.pids.insert(pid);
+    }
+    s
 }
 
 /// Returns (pgrp, utime + stime, is_zombie) from `/proc/<pid>/stat`.
@@ -221,7 +265,14 @@ mod tests {
         assert_eq!(parse_stat(zombie), Some((9, 2, true)));
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_ps_output() {
+        let out = "  101   100 S      0:01.25\n  102   100 Z      0:00.50\n  103   100 R+  1:02:03.04\n  104   200 S      9:59.99\ngarbage\n";
+        let s = parse_ps(out, 100);
+        assert_eq!(s.pids, [101, 103].into_iter().collect());
+        assert_eq!(s.cpu_ticks, 125 + 372_304);
+    }
+
     #[test]
     fn own_process_group_is_visible() {
         let pgid = rustix::process::getpgrp().as_raw_nonzero().get() as u32;
