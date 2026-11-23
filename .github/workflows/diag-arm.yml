@@ -28,9 +28,13 @@ jobs:
           ps -eo pid,pgid,sid,args | awk '$1 < '"$me"' && $2 == '"$(ps -o pgid= -p $me)"
           touch kills.txt
           tail -f kills.txt | awk -v me=$me '{ if (match($0, /kill\((-?[0-9]+), (SIG[A-Z0-9]+)/, m)) { t = m[1] < 0 ? -m[1] : m[1]; if (t < me && m[2] != "0") { print "OLDKILL " $0; fflush() } } }' &
-          timeout 600 strace -f -qq -e trace=kill,tgkill,tkill -e signal=none -o kills.txt \
+          timeout 600 strace -f -qq -e trace=kill,tgkill,tkill,execve -e signal=none -o kills.txt \
             cargo test --no-fail-fast > out.txt 2>&1
           echo "rc=$?"
           grep -E "^test result|FAILED|running for over" out.txt | head -40
+          echo "== kills at small or older targets, with the sender's command:"
+          grep -E "kill\(-?[0-9]+, SIG" kills.txt | awk -v me=$me '{ match($0, /kill\((-?[0-9]+),/, m); t = m[1] < 0 ? -m[1] : m[1]; if (t < me) print $1 }' | sort -u | while read p; do echo "-- sender $p:"; grep "^$p " kills.txt | grep -E "execve|kill\(" | grep -v "ENOENT" | cut -c1-220 | head -6; done
+          echo "== bwrap: $(command -v bwrap) $(bwrap --unshare-pid --ro-bind / / true && echo works || echo fails)"
+          echo "== leak test:"; grep -A12 "a_trial_that_leaves_a_process_behind_voids_the_comparison stdout" out.txt | cut -c1-300
           echo "== distinct kill targets:"; grep -oE "kill\(-?[0-9]+, SIG[A-Z0-9]+" kills.txt | sort | uniq -c | sort -rn | head -40
           exit 0
