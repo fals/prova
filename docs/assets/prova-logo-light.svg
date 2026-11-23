@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 244 64" width="488" height="128" role="img" aria-labelledby="t">
+  <title id="t">prova: tests with memory, experiments with proof</title>
+  <rect width="64" height="64" rx="15" fill="#1B1530"/>
+  <g fill="#3DDC84">
+    <circle cx="19.5" cy="13.25" r="4.7"/><circle cx="32" cy="13.25" r="4.7"/><circle cx="44.5" cy="13.25" r="4.7"/>
+    <circle cx="19.5" cy="25.75" r="4.7"/><circle cx="44.5" cy="25.75" r="4.7"/>
+    <circle cx="19.5" cy="38.25" r="4.7"/><circle cx="32" cy="38.25" r="4.7"/><circle cx="44.5" cy="38.25" r="4.7"/>
+  </g>
+  <!-- the one failure -->
+  <circle cx="19.5" cy="50.75" r="4.7" fill="#FF5D6C"/>
+  <g fill="none" stroke="#1B1530" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M86 24V60"/><circle cx="99" cy="37" r="13"/>
+    <path d="M124 24V50M124 38Q124 25 136 25"/>
+    <circle cx="160" cy="37" r="13"/>
+    <path d="M181 25L192 50L203 25"/>
+    <circle cx="224" cy="37" r="13"/><path d="M237 24V50"/>
+  </g>
+</svg>

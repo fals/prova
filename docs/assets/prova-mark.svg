@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t">
+  <title id="t">prova</title>
+  <rect width="64" height="64" rx="15" fill="#1B1530"/>
+  <!-- a p in nine dots (prova dos nove): eight passes -->
+  <g fill="#3DDC84">
+    <circle cx="19.5" cy="13.25" r="4.7"/><circle cx="32" cy="13.25" r="4.7"/><circle cx="44.5" cy="13.25" r="4.7"/>
+    <circle cx="19.5" cy="25.75" r="4.7"/><circle cx="44.5" cy="25.75" r="4.7"/>
+    <circle cx="19.5" cy="38.25" r="4.7"/><circle cx="32" cy="38.25" r="4.7"/><circle cx="44.5" cy="38.25" r="4.7"/>
+  </g>
+  <!-- the one failure -->
+  <circle cx="19.5" cy="50.75" r="4.7" fill="#FF5D6C"/>
+</svg>
