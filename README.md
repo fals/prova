@@ -45,15 +45,16 @@ next: fix and rerun, or `prova cancel 3fa9c1d2`; `prova wait 3fa9c1d2 --after 14
   JMH or BenchmarkDotNet. Pre-registered protocol, interleaved
   (ABBA) trials, Mann-Whitney test and confidence interval, accept/reject verdict.
   ([experiments](docs/architecture.md#experiments))
-- **Specification first.** State the problem formally (Quint, Lean, any
-  checker), check it, then let it judge: a candidate that violates it is
+- **Specification first.** State the problem formally ([Quint](https://quint.sh),
+  [TLA+](https://lamport.azurewebsites.net/tla/tla.html), [Lean](https://lean-lang.org), any checker), check it, then let it judge: a candidate that violates it is
   rejected before it is measured. ([skill](skills/prova-spec/SKILL.md))
 - **Built for agents.** Skills for six languages, compact output with the next
   command, JSON output, stable exit codes, MCP tools. ([for agents](#for-agents))
 - **One history per repository.** Clones and worktrees share it; every run
   records where it ran. ([storage](docs/architecture.md#storage))
-- **Formally specified.** Run and experiment lifecycles are Quint specs,
-  model-checked and replayed against the Rust code. ([invariants](docs/architecture.md#invariants-and-where-they-are-enforced))
+- **Formally specified.** Run and experiment lifecycles are Quint specs
+  (Quint is [TLA+](https://lamport.azurewebsites.net/tla/tla.html)'s logic
+  in a typed, programmer-friendly syntax), model-checked and replayed against the Rust code. ([invariants](docs/architecture.md#invariants-and-where-they-are-enforced))
 
 Rust, Go, Python, TypeScript, Java and C# are covered end to end by real
 [fixture projects](fixtures/README.md).
@@ -162,6 +163,25 @@ green runs and the red one the agent came for.
 - [Vision](docs/vision.md): the problem prova was built to solve
 - [Contributing](AGENTS.md): rules for humans and agents working on prova;
   prova is tested with prova
+
+## Acknowledgements
+
+prova's specification-first workflow stands on other people's work:
+
+- [TLA+](https://lamport.azurewebsites.net/tla/tla.html), Leslie Lamport's
+  language for specifying systems as state machines with invariants.
+- [Quint](https://quint.sh) by Informal Systems: the same logic as
+  TLA+ with a typed syntax close to code, a simulator and a test runner.
+  prova's own lifecycles are written in it (`spec/`), and it is the default
+  the `prova-spec` skill teaches.
+- [Apalache](https://apalache-mc.org), the model checker behind
+  `quint verify`.
+- [Lean](https://lean-lang.org), for properties that need a proof; the
+  executable-definition pattern follows
+  [AWS Cedar](https://github.com/cedar-policy/cedar-spec).
+
+Why these, and when to use which:
+[Specification first](docs/getting-started.md#specification-first).
 
 ## License
 

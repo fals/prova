@@ -281,7 +281,9 @@ reduced to their median). `wall_ms` is always recorded. `prova exp metrics --
 <cmd>` lists what a command yields.
 
 **Specification first.** `--spec <file>` freezes the problem's specification
-(Quint, Lean, a labelled dataset) by content hash in the protocol;
+([Quint](https://quint.sh), TLA+, [Lean](https://lean-lang.org), a
+labelled dataset; [which to use](getting-started.md#specification-first))
+by content hash in the protocol;
 `--oracle <cmd>` (model checker plus trace conformance, property tests, a
 proof build) runs once in each variant before any trial. Every test that
 passed in the baseline's oracle must pass in the candidate's; an oracle that

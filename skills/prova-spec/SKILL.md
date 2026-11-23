@@ -21,9 +21,11 @@ are cheap.
 
 ## 1. Write the specification
 
-Use Quint unless the project already uses TLA+, Alloy or Lean. Quint needs
-Node: `npm i -g @informalsystems/quint`. Put specifications in `spec/` (or wherever the
-project keeps them).
+Use [Quint](https://quint.sh) unless the project already uses TLA+,
+Alloy or Lean. Quint has the logic of TLA+ (state, actions, invariants) in
+a typed syntax close to code, so TLA+ knowledge carries over. It needs
+Node: `npm i -g @informalsystems/quint` (examples here are checked with
+0.33.1). Put specifications in `spec/` (or wherever the project keeps them).
 
 A specification answers four questions. Write them as comments first, then
 as Quint:
@@ -60,7 +62,8 @@ is the frozen labelled dataset plus the output contract (every input gets
 exactly one label from the label set). Register the dataset file as a specification
 (step 4); the metric is the accuracy the workload prints.
 
-Use Lean when a property needs a proof, not just bounded checking: see
+Use [Lean](https://lean-lang.org) when a property needs a proof, not just
+bounded checking: see
 [references/lean.md](references/lean.md).
 
 ## 2. Check the specification
@@ -69,7 +72,7 @@ Use Lean when a property needs a proof, not just bounded checking: see
 quint typecheck spec/ipam.qnt
 quint test spec/ipam.qnt                                   # your scenarios
 quint run spec/ipam.qnt --invariant safety --max-steps 20  # random exploration
-quint verify spec/ipam.qnt --invariant safety              # exhaustive, needs Java (Apalache)
+quint verify spec/ipam.qnt --invariant safety              # exhaustive (Apalache model checker), needs Java
 lake build                                                 # Lean: every theorem is checked
 ```
 

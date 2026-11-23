@@ -10,7 +10,7 @@
 - [Skill: test loop](skills/prova-test/SKILL.md): how an agent runs and fixes tests with prova
 - [Skill: adopt a project](skills/prova-adopt/SKILL.md): put an existing test command under prova without editing it
 - [Skill: experiments](skills/prova-experiment/SKILL.md): any objective (time, steps, accuracy), native benchmark tools, protocol, verdicts
-- [Skill: specification first](skills/prova-spec/SKILL.md): formalize a problem in Quint, check it, use it as the oracle that gates experiments
+- [Skill: specification first](skills/prova-spec/SKILL.md): formalize a problem (Quint by default, a typed syntax for TLA+'s logic; TLA+ or Lean when the project needs them), check it, use it as the oracle that gates experiments
 - [Language skills](skills/): prova-rust, prova-go, prova-python, prova-ts, prova-java, prova-csharp
 
 ## Understand prova

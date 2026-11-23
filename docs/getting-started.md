@@ -109,7 +109,28 @@ best. To go back after one that turned out wrong:
 ## Specification first
 
 For algorithms and protocols, state what a correct answer is before writing
-code, check that statement, and let it judge (skill `prova-spec`):
+code, check that statement, and let it judge (skill `prova-spec`).
+
+Why: an agent that writes the code, the tests and the success criterion in
+one go can always declare success, and a faster wrong answer looks like a
+win. A specification written and checked first is a judge the candidate
+cannot edit: prova freezes it by content hash and rejects any candidate
+that violates it before measuring anything.
+
+prova runs any checker as the oracle; it embeds none. Which one to use:
+
+| Tool | What it is | Use it when | Needs |
+|---|---|---|---|
+| [Quint](https://quint.sh) (Informal Systems) | [TLA+](https://lamport.azurewebsites.net/tla/tla.html)'s logic (Lamport's Temporal Logic of Actions: state, actions, invariants) in a typed syntax close to code, with a simulator, a test runner and traces to replay against the implementation | the default: state machines, protocols, allocators, reference answers | Node; `npm i -g @informalsystems/quint` (prova's CI uses 0.33.1) |
+| TLA+ | the original language, with the TLC and [Apalache](https://apalache-mc.org) model checkers | the project already has TLA+ specifications | Java |
+| [Lean](https://lean-lang.org) | a proof assistant: an executable definition plus theorems checked at build time | a property needs a proof for every input, not a bounded check | [elan](https://github.com/leanprover/elan); `lake build` is the oracle |
+| A frozen labelled dataset | the expected output for each input | accuracy objectives (classification, ranking, extraction) | nothing |
+
+Quint's simulator (`quint run`) samples behaviours at random; `quint verify`
+checks exhaustively through Apalache and needs Java. prova's own run and
+experiment lifecycles are Quint specifications in `spec/`, replayed against
+the Rust engine ([ADR 0011](adr/0011-formalization-quint-not-lean.md),
+[ADR 0015](adr/0015-spec-first-experiments.md)).
 
 ```
 quint run spec/ipam.qnt --invariant safety        # the specification holds

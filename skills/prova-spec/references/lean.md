@@ -21,5 +21,8 @@ theorem countPrimes_excludes_n : countPrimes 7 = 3 ∧ countPrimes 8 = 4 := by d
 `lake build` fails if any theorem is false; a `lean_exe` prints the
 definition's answers for a range of inputs, and a small program in the
 project's language compares the implementation with them. Core Lean is
-enough for this; mathlib is large and rarely needed. Pin the toolchain in
-`lean-toolchain`.
+enough for this; mathlib is large and rarely needed.
+
+Install Lean with [elan](https://github.com/leanprover/elan) (it provides
+`lean` and `lake`), and pin the toolchain in `lean-toolchain` so every
+machine checks with the same version.
