@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b20bd96
+          ref: b20bd96a1256159c534c8576363ec3684ab9ce6c
       - uses: dtolnay/rust-toolchain@stable
       - name: Limits
         run: |
