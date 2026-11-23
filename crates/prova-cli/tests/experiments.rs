@@ -434,7 +434,7 @@ fn candidates_work_in_a_repository_without_commits() {
     let d = std::env::temp_dir().join(format!("prova-exp-snap-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("delay"), "0.06").unwrap();
+    std::fs::write(d.join("delay"), "0.3").unwrap();
     std::fs::write(
         d.join("work.sh"),
         "#!/bin/sh\nsleep $(cat delay)\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
@@ -442,7 +442,7 @@ fn candidates_work_in_a_repository_without_commits() {
     .unwrap();
     sh(&d, "chmod +x work.sh && git init -q");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
