@@ -81,7 +81,11 @@ needs attention.
 - `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
   flaky test that changed is listed apart (`changed, but known flaky`), never
   as fixed.
-- `prova flaky` known flaky tests. `prova sizes` how many tests of each size.
+- `prova flaky` known flaky tests. `prova sizes` how many tests of each size,
+  and what made each medium or large one so ("started postgres", "1 local
+  socket"). `prova history <test>` shows its `size:` and why; `small?`
+  means seen small in fewer than 3 runs, `medium or less` that prova never
+  saw it alone. Sizes come from what tests use, never from duration.
 
 ## Writing tests
 

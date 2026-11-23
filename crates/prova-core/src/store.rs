@@ -375,7 +375,7 @@ impl Store {
                 tx.execute(
                     "INSERT OR IGNORE INTO test_sizes (run_id, test_id, attempt, size, evidence)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![e.run, id, attempt, serde_json::to_value(size)?.as_str().unwrap_or("small"), evidence],
+                    params![e.run, id, attempt, size.as_str(), evidence],
                 )?;
             }
             if let EventKind::TestFinished {

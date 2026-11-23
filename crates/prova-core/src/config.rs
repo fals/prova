@@ -47,6 +47,23 @@ pub enum Size {
 }
 
 impl Size {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Size::Small => "small",
+            Size::Medium => "medium",
+            Size::Large => "large",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Size> {
+        match s {
+            "small" => Some(Size::Small),
+            "medium" => Some(Size::Medium),
+            "large" => Some(Size::Large),
+            _ => None,
+        }
+    }
+
     /// Default idle budget before a stall is reported for a whole run.
     pub fn stall_after(self) -> Duration {
         match self {

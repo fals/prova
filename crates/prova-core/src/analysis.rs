@@ -51,8 +51,9 @@ pub struct TestStats {
     /// variables: these names differ.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_dependent: Vec<String>,
+    /// Its size from what it used (ADR 0025), never from its duration.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed_size: Option<&'static str>,
+    pub size: Option<SizeView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p50_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -307,7 +308,7 @@ fn stats_with(
         flaky: (retry > 0 || flips > 0) && !failing_now,
         env_dependent: env_dependent.into_iter().take(5).collect(),
         failing_now,
-        proposed_size: percentile(&durations, 95.0).map(proposed_size),
+        size: observed_size(store, test_id)?,
         p50_ms: percentile(&durations, 50.0),
         p95_ms: percentile(&durations, 95.0),
         last_passed,
@@ -394,14 +395,73 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
     Ok(out)
 }
 
-/// Size proposal from duration alone. Declared sizes also constrain
-/// resources (ADR 0005); duration is what a black box can observe.
-pub fn proposed_size(p95_ms: u64) -> &'static str {
-    match p95_ms {
-        0..=1000 => "small",
-        1001..=30_000 => "medium",
-        _ => "large",
+/// A test's size from what it used (ADR 0025).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SizeView {
+    /// Decided: medium or large as soon as seen, small after
+    /// `SMALL_AFTER` attributed runs that saw nothing more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<crate::config::Size>,
+    /// When nothing could be attributed: the largest size of the runs it
+    /// was in, an upper bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_most: Option<crate::config::Size>,
+    /// What the agent reads: the size and why.
+    pub label: String,
+}
+
+/// Attributed runs that must all show one process and no socket before a
+/// test is called small (ADR 0025 §5): sampling can miss what is brief.
+pub const SMALL_AFTER: usize = 3;
+
+pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
+    use crate::config::Size;
+    let mut stmt = store.conn().prepare(
+        "SELECT size, evidence FROM test_sizes
+          WHERE test_id = ?1 AND run_id NOT IN (SELECT run_id FROM forgotten)",
+    )?;
+    let seen: Vec<(Size, String)> = stmt
+        .query_map(params![test_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(s, e)| Some((Size::parse(&s)?, e)))
+        .collect();
+    if let Some((size, evidence)) = seen.iter().max_by_key(|(s, _)| *s) {
+        let label = match size {
+            Size::Small if seen.len() >= SMALL_AFTER => {
+                format!("small ({evidence}, in {} runs)", seen.len())
+            }
+            Size::Small => format!("small? ({} of {SMALL_AFTER} runs)", seen.len()),
+            _ => format!("{} ({evidence})", size.as_str()),
+        };
+        let decided = *size != Size::Small || seen.len() >= SMALL_AFTER;
+        return Ok(Some(SizeView {
+            size: decided.then_some(*size),
+            at_most: None,
+            label,
+        }));
     }
+    let bound: Option<Size> = store
+        .conn()
+        .prepare(
+            "SELECT json_extract(e.payload, '$.size') FROM events e
+              WHERE e.kind = 'run_size'
+                AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1)
+                AND e.run_id NOT IN (SELECT run_id FROM forgotten)",
+        )?
+        .query_map(params![test_id], |r| r.get::<_, Option<String>>(0))?
+        .filter_map(|r| r.ok().flatten())
+        .filter_map(|s| Size::parse(&s))
+        .max();
+    Ok(bound.map(|b| SizeView {
+        size: None,
+        at_most: Some(b),
+        label: format!(
+            "{} or less (never seen alone or in its own process, so its own use is unknown)",
+            b.as_str()
+        ),
+    }))
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -410,46 +470,55 @@ pub struct SizeReport {
     pub small: usize,
     pub medium: usize,
     pub large: usize,
+    /// Not yet decided: not attributed, or small in fewer runs than needed.
+    pub unknown: usize,
+    /// Of the unknown, those seen small in fewer runs than needed.
+    pub small_so_far: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
-    /// Slowest tests by p95: (test, ms).
-    pub largest: Vec<(String, u64)>,
+    /// Medium and large tests with what made them so: (test, label).
+    pub larger: Vec<(String, String)>,
 }
 
 pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
+    use crate::config::Size;
     let mut stmt = store.conn().prepare(
-        "SELECT t.display, a.duration_ms FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.outcome = 'passed' AND a.duration_ms IS NOT NULL AND (?1 IS NULL OR t.suite = ?1)
-         ORDER BY a.ts_ms DESC LIMIT 200000",
+        "SELECT id, display FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
     )?;
-    let mut by_test: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for row in stmt.query_map(params![suite], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })? {
-        let (t, d) = row?;
-        let v = by_test.entry(t).or_default();
-        if v.len() < 20 {
-            v.push(d as u64);
-        }
-    }
+    let tests: Vec<(String, String)> = stmt
+        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut r = SizeReport::default();
-    for (t, mut v) in by_test {
-        v.sort_unstable();
-        let p95 = percentile(&v, 95.0).unwrap_or(0);
-        match proposed_size(p95) {
-            "small" => r.small += 1,
-            "medium" => r.medium += 1,
-            _ => r.large += 1,
+    for (id, display) in tests {
+        let view = observed_size(store, &id)?;
+        match view.as_ref().and_then(|v| v.size) {
+            Some(Size::Small) => r.small += 1,
+            Some(Size::Medium) => r.medium += 1,
+            Some(Size::Large) => r.large += 1,
+            None => {
+                r.unknown += 1;
+                if view.as_ref().is_some_and(|v| v.label.starts_with("small?")) {
+                    r.small_so_far += 1;
+                }
+            }
         }
-        r.largest.push((t, p95));
+        if let Some(v) = view
+            && matches!(v.size, Some(Size::Medium | Size::Large))
+        {
+            r.larger.push((display, v.label));
+        }
     }
-    r.total = r.small + r.medium + r.large;
-    r.largest.sort_by_key(|t| std::cmp::Reverse(t.1));
-    r.largest.truncate(20);
-    if r.total >= 10 && (r.small as f64) < 0.6 * r.total as f64 {
+    r.total = r.small + r.medium + r.large + r.unknown;
+    r.larger
+        .sort_by_key(|(_, l)| std::cmp::Reverse(l.starts_with("large")));
+    // Small takes several runs to establish, medium one: count tests seen
+    // small so far, or the share is too low early on.
+    let small = r.small + r.small_so_far;
+    let seen = small + r.medium + r.large;
+    if seen >= 10 && (small as f64) < 0.6 * seen as f64 {
         r.warning = Some(format!(
-            "only {:.0}% of tests are small; aim for most tests to be small (rough guide 80/15/5)",
-            100.0 * r.small as f64 / r.total as f64
+            "only {:.0}% of the tests with an observed size are small; aim for most tests to be small (rough guide 80/15/5)",
+            100.0 * small as f64 / seen as f64
         ));
     }
     Ok(r)

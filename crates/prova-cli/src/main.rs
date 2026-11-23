@@ -1774,19 +1774,21 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 println!("{}", serde_json::to_string(&d)?);
             } else {
                 println!(
-                    "{} tests by observed p95 duration: {} small (<=1s), {} medium (<=30s), {} large",
-                    d.total, d.small, d.medium, d.large
+                    "{} tests by what they used (ADR 0025): small {}  medium {}  large {}  unknown {}",
+                    d.total, d.small, d.medium, d.large, d.unknown
                 );
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
-                if d.total == 0 {
+                if d.unknown > 0 {
                     println!(
-                        "no per-test durations recorded yet: the framework output carries none (e.g. plain `cargo test`); a JUnit report (nextest, pytest --junitxml) or go test -json provides them"
+                        "unknown: {} seen small in fewer than {} runs so far; the others were never seen alone (a framework that reports each test's start: go test -json, pytest-reportlog, the Vitest reporter) or in their own process (nextest). A test shorter than prova's 0.5 s samples is rarely seen",
+                        d.small_so_far,
+                        analysis::SMALL_AFTER
                     );
                 }
-                for (t, ms) in d.largest.iter().take(10) {
-                    println!("  {ms:>8}ms  {}", render::clean(t));
+                for (t, label) in d.larger.iter().take(20) {
+                    println!("  {}: {}", render::clean(t), render::clean(label));
                 }
             }
             Ok(exit::PASSED)

@@ -161,6 +161,33 @@ fn a_loop_of_short_commands_is_not_a_stall() {
     assert_eq!(w.status.code(), Some(5), "never stalled: {}", stdout(&w));
 }
 
+/// A busy child in a process group of its own (nextest starts every test
+/// so) is the run's activity: the run is not stalled.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_child_in_its_own_group_is_not_a_stall() {
+    let d = workspace("own-group");
+    let id = detach(
+        &d,
+        &["--stall-after", "1s"],
+        "setsid sh -c 'end=$((SECONDS + 5)); while [ $SECONDS -lt $end ]; do :; done' & wait",
+    );
+    let _cancel = CancelOnDrop(&d, id.clone());
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "3s",
+            "--json",
+        ],
+    );
+    assert_eq!(w.status.code(), Some(5), "never stalled: {}", stdout(&w));
+}
+
 #[test]
 fn kill_after_bounds_the_run() {
     let d = workspace("ceiling");

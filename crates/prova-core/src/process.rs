@@ -44,6 +44,84 @@ pub fn sample_group(pgid: u32) -> GroupSample {
     s
 }
 
+/// The group and every process descended from it, even in groups of their
+/// own: nextest starts each test in a new process group, and those tests
+/// are the run's work (their CPU is activity; what they use decides their
+/// size, ADR 0025). Kills and leftovers still go by the group.
+pub fn sample_tree(pgid: u32) -> GroupSample {
+    tree_of(pgid, &all_processes())
+}
+
+/// (pid, group, parent, CPU ticks, zombie) of every process.
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<(u32, u32, u32, u64, bool)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (group, ticks, zombie) = parse_stat(&stat)?;
+            let ppid = stat[stat.rfind(')')? + 2..]
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            Some((pid, group, ppid, ticks, zombie))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn all_processes() -> Vec<(u32, u32, u32, u64, bool)> {
+    let Some(out) = ps(&[
+        "-A", "-o", "pid=", "-o", "pgid=", "-o", "ppid=", "-o", "stat=", "-o", "time=",
+    ]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let [pid, group, ppid, stat, time] = f[..] else {
+                return None;
+            };
+            Some((
+                pid.parse().ok()?,
+                group.parse().ok()?,
+                ppid.parse().ok()?,
+                ps_ticks(time).unwrap_or(0),
+                stat.starts_with('Z'),
+            ))
+        })
+        .collect()
+}
+
+fn tree_of(pgid: u32, all: &[(u32, u32, u32, u64, bool)]) -> GroupSample {
+    let mut s = GroupSample::default();
+    let mut members: BTreeSet<u32> = all
+        .iter()
+        .filter(|p| p.1 == pgid && !p.4)
+        .map(|p| p.0)
+        .collect();
+    loop {
+        let more: Vec<u32> = all
+            .iter()
+            .filter(|p| !p.4 && !members.contains(&p.0) && members.contains(&p.2))
+            .map(|p| p.0)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        members.extend(more);
+    }
+    for p in all.iter().filter(|p| members.contains(&p.0)) {
+        s.cpu_ticks += p.3;
+        s.pids.insert(p.0);
+    }
+    s
+}
+
 /// Without `/proc` (macOS), `ps` lists every process with its group, state
 /// and CPU time; a failed `ps` gives an empty sample (only output then
 /// counts as activity).
@@ -132,7 +210,9 @@ pub fn belongs_to_run(pid: u32, run: &str) -> bool {
 /// many were signalled.
 pub fn kill_run_processes(pgid: u32, run: &str) -> usize {
     let mut n = 0;
-    for pid in sample_group(pgid).pids {
+    // The tree, not only the group: a child that started its own group
+    // still carries the run's id.
+    for pid in sample_tree(pgid).pids {
         if belongs_to_run(pid, run)
             && let Some(p) = Pid::from_raw(pid as i32)
         {
@@ -371,6 +451,22 @@ mod tests {
         assert_eq!(s.cpu_ticks, 125 + 372_304);
         assert_eq!(ps_ticks(" 0:00.07\n"), Some(7));
         assert_eq!(ps_ticks("x"), None);
+    }
+
+    #[test]
+    fn a_tree_includes_descendants_in_other_groups() {
+        // 10 leads group 10; 11 (nextest's test) is its child in group 11;
+        // 12 is 11's child; 20 is unrelated; 13 is a zombie child.
+        let all = [
+            (10, 10, 1, 5, false),
+            (11, 11, 10, 7, false),
+            (12, 11, 11, 1, false),
+            (13, 10, 10, 9, true),
+            (20, 20, 1, 50, false),
+        ];
+        let t = tree_of(10, &all);
+        assert_eq!(t.pids, [10, 11, 12].into_iter().collect());
+        assert_eq!(t.cpu_ticks, 13);
     }
 
     #[test]
