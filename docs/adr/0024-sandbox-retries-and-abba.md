@@ -1,6 +1,6 @@
 # 0024: Sandboxed arms, retries decided by their last attempt, ABBA trials
 
-Status: Proposed (2026-11-23). Amends [0002](0002-formal-model.md) and [0017](0017-no-false-passes.md) (retries), [0007](0007-experiments.md) (trial order) and [0023](0023-evidence-hygiene-and-experiment-isolation.md) (isolation, evidence).
+Status: Accepted (2026-11-23). Amends [0002](0002-formal-model.md) and [0017](0017-no-false-passes.md) (retries), [0007](0007-experiments.md) (trial order) and [0023](0023-evidence-hygiene-and-experiment-isolation.md) (isolation, evidence).
 
 ## Context
 
