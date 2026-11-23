@@ -2,28 +2,60 @@
 
 ## Install
 
-One static binary, no daemon. On Linux (x86_64, aarch64) or macOS (Apple
-silicon, Intel):
+One static binary, no daemon. Linux (x86_64, aarch64) and macOS (Apple
+silicon, Intel).
+
+### Install script
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 ```
 
-The script downloads the latest release for your platform, checks its
-SHA-256 checksum and installs `prova` into `~/.local/bin`
-(`PROVA_INSTALL_DIR` to change it, `PROVA_VERSION=v0.1.0` to pin a version).
-The tarballs and checksums are also attached to each
-[GitHub release](https://github.com/fals/prova/releases).
+It downloads the latest release for your OS and CPU, checks its SHA-256
+checksum and installs `prova` into `~/.local/bin` (it says so if that
+directory is not on your `PATH`). To pin a version or choose the directory,
+set the variables on the `sh` side of the pipe:
 
-In a container, copy the binary from the image into the image where your
-tests run (devcontainer, CI, agent sandbox); prova must run where the
-project's toolchain is:
-
-```dockerfile
-COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
+```sh
+curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh \
+  | PROVA_VERSION=v0.1.0 PROVA_INSTALL_DIR=/usr/local/bin sh
 ```
 
-From source: `cargo install --git https://github.com/fals/prova prova-cli`.
+The tarballs and their checksums are also attached to each
+[GitHub release](https://github.com/fals/prova/releases).
+
+### Docker
+
+`ghcr.io/fals/prova` (tags `v0.1.0` and `latest`, amd64 and arm64) contains
+only the static binary: no shell and no toolchain. prova runs your
+project's own test command, so it must live where that toolchain is.
+`docker run ghcr.io/fals/prova` can therefore only print its version; to
+use it, copy the binary into the image where your tests run
+(devcontainer, CI image, agent sandbox):
+
+```dockerfile
+FROM rust:1.95            # your project's own build image
+COPY --from=ghcr.io/fals/prova:v0.1.0 /prova /usr/local/bin/prova
+```
+
+To take the binary out of the image without a Dockerfile:
+
+```sh
+id=$(docker create ghcr.io/fals/prova:v0.1.0)
+docker cp "$id":/prova ~/.local/bin/prova
+docker rm "$id"
+```
+
+Prefer a version tag over `latest`, so an image rebuild does not change
+prova under you.
+
+### From source
+
+```sh
+cargo install --git https://github.com/fals/prova --tag v0.1.0 prova-cli
+```
+
+### Platform notes
 
 On macOS, prova watches test processes through `ps` instead of `/proc`.
 Two checks need counters macOS does not give: a pass whose command used
