@@ -1,0 +1,29 @@
+# TEMPORARY (issue #75): find why the short-commands test froze the arm64
+# runner. Deleted before #74 merges.
+name: diag-arm
+on:
+  pull_request:
+    paths: [.github/workflows/diag-arm.yml]
+jobs:
+  diag:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b20bd96
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Limits
+        run: |
+          nproc; cat /proc/sys/kernel/pid_max; ulimit -u
+          cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "cgroup $cg"
+          cat $cg/pids.max $cg/pids.current 2>&1
+          systemctl show 'actions.runner*' -p TasksMax -p TasksCurrent 2>&1 | head
+      - run: cargo build -q -p prova-cli --tests
+      - name: The test, watched
+        run: |
+          cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+          ( for i in $(seq 1 90); do echo "t=$i pids=$(cat $cg/pids.current 2>/dev/null)/$(cat $cg/pids.max 2>/dev/null) procs=$(ps -e --no-headers | wc -l) load=$(cut -d' ' -f1 /proc/loadavg)"; sleep 1; done ) &
+          b=$(ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$')
+          timeout 90 target/debug/deps/$b a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture; echo "test rc=$?"
+          ps -eo pid,pgid,stat,etime,args | grep -v "ps -eo" | tail -15
