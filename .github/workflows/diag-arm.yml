@@ -26,7 +26,8 @@ jobs:
           set -x
           command -v strace || sudo apt-get install -y -q strace >/dev/null
           echo "step shell: pid $$ pgid $(ps -o pgid= -p $$) sid $(ps -o sid= -p $$)"
-          timeout 120 setsid --wait strace -f -qq -e trace=kill,tgkill,tkill -e signal=none -o kills.txt \
+          touch kills.txt; tail -f kills.txt | grep --line-buffered -v ", 0) " | sed -u 's/^/KILL /' &
+          timeout 120 strace -f -qq -e trace=kill,tgkill,tkill -e signal=none -o kills.txt \
             cargo test -q -p prova-cli --test opaque_run -- a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture > out.txt 2>&1
           echo "rc=$?"
           tail -30 out.txt
