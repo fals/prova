@@ -347,6 +347,10 @@ struct ProtocolArgs {
     /// With --change: the candidate may change only those paths.
     #[arg(long = "change-only", requires = "scope")]
     scope_only: bool,
+    /// Let trials and the oracle use the network (by default a sandboxed
+    /// arm has only loopback).
+    #[arg(long)]
+    allow_network: bool,
 }
 
 #[derive(Subcommand)]
@@ -521,6 +525,7 @@ fn protocol_from(
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
         scope_only: a.scope_only,
+        allow_network: a.allow_network,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -612,12 +617,23 @@ fn exp_start(
         }
         return Ok(exit::PASSED);
     }
+    // Bounded like `prova run --until done` (round 11: a foreground
+    // comparison blocked with no limit): 9 minutes, then the command to
+    // continue; the comparison goes on in the background.
+    let deadline = std::time::Instant::now() + Duration::from_secs(9 * 60);
     loop {
         let r = experiment::wait(store, name, Duration::from_secs(30))?;
         if exp_exit(&r) != exit::RUNNING {
             let _ = child.wait();
             render::experiment(&r, json);
             return Ok(exp_exit(&r));
+        }
+        if std::time::Instant::now() >= deadline {
+            render::experiment(&r, json);
+            if !json {
+                println!("next: prova exp wait {name} --max-wait 9m");
+            }
+            return Ok(exit::RUNNING);
         }
         if !json {
             render::exp_progress(&r);
@@ -894,6 +910,13 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             } else {
                 Some(baseline.as_str())
             };
+            if p.alpha > 0.1 || p.min_effect < 0.01 {
+                eprintln!(
+                    "warning: alpha {} and minimum effect {:.1}% make a lucky ACCEPT likely; every verdict will say so",
+                    p.alpha,
+                    p.min_effect * 100.0
+                );
+            }
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
             // The baseline as a commit, not only a ref name (round 9).
             let sha = experiment::variant(&store, &name, "baseline")?

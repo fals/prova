@@ -580,6 +580,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             if let Some(sb) = res["sandbox"].as_str() {
                 println!("sandbox: {}", clean(sb));
             }
+            for c in res["caveats"].as_array().into_iter().flatten() {
+                println!("caveat: {}", clean(c.as_str().unwrap_or("")));
+            }
             let p = &res["primary"];
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
@@ -648,6 +651,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             "no comparison yet; next: prova exp candidate {}",
             r.experiment
         );
+    }
+    for w in &r.integrity {
+        println!("warning: {}", clean(w));
     }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).

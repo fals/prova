@@ -51,6 +51,10 @@ needs attention.
      its usual time, the suite's default, or the test runner's own
      warning). A stall ends any wait, including a plain `prova run -- ...`:
      cancel it.
+   - `environment-dependent, not flaky`: the test passed on this code only
+     with different environment variables (named); find which one matters.
+   - `prova forget <run> --reason "..."` takes a run whose results were not
+     real out of every test's history (and the flaky labels it caused).
    - `failed, then passed on a retry`: the run passes (a test's last
      attempt decides) but unverified: the test is flaky.
    - `failing now: more failures in a row than its flakiness explains`: a

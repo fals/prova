@@ -94,6 +94,10 @@ pub struct Protocol {
     /// to the default (round 10: allowing go.mod narrowed it to go.mod).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scope_only: bool,
+    /// Trials and oracle may use the network (a sandboxed arm has only
+    /// loopback otherwise).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_network: bool,
 }
 
 /// A specification file: path relative to the repository root, sha256.
@@ -527,6 +531,7 @@ pub struct Variant {
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let o = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -614,6 +619,7 @@ pub fn create(
     if let Some(r) = baseline_ref {
         for f in &protocol.specs {
             let at_ref = Command::new("git")
+                .env("GIT_NO_REPLACE_OBJECTS", "1")
                 .args(["show", &format!("{r}:{}", f.path)])
                 .current_dir(store.root())
                 .output()
@@ -739,6 +745,7 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
     let _ = std::fs::remove_file(&index);
     let run = |args: &[&str]| -> Result<String> {
         let o = Command::new("git")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(args)
             .current_dir(&top)
             .env("GIT_INDEX_FILE", &index)
@@ -772,6 +779,7 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
             .ok()
             .filter(|p| {
                 !Command::new("git")
+                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["check-ignore", "-q", "--"])
                     .arg(p)
                     .current_dir(&top)
@@ -925,6 +933,8 @@ struct TrialResult {
     leaked: Vec<String>,
     /// CPU (ms) other processes on the machine used during the trial.
     foreign_ms: f64,
+    /// CPU (ms) the trial's own processes used.
+    own_ms: f64,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -936,6 +946,7 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if !wt.exists() {
                 let ok = Command::new("git")
+                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "add", "--detach", "--force"])
                     .arg(&wt)
                     .arg(sha)
@@ -948,6 +959,16 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
                 if !ok {
                     return refused(format!("could not create worktree for {sha}"));
                 }
+            }
+            // The checkout must hold the commit's own bytes: a local smudge
+            // filter or a `git replace` changes what runs without changing
+            // the commit (round 11).
+            if let Some(path) = checkout_differs(&wt) {
+                return refused(format!(
+                    "the checkout of {} differs from commit {}'s own content at {path} (a local git filter, or a replaced object?): refusing to measure it",
+                    v.name,
+                    &sha[..12]
+                ));
             }
             wt
         }
@@ -977,7 +998,7 @@ fn run_trial(
     count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
-    let mut cmd = sandboxed(dir, &p.command[0], &p.command[1..]);
+    let mut cmd = sandboxed(dir, &p.command[0], &p.command[1..], p.allow_network);
     cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1003,6 +1024,7 @@ fn run_trial(
                 primary_lines: 0,
                 leaked: vec![],
                 foreign_ms: 0.0,
+                own_ms: 0.0,
             });
         }
     };
@@ -1085,6 +1107,7 @@ fn run_trial(
         primary_lines,
         leaked,
         foreign_ms,
+        own_ms: cpu_after.1.saturating_sub(cpu_before.1) as f64 * 10.0,
     })
 }
 
@@ -1103,7 +1126,22 @@ pub fn work(
     tests: &TestReader,
 ) -> Result<()> {
     process::become_subreaper();
-    let result = work_comparison(store, comparison, parse, count, tests);
+    let mut result = work_comparison(store, comparison, parse, count, tests);
+    // An error must end the comparison, or it stays "running" and every
+    // wait on it waits for nothing (a refused checkout, round 11).
+    if let Err(err) = &result {
+        let names: Option<(String, String)> = store
+            .conn()
+            .query_row(
+                "SELECT experiment, candidate FROM comparisons WHERE id = ?1 AND status = 'running'",
+                params![comparison],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((exp, cand)) = names {
+            result = end_failed(store, &exp, comparison, &cand, &err.to_string());
+        }
+    }
     let cleaned = keep_failed_logs(store, comparison);
     result.and(cleaned)
 }
@@ -1149,6 +1187,7 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if wt.exists() {
                 let _ = Command::new("git")
+                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "remove", "--force"])
                     .arg(&wt)
                     .current_dir(store.root())
@@ -1199,6 +1238,9 @@ fn work_comparison(
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
     // CPU other processes used per trial, per arm, with the trial's wall time.
     let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
+    // The trial's own CPU, with its wall time: a process stopped from
+    // outside (SIGSTOP) takes wall time but no CPU (round 11).
+    let own: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     let run_one = |arm: Arm, warmup: bool| -> Result<bool> {
         counter.set(counter.get() + 1);
         let seq = counter.get();
@@ -1216,6 +1258,7 @@ fn work_comparison(
         if !warmup {
             lines.borrow_mut()[i].push(r.primary_lines);
             foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
+            own.borrow_mut()[i].push((r.own_ms, r.wall_ms));
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1259,7 +1302,7 @@ fn work_comparison(
     if let Some(setup) = &p.setup {
         for (i, (arm, _)) in arms.iter().enumerate() {
             let log = private_file(&logs.join(format!("setup-{}.log", arm.as_str())))?;
-            let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()])
+            let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()], true)
                 .env_remove("PROVA_HOME")
                 .env("PYTHONNOUSERSITE", "1")
                 .env("PYTHONPYCACHEPREFIX", pycache_dir(&dirs[i]))
@@ -1436,7 +1479,8 @@ fn work_comparison(
         // something aimed at one arm (round 9: systemd-run burner).
         if let Some(reason) = {
             let f = foreign.borrow();
-            load_imbalance(&f[0], &f[1])
+            let o = own.borrow();
+            load_imbalance(&f[0], &f[1]).or_else(|| stopped_arm(&o[0], &o[1]))
         } {
             return end_failed(store, &exp, comparison, &cand_name, &reason);
         }
@@ -1477,6 +1521,36 @@ fn work_comparison(
         }
         let verdict = c.decide(outcome).unwrap_or(Verdict::Invalid);
         let mut result = result;
+        // A weak protocol, or many experiments on the same baseline and
+        // metric, make a lucky ACCEPT likelier: say so (round 11).
+        let mut caveats = Vec::new();
+        if p.alpha > 0.1 {
+            caveats.push(format!("alpha {} is weak (0.05 is usual)", p.alpha));
+        }
+        if p.min_effect < 0.01 {
+            caveats.push(format!(
+                "a minimum effect of {:.1}% lets noise count as an improvement",
+                p.min_effect * 100.0
+            ));
+        }
+        if let Some(sha) = &arms[0].1.commit_sha {
+            let others: i64 = store.conn().query_row(
+                "SELECT COUNT(DISTINCT x.name) FROM experiments x JOIN variants v ON v.experiment = x.name
+                  WHERE v.name = 'baseline' AND v.commit_sha = ?1 AND x.name <> ?2
+                    AND json_extract(x.protocol, '$.metric') = ?3",
+                params![sha, exp, p.metric],
+                |r| r.get(0),
+            )?;
+            if others > 0 {
+                caveats.push(format!(
+                    "{others} other experiment(s) measured {} on this baseline: across them one lucky ACCEPT is likelier",
+                    p.metric
+                ));
+            }
+        }
+        if !caveats.is_empty() {
+            result["caveats"] = serde_json::json!(caveats);
+        }
         // Say how isolated the arms were (ADR 0024).
         result["sandbox"] = serde_json::json!(if sandbox_available() {
             "bubblewrap: each arm could write only its own checkout, its private state and the shared toolchain caches"
@@ -1812,6 +1886,7 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
 /// writable: builds create their outputs there).
 fn read_only_tracked(dir: &Path) {
     let Ok(o) = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["ls-files", "-z"])
         .current_dir(dir)
         .output()
@@ -1911,43 +1986,63 @@ pub fn sandbox_available() -> bool {
 /// state (caches, bytecode), a private /tmp and the toolchain caches builds
 /// must write; its own process namespace, which dies with prova. The other
 /// arm's checkout, prova's store and the user's files cannot be changed.
-fn sandboxed(dir: &Path, program: &str, args: &[String]) -> Command {
-    if !sandbox_available() {
-        let mut c = Command::new(program);
-        c.args(args);
-        return c;
-    }
+fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Command {
     let state = pycache_dir(dir);
     let _ = std::fs::create_dir_all(&state);
-    let mut c = Command::new("bwrap");
-    c.args([
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-    ]);
-    c.arg("--bind").arg(dir).arg(dir);
-    c.arg("--bind").arg(&state).arg(&state);
-    // Toolchain caches a build writes (dependency locks, compiled objects):
-    // shared between arms, a remaining channel (ADR 0024).
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for sub in [
-            ".cache", ".cargo", ".m2", ".nuget", ".npm", "go", ".gradle", ".dotnet",
-        ] {
-            let p = home.join(sub);
-            if p.is_dir() {
-                c.arg("--bind").arg(&p).arg(&p);
-            }
+    let mut c = if sandbox_available() {
+        let mut c = Command::new("bwrap");
+        c.args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+        ]);
+        c.arg("--bind").arg(dir).arg(dir);
+        c.arg("--bind").arg(&state).arg(&state);
+        // Shared toolchain caches stay read-only (round 11: a candidate
+        // patched the baseline's compiled test in the shared Go build
+        // cache); each arm writes its own caches, set below.
+        c.args(["--unshare-pid", "--die-with-parent", "--new-session"]);
+        if !network {
+            // Loopback only: no accomplice on the network or the host.
+            c.arg("--unshare-net");
+        }
+        c.arg("--").arg(program).args(args);
+        c.env("TMPDIR", "/tmp");
+        c
+    } else {
+        let mut c = Command::new(program);
+        c.args(args);
+        c
+    };
+    // Per-arm caches, sandboxed or not: nothing one arm compiles is read
+    // by the other.
+    c.env("GOCACHE", state.join("go-build"))
+        .env("XDG_CACHE_HOME", state.join("cache"))
+        .env("npm_config_cache", state.join("npm"));
+    // The session's secrets are none of the workload's business (round 11).
+    for (k, _) in std::env::vars() {
+        let u = k.to_ascii_uppercase();
+        if [
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "API_KEY",
+            "CREDENTIAL",
+            "COOKIE",
+        ]
+        .iter()
+        .any(|w| u.contains(w))
+        {
+            c.env_remove(&k);
         }
     }
-    c.args(["--unshare-pid", "--die-with-parent", "--new-session", "--"]);
-    c.arg(program).args(args);
-    c.env("TMPDIR", "/tmp");
     c
 }
 
@@ -2013,9 +2108,96 @@ fn drifted(
     Ok(None)
 }
 
+/// Whether one arm's trials sat stopped (SIGSTOP from outside, or starved)
+/// while the other's ran: (own CPU ms, wall ms) per trial. A CPU-bound
+/// workload keeps about one core busy; one arm far below it, every trial,
+/// while the other is near it, was held back (round 11).
+pub fn stopped_arm(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
+    let util = |v: &[(f64, f64)]| -> Vec<f64> {
+        v.iter()
+            .filter(|(_, w)| *w >= 1000.0)
+            .map(|(ms, w)| ms / w)
+            .collect()
+    };
+    let (ub, uc) = (util(base), util(cand));
+    if ub.len() < 3 || uc.len() < 3 {
+        return None;
+    }
+    let max = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+    let (low, high, arm) = if max(&ub) < min(&uc) {
+        (&ub, &uc, "baseline")
+    } else if max(&uc) < min(&ub) {
+        (&uc, &ub, "candidate")
+    } else {
+        return None;
+    };
+    // Held back: every trial of one arm under 60% of a core while every
+    // trial of the other kept at least 90% of one busy.
+    (max(low) < 0.6 && min(high) >= 0.9).then(|| {
+        format!(
+            "the {arm}'s trials ran only {:.0}% of their time while the other arm's ran {:.0}% or more: something stopped or starved that arm (SIGSTOP from outside?), so the comparison is void",
+            max(low) * 100.0,
+            min(high) * 100.0
+        )
+    })
+}
+
+/// The first tracked file whose bytes differ from the blob the commit
+/// records, hashed without any filter.
+fn checkout_differs(dir: &Path) -> Option<String> {
+    let listed = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(["ls-files", "-s", "-z"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    let entries: Vec<(String, String)> = listed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| {
+            let e = String::from_utf8_lossy(e);
+            let (meta, path) = e.split_once('\t')?;
+            let mut f = meta.split_whitespace();
+            let mode = f.next()?;
+            let blob = f.next()?;
+            // Regular files only (not symlinks or submodules).
+            mode.starts_with("100")
+                .then(|| (blob.to_owned(), path.to_owned()))
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let mut child = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(["hash-object", "--no-filters", "--stdin-paths"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let paths: String = entries.iter().map(|(_, p)| format!("{p}\n")).collect();
+    let mut stdin = child.stdin.take()?;
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(paths.as_bytes());
+    });
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    let hashes = String::from_utf8_lossy(&out.stdout).into_owned();
+    entries
+        .iter()
+        .zip(hashes.lines())
+        .find(|((blob, _), h)| blob != h)
+        .map(|((_, p), _)| p.clone())
+}
+
 /// `git status` of tracked files in a checkout (empty outside git).
 fn tracked_state(dir: &Path) -> String {
     Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -2055,17 +2237,22 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    let ok = sandboxed(dir, "sh", &["-c".to_owned(), oracle.clone()])
-        .env_remove("PROVA_HOME")
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = sandboxed(
+        dir,
+        "sh",
+        &["-c".to_owned(), oracle.clone()],
+        p.allow_network,
+    )
+    .env_remove("PROVA_HOME")
+    .env("PYTHONNOUSERSITE", "1")
+    .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
+    .current_dir(dir)
+    .stdin(Stdio::null())
+    .stdout(log.try_clone()?)
+    .stderr(log)
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
     // A process the oracle leaves behind would run into the trials and be
     // blamed on them (round 10: a daemon from the candidate's oracle was
     // reported as the baseline trial's leak).
@@ -2242,7 +2429,7 @@ fn finish(
         && b == "baseline"
         && let (Ok(bv), Ok(cv)) = (variant(store, &e.name, &b), variant(store, &e.name, &c))
         && let (Some(bs), Some(cs)) = (&bv.commit_sha, &cv.commit_sha)
-        && !Command::new("git")
+        && !Command::new("git").env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(["merge-base", "--is-ancestor", bs, cs])
             .current_dir(store.root())
             .status()
@@ -2363,6 +2550,10 @@ pub struct Report {
     /// How to read the kept logs of the latest comparison, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
+    /// Stored verdicts or a best that the immutable samples do not support
+    /// (an edited database): each is a reason not to trust the record.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub integrity: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2478,6 +2669,7 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
                     .is_some_and(|r| r["specification"] == "violated")
         })
         .map(|_| format!("prova exp log {exp}"));
+    let integrity = integrity(store, &e)?;
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
@@ -2487,7 +2679,69 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         comparison,
         decisions,
         logs,
+        integrity,
     })
+}
+
+/// Re-derives every stored ACCEPT from the immutable samples, with the Holm
+/// family as it stood when it was decided, and checks the best against the
+/// record (round 11: editing prova.db turned a REJECT into an ACCEPT). The
+/// same user can edit the file; this makes it show.
+fn integrity(store: &Store, e: &Experiment) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stmt = store.conn().prepare(
+        "SELECT id, candidate, COALESCE(ended_ms, 0) FROM comparisons
+          WHERE experiment = ?1 AND status = 'decided' AND verdict = 'accept'",
+    )?;
+    let accepted: Vec<(String, String, i64)> = stmt
+        .query_map(params![e.name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let p = &e.protocol;
+    for (id, cand, ended) in &accepted {
+        let (base, c) = samples(store, id, &p.metric)?;
+        if base.len() < p.min_trials as usize || c.len() < p.min_trials as usize {
+            out.push(format!(
+                "comparison {id} is recorded as ACCEPT but has no measurements to support it"
+            ));
+            continue;
+        }
+        let mut fam = store.conn().prepare(
+            "SELECT json_extract(result, '$.primary.p') FROM comparisons
+              WHERE experiment = ?1 AND status = 'decided' AND id <> ?2 AND COALESCE(ended_ms, 0) < ?3",
+        )?;
+        let mut ps: Vec<f64> = fam
+            .query_map(params![e.name, id, ended], |r| r.get::<_, Option<f64>>(0))?
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        let raw = stats::mann_whitney(&base, &c).p;
+        ps.push(raw);
+        let adjusted = *stats::holm(&ps).last().unwrap_or(&raw);
+        let primary = measure(&p.metric, p.better, &base, &c, p.alpha, Some(adjusted));
+        let (v, _) = judge(&primary, &[], p.min_effect, p.alpha);
+        if v != Verdict::Accept {
+            out.push(format!(
+                "comparison {id} ({cand}) is recorded as ACCEPT, but its own samples give {}: the record was changed",
+                v.as_str()
+            ));
+        }
+    }
+    let best_ok = e.best == "baseline"
+        || accepted.iter().any(|(_, c, _)| *c == e.best)
+        || store
+            .conn()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM best_resets WHERE experiment = ?1 AND to_best = ?2)",
+                params![e.name, e.best],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+    if !best_ok {
+        out.push(format!(
+            "the best is {}, but no ACCEPT or recorded reset made it so: the record was changed",
+            e.best
+        ));
+    }
+    Ok(out)
 }
 
 /// Blocks at most `max_wait` until the latest comparison ends.
@@ -2504,6 +2758,21 @@ pub fn wait(store: &Store, exp: &str, max_wait: Duration) -> Result<Report> {
 }
 
 use std::os::unix::process::CommandExt;
+
+#[cfg(test)]
+mod stopped_tests {
+    #[test]
+    fn an_arm_held_back_while_the_other_ran_is_caught() {
+        let ran = vec![(1950.0, 2000.0); 5];
+        let held = vec![(1000.0, 2000.0); 5];
+        assert!(super::stopped_arm(&held, &ran).is_some());
+        // A parallel speedup: more than a core is fine, the baseline ran.
+        let parallel = vec![(7000.0, 2000.0); 5];
+        assert!(super::stopped_arm(&ran, &parallel).is_none());
+        // Both mostly waiting (sleep-bound workloads): nothing to say.
+        assert!(super::stopped_arm(&[(100.0, 2000.0); 5], &[(200.0, 2000.0); 5]).is_none());
+    }
+}
 
 #[cfg(test)]
 mod load_tests {
