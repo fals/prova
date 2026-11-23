@@ -31,12 +31,12 @@ The release workflow then, in order:
    GitHub release with the tarballs, checksums and `install.sh`, and pushes
    `ghcr.io/fals/prova:<tag>` and `:latest` for amd64 and arm64.
 
-## After the first release (once)
+## Image visibility
 
-GitHub creates new container packages as private. Make it public in the
-package settings (`https://github.com/users/fals/packages/container/prova/settings`,
-Danger Zone, Change visibility), or `docker pull ghcr.io/fals/prova`
-fails for everyone else.
+The image inherits the public repository's visibility (it carries the
+`org.opencontainers.image.source` label): v0.1.0 was pullable anonymously
+right after publishing. If a package ever shows as private, change it in
+`https://github.com/users/fals/packages/container/prova/settings`.
 
 ## Check what was published
 
@@ -45,5 +45,5 @@ From a machine that never built prova:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 prova --version
-docker run --rm ghcr.io/fals/prova:latest --version
+docker run --rm ghcr.io/fals/prova:<tag> --version
 ```

@@ -67,15 +67,17 @@ Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):
 curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh | sh
 ```
 
-In a container image, copy the static binary next to your toolchain:
+With Docker: the image `ghcr.io/fals/prova` holds only the static binary
+(amd64 and arm64). Copy it into the image where your tests run, since prova
+runs your project's own test command:
 
 ```dockerfile
-COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
+COPY --from=ghcr.io/fals/prova:v0.1.0 /prova /usr/local/bin/prova
 ```
 
 Release tarballs with checksums are on the
 [releases page](https://github.com/fals/prova/releases); from source:
-`cargo install --git https://github.com/fals/prova prova-cli`. More in
+`cargo install --git https://github.com/fals/prova prova-cli`. All options in
 [Getting started](docs/getting-started.md#install).
 
 ## Quickstart
