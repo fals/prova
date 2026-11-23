@@ -658,11 +658,37 @@ fn observe_child(
     // ADR 0017: the verdict is decided from all the evidence.
     let not_passed = report.not_passed;
     let mut contradictions = report.contradictions;
+    // A test whose harness never reported, in a run that ended on its own:
+    // the run fails (a contradiction), and none of its results is evidence
+    // (attempts are immutable, so the run is marked, not rewritten). A run
+    // that was killed or cancelled cut the output itself (round 11).
+    if status == Status::Finished {
+        if !not_passed.is_empty() {
+            sup.emit(EventKind::RunWarning {
+                message: format!(
+                    "{} test(s) were reported passed but their harness never finished, e.g. {}{NO_EVIDENCE}",
+                    not_passed.len(),
+                    not_passed[0]
+                ),
+            });
+        }
+    } else {
+        contradictions.retain(|c| !c.contains("never reported a result"));
+    }
     let mut warnings = report.warnings;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
     if spec.expects_tests() && status == Status::Finished {
+        // A selection that only skipped tests ran none (round 11: vitest -t
+        // reports the rest as skipped; 0 passed, 5 skipped exited 0).
+        let ran = sup
+            .lifecycle
+            .outcomes()
+            .values()
+            .filter(|o| **o != Outcome::Skipped)
+            .count()
+            + sup.lifecycle.open().len();
         if let Some(sel) = &spec.selection
-            && observed == 0
+            && (observed == 0 || ran == 0)
             && sup.level > Level::Opaque
         {
             contradictions.push(format!(
@@ -870,7 +896,10 @@ fn observe_child(
         };
         // Fast tests repeat the same coarse durations by nature: only a
         // run with real time in it is identifiable this way.
-        if mine.len() >= 2 && mine.iter().map(|(_, d)| d).sum::<i64>() >= 100 {
+        // Three or more tests of 10 ms or more: the same results by
+        // coincidence would need every one of them to match (round 11:
+        // a 1.5 s sleep and four 3 ms tests matched once).
+        if mine.iter().filter(|(_, d)| *d >= 10).count() >= 3 {
             let mut stmt = store.conn().prepare(
                 "SELECT DISTINCT run_id FROM attempts WHERE test_id = ?1 AND duration_ms = ?2 AND run_id <> ?3",
             )?;
@@ -1035,17 +1064,6 @@ fn observe_child(
     )?;
     for (test, text) in &report.test_outputs {
         crate::output::keep_test(store, run, &crate::store::test_id(&sup.suite, test), text)?;
-    }
-    if !not_passed.is_empty() {
-        sup.flush()?;
-        for name in &not_passed {
-            store.conn().execute(
-                "UPDATE attempts SET outcome = 'errored', message = 'passed by exit code, but its test harness never reported a result'
-                  WHERE run_id = ?1 AND outcome = 'passed'
-                    AND test_id IN (SELECT id FROM tests WHERE display = ?2)",
-                rusqlite::params![run, name],
-            )?;
-        }
     }
     let tail: Vec<String> = sup.tail.iter().cloned().collect();
     let fingerprint = (outcome != Outcome::Passed)
@@ -1485,11 +1503,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         .and_then(|s| s.selection);
     // Only a run that finished can suggest flakiness: a cancelled or aborted
     // run's unfinished tests say nothing about the code (ADR 0018).
-    let suite_passed_on_same_code = row.status == Status::Finished
-        && store
-            .suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?
-            .iter()
-            .any(|r| r.code == row.code && r.outcome == Some(Outcome::Passed));
+    // Only a verified pass is evidence the suite can pass on this code
+    // (round 11: an echoed pass made a real failure "likely flaky").
+    let suite_passed_on_same_code = row.status == Status::Finished && {
+        let prev = store.suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?;
+        let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
+        let thin = store.unverified(&ids)?;
+        prev.iter().any(|r| {
+            r.code == row.code && r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id)
+        })
+    };
     let mut failures = Vec::new();
     for (key, outcome, message, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
@@ -1663,6 +1686,11 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .iter()
         .filter(|r| r.code == row.code)
         .map(|r| match r.status {
+            // An unverified pass is not a plain "passed" (round 11: "none of
+            // them passed; on this exact code: passed").
+            Status::Finished if r.outcome == Some(Outcome::Passed) && thin.contains(&r.id) => {
+                "passed?".to_owned()
+            }
             Status::Finished => r.outcome.map(|o| o.as_str().to_owned()).unwrap_or_default(),
             s => s.as_str().to_owned(),
         })

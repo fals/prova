@@ -66,6 +66,18 @@ pub struct Recognizers {
     /// Tests nextest passed whose harness never reported a result: the
     /// test process exited early with code 0 (round 9: `exit(0)`).
     pub harness_died: Vec<String>,
+    /// libtest's `running N tests` with how many results followed: a
+    /// binary that stops before its `test result:` summary died mid-run.
+    libtest_running: Option<(u64, u64)>,
+    /// Test binaries that stopped early: "after K of N tests".
+    pub harness_stopped: Vec<String>,
+    /// Text results held while an injected stream is expected.
+    held_text_events: Vec<EventKind>,
+    /// The longest time one of the framework's own summaries says its tests
+    /// took (libtest `finished in`, go `ok pkg 1.5s`, pytest `in 1.50s`;
+    /// packages may run in parallel, so not a sum): more than the
+    /// whole run means the output was replayed, not produced (round 11).
+    pub reported_secs: f64,
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
@@ -116,6 +128,36 @@ impl Recognizers {
         if self.started.insert(d) {
             out.push(EventKind::TestStarted { test: key });
         }
+    }
+
+    /// A later attempt of a test that failed (a retry): its result is the
+    /// test's new outcome (ADR 0024: the last attempt decides).
+    fn retry(
+        &mut self,
+        key: TestKey,
+        attempt: u32,
+        event: &str,
+        v: &serde_json::Value,
+        out: &mut Vec<EventKind>,
+    ) {
+        let outcome = match event {
+            "ok" => Outcome::Passed,
+            "failed" => Outcome::Failed,
+            _ => return, // "started": the retry's start is implied
+        };
+        let duration_ms = v["exec_time"].as_f64().map(|s| (s * 1000.0).round() as u64);
+        let message = (outcome == Outcome::Failed)
+            .then(|| v["stdout"].as_str().unwrap_or("").to_owned())
+            .filter(|m| !m.is_empty());
+        self.seen.insert(key.unique(), (key.display(), outcome));
+        out.push(EventKind::TestFinished {
+            test: key,
+            attempt,
+            outcome,
+            duration_ms,
+            message,
+            source: Level::Native,
+        });
     }
 
     fn finished(
@@ -293,6 +335,60 @@ impl Recognizers {
         // (its echoed libtest summary must not count as the run's totals).
         // JSON events (nextest's own, at the end of each binary) are never
         // part of a test's captured output.
+        {
+            let t = line.trim();
+            let secs = |w: &str| {
+                w.trim_end_matches(['s', ',', '='])
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            };
+            if t.starts_with("test result:")
+                && let Some(i) = t.find("finished in ")
+            {
+                self.reported_secs = self.reported_secs.max(secs(&t[i + 12..]).unwrap_or(0.0));
+            } else if let Some(rest) = line.strip_prefix("ok  \t")
+                && let Some(last) = rest.rsplit('\t').next()
+            {
+                self.reported_secs = self.reported_secs.max(secs(last).unwrap_or(0.0));
+            } else if t.starts_with('=')
+                && t.ends_with('=')
+                && let Some(i) = t.rfind(" in ")
+            {
+                self.reported_secs = self.reported_secs.max(
+                    t[i + 4..]
+                        .split_whitespace()
+                        .next()
+                        .and_then(secs)
+                        .unwrap_or(0.0),
+                );
+            }
+        }
+        // Plain libtest: "running N tests", N results, "test result:". A
+        // binary that stops in between died (round 11: `exit(0)` in a test
+        // under `--test-threads=1` gave a verified pass). nextest's own
+        // per-test output is handled apart.
+        if self.nextest_pass_output.is_none() && self.nextest_pending.is_none() {
+            let t = line.trim();
+            if let Some(n) = t
+                .strip_prefix("running ")
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|_| t.ends_with(" tests") || t.ends_with(" test"))
+            {
+                self.close_libtest_running();
+                if n > 0 {
+                    self.libtest_running = Some((n, 0));
+                }
+            } else if t.starts_with("test result:") {
+                self.libtest_running = None;
+            } else if t.starts_with("test ")
+                && (t.ends_with(" ok") || t.contains(" ... FAILED") || t.contains(" ... ignored"))
+                && let Some((_, seen)) = self.libtest_running.as_mut()
+            {
+                *seen += 1;
+            }
+        }
         // A passing test's own output: libtest says "running 1 test" first
         // and "test result:" last; an `exit(0)` inside the test skips it.
         if let Some((_, running, result)) = self.nextest_pass_output.as_mut()
@@ -309,9 +405,23 @@ impl Recognizers {
             }
         }
         if self.nextest_pending.is_some() && !line.starts_with('{') {
+            let t = line.trim_start();
+            // cargo's own lines end the block: `cargo test --doc` after
+            // nextest printed its doctests into the held failure (round 11:
+            // a failing doctest was lost when a unit test failed too).
+            let cargo_line = [
+                "Doc-tests ",
+                "Running ",
+                "Compiling ",
+                "Finished ",
+                "error: test failed",
+            ]
+            .iter()
+            .any(|p| t.starts_with(p));
             if nextest_status(line).is_none()
-                && !line.trim_start().starts_with("────")
-                && !line.trim_start().starts_with("Summary [")
+                && !t.starts_with("────")
+                && !t.starts_with("Summary [")
+                && !cargo_line
             {
                 if let Some((_, _, lines)) = self.nextest_pending.as_mut() {
                     lines.push(line.to_owned());
@@ -329,7 +439,13 @@ impl Recognizers {
                 return out;
             }
         } else if self.vitest_pending.is_some() && !line.trim_start().starts_with("→ ") {
-            self.flush_vitest(&mut out);
+            if self.vitest_stream {
+                let mut held = std::mem::take(&mut self.held_text_events);
+                self.flush_vitest(&mut held);
+                self.held_text_events = held;
+            } else {
+                self.flush_vitest(&mut out);
+            }
         }
         if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
             self.go_package_lines += 1;
@@ -355,12 +471,20 @@ impl Recognizers {
                 }
             }
         } else {
+            // With a stream injected, its events win; the framework's text
+            // is held, and used only if the stream never arrives (round 11:
+            // a suite whose command did not load the reporter ran blind).
+            let streamed = self.level >= Some(Level::Native);
+            let mut held = std::mem::take(&mut self.held_text_events);
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
+                || (self.pytest_stream && !streamed && self.pytest(line, &mut held))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)
+                || (self.vitest_stream && !streamed && self.vitest(line, &mut held))
                 || (!self.vitest_stream && self.vitest(line, &mut out))
                 || self.tap(line, &mut out);
+            self.held_text_events = held;
         }
         out
     }
@@ -477,6 +601,14 @@ impl Recognizers {
         let Some(name) = v["name"].as_str().filter(|_| kind == "test") else {
             return;
         };
+        // nextest names a retry `test#2`: the same test, another attempt
+        // (round 11: retries counted as a second test that failed).
+        let (name, attempt) = match name.rsplit_once('#') {
+            Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                (base, n.parse::<u32>().unwrap_or(1))
+            }
+            _ => (name, 1),
+        };
         let key = if let Some(file) = v["file"].as_str() {
             TestKey {
                 file: None,
@@ -494,6 +626,9 @@ impl Recognizers {
             self.libtest_key(name)
         };
         lift(&mut self.level, Level::Native);
+        if attempt > 1 {
+            return self.retry(key, attempt, event, v, out);
+        }
         if event == "started" {
             self.libtest_open.push(key.clone());
             return self.started(key, out);
@@ -932,6 +1067,16 @@ impl Recognizers {
 
     /// nextest's human status lines, printed live (ADR 0018):
     /// `PASS [   0.004s] (1/5) calc tests::adds`, `SLOW [> 60.000s] ...`.
+    fn close_libtest_running(&mut self) {
+        if let Some((n, seen)) = self.libtest_running.take()
+            && seen < n
+        {
+            self.harness_stopped.push(format!(
+                "a test binary stopped after {seen} of {n} tests, before its summary"
+            ));
+        }
+    }
+
     fn close_pass_output(&mut self) {
         if let Some((name, running, result)) = self.nextest_pass_output.take()
             && running
@@ -1027,10 +1172,23 @@ impl Recognizers {
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         self.close_pass_output();
+        self.close_libtest_running();
         self.close_libtest_block();
         let mut out = Vec::new();
+        // The injected stream never came: the text results are all there is.
+        if self.level < Some(Level::Native) {
+            out.append(&mut self.held_text_events);
+        }
         self.flush_nextest(&mut out);
-        self.flush_vitest(&mut out);
+        if self.vitest_stream {
+            let mut held = Vec::new();
+            self.flush_vitest(&mut held);
+            if self.level < Some(Level::Native) {
+                out.extend(held);
+            }
+        } else {
+            self.flush_vitest(&mut out);
+        }
         out
     }
 
@@ -1908,5 +2066,67 @@ mod passed_tests_tests {
         }
         r.finish();
         assert_eq!(r.harness_died, vec!["tests::divides".to_owned()]);
+    }
+
+    /// Round 11: nextest names a retry `test#2`; it is the same test's
+    /// second attempt, not another test.
+    #[test]
+    fn a_nextest_retry_is_another_attempt_of_the_same_test() {
+        use super::Recognizers;
+        use prova_core::model::{EventKind, Outcome};
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in [
+            r#"{"type":"test","event":"started","name":"calc::calc$tests::flaky"}"#,
+            r#"{"type":"test","event":"failed","name":"calc::calc$tests::flaky","exec_time":0.001,"stdout":"boom"}"#,
+            r#"{"type":"test","event":"started","name":"calc::calc$tests::flaky#2"}"#,
+            r#"{"type":"test","event":"ok","name":"calc::calc$tests::flaky#2","exec_time":0.001}"#,
+        ] {
+            ev.extend(r.line(l));
+        }
+        let finished: Vec<(String, u32, Outcome)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    attempt,
+                    outcome,
+                    ..
+                } => Some((test.name.clone(), *attempt, *outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            vec![
+                ("flaky".to_owned(), 1, Outcome::Failed),
+                ("flaky".to_owned(), 2, Outcome::Passed)
+            ]
+        );
+    }
+
+    /// Round 11: a failing doctest after a nextest failure was taken as that
+    /// failure's captured output and lost.
+    #[test]
+    fn a_doctest_after_a_nextest_failure_is_its_own_result() {
+        use super::Recognizers;
+        use prova_core::model::{EventKind, Outcome};
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in [
+            "        FAIL [   0.003s] (1/1) calc tests::adds",
+            "  stdout ───",
+            "    thread panicked",
+            "   Doc-tests calc",
+            "running 1 test",
+            "test src/lib.rs - add (line 3) ... FAILED",
+        ] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert!(
+            ev.iter().any(|e| matches!(e, EventKind::TestFinished { test, outcome: Outcome::Failed, .. } if test.name.contains("add (line 3)"))),
+            "{ev:?}"
+        );
     }
 }

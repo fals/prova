@@ -119,8 +119,89 @@ pub fn code_identity(dir: &Path) -> String {
     format!("tree:{short}+dirty:{}", &sha256_hex(&material)[..12])
 }
 
+/// Variables that change between shells and sessions without changing what
+/// a test does, and names that may hold secrets: left out of the
+/// environment fingerprint.
+fn env_ignored(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+        "TERM",
+        "COLORTERM",
+        "COLUMNS",
+        "LINES",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "TMUX",
+        "TMUX_PANE",
+        "WINDOWID",
+        "GPG_TTY",
+        "LS_COLORS",
+        "PS1",
+        "PS2",
+        "HISTFILE",
+        "HISTSIZE",
+        "MAIL",
+        "STY",
+        "INVOCATION_ID",
+        "JOURNAL_STREAM",
+        "MANAGERPID",
+        "SYSTEMD_EXEC_PID",
+        "XDG_VTNR",
+        "OLDPWD",
+        "SSH_TTY",
+    ];
+    const PREFIX: &[&str] = &[
+        "SSH_",
+        "XDG_SESSION",
+        "KITTY_",
+        "ALACRITTY_",
+        "TERM_",
+        "VSCODE_",
+        "CLAUDE",
+        "OTEL_",
+        "PROVA_",
+        "LC_TERMINAL",
+        "WT_",
+        "TERMINAL_",
+        "GHOSTTY",
+    ];
+    const SECRET: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "COOKIE",
+    ];
+    EXACT.contains(&name)
+        || PREFIX.iter().any(|p| name.starts_with(p))
+        || name.ends_with("_PID")
+        || SECRET.iter().any(|w| name.to_ascii_uppercase().contains(w))
+}
+
+/// Every other variable as `name -> short hash of its value` (values are
+/// never stored): two runs whose fingerprints differ ran in different
+/// environments (round 11: `HANG=1` and `BADENV=1` made a test "flaky").
+pub fn env_fingerprint() -> Map<String, Value> {
+    let mut m = Map::new();
+    for (k, v) in std::env::vars() {
+        if !env_ignored(&k) {
+            let h = sha256_hex(v.as_bytes());
+            m.insert(k, Value::String(h[..8].to_owned()));
+        }
+    }
+    m
+}
+
 pub fn recorded_env(extra: &[String]) -> Value {
     let mut m = Map::new();
+    m.insert("__fingerprint".to_owned(), Value::Object(env_fingerprint()));
     for name in DEFAULT_ENV
         .iter()
         .copied()
@@ -254,7 +335,8 @@ mod tests {
             env.as_object()
                 .unwrap()
                 .keys()
-                .all(|k| DEFAULT_ENV.contains(&k.as_str()))
+                // Values only for allow-listed names; the rest is hashed.
+                .all(|k| k == "__fingerprint" || DEFAULT_ENV.contains(&k.as_str()))
         );
     }
 }

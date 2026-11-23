@@ -223,7 +223,12 @@ fn context(f: &prova_core::engine::Failure) -> String {
     } else if !c.flaky {
         parts.push("has not passed yet".to_owned());
     }
-    if c.failing_now {
+    if !c.env_dependent.is_empty() {
+        parts.push(format!(
+            "passed on this code with a different environment ({}): environment-dependent, not flaky",
+            c.env_dependent.join(", ")
+        ));
+    } else if c.failing_now {
         // Whatever its past: it fails every time now (round 9).
         parts.push("failing now: more failures in a row than its flakiness explains".to_owned());
     } else if c.flaky {
@@ -405,7 +410,11 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             let confirm = if s.suite.starts_with("cmd:") {
                 format!("`prova history {t}`")
             } else {
-                format!("`prova run {} --select '{t}' --repeat 5`", s.suite)
+                // Not every suite can select (round 11: `make` cannot).
+                format!(
+                    "`prova run {} --select '{t}' --repeat 5` (or `--repeat 5` alone if the suite cannot select)",
+                    s.suite
+                )
             };
             format!(
                 "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
@@ -695,6 +704,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         })
     }
@@ -719,6 +729,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         });
         assert_eq!(first, " [first time seen: no history yet]");
@@ -737,6 +748,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         });
         assert_eq!(never, " [has not passed yet]", "never passed: not new");

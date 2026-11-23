@@ -305,9 +305,19 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                     why: "the project's own command, exactly as CI runs it".into(),
                 });
             } else {
+                // The project's own command, plus prova's Vitest reporter when
+                // it is an npm script running vitest (round 11: `npm test`
+                // alone ran blind once the reporter was injected).
+                let run = match &existing {
+                    Some(cmd) if f.base == "vitest" && cmd.starts_with("npm ") => {
+                        format!("{cmd} -- --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\"")
+                    }
+                    Some(cmd) => cmd.clone(),
+                    None => f.run.into(),
+                };
                 p.suites.push(SuiteProposal {
                     name: "default".into(),
-                    run: existing.clone().unwrap_or_else(|| f.run.into()),
+                    run,
                     select: Some(f.select.into()),
                     why: match &existing {
                         Some(cmd) => {

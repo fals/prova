@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_output.sql"),
     include_str!("migrations/0006_best_resets.sql"),
     include_str!("migrations/0007_immutable_samples.sql"),
+    include_str!("migrations/0008_forgotten_runs.sql"),
 ];
 
 pub struct Store {
@@ -578,6 +579,15 @@ impl Store {
             row_to_run,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Takes a run out of every test's history, with a reason.
+    pub fn forget(&self, run: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO forgotten (run_id, reason, created_ms) VALUES (?1, ?2, ?3)",
+            params![run, reason, crate::ids::now_ms() as i64],
+        )?;
+        Ok(())
     }
 
     /// Which of these runs passed with warnings (unverified, ADR 0017).

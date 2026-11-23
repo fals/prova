@@ -23,6 +23,9 @@ pub struct TestRun {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// The run's environment fingerprint (name -> hash of value).
+    #[serde(skip)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +47,10 @@ pub struct TestStats {
     /// Failed its last 3 runs in a row: failing now, whatever its past.
     #[serde(default)]
     pub failing_now: bool,
+    /// Passed and failed on the same code only with different environment
+    /// variables: these names differ.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_dependent: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed_size: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,8 +109,9 @@ pub fn test_runs_with(
                    -- is no evidence about any test (round 10: it made a real
                    -- bug look flaky)
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
-                                                  AND w.payload LIKE '%; no evidence about the tests%'))))
-         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
+                                                  AND w.payload LIKE '%; no evidence about the tests%'))
+                   AND r3.id NOT IN (SELECT run_id FROM forgotten)))
+         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
@@ -120,11 +128,22 @@ pub fn test_runs_with(
             r.get::<_, Option<i64>>(5)?,
             r.get::<_, Option<String>>(6)?,
             r.get::<_, Option<String>>(7)?,
+            r.get::<_, String>(8)?,
         ))
     })?;
     let mut out: Vec<TestRun> = Vec::new();
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp) = row?;
+        let (run, code, created, attempt, outcome, dur, msg, fp, env) = row?;
+        let env: BTreeMap<String, String> = serde_json::from_str::<serde_json::Value>(&env)
+            .ok()
+            .and_then(|v| {
+                v["__fingerprint"].as_object().map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_owned()))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
         let outcome = Outcome::parse(&outcome).unwrap_or(Outcome::Errored);
         match out.last_mut() {
             Some(last) if last.run == run => {
@@ -148,6 +167,7 @@ pub fn test_runs_with(
                 duration_ms: dur.map(|d| d as u64),
                 message: if outcome.is_failure() { msg } else { None },
                 fingerprint: fp,
+                env,
             }),
         }
     }
@@ -197,14 +217,41 @@ fn stats_with(
         .windows(2)
         .filter(|w| w[0].outcome.is_failure() != w[1].outcome.is_failure())
         .count();
-    let mut by_code: BTreeMap<&str, BTreeSet<bool>> = BTreeMap::new();
+    // A flip is flaky only on the same code in the same environment: a test
+    // that fails only when a variable is set is environment-dependent, not
+    // flaky (round 11). Runs recorded before the fingerprint share "".
+    let env_key = |r: &TestRun| {
+        r.env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut by_code: BTreeMap<(&str, String), BTreeSet<bool>> = BTreeMap::new();
     for r in &counted {
         by_code
-            .entry(r.code.as_str())
+            .entry((r.code.as_str(), env_key(r)))
             .or_default()
             .insert(r.outcome.is_failure());
     }
     let flips = by_code.values().filter(|s| s.len() == 2).count();
+    // Same code, opposite results, different environments: name the
+    // variables that differ between a pass and a failure.
+    let mut env_dependent: BTreeSet<String> = BTreeSet::new();
+    if flips == 0 {
+        for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
+            for f in counted
+                .iter()
+                .filter(|r| r.outcome.is_failure() && r.code == p.code)
+            {
+                for k in p.env.keys().chain(f.env.keys()) {
+                    if p.env.get(k) != f.env.get(k) {
+                        env_dependent.insert(k.clone());
+                    }
+                }
+            }
+        }
+    }
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
     // A test that failed its last 3 runs in a row is failing now, whatever
     // its past: "known flaky" must not hide a real break (round 9: an
@@ -229,7 +276,9 @@ fn stats_with(
     } else {
         ((0.01f64).ln() / rate.ln()).ceil().max(3.0) as usize
     };
-    let failing_now = streak >= needed;
+    // Only a test history calls flaky can be "failing now" instead; one that
+    // never passed has simply not passed yet (round 11).
+    let failing_now = streak >= needed && (retry > 0 || flips > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -256,6 +305,7 @@ fn stats_with(
         passed_on_retry: retry,
         flips_on_same_code: flips,
         flaky: (retry > 0 || flips > 0) && !failing_now,
+        env_dependent: env_dependent.into_iter().take(5).collect(),
         failing_now,
         proposed_size: percentile(&durations, 95.0).map(proposed_size),
         p50_ms: percentile(&durations, 50.0),
@@ -508,6 +558,9 @@ pub struct FailureContext {
     /// Failed its last 3 runs in a row (this one included): no flaky hint.
     #[serde(default)]
     pub failing_now: bool,
+    /// Passed with a different environment on this code: these variables.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_dependent: Vec<String>,
     /// This run was cancelled or aborted: its failures are no evidence
     /// about the code (a killed test reports FAIL), so no label applies.
     pub run_cut_short: bool,
@@ -559,6 +612,7 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         passed_before,
         run_cut_short,
         failing_now: s.failing_now,
+        env_dependent: s.env_dependent.clone(),
         flaky,
         last_passed_code,
         suite_passed_on_same_code: false,

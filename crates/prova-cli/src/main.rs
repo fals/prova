@@ -119,6 +119,13 @@ enum Cmd {
     },
     /// Cancel a run (process group: SIGTERM, grace, SIGKILL).
     Cancel { run: String },
+    /// Take a run out of every test's history (a run whose results were
+    /// not real), with the reason; flaky labels it caused go away.
+    Forget {
+        run: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Show one run, or recent runs.
     Status {
         run: Option<String>,
@@ -1356,8 +1363,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 .iter()
                 .find(|a| OWN_FLAGS.contains(&a.split('=').next().unwrap_or(a)))
             {
-                eprintln!(
-                    "prova: note: {f} comes after `--`, so it goes to the command, not to prova; put prova's flags before `--`"
+                // Refuse instead of running a command we already know is
+                // wrong (round 11: `make test --until first-failure` ran and
+                // left a bogus failed run in history).
+                bail!(
+                    "{f} comes after `--`, so it would go to the command, not to prova: put prova's flags before `--` (to pass it to the command on purpose, wrap it: prova run -- sh -c '...')"
                 );
             }
             let (suite_name, mut spec, run_cwd) = if !command.is_empty() {
@@ -1513,6 +1523,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let s = wait_until(&store, &id, until, after, max)?;
             render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
+        }
+        Cmd::Forget { run, reason } => {
+            let (store, _, _) = open_here()?;
+            let id = store.resolve_run(&run)?;
+            store.forget(&id, &reason)?;
+            println!("run {id} no longer counts in any test's history ({reason})");
+            Ok(exit::PASSED)
         }
         Cmd::Cancel { run } => {
             let (store, _, _) = open_here()?;

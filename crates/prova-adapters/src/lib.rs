@@ -209,6 +209,20 @@ impl Observer for Ladder {
         // nextest counts a test that exited 0 early as passed; its captured
         // output shows libtest never reported it (round 9).
         report.not_passed = self.live.harness_died.clone();
+        let wall_ms = prova_core::ids::now_ms().saturating_sub(started_ms) as f64;
+        if self.live.reported_secs * 1000.0 > wall_ms + 300.0 {
+            report.warnings.push(format!(
+                "the framework's own summaries say the tests took {:.1}s, but the whole run took {:.1}s: this output was replayed, not produced now{}",
+                self.live.reported_secs,
+                wall_ms / 1000.0,
+                prova_core::engine::NO_EVIDENCE
+            ));
+        }
+        if let Some(what) = self.live.harness_stopped.first() {
+            report.contradictions.push(format!(
+                "{what}: the test process ended (a test that exits it early?) and the tests after it never ran"
+            ));
+        }
         if let Some(t) = self.live.harness_died.first() {
             report.contradictions.push(format!(
                 "{} test(s) passed by exit code but their test harness never reported a result (a test that exits the process early?), e.g. {t}",
