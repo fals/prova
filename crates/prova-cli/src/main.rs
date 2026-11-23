@@ -280,6 +280,9 @@ struct ProtocolChange {
     specs: Vec<PathBuf>,
     #[arg(long)]
     oracle: Option<String>,
+    /// Replaces the paths a candidate may change (glob, repeatable).
+    #[arg(long = "change")]
+    scope: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -328,10 +331,23 @@ struct ProtocolArgs {
     /// A violating candidate is rejected without being measured.
     #[arg(long)]
     oracle: Option<String>,
+    /// Paths a candidate may change (glob: `*` within a directory, `**`
+    /// across; repeatable), e.g. `--change primes.go`. Without it, a
+    /// candidate may change anything but tests, benchmarks and build files.
+    #[arg(long = "change")]
+    scope: Vec<String>,
 }
 
 #[derive(Subcommand)]
 enum ExpCmd {
+    /// Set the best variant by hand, e.g. back to `baseline` after an
+    /// ACCEPT that turned out wrong; recorded in the decision log.
+    Best {
+        name: String,
+        variant: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Create an experiment; the baseline is a git ref (default HEAD).
     New {
         name: String,
@@ -411,6 +427,9 @@ enum ExpCmd {
         name: String,
         /// One log: a trial number, setup-baseline, oracle-candidate, ...
         entry: Option<String>,
+        /// Only the last N kept lines of each log.
+        #[arg(long)]
+        tail: Option<usize>,
     },
     /// Run a workload once and show the metrics prova reads from it
     /// (benchmark tools and JSON metric lines), to choose --metric.
@@ -489,6 +508,7 @@ fn protocol_from(
         setup: a.setup.clone(),
         specs,
         oracle: a.oracle.clone(),
+        scope: a.scope.clone(),
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -673,6 +693,38 @@ fn init(claude: bool) -> Result<u8> {
     Ok(exit::PASSED)
 }
 
+/// Whether a test prova names `calc.CalcTest::divides` is one a framework
+/// filter selects. Filters use the framework's syntax: a Go regex
+/// (`^TestAdd$`), Maven's `Class#method` with `*` and `+` (round 8), .NET's
+/// `FullyQualifiedName~Name`, or a plain substring.
+fn filter_matches(filter: &str, test: &str) -> bool {
+    let f = filter
+        .trim()
+        .trim_start_matches("FullyQualifiedName~")
+        .trim_start_matches("FullyQualifiedName=");
+    // Maven: `Class#a+b` selects methods a and b of Class.
+    if let Some((class, methods)) = f.split_once('#') {
+        return methods
+            .split('+')
+            .any(|m| filter_matches(&format!("{class}::{m}"), test));
+    }
+    let plain = f.trim_start_matches('^').trim_end_matches('$');
+    if plain.contains('*') {
+        // A glob: every literal piece, in order.
+        let mut rest = test;
+        for piece in plain.split('*').filter(|p| !p.is_empty()) {
+            match rest.find(piece) {
+                Some(i) => rest = &rest[i + piece.len()..],
+                None => return false,
+            }
+        }
+        return true;
+    }
+    test.contains(plain)
+        || test.rsplit("::").next().is_some_and(|leaf| leaf == plain)
+        || test.replace("::", ".").contains(plain)
+}
+
 /// Runs a spec to the end, without detaching, and returns its summary.
 fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
     let id = engine::create_run(store, req)?;
@@ -719,11 +771,33 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             .collect();
         // The filter is the framework's own syntax: a Go regex (`^TestAdd$`)
         // is anchored to the test name, not to prova's full name (round 6).
-        let plain = filter.trim_start_matches('^').trim_end_matches('$');
-        let matches =
-            |t: &str| t.contains(plain) || t.rsplit("::").next().is_some_and(|leaf| leaf == plain);
+        let matches = |t: &str| filter_matches(&filter, t);
         let unrelated: Vec<&String> = tests.iter().filter(|t| !matches(t)).collect();
-        let (ok, why) = if s.level == prova_core::model::Level::Opaque {
+        // The framework's own "nothing matched" beats a level diagnosis: an
+        // opaque run with that message means the filter's syntax is wrong
+        // for the framework, not the level (round 8: surefire with -q).
+        let nothing_matched = s
+            .output_tail
+            .iter()
+            .chain(s.notes.iter())
+            .chain(s.detail.iter())
+            .find(|l| {
+                let l = l.to_lowercase();
+                l.contains("no tests matching")
+                    || l.contains("no test matches")
+                    || l.contains("no tests ran")
+                    || l.contains("no tests found")
+                    || l.contains("no tests to run")
+            })
+            .map(|l| render::clean(l.trim()));
+        let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
+            (
+                false,
+                format!(
+                    "filter {filter:?} matched no test; the framework says: {line}. Use the framework's own filter syntax (Maven: Class#method, .NET: FullyQualifiedName~Name)"
+                ),
+            )
+        } else if s.level == prova_core::model::Level::Opaque {
             (false, "cannot verify: run is at level opaque (no per-test results); see the prova-<language> skill to raise the level".to_owned())
         } else if tests.is_empty() {
             (
@@ -865,6 +939,9 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             if c.oracle.is_some() {
                 p.oracle = c.oracle;
             }
+            if !c.scope.is_empty() {
+                p.scope = c.scope;
+            }
             experiment::set_protocol(&store, &name, &p)?;
             println!("protocol of {name} updated (hash {})", p.hash());
             println!("{}", render::protocol_line(&p));
@@ -933,6 +1010,16 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             render::experiment(&r, json);
             Ok(exp_exit(&r))
         }
+        ExpCmd::Best {
+            name,
+            variant,
+            reason,
+        } => {
+            let from = experiment::reset_best(&store, &name, &variant, &reason)?;
+            println!("best of {name}: {from} -> {variant} (recorded with the decisions)");
+            println!("next: prova exp candidate {name}");
+            Ok(exit::PASSED)
+        }
         ExpCmd::Cancel { name } => {
             let id = experiment::latest_comparison(&store, &name)?
                 .ok_or_else(|| anyhow!("no comparison to cancel"))?;
@@ -940,7 +1027,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)
         }
-        ExpCmd::Log { name, entry } => {
+        ExpCmd::Log { name, entry, tail } => {
             let Some(c) = experiment::latest_comparison(&store, &name)? else {
                 bail!("experiment {name} has no comparison yet");
             };
@@ -960,6 +1047,12 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     println!("== trial {n}");
                 } else {
                     println!("== {n}");
+                }
+                if let Some(t) = tail {
+                    for l in e.tail(t) {
+                        println!("{l}");
+                    }
+                    continue;
                 }
                 print!("{}", e.render());
             }
@@ -1651,6 +1744,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 &store,
                 &comparison,
                 &prova_adapters::bench::parse,
+                &prova_adapters::bench::counts,
                 &prova_adapters::recognize::passed_tests,
             )?;
             Ok(exit::PASSED)
@@ -1756,8 +1850,11 @@ fn repeat_runs(
         for t in &always {
             println!("  FAIL {}: failed every time", render::clean(t));
         }
+        let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
         if mixed.is_empty() && always.is_empty() {
             println!("  every test passed every time");
+        } else if steady > 0 {
+            println!("  {steady} other test(s) passed every time");
         }
         if done < n {
             println!(
@@ -1909,6 +2006,26 @@ mod quoting_tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(super::sh_quote(&a), "go test -run '^$' -bench X 'it'\\''s'");
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::filter_matches;
+
+    #[test]
+    fn framework_filters_match_prova_names() {
+        let t = "calc.CalcTest::divides";
+        assert!(filter_matches("CalcTest#divides", t));
+        assert!(filter_matches("CalcTest#div*", t));
+        assert!(filter_matches("CalcTest#adds+divides", t));
+        assert!(!filter_matches("CalcTest#adds", t));
+        assert!(filter_matches("^divides$", t));
+        assert!(filter_matches(
+            "FullyQualifiedName~Calc.CalcTests.Divides",
+            "Calc.CalcTests::Divides"
+        ));
+        assert!(filter_matches("calc.CalcTest.divides", t));
     }
 }
 

@@ -28,8 +28,8 @@ pub enum ConfigError {
     },
     #[error("no suite named {0:?} in prova.toml (known: {1})")]
     UnknownSuite(String, String),
-    #[error("suite {0} has no `select` template; cannot run a single test")]
-    NoSelect(String),
+    #[error("suite {0} has no `select` template; cannot run a single test{1}")]
+    NoSelect(String, String),
     #[error(
         "invalid selection {0:?}: must be non-empty, not start with '-', no control characters"
     )]
@@ -230,7 +230,24 @@ impl Config {
                 // as one quoted word; its text never becomes shell syntax.
                 s.select
                     .as_ref()
-                    .ok_or_else(|| ConfigError::NoSelect(name.into()))?
+                    .ok_or_else(|| {
+                        // Point to a suite that can (round 8).
+                        let other: Vec<&String> = self
+                            .suite
+                            .iter()
+                            .filter(|(n, x)| *n != name && x.select.is_some())
+                            .map(|(n, _)| n)
+                            .collect();
+                        ConfigError::NoSelect(
+                            name.into(),
+                            other
+                                .first()
+                                .map(|o| {
+                                    format!("; suite `{o}` can: prova run {o} --select <test>")
+                                })
+                                .unwrap_or_default(),
+                        )
+                    })?
                     .replace("{filter}", "\"$PROVA_FILTER\"")
             }
         };
