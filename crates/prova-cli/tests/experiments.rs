@@ -601,7 +601,7 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\nif [ -f leak ]; then if command -v setsid >/dev/null; then setsid sleep 37.125; else sleep 37.125; fi >/dev/null 2>&1 < /dev/null & fi\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\ncommand -v setsid >/dev/null && S=setsid\nif [ -f leak ]; then $S sleep 37.125 >/dev/null 2>&1 < /dev/null & fi\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
