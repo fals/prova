@@ -19,18 +19,16 @@ jobs:
           cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "cgroup $cg"
           cat $cg/pids.max $cg/pids.current 2>&1
           systemctl show 'actions.runner*' -p TasksMax -p TasksCurrent 2>&1 | head
-      - run: cargo build -q -p prova-cli --tests
-      - name: The test, watched
+      - run: cargo test -q -p prova-cli --test opaque_run --no-run
+      - name: The test, in its own session, every kill() recorded
         shell: bash {0}
         run: |
           set -x
-          cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
-          ( for i in $(seq 1 60); do echo "t=$i pids=$(cat $cg/pids.current 2>/dev/null) procs=$(ps -e --no-headers | wc -l)"; sleep 1; done ) &
-          ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$'
-          b=$(ls target/debug/deps/ | grep -E '^opaque_run-[0-9a-f]+$' | head -1)
-          echo "pgid of this shell: $(ps -o pgid= -p $$) sid: $(ps -o sid= -p $$)"
-          timeout 90 target/debug/deps/$b a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture > out.txt 2>&1
-          echo "test rc=$?"
-          cat out.txt
-          ps -eo pid,pgid,sid,stat,etime,args | tail -25
+          command -v strace || sudo apt-get install -y -q strace >/dev/null
+          echo "step shell: pid $$ pgid $(ps -o pgid= -p $$) sid $(ps -o sid= -p $$)"
+          timeout 120 setsid --wait strace -f -qq -e trace=kill,tgkill,tkill -e signal=none -o kills.txt \
+            cargo test -q -p prova-cli --test opaque_run -- a_loop_of_short_commands_is_not_a_stall --test-threads 1 --nocapture > out.txt 2>&1
+          echo "rc=$?"
+          tail -30 out.txt
+          echo "== kill() calls:"; grep -v "kill(0, 0)\|, 0)" kills.txt | head -60
           exit 0
