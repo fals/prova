@@ -25,6 +25,10 @@ COPY --from=ghcr.io/fals/prova:latest /prova /usr/local/bin/prova
 
 From source: `cargo install --git https://github.com/fals/prova prova-cli`.
 
+On macOS, prova watches test processes through `ps` instead of `/proc`.
+Experiments there run without a sandbox and without machine-wide CPU
+counters; every verdict says which checks did not run.
+
 Experiments isolate each arm in a sandbox when
 [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
 installed; without it they still run, and every verdict says the arms were

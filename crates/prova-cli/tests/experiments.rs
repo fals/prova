@@ -365,9 +365,10 @@ fn a_broken_edit_after_an_accept_is_rejected_and_the_best_still_runs_as_recorded
 
 #[test]
 fn edits_after_recording_do_not_change_what_is_measured() {
-    let d = repo("snap-edit", "0.06");
+    // A gap far above process start-up jitter (shared macOS runners).
+    let d = repo("snap-edit", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     std::fs::write(d.join("delay"), "0.5").unwrap(); // edited after recording
     let o = prova(&d, &["exp", "run", "e", "--json"]);

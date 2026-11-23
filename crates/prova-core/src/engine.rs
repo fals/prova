@@ -194,7 +194,8 @@ struct Supervisor<'a> {
     suite: String,
     default_slow: Duration,
     /// CPU ticks of waited-for children when the command started.
-    cpu_start: u64,
+    /// Children's CPU ticks at the start, when the OS reports them.
+    cpu_start: Option<u64>,
     /// The framework's own test count, when it printed one.
     framework_total: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
@@ -403,7 +404,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         terminating: false,
         partial: Default::default(),
         framework_total: None,
-        cpu_start: 0,
+        cpu_start: None,
     };
     store.set_level(run, sup.level)?;
 
@@ -456,7 +457,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
-    sup.cpu_start = process::cpu_ticks().1;
+    sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
     if !injected.is_empty() {
         // Short: the temporary paths are noise in every summary (round 9).
@@ -850,8 +851,8 @@ fn observe_child(
         // (round 10: `echo "--- PASS: TestDiv"` passed in a Java project). Any
         // real test framework uses at least a clock tick.
         if status == Status::Finished
-            && process::cpu_ticks().1 == sup.cpu_start
-            && cfg!(target_os = "linux")
+            && sup.cpu_start.is_some()
+            && process::children_ticks() == sup.cpu_start
         {
             let passed: i64 = store.conn().query_row(
                 "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND outcome = 'passed'",
