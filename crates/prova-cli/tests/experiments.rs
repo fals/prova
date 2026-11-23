@@ -147,7 +147,8 @@ fn protocol_is_frozen_after_the_first_trial() {
 #[test]
 fn crashing_candidate_is_logged_as_crash() {
     let d = repo("crash", "0.01");
-    new_exp(&d, &[]);
+    // The workload script is a harness file: allow changing it here.
+    new_exp(&d, &["--change", "**"]);
     std::fs::write(d.join("work.sh"), "#!/bin/sh\nexit 3\n").unwrap();
     prova(&d, &["exp", "candidate", "e"]);
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
@@ -499,4 +500,189 @@ fn a_store_ignored_inside_the_repository_does_not_block_candidates() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let o = inside(&["exp", "candidate", "e"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Round 8 red team: a candidate may not change the files that decide the
+/// verdict (tests, benchmarks, build files) unless the protocol allows it.
+#[test]
+fn a_candidate_that_changes_the_harness_is_rejected_unmeasured() {
+    let d = repo("scope", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\necho '{\"metric\":\"mem_kb\",\"value\":1}'\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "never measured");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("out of scope") && reason.contains("work.sh"),
+        "{reason}"
+    );
+}
+
+/// Round 8 red team: with `--change`, only those paths may change.
+#[test]
+fn a_change_scope_limits_what_a_candidate_may_touch() {
+    let d = repo("scope-explicit", "0.01");
+    std::fs::write(d.join("other"), "1").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm other",
+    );
+    new_exp(&d, &["--change", "delay"]);
+    std::fs::write(d.join("other"), "2").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("outside the protocol's --change scope, e.g. other"),
+        "{r}"
+    );
+}
+
+/// Round 8 red team: code under test printed extra benchmark lines, and
+/// the median of real and fake lines was the fake value.
+#[test]
+fn extra_metric_lines_void_the_comparison() {
+    let d = std::env::temp_dir().join(format!("prova-exp-forged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("reps"), "1").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nfor i in $(seq $(cat reps)); do echo '{\"metric\":\"t\",\"value\":5}'; done\n",
+    )
+    .unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "t",
+            "--trials",
+            "5",
+            "--warmup",
+            "0",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("reps"), "3").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("reported t 3x per trial, the baseline's 1x"),
+        "{reason}"
+    );
+}
+
+/// Round 8 red team: a process escaping the trial's group (setsid) kept
+/// running into the other arm's trials and skewed them.
+#[test]
+fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
+    let d = std::env::temp_dir().join(format!("prova-exp-leak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\n[ -f leak ] && setsid sleep 30 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
+    )
+    .unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "t",
+            "--trials",
+            "5",
+            "--warmup",
+            "0",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("leak"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("left process") && reason.contains("sleep"),
+        "{reason}"
+    );
+}
+
+/// Round 8: a spec edited but not committed was frozen as edited, and every
+/// comparison then said "baseline violates the specification".
+#[test]
+fn an_uncommitted_spec_is_refused_at_creation() {
+    let d = repo("dirty-spec", "0.01");
+    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm spec",
+    );
+    std::fs::write(d.join("spec.txt"), "answer = anything\n").unwrap();
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--spec",
+            "spec.txt",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("spec.txt differs from the baseline HEAD"));
+}
+
+/// Round 8: after an ACCEPT found wrong, the best can be set back, and the
+/// decision log says so.
+#[test]
+fn the_best_can_be_reset_with_a_reason() {
+    let d = repo("reset-best", "0.06");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.01").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["best"], "c1", "{r}");
+    let o = prova(
+        &d,
+        &["exp", "best", "e", "baseline", "--reason", "cached results"],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let s = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    assert_eq!(s["best"], "baseline");
+    let last = s["decisions"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["decision"], "reset", "{last}");
 }

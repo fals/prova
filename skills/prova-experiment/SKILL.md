@@ -29,8 +29,6 @@ prova exp metrics -- go test -run '^$' -bench CountPrimes -count 3 .
 ```
 
 ```
-BenchmarkCountPrimes.allocs_per_op   0.000 allocs
-BenchmarkCountPrimes.bytes_per_op    0.000 B
 BenchmarkCountPrimes.ns_per_op       18348449.000 ns
 wall_ms                              3625.753 ms
 ```
@@ -40,12 +38,12 @@ prova reads, from the workload's whole output:
 | Source | Metric names |
 |---|---|
 | JSON lines `{"metric": "accuracy", "value": 0.93, "unit": "ratio"}` | as printed |
-| `go test -bench` (median of `-count` repeats) | `BenchmarkX.ns_per_op`, `.bytes_per_op`, `.allocs_per_op`, custom `b.ReportMetric` units |
+| `go test -bench` (median of `-count` repeats) | `BenchmarkX.ns_per_op`; `.bytes_per_op`, `.allocs_per_op` with `-benchmem`; custom `b.ReportMetric` units |
 | criterion | `name.time_ns` (point estimate) |
 | pytest-benchmark | `test_name.mean_ns`, `.median_ns` |
 | Vitest bench | `name.mean_ns`, `name.hz` |
 | JMH | `Class.method.ns_per_op` (time modes), `.ops_per_s` (throughput) |
-| BenchmarkDotNet | `Method.mean_ns`, `.median_ns` |
+| BenchmarkDotNet | `Method.mean_ns`; `.median_ns` when the summary table has a Median column |
 | always | `wall_ms` of the whole command |
 
 Times are normalized to nanoseconds, because tools switch units with speed.
@@ -67,6 +65,15 @@ prova exp new <name> --hypothesis "<what you expect and why>" \
   the baseline worktree has no installed dependencies or build caches.
 - `--spec spec/x.qnt --oracle "make conformance"`: see section 5.
 - `--kill-after 2m` bounds one trial.
+- `--change primes.go` (repeatable, globs) names the files a candidate may
+  change. Without it, a candidate may change anything except the files that
+  decide the verdict: tests, benchmarks, build and runner files (`*_test.go`,
+  `test_*.py`, `*.bench.ts`, `src/test/**`, `Makefile`, `*.sh`, ...). A
+  candidate that touches them is rejected unmeasured; if the change truly
+  needs one (a new dependency in `Cargo.toml`), say so in a new experiment
+  with `--change`.
+- Specification files must be committed: `exp new` refuses a `--spec` file
+  that differs from the baseline.
 - The protocol freezes at the first trial. To change it, start a new
   experiment; never edit it after seeing data.
 
@@ -109,8 +116,21 @@ improvement loop does not get lucky by trying many ideas.
   candidate violates the specification. Revert, or fix correctness first.
 - `INCONCLUSIVE` turns into more trials up to `--max-trials`, then `REJECT`.
 - `INVALID`: trials ran on different machines; rerun on one machine.
-- Failed comparison: a trial or the setup crashed, or the baseline violates
-  the specification; `prova exp log <name>` prints what failed.
+- Failed comparison: a trial or the setup crashed, the baseline violates the
+  specification, a trial left a process running (it would slow the other
+  arm), or the two arms printed the metric a different number of times per
+  trial (forged or changed output); `prova exp log <name>` prints what failed
+  (`--tail 40` for the end of each log).
+- An ACCEPT of 1000x or more carries a warning: check for caching across
+  iterations or a smaller workload before believing it.
+- An ACCEPT found wrong afterwards: `prova exp best <name> baseline --reason
+  "..."` sets the best back (recorded in the decision log), so later
+  candidates are not compared against it.
+
+prova guards the verdict against changed tests and benchmarks, a skipped
+oracle, forged extra lines and leaked processes. It cannot judge code that
+detects the oracle or the benchmark and behaves differently there: read the
+candidate's diff before reporting a large win.
 
 Before reporting: `prova exp revalidate <name>` runs the best against the
 original baseline with fresh trials. `prova exp status <name>` shows the

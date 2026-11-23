@@ -67,9 +67,10 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 /// Results are the same test when their full names match and their files
 /// match or one is unknown (quiet `cargo test` names no binary), or when
 /// one side knows only the bare name (`go test` text output names no
-/// package). From a cancelled or aborted run only passes and skips count:
-/// its failures may be the cancel itself (a killed test reports FAIL), so
-/// they are no evidence about the code (round 6); `current` is included.
+/// package). From a cancelled or aborted run, every completed result counts
+/// but the tests it cut off (errored, "did not finish"): a test that fails
+/// while the run is being cancelled is recorded as unfinished (ADR 0020), so
+/// a failure there finished on its own (round 8); `current` is included.
 pub fn test_runs(store: &Store, test_id: &str, limit: usize) -> Result<Vec<TestRun>> {
     test_runs_with(store, test_id, limit, None)
 }
@@ -93,12 +94,12 @@ pub fn test_runs_with(
              WHERE r.id IN (
                  SELECT a3.run_id FROM attempts a3 JOIN runs r3 ON r3.id = a3.run_id
                  WHERE a3.test_id IN (SELECT id FROM same)
-                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome IN ('passed', 'skipped'))))
+                   AND (r3.status = 'finished' OR r3.id = ?3 OR a3.outcome <> 'errored')))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
-           AND (r.status = 'finished' OR r.id = ?3 OR a.outcome IN ('passed', 'skipped'))
+           AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
     let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
@@ -492,10 +493,12 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
     let flaky = s.flaky;
     let this = s.recent.iter().find(|r| r.run == run);
     let first_seen = !s.recent.iter().any(|r| r.run != run);
+    // Only a test the cut cut off is no evidence; one that failed before
+    // the cancel failed on its own (round 8).
     let run_cut_short = matches!(
         store.run(run)?.status,
         crate::model::Status::Cancelled | crate::model::Status::Aborted
-    );
+    ) && this.is_some_and(|r| r.outcome == crate::model::Outcome::Errored);
     let fp = this.and_then(|r| r.fingerprint.clone());
     let seen_before = s
         .recent

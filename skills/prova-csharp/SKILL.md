@@ -15,5 +15,7 @@ description: prova setup details for .NET projects (dotnet test, xUnit, NUnit, M
 - A leaked process after `dotnet test` is usually the MSBuild build
   server; prova kills it. `DOTNET_CLI_USE_MSBUILD_SERVER=0` avoids it.
 - Build once, then test with `--no-build` in the fix loop to shorten runs.
-- Hang dumps (`--blame-hang`) are optional; prova already reports stalls
-  and slow tests by name.
+- Hang dumps (`--blame-hang`) are optional. TRX arrives at the end, so a
+  hung test shows as a stall (no CPU, no output, `--stall-after`, 60 s by
+  default); prova names the tests of the last finished run that have not
+  reported yet, the hung one among them. Cancel it there.

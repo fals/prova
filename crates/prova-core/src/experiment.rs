@@ -85,6 +85,11 @@ pub struct Protocol {
     /// any trial; a violating candidate is rejected unmeasured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle: Option<String>,
+    /// Paths a candidate may change (globs; `*` within a segment, `**`
+    /// across). Empty: anything but test, benchmark and build files
+    /// (`HARNESS_FILES`), which decide the verdict (round 8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
 }
 
 /// A specification file: path relative to the repository root, sha256.
@@ -357,7 +362,19 @@ pub fn judge(
         }
     }
     // Positive means better in either direction: say so next to the numbers.
-    let ci = format!("[{}, {}], positive = better", pct(lo), pct(hi));
+    // A shrink of a non-negative quantity stops at 100%; say the bound was
+    // cut there rather than print a bare +100.0% (round 8).
+    let capped = primary.better == Better::Lower && hi >= 1.0;
+    let ci = format!(
+        "[{}, {}{}], positive = better",
+        pct(lo),
+        pct(hi),
+        if capped {
+            " (cut at the 100% maximum)"
+        } else {
+            ""
+        }
+    );
     // The change as a ratio of medians ("37.6x"), easier to read than +97%.
     let (b, c) = (primary.baseline_median, primary.candidate_median);
     let ratio = if b > 0.0 && c > 0.0 && b.is_finite() && c.is_finite() {
@@ -384,7 +401,9 @@ pub fn judge(
     };
     // With few trials the exact rank test cannot go lower: say so.
     let floor = crate::stats::min_two_sided_p(primary.n_baseline, primary.n_candidate);
-    let at_floor = if primary.p_adjusted <= floor * (1.0 + 1e-9) {
+    // Only the raw p can sit at the exact test's floor (an asymptotic p can
+    // be lower; round 8 printed "p=0.0075; 0.0079 is the smallest").
+    let at_floor = if (primary.p - floor).abs() <= floor * 1e-9 {
         format!(
             "; {:.4} is the smallest p possible with {} + {} trials",
             floor, primary.n_baseline, primary.n_candidate
@@ -392,11 +411,19 @@ pub fn judge(
     } else {
         String::new()
     };
+    // A change of three orders of magnitude is rarely what the code does:
+    // caching across iterations, a smaller workload, or output the code
+    // prints itself (round 8). Accepted, but flagged.
+    let implausible = if b > 0.0 && c > 0.0 && (b / c).max(c / b) >= 1000.0 {
+        "; warning: a change this large is rarely real: check that the workload still does the same work (no caching across iterations, same input) and that the numbers come from the benchmark, not from the code"
+    } else {
+        ""
+    };
     if primary.p_adjusted < alpha && lo > min_effect {
         (
             Verdict::Accept,
             format!(
-                "{} improved {}{ratio} (CI {ci}, {pname}={:.4}{at_floor})",
+                "{} improved {}{ratio} (CI {ci}, {pname}={:.4}{at_floor}){implausible}",
                 primary.metric,
                 pct(primary.improvement),
                 primary.p_adjusted
@@ -558,6 +585,25 @@ pub fn create(
 ) -> Result<()> {
     valid_name(name)?;
     protocol.validate()?;
+    // The spec is frozen as it is now; the baseline must be that spec, or
+    // every comparison fails with a misleading "baseline violates" (round 8).
+    if let Some(r) = baseline_ref {
+        for f in &protocol.specs {
+            let at_ref = Command::new("git")
+                .args(["show", &format!("{r}:{}", f.path)])
+                .current_dir(store.root())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| sha256_hex(&o.stdout));
+            if at_ref.as_deref() != Some(f.sha256.as_str()) {
+                return refused(format!(
+                    "specification file {} differs from the baseline {r} (uncommitted changes?): commit it first, so both arms are judged by the same specification",
+                    f.path
+                ));
+            }
+        }
+    }
     let rel = cwd
         .strip_prefix(store.root())
         .unwrap_or(Path::new(""))
@@ -844,6 +890,11 @@ struct TrialResult {
     exit_code: Option<i32>,
     wall_ms: f64,
     metrics: Vec<(String, f64, Option<String>)>,
+    /// Lines that reported the primary metric (a forged extra line shows up
+    /// as a count the other arm does not have).
+    primary_lines: usize,
+    /// Processes the workload left running after it ended (`pid comm`).
+    leaked: Vec<String>,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -881,6 +932,9 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
 /// Turns a trial's whole output into metrics (name, value, unit); the
 /// benchmark recognizers live in prova-adapters.
 pub type MetricParser = dyn Fn(&str) -> Vec<(String, f64, Option<String>)>;
+/// How many output lines reported each metric (`go test -count 3` reports
+/// each benchmark 3 times).
+pub type MetricCounter = dyn Fn(&str) -> Vec<(String, usize)>;
 /// Reads the tests that passed in a finished command's output (the oracle's).
 pub type TestReader = dyn Fn(&str) -> Vec<String>;
 
@@ -890,6 +944,7 @@ fn run_trial(
     v: &Variant,
     log: &Path,
     parse: &MetricParser,
+    count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
     let mut cmd = Command::new(&p.command[0]);
@@ -911,6 +966,8 @@ fn run_trial(
                 exit_code: None,
                 wall_ms: 0.0,
                 metrics: vec![],
+                primary_lines: 0,
+                leaked: vec![],
             });
         }
     };
@@ -962,15 +1019,31 @@ fn run_trial(
         text.push('\n');
     }
     process::kill_group(pgid); // leftovers must not disturb the next trial
+    // A process that left the group (setsid) was reparented to this worker,
+    // a child subreaper: it would run on during the other arm's trials and
+    // skew them (round 8). Kill it, and report it.
+    let leaked = process::reap_orphans();
+    for l in &leaked {
+        writeln!(
+            log,
+            "prova: the workload left a process running after it ended: {l}"
+        )?;
+    }
     if let Ok(e) = err_thread.join() {
         log.write_all(&e)?;
         text.push_str(&String::from_utf8_lossy(&e));
     }
     let metrics = parse(&text);
+    let primary_lines = count(&text)
+        .into_iter()
+        .find(|(n, _)| *n == p.metric)
+        .map_or(0, |(_, c)| c);
     Ok(TrialResult {
         exit_code: status.and_then(|s| s.code()),
         wall_ms,
         metrics,
+        primary_lines,
+        leaked,
     })
 }
 
@@ -985,9 +1058,11 @@ pub fn work(
     store: &Store,
     comparison: &str,
     parse: &MetricParser,
+    count: &MetricCounter,
     tests: &TestReader,
 ) -> Result<()> {
-    let result = work_comparison(store, comparison, parse, tests);
+    process::become_subreaper();
+    let result = work_comparison(store, comparison, parse, count, tests);
     let cleaned = keep_failed_logs(store, comparison);
     result.and(cleaned)
 }
@@ -1052,6 +1127,7 @@ fn work_comparison(
     store: &Store,
     comparison: &str,
     parse: &MetricParser,
+    count: &MetricCounter,
     tests: &TestReader,
 ) -> Result<()> {
     let (exp, base_name, cand_name): (String, String, String) = store.conn().query_row(
@@ -1077,6 +1153,9 @@ fn work_comparison(
     private_dir(&logs)?;
 
     let counter = std::cell::Cell::new(0u32);
+    // Primary-metric lines per trial, per arm; and the first leaked process.
+    let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
+    let leaked: std::cell::RefCell<Option<String>> = Default::default();
     let run_one = |arm: Arm, warmup: bool| -> Result<bool> {
         counter.set(counter.get() + 1);
         let seq = counter.get();
@@ -1089,8 +1168,17 @@ fn work_comparison(
             &arms[i].1,
             &logs.join(format!("{seq}.log")),
             parse,
+            count,
         )?;
-        let ok = r.exit_code == Some(0);
+        if !warmup {
+            lines.borrow_mut()[i].push(r.primary_lines);
+        }
+        if let Some(l) = r.leaked.first() {
+            leaked.borrow_mut().get_or_insert_with(|| {
+                format!("{} trial {seq} left process {l} running", arm.as_str())
+            });
+        }
+        let ok = r.exit_code == Some(0) && r.leaked.is_empty();
         let tx = store.conn().unchecked_transaction()?;
         tx.execute(
             "INSERT INTO trials (comparison, seq, arm, warmup, state, exit_code, fingerprint, started_ms, ended_ms)
@@ -1141,6 +1229,36 @@ fn work_comparison(
             }
         }
     }
+    // The candidate may change only what the protocol allows: test,
+    // benchmark and build files decide the verdict (round 8).
+    if let (Some(b), Some(cand)) = (&arms[0].1.commit_sha, &arms[1].1.commit_sha) {
+        let changed: Vec<String> = git(store.root(), &["diff", "--name-only", b, cand])
+            .map(|o| o.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        let outside = out_of_scope(p, &changed);
+        if let Some(first) = outside.first() {
+            let why = if p.scope.is_empty() {
+                format!(
+                    "candidate changes {} file(s) that decide the verdict (tests, benchmarks, build files), e.g. {first}; if the change needs them, allow it with `--change <path>` in a new experiment",
+                    outside.len()
+                )
+            } else {
+                format!(
+                    "candidate changes {} file(s) outside the protocol's --change scope, e.g. {first}",
+                    outside.len()
+                )
+            };
+            let result = serde_json::json!({
+                "reason": format!("candidate is out of scope: {why}"),
+                "specification": "violated",
+            });
+            let mut c = Comparison::new(p.min_trials, p.max_trials);
+            c.check_spec(Arm::Baseline, true);
+            c.check_spec(Arm::Candidate, false);
+            c.reject_violation();
+            return finish(store, &e, comparison, &cand_name, Verdict::Reject, result);
+        }
+    }
     let mut c = Comparison::new(p.min_trials, p.max_trials);
     // Tests the baseline's oracle ran: the candidate's must run them too.
     // An oracle exit code alone is no proof: a candidate can add code that
@@ -1160,7 +1278,7 @@ fn work_comparison(
             match missing.first() {
                 None => Ok(()),
                 Some(first) => Err(format!(
-                    "oracle `{oracle}` exited 0, but {} test(s) that passed in the baseline's oracle did not pass in the candidate's (e.g. {first}): its checks were skipped (`prova exp log <experiment> {name}`)",
+                    "oracle `{oracle}` exited 0, but {} test(s) that passed in the baseline's oracle did not pass in the candidate's (e.g. {first}): its checks failed or were skipped (`prova exp log <experiment> {name}`)",
                     missing.len()
                 )),
             }
@@ -1185,13 +1303,11 @@ fn work_comparison(
     for _ in 0..p.warmup {
         for arm in [Arm::Baseline, Arm::Candidate] {
             if !run_one(arm, true)? {
-                return end_failed(
-                    store,
-                    &exp,
-                    comparison,
-                    &cand_name,
-                    &format!("{} warmup trial failed", arm.as_str()),
+                let why = leaked.borrow().clone().map_or_else(
+                    || format!("{} warmup trial failed", arm.as_str()),
+                    |l| format!("{l} after it ended; it would disturb the other arm's trials (`prova exp log {exp}`)"),
                 );
+                return end_failed(store, &exp, comparison, &cand_name, &why);
             }
         }
     }
@@ -1203,15 +1319,40 @@ fn work_comparison(
             }
             let Some(arm) = c.next_arm() else { break };
             if !run_one(arm, false)? {
-                let reason = format!(
-                    "{} trial {} failed (exit != 0; `prova exp log {exp} {}`)",
-                    arm.as_str(),
-                    counter.get(),
-                    counter.get()
+                let reason = leaked.borrow().clone().map_or_else(
+                    || {
+                        format!(
+                            "{} trial {} failed (exit != 0; `prova exp log {exp} {}`)",
+                            arm.as_str(),
+                            counter.get(),
+                            counter.get()
+                        )
+                    },
+                    |l| {
+                        format!(
+                            "{l} after it ended; it would disturb the other arm's trials (`prova exp log {exp} {}`)",
+                            counter.get()
+                        )
+                    },
                 );
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
             c.trial(&fingerprint_of(store, comparison, counter.get())?);
+        }
+        // Each arm's workload must report the metric as often per trial as
+        // the other: extra lines are forged output (a candidate's code can
+        // print benchmark lines), missing ones a changed workload (round 8).
+        {
+            let l = lines.borrow();
+            let usual = |v: &Vec<usize>| v.iter().copied().max().unwrap_or(0);
+            let (b, c) = (usual(&l[0]), usual(&l[1]));
+            if b != c || l[1].iter().any(|n| *n != c) {
+                let reason = format!(
+                    "the candidate's workload reported {} {}x per trial, the baseline's {b}x: extra lines are forged output, missing ones a changed workload; the comparison is void",
+                    p.metric, c
+                );
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
+            }
         }
         let (outcome, result) = evaluate(store, &e, comparison)?;
         if outcome == Verdict::Inconclusive && target < p.max_trials {
@@ -1240,6 +1381,91 @@ fn work_comparison(
         }
         return finish(store, &e, comparison, &cand_name, verdict, result);
     }
+}
+
+/// Files that decide a verdict rather than implement the change: tests,
+/// benchmarks, build and runner configuration. Without `--change`, a
+/// candidate may not touch them (round 8: forged oracle output from an added
+/// `TestMain`, a smaller benchmark input, fake benchmark lines).
+pub const HARNESS_FILES: &[&str] = &[
+    "**/*_test.go",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/conftest.py",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*.bench.*",
+    "**/*Test.java",
+    "**/*Tests.java",
+    "**/*Test.cs",
+    "**/*Tests.cs",
+    "**/*Test.kt",
+    "**/test/**",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/bench/**",
+    "**/benches/**",
+    "**/benchmarks/**",
+    "**/spec/**",
+    "**/Makefile",
+    "**/GNUmakefile",
+    "**/*.mk",
+    "prova.toml",
+    "**/package.json",
+    "**/pytest.ini",
+    "**/pyproject.toml",
+    "**/setup.cfg",
+    "**/tox.ini",
+    "**/Cargo.toml",
+    "**/go.mod",
+    "**/pom.xml",
+    "**/build.gradle*",
+    "**/*.csproj",
+    "**/*.sln",
+    "**/vitest.config.*",
+    "**/jest.config.*",
+    "**/*.sh",
+];
+
+/// Matches a path against a glob: `*` within one segment, `**` any number
+/// of segments.
+pub fn glob_match(glob: &str, path: &str) -> bool {
+    fn seg(p: &str, s: &str) -> bool {
+        match p.split_once('*') {
+            None => p == s,
+            Some((pre, rest)) => {
+                s.starts_with(pre)
+                    && (0..=s.len() - pre.len()).any(|i| {
+                        s.is_char_boundary(pre.len() + i) && seg(rest, &s[pre.len() + i..])
+                    })
+            }
+        }
+    }
+    fn go(g: &[&str], p: &[&str]) -> bool {
+        match g.first() {
+            None => p.is_empty(),
+            Some(&"**") => (0..=p.len()).any(|i| go(&g[1..], &p[i..])),
+            Some(x) => !p.is_empty() && seg(x, p[0]) && go(&g[1..], &p[1..]),
+        }
+    }
+    let g: Vec<&str> = glob.split('/').collect();
+    let p: Vec<&str> = path.split('/').collect();
+    go(&g, &p)
+}
+
+/// Files the candidate changed that the protocol does not let it change.
+fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
+    changed
+        .iter()
+        .filter(|f| {
+            if p.scope.is_empty() {
+                HARNESS_FILES.iter().any(|g| glob_match(g, f))
+            } else {
+                !p.scope.iter().any(|g| glob_match(g, f))
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Whether a variant satisfies the protocol's specification: its spec files
@@ -1467,6 +1693,26 @@ fn finish(
     Ok(())
 }
 
+/// Sets the best variant by hand (after an ACCEPT found wrong), with the
+/// reason recorded next to the decision log.
+pub fn reset_best(store: &Store, exp: &str, to: &str, reason: &str) -> Result<String> {
+    let e = get(store, exp)?;
+    if !existing_variant(store, exp, to)? {
+        return refused(format!("no variant {to:?} in experiment {exp}"));
+    }
+    let tx = store.conn().unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO best_resets (experiment, from_best, to_best, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![exp, e.best, to, reason, now_ms() as i64],
+    )?;
+    tx.execute(
+        "UPDATE experiments SET best = ?2 WHERE name = ?1",
+        params![exp, to],
+    )?;
+    tx.commit()?;
+    Ok(e.best)
+}
+
 // ------------------------------------------------------------ reports
 
 #[derive(Debug, Clone, Serialize)]
@@ -1571,7 +1817,12 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         None => None,
     };
     let mut stmt = store.conn().prepare(
-        "SELECT comparison, candidate, decision, reason FROM decisions WHERE experiment = ?1 ORDER BY created_ms",
+        "SELECT comparison, candidate, decision, reason FROM (
+           SELECT comparison, candidate, decision, reason, created_ms FROM decisions WHERE experiment = ?1
+           UNION ALL
+           SELECT '-', to_best, 'reset', 'best set by hand from ' || from_best || ': ' || reason, created_ms
+             FROM best_resets WHERE experiment = ?1)
+         ORDER BY created_ms",
     )?;
     let decisions = stmt
         .query_map(params![exp], |r| {

@@ -536,3 +536,43 @@ fn an_attached_run_returns_on_a_stall() {
         .to_owned();
     prova(&d, &["cancel", &id]);
 }
+
+/// Round 8: an idle JVM or .NET runtime still uses a little CPU (GC, timers);
+/// any tick counted as activity, so a hung xUnit/JUnit test never stalled.
+#[test]
+fn a_process_that_barely_ticks_still_stalls() {
+    let d = workspace("ticks");
+    // ~1 ms of CPU every 200 ms, no new processes: a runtime idling.
+    let id = detach(
+        &d,
+        &["--stall-after", "2s"],
+        "exec perl -e 'while (1) { for (1..20000) {} select(undef, undef, undef, 0.2) }'",
+    );
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "15s",
+            "--json",
+        ],
+    );
+    assert_eq!(w.status.code(), Some(3), "stalled: {}", stdout(&w));
+    prova(&d, &["cancel", &id]);
+}
+
+/// Round 8: pytest's progress dots have no newline until a test finishes;
+/// before a hang they never reached the live output, which named nothing.
+#[test]
+fn an_unfinished_line_is_in_the_live_output() {
+    let d = workspace("partial");
+    let id = detach(&d, &["--stall-after", "1s"], "printf '....'; exec sleep 30");
+    let w = prova(&d, &["wait", &id, "--until", "stall", "--max-wait", "15s"]);
+    assert_eq!(w.status.code(), Some(3), "{}", stdout(&w));
+    let out = prova(&d, &["output", &id]);
+    assert!(stdout(&out).contains("...."), "{}", stdout(&out));
+    prova(&d, &["cancel", &id]);
+}

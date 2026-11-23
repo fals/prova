@@ -56,6 +56,25 @@ pub fn parse(output: &str) -> Vec<Metric> {
     median_per_metric(raw)
 }
 
+/// How many output lines reported each metric, before the median: the
+/// workload's shape, so a forged extra line is visible (round 8).
+pub fn counts(output: &str) -> Vec<(String, usize)> {
+    let mut raw: Vec<Metric> = Vec::new();
+    let lines: Vec<&str> = output.lines().collect();
+    json_lines(&lines, &mut raw);
+    go(&lines, &mut raw);
+    criterion(&lines, &mut raw);
+    pytest_benchmark(&lines, &mut raw);
+    vitest(&lines, &mut raw);
+    jmh(&lines, &mut raw);
+    benchmarkdotnet(&lines, &mut raw);
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, _, _) in raw {
+        *by.entry(name).or_default() += 1;
+    }
+    by.into_iter().collect()
+}
+
 fn median_per_metric(raw: Vec<Metric>) -> Vec<Metric> {
     let mut by: BTreeMap<String, (Vec<f64>, Option<String>)> = BTreeMap::new();
     for (name, v, unit) in raw {

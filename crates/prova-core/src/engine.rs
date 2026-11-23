@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -27,6 +27,12 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 const TICK: Duration = Duration::from_millis(100);
 const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+/// CPU use that counts as activity: at least this many clock ticks (1/100 s
+/// each) within `BUSY_WINDOW`, i.e. 2% of one core. An idle JVM or .NET
+/// runtime still ticks now and then (GC, JIT, timers), and any tick used to
+/// count, so a hung xUnit or JUnit test was never a stall (round 8).
+const BUSY_TICKS: u64 = 10;
+const BUSY_WINDOW: Duration = Duration::from_secs(5);
 const GRACE: Duration = Duration::from_secs(3);
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 const TAIL_LINES: usize = 40;
@@ -123,25 +129,44 @@ pub fn spawn_supervisor(store: &Store, exe: &Path, run: &str) -> std::io::Result
 use std::os::unix::process::CommandExt;
 
 enum Chunk {
-    Line(String),
+    /// A complete line from stream 0 (stdout) or 1 (stderr).
+    Line(usize, String),
+    /// The start of a line not finished yet (pytest's progress dots before
+    /// a hang): shown in the live output at once (round 8).
+    Partial(usize, String),
     Eof,
 }
 
-fn reader(stream: impl Read + Send + 'static, tx: mpsc::Sender<Chunk>) {
+fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Chunk>) {
     std::thread::spawn(move || {
-        let mut r = BufReader::new(stream);
-        let mut buf = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
         loop {
-            buf.clear();
-            match r.read_until(b'\n', &mut buf) {
+            match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let line = String::from_utf8_lossy(&buf).into_owned();
-                    if tx.send(Chunk::Line(line)).is_err() {
-                        return;
+                Ok(n) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(i) = pending.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=i).collect();
+                        let line = String::from_utf8_lossy(&line).into_owned();
+                        if tx.send(Chunk::Line(id, line)).is_err() {
+                            return;
+                        }
+                    }
+                    if !pending.is_empty() {
+                        let part = String::from_utf8_lossy(&pending).into_owned();
+                        if tx.send(Chunk::Partial(id, part)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
+        }
+        if !pending.is_empty() {
+            let _ = tx.send(Chunk::Line(
+                id,
+                String::from_utf8_lossy(&pending).into_owned(),
+            ));
         }
         let _ = tx.send(Chunk::Eof);
     });
@@ -161,6 +186,8 @@ struct Supervisor<'a> {
     level: Level,
     suite: String,
     default_slow: Duration,
+    /// Text of an unfinished line already written to the spool, per stream.
+    partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
     /// killed by it, and says nothing about the code (round 7).
     terminating: bool,
@@ -267,8 +294,21 @@ impl Supervisor<'_> {
         self.store.append_events(&events)
     }
 
-    fn line(&mut self, line: &str, observer: &mut dyn Observer) {
-        let _ = self.output.write_all(line.as_bytes());
+    /// The start of a line not finished yet: into the spool at once, so
+    /// `prova output` and a stall summary show it.
+    fn partial(&mut self, stream: usize, text: &str) {
+        let done = &mut self.partial[stream];
+        let new = text.strip_prefix(done.as_str()).unwrap_or(text);
+        let _ = self.output.write_all(new.as_bytes());
+        let _ = self.output.flush();
+        *done = text.to_owned();
+    }
+
+    fn line(&mut self, stream: usize, line: &str, observer: &mut dyn Observer) {
+        let shown = std::mem::take(&mut self.partial[stream]);
+        let _ = self
+            .output
+            .write_all(line.strip_prefix(shown.as_str()).unwrap_or(line).as_bytes());
         self.distiller.push(line);
         let trimmed = line.trim_end();
         if !trimmed.is_empty() {
@@ -322,6 +362,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             .unwrap_or(Duration::from_secs(60)),
         running: BTreeMap::new(),
         terminating: false,
+        partial: Default::default(),
     };
     store.set_level(run, sup.level)?;
 
@@ -353,7 +394,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         Ok(c) => c,
         Err(e) => {
             let reason = format!("could not start {}: {e}", spec.command.display());
-            sup.line(&format!("prova: {reason}\n"), observer);
+            sup.line(1, &format!("prova: {reason}\n"), observer);
             return store.finish_run(
                 run,
                 1,
@@ -413,10 +454,10 @@ fn observe_child(
 
     let (tx, rx) = mpsc::channel();
     if let Some(out) = child.stdout.take() {
-        reader(out, tx.clone());
+        reader(0, out, tx.clone());
     }
     if let Some(err) = child.stderr.take() {
-        reader(err, tx.clone());
+        reader(1, err, tx.clone());
     }
     drop(tx);
 
@@ -426,6 +467,7 @@ fn observe_child(
     let mut last_activity = Instant::now();
     let mut last_sample = Instant::now();
     let mut sample = process::sample_group(pgid);
+    let mut recent_ticks: VecDeque<(Instant, u64)> = VecDeque::new();
     let mut stalled = false;
     let mut terminating: Option<(Instant, Status, String)> = None;
     let mut open_streams = 2;
@@ -435,9 +477,13 @@ fn observe_child(
         let deadline = Instant::now() + TICK;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok(Chunk::Line(l)) => {
+                Ok(Chunk::Line(i, l)) => {
                     last_activity = Instant::now();
-                    sup.line(&l, observer);
+                    sup.line(i, &l, observer);
+                }
+                Ok(Chunk::Partial(i, p)) => {
+                    last_activity = Instant::now();
+                    sup.partial(i, &p);
                 }
                 Ok(Chunk::Eof) => open_streams -= 1,
                 Err(_) => break,
@@ -455,7 +501,15 @@ fn observe_child(
         if now.duration_since(last_sample) >= SAMPLE_EVERY {
             last_sample = now;
             let s = process::sample_group(pgid);
-            if s.cpu_ticks != sample.cpu_ticks || !s.pids.is_subset(&sample.pids) {
+            recent_ticks.push_back((now, s.cpu_ticks.saturating_sub(sample.cpu_ticks)));
+            while recent_ticks
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > BUSY_WINDOW)
+            {
+                recent_ticks.pop_front();
+            }
+            let busy = recent_ticks.iter().map(|(_, d)| d).sum::<u64>() >= BUSY_TICKS;
+            if busy || !s.pids.is_subset(&sample.pids) {
                 last_activity = now;
             }
             sample = s;
@@ -502,7 +556,8 @@ fn observe_child(
                 break;
             };
             match rx.recv_timeout(left) {
-                Ok(Chunk::Line(l)) => sup.line(&l, observer),
+                Ok(Chunk::Line(i, l)) => sup.line(i, &l, observer),
+                Ok(Chunk::Partial(i, p)) => sup.partial(i, &p),
                 Ok(Chunk::Eof) => *open -= 1,
                 Err(_) => break,
             }
@@ -562,8 +617,19 @@ fn observe_child(
                 missing_since_last_pass(store, run, &sup.suite, &current)?
             {
                 if current.is_empty() && observed == 0 {
+                    // Say why when the output does (a compile error, round 8).
+                    let cause = (exit_code != Some(0))
+                        .then(|| sup.distiller.first_crash())
+                        .flatten()
+                        .map(|(_, t)| {
+                            format!(
+                                "; the command failed first: {}",
+                                t.trim().chars().take(160).collect::<String>()
+                            )
+                        })
+                        .unwrap_or_default();
                     contradictions.push(format!(
-                        "the suite's last passing run {prev} ran {total} test(s); this run observed none"
+                        "the suite's last passing run {prev} ran {total} test(s); this run observed none{cause}"
                     ));
                 } else if !missing.is_empty() {
                     let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
@@ -579,6 +645,32 @@ fn observe_child(
                     ));
                 }
             }
+        }
+    }
+    // A run cut short where prova saw no test running (result files come
+    // only at the end, or quiet output): name the tests of the last passing
+    // run that never reported; the hung one is among them (round 8).
+    if status != Status::Finished && spec.selection.is_none() && sup.running.is_empty() {
+        sup.flush()?;
+        let current: Vec<String> = {
+            let mut stmt = store
+                .conn()
+                .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if let Some((prev, missing, _)) = missing_since_last_run(store, run, &sup.suite, &current)?
+            && !missing.is_empty()
+        {
+            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+            sup.emit(EventKind::RunNote {
+                message: format!(
+                    "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {}{}",
+                    missing.len(),
+                    names.join(", "),
+                    if missing.len() > names.len() { ", ..." } else { "" }
+                ),
+            });
         }
     }
     if let Some(code @ (126 | 127)) = exit_code {
@@ -706,14 +798,38 @@ fn missing_since_last_pass(
     suite: &str,
     current: &[String],
 ) -> Result<Option<(String, Vec<String>, usize)>> {
+    missing_since(store, run, suite, current, true)
+}
+
+/// Like `missing_since_last_pass`, from the last finished full run whatever
+/// its outcome: the suspects of a hang (round 8: a suite that never passed
+/// yet still names them).
+fn missing_since_last_run(
+    store: &Store,
+    run: &str,
+    suite: &str,
+    current: &[String],
+) -> Result<Option<(String, Vec<String>, usize)>> {
+    missing_since(store, run, suite, current, false)
+}
+
+fn missing_since(
+    store: &Store,
+    run: &str,
+    suite: &str,
+    current: &[String],
+    passed_only: bool,
+) -> Result<Option<(String, Vec<String>, usize)>> {
     use rusqlite::OptionalExtension;
     let prev: Option<String> = store
         .conn()
         .query_row(
-            "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished' AND outcome = 'passed'
+            "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished'
+               AND (?3 = 0 OR outcome = 'passed')
                AND json_extract(spec, '$.selection') IS NULL
+               AND EXISTS (SELECT 1 FROM attempts a WHERE a.run_id = runs.id)
              ORDER BY created_ms DESC LIMIT 1",
-            rusqlite::params![suite, run],
+            rusqlite::params![suite, run, passed_only as i64],
             |r| r.get(0),
         )
         .optional()?;
@@ -1104,6 +1220,32 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A stalled run where no test is seen running: name the suspects, the
+    // tests of the last passing run that have not reported yet (round 8).
+    if !row.status.is_terminal()
+        && stalled_ms.is_some()
+        && running.is_empty()
+        && selection.is_none()
+    {
+        let current: Vec<String> = {
+            let mut stmt = store
+                .conn()
+                .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if let Some((prev, missing, _)) = missing_since_last_run(store, run, &row.suite, &current)?
+            && !missing.is_empty()
+        {
+            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+            notes.push(format!(
+                "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
+                missing.len(),
+                names.join(", "),
+                if missing.len() > names.len() { ", ..." } else { "" }
+            ));
+        }
+    }
     // A selection that ran nothing must not look like a pass.
     let ran = counts.passed + counts.failed + counts.skipped + counts.errored;
     // (A selection that matched nothing at level 1+ fails the run, with
@@ -1177,15 +1319,18 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         return Ok(None);
     };
     let last_passed = prev.iter().find(|r| r.outcome == Some(Outcome::Passed));
+    // Only finished runs are evidence of "the same failure" (round 8: a
+    // cancelled hang was counted as seen before).
     let same = row
         .fingerprint
         .as_ref()
         .map(|f| {
             prev.iter()
-                .filter(|r| r.fingerprint.as_ref() == Some(f))
+                .filter(|r| r.status == Status::Finished && r.fingerprint.as_ref() == Some(f))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let finished = prev.iter().filter(|r| r.status == Status::Finished).count();
     // A cancelled or aborted run is named as such, not by an outcome.
     let same_code_outcomes: Vec<String> = prev
         .iter()
@@ -1196,7 +1341,8 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         })
         .collect();
     Ok(Some(serde_json::json!({
-        "previous_runs": prev.len(),
+        "previous_runs": finished,
+        "cut_short_runs": prev.len() - finished,
         "selection": selection,
         "last": { "run": last.id, "outcome": last.outcome, "code": last.code },
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),

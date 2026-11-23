@@ -322,6 +322,10 @@ fn history_line(h: &serde_json::Value) -> String {
             " (full runs)"
         }
     )];
+    let cut = h["cut_short_runs"].as_u64().unwrap_or(0);
+    if cut > 0 {
+        parts[0].push_str(&format!(", plus {cut} cancelled or aborted"));
+    }
     match h["last_passed"].as_object() {
         Some(p) => parts.push(format!(
             "last green: run {} at {}",
@@ -357,6 +361,12 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             format!("prova wait {} --until done", s.run)
         }
         WaitReason::Running => format!("prova wait {} --after {}", s.run, s.last_seq),
+        // Every failure so far is a known flaky test: there is nothing to
+        // fix yet; keep watching for a real one (round 8).
+        WaitReason::Failure if all_known_flaky(s) => format!(
+            "only known flaky test(s) failed so far: `prova wait {} --after {}` to keep watching for a real failure",
+            s.run, s.last_seq
+        ),
         WaitReason::Failure => format!(
             "fix and rerun, or `prova cancel {}`; `prova wait {} --after {}` to keep watching",
             s.run, s.run, s.last_seq
@@ -366,8 +376,29 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             s.run, s.run, s.last_seq
         ),
         WaitReason::Done if s.outcome == Some(Outcome::Passed) => "done".into(),
+        WaitReason::Done if all_known_flaky(s) => {
+            let confirm = if s.suite.starts_with("cmd:") {
+                "`prova history <test>`".to_owned()
+            } else {
+                format!("`prova run {} --select <test> --repeat 5`", s.suite)
+            };
+            format!(
+                "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
+            )
+        }
         WaitReason::Done => format!("prova output {} --tail 200", s.run),
     }
+}
+
+/// Every failure shown is a test history already knows as flaky.
+fn all_known_flaky(s: &Summary) -> bool {
+    !s.failures.is_empty()
+        && s.failures.len() == s.counts.failed as usize + s.counts.errored as usize
+        && s.failures.iter().all(|f| {
+            f.context
+                .as_ref()
+                .is_some_and(|c| c.flaky && !c.run_cut_short)
+        })
 }
 
 /// One stderr line while a long wait goes on (ADR 0019): the run is alive.
@@ -435,6 +466,13 @@ pub fn runs(rows: &[RunRow], json: bool) {
             (Some(a), Some(b)) => {
                 format_duration(std::time::Duration::from_millis(b.saturating_sub(a)))
             }
+            // A running run: how long so far (round 8 showed "-").
+            (Some(a), None) => format!(
+                "{}+",
+                format_duration(std::time::Duration::from_millis(
+                    prova_core::ids::now_ms().saturating_sub(a)
+                ))
+            ),
             _ => "-".into(),
         };
         // A `--select` run is not a full run of the suite: say so (round 7).
@@ -687,6 +725,14 @@ pub fn protocol_line(p: &prova_core::experiment::Protocol) -> String {
     if !p.specs.is_empty() {
         let names: Vec<&str> = p.specs.iter().map(|f| f.path.as_str()).collect();
         s.push_str(&format!("; spec {}", names.join(", ")));
+    }
+    if p.scope.is_empty() {
+        s.push_str("; candidates may not change tests, benchmarks or build files");
+    } else {
+        s.push_str(&format!(
+            "; candidates may change only {}",
+            p.scope.join(", ")
+        ));
     }
     match &p.oracle {
         Some(o) => s.push_str(&format!("; oracle `{o}`")),

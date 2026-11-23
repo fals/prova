@@ -45,6 +45,13 @@ const CACHES: &[&str] = &[
     ":(exclude,glob)**/.pytest_cache/**",
     ":(exclude,glob)**/.mypy_cache/**",
     ":(exclude,glob)**/.ruff_cache/**",
+    // Build outputs written by the build itself (round 8: Maven Shade's
+    // dependency-reduced-pom.xml changed the code identity).
+    ":(exclude,glob)**/dependency-reduced-pom.xml",
+    ":(exclude,glob)**/target/**",
+    ":(exclude,glob)**/obj/**",
+    ":(exclude,glob)**/bin/Debug/**",
+    ":(exclude,glob)**/bin/Release/**",
     // prova's own config and folder are not the code under test: adding
     // prova.toml must not make the same code look like a new version.
     ":(exclude,top)prova.toml",

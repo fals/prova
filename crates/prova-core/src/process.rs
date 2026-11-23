@@ -105,6 +105,67 @@ pub fn supervises(pid: u32, run: &str) -> bool {
     }
 }
 
+/// Makes this process the reaper of its orphaned descendants, so a process
+/// that escapes its group (`setsid`) is still ours to find (round 8).
+#[cfg(target_os = "linux")]
+pub fn become_subreaper() {
+    let _ = rustix::process::set_child_subreaper(Some(rustix::process::getpid()));
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn become_subreaper() {}
+
+/// Kills and reaps every child process of this one, returning `pid comm`
+/// of each. Call when no child should be alive: what is found was left
+/// behind by a workload.
+#[cfg(target_os = "linux")]
+pub fn reap_orphans() -> Vec<String> {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let comm = stat[stat.find('(').map_or(0, |i| i + 1)..close].to_owned();
+        let f: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+        let (Some(state), Some(ppid)) = (f.first(), f.get(1).and_then(|p| p.parse::<u32>().ok()))
+        else {
+            continue;
+        };
+        if ppid != me {
+            continue;
+        }
+        if let Some(p) = Pid::from_raw(pid as i32) {
+            if *state != "Z" {
+                found.push(format!("{pid} {comm}"));
+                // Its own group too: it may have started more.
+                let _ = rustix::process::kill_process_group(p, Signal::KILL);
+                let _ = rustix::process::kill_process(p, Signal::KILL);
+            }
+            let _ = rustix::process::waitpid(Some(p), rustix::process::WaitOptions::empty());
+        }
+    }
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn reap_orphans() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -201,10 +201,11 @@ fn a_cut_off_test_keeps_its_identity_and_is_shown_as_unfinished() {
     assert!(h.status.success(), "one test, not ambiguous: {}", text(&h));
 }
 
-/// Round 6: a test killed by a cancel reports FAIL; that failure is no
-/// evidence about the code, so it is neither labelled nor counted.
+/// Round 8: a test that failed before the run was cancelled failed on its
+/// own: it keeps its label and counts. (A test killed by the cancel is
+/// unfinished instead; see the round 7 test below.)
 #[test]
-fn failures_of_a_cancelled_run_are_no_evidence() {
+fn a_failure_before_the_cancel_is_still_evidence() {
     let d = workspace("cancelfail");
     std::fs::write(
         d.join("prova.toml"),
@@ -226,13 +227,11 @@ fn failures_of_a_cancelled_run_are_no_evidence() {
         &["wait", &id, "--until", "done", "--max-wait", "10s"],
     ));
     assert!(
-        s.contains("[run cancelled or aborted: no evidence about the code]"),
+        s.contains("FAIL calc::x [") && !s.contains("no evidence"),
         "{s}"
     );
-    assert!(!s.contains("FLAKY"), "{s}");
-    assert!(!text(&prova(&d, &["flaky"])).contains("calc::x"));
     let h = text(&prova(&d, &["history", "calc::x"]));
-    assert!(h.contains("1 finished runs, 0 failed"), "{h}");
+    assert!(h.contains("1 failed"), "{h}");
 }
 
 /// Round 6: `prova flaky` agreed with history only within one suite.
@@ -313,6 +312,47 @@ fn a_test_killed_by_the_cancel_is_unfinished_not_failed() {
     ));
     assert!(
         s.contains("UNFINISHED TestA") && !s.contains("FAIL TestA"),
+        "{s}"
+    );
+}
+
+/// Round 8: result files arrive only at the end, so a hung xUnit/JUnit run
+/// named no test; the tests of the last passing run that never reported
+/// are the suspects.
+#[test]
+fn a_hung_run_without_live_tests_names_the_suspects() {
+    let d = workspace("suspects");
+    std::fs::write(
+        d.join("prova.toml"),
+        concat!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; ",
+            "printf '<testsuite name=\\\"s\\\"><testcase classname=\\\"s\\\" name=\\\"a\\\"/><testcase classname=\\\"s\\\" name=\\\"hangs\\\"/></testsuite>' ",
+            "> build/test-results/junit.xml\"\n",
+        ),
+    )
+    .unwrap();
+    let first = text(&prova(&d, &["run", "j"]));
+    assert!(first.contains("PASSED"), "{first}");
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(
+        w.contains("not reported yet") && w.contains("s::hangs"),
+        "{w}"
+    );
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    let s = text(&prova(
+        &d,
+        &["wait", &id, "--until", "done", "--max-wait", "10s"],
+    ));
+    assert!(
+        s.contains("never reported before the run was cut short") && s.contains("s::hangs"),
         "{s}"
     );
 }
