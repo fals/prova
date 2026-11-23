@@ -62,6 +62,15 @@ pub fn clean(s: &str) -> String {
 }
 
 pub fn summary(s: &Summary, json: bool) {
+    summary_until(s, json, None);
+}
+
+/// A summary whose `next:` continues the same wait (`--until done`).
+pub fn summary_until(s: &Summary, json: bool, until: Option<prova_core::engine::Until>) {
+    print_summary(s, json, until);
+}
+
+fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Until>) {
     if json {
         println!("{}", serde_json::to_string(s).unwrap_or_default());
         return;
@@ -146,7 +155,7 @@ pub fn summary(s: &Summary, json: bool) {
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
     }
-    println!("next: {}", next(s));
+    println!("next: {}", next(s, until));
 }
 
 fn context(f: &prova_core::engine::Failure) -> String {
@@ -281,8 +290,11 @@ fn history_line(h: &serde_json::Value) -> String {
     parts.join("; ")
 }
 
-fn next(s: &Summary) -> String {
+fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
     match s.reason {
+        WaitReason::Running if until == Some(prova_core::engine::Until::Done) => {
+            format!("prova wait {} --until done", s.run)
+        }
         WaitReason::Running => format!("prova wait {} --after {}", s.run, s.last_seq),
         WaitReason::Failure => format!(
             "fix and rerun, or `prova cancel {}`; `prova wait {} --after {}` to keep watching",

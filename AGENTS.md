@@ -63,15 +63,16 @@ Test commands depend on the dogfooding stage, below.
 **Stage B, from M1 on:** every test run goes through prova.
 
 ```
-prova run small            # inner loop
-prova wait <run> --until first-failure --max-wait 30s
-prova run medium           # before opening a PR
+prova run small --until first-failure   # inner loop
+prova run medium --until done           # before opening a PR
+prova run large --until done            # fixtures; repeat the printed `next:` once if it says so
 prova history <test>       # before calling a failure new or flaky
 ```
 
 - Use the **stable** prova binary to test the **development** prova. The stable binary is built from the last green `main` and installed with `cargo install --path crates/prova-cli --root .prova/stable` (path ignored by git). Never test prova with the binary you are changing: a bug would hide itself. Tests isolate themselves with `PROVA_HOME`; never run the development binary against your real home.
 - Never run raw test commands in Stage B, except to debug prova itself, and say so in your report. A Claude Code hook (`.claude/hooks/require-prova.sh`) blocks direct `cargo test` / `cargo nextest`; other harnesses must follow the rule by hand.
 - Every performance claim (faster, smaller, fewer allocations) requires a prova experiment with a frozen protocol and an `accept` verdict ([0007](docs/adr/0007-experiments.md)). Link the experiment id in the PR. "It looked faster once" is not evidence.
+- One command per intent ([0019](docs/adr/0019-one-command-per-intent.md)): no shell loops, pipes or output parsing around prova. If you are about to write one, that is a prova bug: open a `dogfood` issue with the loop.
 - If prova gets in the way, that is a prova bug: open an issue labelled `dogfood` with the exact command and run id, then work around it.
 
 ## Testing rules

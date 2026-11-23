@@ -19,10 +19,10 @@ if printf '%s' "$cmd" | grep -Eq '(^|[;&|(`]\s*|\s)cargo(\s+\+\S+)?\s+(test|next
   cat >&2 <<'MSG'
 Blocked: this repository tests itself with prova (AGENTS.md, Dogfooding).
 Use the stable prova instead of running cargo test directly:
-  .prova/stable/bin/prova run small [--select <test>]   # unit tests
-  .prova/stable/bin/prova run medium                    # integration tests
-  .prova/stable/bin/prova run spec                      # full gate (scripts/ci.sh)
-  .prova/stable/bin/prova run large                     # fixtures, all languages
+  .prova/stable/bin/prova run small --until first-failure [--select <test>]
+  .prova/stable/bin/prova run medium --until done
+  .prova/stable/bin/prova run spec --until done         # full gate (scripts/ci.sh)
+  .prova/stable/bin/prova run large --until done        # fixtures; repeat `next:` once
 If prova itself is broken, say so and open a `dogfood` issue.
 MSG
   exit 2

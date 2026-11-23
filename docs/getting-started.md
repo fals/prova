@@ -27,8 +27,8 @@ prova adopt --verify default --filter <a real test name>
 Then, in the fix loop (humans and agents alike):
 
 ```
-prova run default --detach      # returns a run id at once
-prova wait <run>                # returns on first failure, slow test, stall, or end
+prova run default --until first-failure   # first failure, slow test, stall, or end
+prova run default --until done            # the result; `next:` continues if it takes longer
 prova run default --select <test>
 prova history <test>            # new failure, flaky, or pre-existing?
 ```

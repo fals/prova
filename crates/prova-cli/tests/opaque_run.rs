@@ -390,3 +390,59 @@ fn detach_prints_only_the_id_and_misplaced_flags_are_flagged() {
     let o = prova(&d, &["run", "--", "true", "--detach"]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("--detach comes after `--`"));
 }
+
+/// ADR 0019: "run this and give me the result" is one command; when the
+/// budget ends first, the continuation is one command too, never a loop.
+#[test]
+fn run_until_done_is_one_command_and_continues_with_one() {
+    let d = workspace("until");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            "echo 'test a ... ok'",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(stdout(&o).contains("PASSED"));
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--max-wait",
+            "1s",
+            "--",
+            "sh",
+            "-c",
+            "sleep 4; echo 'test b ... ok'",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(5),
+        "budget ended first: {}",
+        stdout(&o)
+    );
+    let next = stdout(&o)
+        .lines()
+        .find_map(|l| l.strip_prefix("next: "))
+        .unwrap()
+        .to_owned();
+    assert!(next.ends_with("--until done"), "{next}");
+    let args: Vec<&str> = next.split_whitespace().skip(1).collect();
+    let o = prova(&d, &args);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert!(
+        prova(&d, &["run", "--detach", "--until", "done", "--", "true"])
+            .status
+            .code()
+            == Some(2)
+    );
+}

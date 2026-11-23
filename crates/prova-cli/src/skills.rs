@@ -88,7 +88,7 @@ pub const AGENTS_SECTION: &str = "<!-- prova:begin -->
 This project runs tests and performance experiments through `prova`.
 Do not run test commands directly or wrap them in timeouts.
 
-- Tests: `prova run <suite> --detach`, then `prova wait <run>`; fix the first
+- Tests: `prova run <suite> --until first-failure` (or `--until done`); fix the first
   failure while it runs. Skill: `prova-test`.
 - Claims that a change is better (faster, fewer steps, more accurate): `prova exp ...` with a
   frozen protocol and a verdict. Skill: `prova-experiment`.

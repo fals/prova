@@ -66,8 +66,16 @@ enum Cmd {
         #[arg(long)]
         select: Option<String>,
         /// Return the run id immediately; follow with `prova wait`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "until")]
         detach: bool,
+        /// Start the run and wait for this in one command (ADR 0019):
+        /// `done` (the result), `first-failure`, or `stall`.
+        #[arg(long, value_enum)]
+        until: Option<UntilArg>,
+        /// With --until: wait at most this long (default 9m for `done`,
+        /// 30s otherwise); then exit 5 with the command to continue.
+        #[arg(long, requires = "until")]
+        max_wait: Option<String>,
         /// Report a stall after this long without activity (e.g. 30s).
         /// Default: the suite's `stall_after`, else by size (small 30s,
         /// medium 60s, large 5m), else 60s.
@@ -95,8 +103,10 @@ enum Cmd {
         run: String,
         #[arg(long, value_enum, default_value = "first-failure")]
         until: UntilArg,
-        #[arg(long, default_value = "30s")]
-        max_wait: String,
+        /// Default: 9m for `--until done` (under the usual 10-minute limit of
+        /// one tool call), 30s otherwise (ADR 0019).
+        #[arg(long)]
+        max_wait: Option<String>,
         /// Only consider events after this sequence number.
         #[arg(long, default_value_t = 0)]
         after: u64,
@@ -1007,6 +1017,16 @@ fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
     Ok((store, root, cwd))
 }
 
+/// How long one wait may last (ADR 0019): the caller's --max-wait, else 9
+/// minutes for the result (one tool call's usual limit is 10), else 30 s.
+fn wait_budget(until: UntilArg, max_wait: Option<&str>) -> Result<std::time::Duration> {
+    match max_wait {
+        Some(m) => parse_duration(m).ok_or_else(|| anyhow!("invalid --max-wait {m:?}")),
+        None if matches!(until, UntilArg::Done) => Ok(std::time::Duration::from_secs(9 * 60)),
+        None => Ok(std::time::Duration::from_secs(30)),
+    }
+}
+
 /// Arguments as a shell would need them typed (`-run '^$'`), for hints the
 /// agent copies.
 fn sh_quote(args: &[String]) -> String {
@@ -1125,6 +1145,8 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             kill_after,
             inject,
             keep_output,
+            until,
+            max_wait,
             json,
             command,
         } => {
@@ -1218,6 +1240,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let exe = std::env::current_exe()?;
             let mut child =
                 engine::spawn_supervisor(&store, &exe, &id).context("starting supervisor")?;
+            if let Some(until) = until {
+                // One command for "run this and tell me" (ADR 0019).
+                let max = wait_budget(until, max_wait.as_deref())?;
+                let s = engine::wait(&store, &id, until.into(), 0, max)?;
+                render::summary_until(&s, json, Some(until.into()));
+                return Ok(exit_code(&s));
+            }
             if detach {
                 if json {
                     println!("{}", serde_json::json!({ "run": id }));
@@ -1243,10 +1272,9 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         } => {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
-            let max = parse_duration(&max_wait)
-                .ok_or_else(|| anyhow!("invalid --max-wait {max_wait:?}"))?;
+            let max = wait_budget(until, max_wait.as_deref())?;
             let s = engine::wait(&store, &id, until.into(), after, max)?;
-            render::summary(&s, json);
+            render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
         }
         Cmd::Cancel { run } => {

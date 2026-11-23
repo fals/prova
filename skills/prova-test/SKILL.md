@@ -11,15 +11,20 @@ needs attention.
 
 ## Loop
 
-1. Start the run detached and wait for the first significant event:
+1. One command per intent. Start the run and wait for what you need:
 
    ```
-   prova run <suite> --detach          # the run id on stdout (hints on stderr): r=$(prova run <suite> --detach)
-   prova wait <run> --max-wait 30s     # returns on first failure, slow test, stall, or end
+   prova run <suite> --until first-failure   # returns on the first failure, a slow test, a stall, or the end (30 s budget)
+   prova run <suite> --until done            # the result (budget 9 min, under a tool call's usual limit)
    ```
 
-   `prova run <suite>` without `--detach` does both and blocks until the end;
-   use it only for short suites.
+   When the budget ends first, prova exits 5 and prints the one command to
+   continue (`next: prova wait <run> --until done`): run exactly that, once
+   per tool call. Never wrap prova in shell loops, pipes, `sleep` or output
+   parsing: every intent has a command, and `--json` gives one object when
+   you need fields. If your tool calls are shorter than 9 minutes, pass
+   `--max-wait`. Use `--detach` only to do other work meanwhile; then
+   `prova wait <run>` (or `--until done`).
 
 2. Read the result. Each failure carries history:
 

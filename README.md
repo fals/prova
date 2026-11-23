@@ -23,11 +23,7 @@ of one lucky benchmark. It is one binary, built for coding agents and the
 people who run them.
 
 ```console
-$ prova run --detach -- make test
-run 3fa9c1d2 started
-next: prova wait 3fa9c1d2
-
-$ prova wait 3fa9c1d2
+$ prova run --until first-failure -- make test
 run 3fa9c1d2  suite cmd:38dcb90d  `make test`
 FAILING (run still going)  1.2s  level recognized output  code tree:4e1f0c..+dirty:9a2b..
   FAIL calc::divides [new failure, last passed at tree:4e1f0c..]: expected 4, got 16
@@ -107,8 +103,8 @@ Run `prova init` in a repository: it installs the skills into `.agents/skills`
 prova's files. Then the agent knows the loop:
 
 ```text
-prova run <suite> --detach        start, get a run id
-prova wait <run>                  first failure, slow test, stall or end (max 30 s)
+prova run <suite> --until first-failure   first failure, slow test, stall or end (30 s)
+prova run <suite> --until done            the result (9 min budget; `next:` continues)
 prova run <suite> --select <t>    rerun what failed
 prova history <t>                 new failure, pre-existing, or flaky?
 prova exp ...                     any "is it better?" claim, gated by the spec
@@ -129,8 +125,9 @@ prova exp ...                     any "is it better?" claim, gated by the spec
 Harness without skills support? Paste this into its instructions:
 
 ```markdown
-Run tests only through prova. Start with `prova run <suite> --detach`, then
-`prova wait <run>` (returns within 30 s). Fix the first failure while the run
+Run tests only through prova: `prova run <suite> --until first-failure`
+(returns within 30 s) or `--until done` for the result; continue with the
+printed `next:` command, never a shell loop. Fix the first failure while the run
 continues; rerun one test with `--select`. Check `prova history <test>` before
 calling a failure new or flaky. Performance claims need `prova exp`.
 ```
