@@ -1,5 +1,12 @@
 # Trace conformance: replay the specification against the code
 
+Contents: [Generate traces](#generate-traces) ·
+[ITF format](#itf-format-what-the-driver-reads) ·
+[Driver shape](#driver-shape-any-language) ·
+[Python driver](#python-driver-tested-against-examplesipamqnt) ·
+[Other languages](#other-languages) ·
+[The oracle command](#the-oracle-command)
+
 ## Generate traces
 
 ```sh
@@ -42,11 +49,11 @@ for each trace:
 exit non-zero if any trace diverged
 ```
 
-Where the spec is nondeterministic (`nondet ip = free.oneOf()`), the
+Where the specification is nondeterministic (`nondet ip = free.oneOf()`), the
 implementation may choose differently. Either force the choice (pass the
 picked value into the implementation, if it has such an input) or compare
-only what the spec fixes (which pods have an address) and check the
-invariants on the rest (addresses unique, in the pool). Errors the spec
+only what the specification fixes (which pods have an address) and check the
+invariants on the rest (addresses unique, in the pool). Errors the specification
 models as "state unchanged" are expected exceptions, not failures.
 
 ## Python driver (tested against `examples/ipam.qnt`)
@@ -116,5 +123,5 @@ conformance:
 	python3 conformance.py traces/gen
 ```
 
-It checks the spec still holds, then the implementation against it. Pass it
+It checks the specification still holds, then the implementation against it. Pass it
 to `prova exp new --oracle "make conformance"`.

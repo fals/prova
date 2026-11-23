@@ -1,12 +1,12 @@
 ---
 name: prova-ts
-description: prova setup details for JavaScript and TypeScript projects (Vitest, Jest). Use together with prova-adopt or prova-test in a JS/TS codebase.
+description: Gives the Vitest, Jest and node --test settings that let prova see every JavaScript or TypeScript test (prova's Vitest reporter, JUnit reporters, -t filters, no watch mode). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a JavaScript or TypeScript codebase.
 ---
 
 # prova for JavaScript and TypeScript
 
 - Vitest, best: prova's own reporter streams every test live (level
-  `native`, durations and messages). Opt in and add the reporter next to
+  `native stream`, durations and messages). Opt in and add the reporter next to
   the default one; the project's files stay untouched:
 
   ```toml

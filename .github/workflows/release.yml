@@ -51,7 +51,7 @@ jobs:
         if: contains(matrix.target, 'linux')
         run: |
           file target/${{ matrix.target }}/release/prova
-          file target/${{ matrix.target }}/release/prova | grep -q "statically linked"
+          file target/${{ matrix.target }}/release/prova | grep -Eq "static(ally|-pie) linked"
       - name: Package
         run: |
           name=prova-${{ matrix.target }}
@@ -75,6 +75,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Tag matches the version prova reports
+        run: |
+          v=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but prova-cli is $v"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           path: dist

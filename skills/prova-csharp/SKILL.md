@@ -1,6 +1,6 @@
 ---
 name: prova-csharp
-description: prova setup details for .NET projects (dotnet test, xUnit, NUnit, MSTest). Use together with prova-adopt or prova-test in a C# codebase.
+description: Gives the dotnet test flags and prova.toml settings that let prova see every .NET test (TRX and JUnit reports, --filter, xUnit, NUnit, MSTest, hung tests). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a C# or .NET codebase.
 ---
 
 # prova for .NET

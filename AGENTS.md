@@ -159,6 +159,7 @@ Each milestone ends with something an agent can actually use.
 - Commit messages: imperative subject under 72 characters, body explaining why.
 - Model-authored commits end with the `Co-Authored-By` line given by the harness.
 - Never commit `.prova/`, `target/`, secrets, or machine-specific paths.
+- Releases: a `v*` tag on `main`, after the checklist in [docs/releasing.md](docs/releasing.md); only the owner tags.
 
 ## When in doubt
 

@@ -94,6 +94,7 @@ fn parse_ps(out: &str, pgid: u32) -> GroupSample {
 }
 
 /// Returns (pgrp, utime + stime, is_zombie) from `/proc/<pid>/stat`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_stat(stat: &str) -> Option<(u32, u64, bool)> {
     // The command name may contain spaces and parentheses; fields resume
     // after the last ')'.

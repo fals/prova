@@ -1,12 +1,12 @@
 ---
 name: prova-rust
-description: prova setup details for Rust projects (cargo test, cargo-nextest). Use together with prova-adopt or prova-test in a Rust codebase.
+description: Gives the cargo test and cargo-nextest settings that let prova see every Rust test (libtest JSON stream, doctests, JUnit report, --quiet output, size-split suites, criterion). Use when writing or fixing a suite's `run` or `select` command in prova.toml, when `prova run` stays at level opaque or hides passing tests, or when selecting a single test, in a Rust codebase.
 ---
 
 # prova for Rust
 
 - Best: cargo-nextest 0.9.66+ with its libtest JSON stream (level
-  `native`: every test live, with its duration and output). `prova adopt`
+  `native stream`: every test live, with its duration and output). `prova adopt`
   proposes it when it finds nextest:
 
   ```toml
@@ -69,4 +69,5 @@ description: prova setup details for Rust projects (cargo test, cargo-nextest). 
 - Benchmarks for `prova exp`: criterion output is read directly
   (`name.time_ns`); otherwise print `{"metric": ..., "value": ...}`.
 
-See `references/pitfalls.md` for common problems.
+Common problems (long first build, fail-fast, fixed ports, `#[ignore]`):
+[references/pitfalls.md](references/pitfalls.md).

@@ -1,6 +1,6 @@
 ---
 name: prova-experiment
-description: Decide whether a change is better (faster, fewer steps, more accurate, less memory, any numeric objective) with a pre-registered protocol, interleaved trials and a statistical verdict, optionally gated by a formal specification. Use for optimisation, benchmarking (go test -bench, criterion, pytest-benchmark, Vitest bench, JMH, BenchmarkDotNet), algorithm comparisons, load tests, or any "is it better" question, instead of timing or eyeballing runs by hand.
+description: Decides whether a change is better (faster, fewer steps, more accurate, less memory, any numeric objective) with a pre-registered protocol, interleaved trials and a statistical verdict, optionally gated by a formal specification. Use for optimisation, benchmarking (go test -bench, criterion, pytest-benchmark, Vitest bench, JMH, BenchmarkDotNet), algorithm comparisons, load tests, or any "is it better" question, instead of timing or eyeballing runs by hand.
 ---
 
 # Experiments with prova
@@ -9,7 +9,11 @@ One run proves nothing, and neither does a run you chose after seeing
 several. prova fixes the question first, runs baseline and candidate
 interleaved, and decides with a rank test and a confidence interval.
 
-## 0. Is it the right question?
+Terms: a *variant* is one version of the code (the baseline, or a recorded
+candidate); the *best* is the variant later candidates are compared against;
+an *arm* is one variant's side of a comparison (its checkout and trials).
+
+## Before starting: is it the right question?
 
 - What does "better" mean, as one number? Time per operation, accuracy on a
   frozen dataset, nodes expanded, retries, bytes allocated. Pick one primary
@@ -133,26 +137,13 @@ improvement loop does not get lucky by trying many ideas.
   "..."` sets the best back (recorded in the decision log), so later
   candidates are not compared against it.
 
-Where bubblewrap is installed, each arm runs sandboxed (`sandbox:` line in
-the verdict): it can write only its own checkout, a private state directory
-and a private `/tmp`, with no network for trials and the oracle unless the
-protocol has `--allow-network`. Each arm has its own build caches, and
-secret-named variables are not passed. Without bubblewrap, the verdict says
-the arms were not isolated. Trials run in ABBA order. `caveat:` lines flag a
-weak protocol or other experiments on the same baseline. `exp status`
-re-checks every ACCEPT against its samples and warns if the record was
-changed. A foreground `exp run` waits at most 9 minutes; continue with
-`prova exp wait`.
+A foreground `exp run` waits at most 9 minutes; continue with
+`prova exp wait`. `caveat:` lines in the verdict flag a weak protocol or
+other experiments on the same baseline. Sandboxed arms have no network
+unless the protocol has `--allow-network`: install dependencies in `--setup`.
 
-prova guards the verdict against changed tests and benchmarks, a skipped
-oracle, forged extra lines, leaked processes, code that rewrites tracked
-files at run time (both checkouts are read-only and checked after every
-oracle and trial), load aimed at one arm from outside the trials (judged
-for trials of a second or more), and a weak reference: `--against` and
-`exp best` take only the baseline or a kept variant, and an ACCEPT against
-a baseline that is not an ancestor of the candidate says so. Trials do not
-see `PROVA_HOME`, and recorded samples cannot be changed.
-
+prova guards the verdict against most ways of faking a win (what it checks,
+and how arms are isolated: [references/integrity.md](references/integrity.md)).
 It cannot judge code that detects the oracle or the benchmark and behaves
 differently there, or that rewrites its own output in process: read the
 candidate's diff before reporting a win, large or not.
@@ -173,7 +164,7 @@ prova exp new route --hypothesis "A* expands fewer nodes than BFS, same paths" \
   --metric nodes_expanded --better lower --min-effect 20% --trials 5 -- ./bench-route.sh
 ```
 
-- The spec files are frozen by content hash in the protocol. A candidate
+- The specification files are frozen by content hash in the protocol. A candidate
   that edits them is a violation. Freeze the oracle's own files too (its
   conformance test, its reference table, the Makefile target): pass each
   with `--spec`, or a candidate could weaken the check instead of the code.

@@ -1,6 +1,6 @@
 ---
 name: prova-adopt
-description: Put an existing project's tests under prova without changing how the project runs them. Use when a repository has no prova.toml yet, when `prova run` reports level opaque, or when asked to set up prova, adopt prova, or make tests run through prova.
+description: Puts an existing project's tests under prova without changing how the project runs them. Use when a repository has no prova.toml yet, when `prova run` reports level opaque, or when asked to set up prova, adopt prova, or make tests run through prova.
 ---
 
 # Adopt prova in an existing project
@@ -12,7 +12,7 @@ project's test scripts, Makefile or CI config to adopt prova.
 
 1. Run the existing command through prova and note the level it reaches:
 
-   ```
+   ```sh
    prova run -- make test          # or ./scripts/test.sh, npm test, ...
    ```
 
@@ -20,7 +20,7 @@ project's test scripts, Makefile or CI config to adopt prova.
 
 2. Let prova propose a `prova.toml`:
 
-   ```
+   ```sh
    prova adopt                     # prints a proposal, writes nothing
    prova adopt --write             # writes prova.toml if none exists
    ```
@@ -31,7 +31,7 @@ project's test scripts, Makefile or CI config to adopt prova.
 
 3. Verify selection with one real test name taken from step 1 output:
 
-   ```
+   ```sh
    prova adopt --verify default --filter <test name>
    ```
 
@@ -56,7 +56,8 @@ project's test scripts, Makefile or CI config to adopt prova.
    example enabling the framework's JUnit XML reporter or verbose output.
    See the `prova-<language>` skill for the exact flag.
 
-5. `.prova/` must be in `.gitignore` (`prova init` does it). `prova.toml`
+5. `.prova/` must be in `.gitignore`: `prova init` (the command that
+   installs these skills) adds it; otherwise add the line. `prova.toml`
    belongs in version control; commit it when the user's workflow allows.
 
 Then use the `prova-test` skill for the fix loop.

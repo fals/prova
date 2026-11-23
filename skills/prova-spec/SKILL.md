@@ -1,6 +1,6 @@
 ---
 name: prova-spec
-description: Formalize a problem before implementing it, then let the specification judge every implementation. Use when asked to build or improve an algorithm, protocol, allocator, scheduler, parser, network plugin (CNI), search or solver, or anything whose correctness can be stated; when an experiment targets accuracy, step counts or correctness rather than speed; or when "it works" must be proven rather than claimed.
+description: Formalizes a problem before implementing it, then lets the specification judge every implementation. Use when asked to build or improve an algorithm, protocol, allocator, scheduler, parser, network plugin (CNI), search or solver, or anything whose correctness can be stated; when an experiment targets accuracy, step counts or correctness rather than speed; or when "it works" must be proven rather than claimed.
 ---
 
 # Specification first
@@ -22,7 +22,7 @@ are cheap.
 ## 1. Write the specification
 
 Use Quint unless the project already uses TLA+, Alloy or Lean. Quint needs
-Node: `npm i -g @informalsystems/quint`. Put specs in `spec/` (or wherever the
+Node: `npm i -g @informalsystems/quint`. Put specifications in `spec/` (or wherever the
 project keeps them).
 
 A specification answers four questions. Write them as comments first, then
@@ -45,7 +45,7 @@ Rules that keep it useful:
 - **Errors are behaviour.** Pool exhausted, unknown pod, duplicate request:
   say what happens (state unchanged, error returned).
 - **The objective is not in the spec.** Speed, accuracy, steps are measured
-  by the experiment. The spec says which answers are acceptable.
+  by the experiment. The specification says which answers are acceptable.
 - One `run ...Test` per scenario the human cares about, with `assert`.
 
 Worked examples in this skill, both model-checked:
@@ -57,34 +57,11 @@ Worked examples in this skill, both model-checked:
 
 For accuracy on data (classification, ranking, extraction) the specification
 is the frozen labelled dataset plus the output contract (every input gets
-exactly one label from the label set). Register the dataset file as a spec
+exactly one label from the label set). Register the dataset file as a specification
 (step 4); the metric is the accuracy the workload prints.
 
-### Lean: an executable definition plus theorems
-
-Use Lean when a property needs a proof, not just bounded checking. The
-pattern (as in AWS Cedar): write the obvious, slow definition, prove the
-properties you rely on, and run the definition as the reference.
-
-```lean
-/-- The number of primes strictly below `n`. Obviously right, not fast. -/
-def countPrimes (n : Nat) : Nat := ((List.range n).filter isPrime).length
-
-/-- Adding one to `n` adds one exactly when `n` is prime. -/
-theorem countPrimes_succ (n : Nat) :
-    countPrimes (n + 1) = countPrimes n + (if isPrime n then 1 else 0) := by
-  unfold countPrimes
-  rw [List.range_succ, List.filter_append]
-  cases h : isPrime n <;> simp [List.filter, h]
-
-theorem countPrimes_excludes_n : countPrimes 7 = 3 ∧ countPrimes 8 = 4 := by decide
-```
-
-`lake build` fails if any theorem is false; a `lean_exe` prints the
-definition's answers for a range of inputs, and a small program in the
-project's language compares the implementation with them. Core Lean is
-enough for this; mathlib is large and rarely needed. Pin the toolchain in
-`lean-toolchain`.
+Use Lean when a property needs a proof, not just bounded checking: see
+[references/lean.md](references/lean.md).
 
 ## 2. Check the specification
 
@@ -98,7 +75,7 @@ lake build                                                 # Lean: every theorem
 
 Then **break it on purpose**: change one action so it is wrong (hand out any
 address instead of a free one) and confirm the checker reports a violation
-with a short counterexample. A spec that cannot fail checks nothing. Revert.
+with a short counterexample. A specification that cannot fail checks nothing. Revert.
 
 Commit the specification before implementing. It is now the goal.
 
@@ -107,7 +84,7 @@ Commit the specification before implementing. It is now the goal.
 The oracle is one command that succeeds only if an implementation satisfies
 the specification. Pick the strongest you can afford:
 
-1. **Trace conformance** (state machines). Generate traces from the spec and
+1. **Trace conformance** (state machines). Generate traces from the specification and
    replay them against the implementation:
    ```sh
    quint run spec/ipam.qnt --mbt --max-samples 50 --max-steps 20 \
@@ -116,8 +93,9 @@ the specification. Pick the strongest you can afford:
    A small driver in the project's language reads each trace, performs the
    action named in `mbt::actionTaken` with the values in `mbt::nondetPicks`,
    and compares the implementation's state with the trace's state after every
-   step. See `references/conformance.md` for the trace format and drivers.
-2. **Reference answers** (functions). Get a table of the spec's answers
+   step. See [references/conformance.md](references/conformance.md) for the trace
+   format and drivers.
+2. **Reference answers** (functions). Get a table of the specification's answers
    and check the implementation returns acceptable ones for every input,
    including edge cases. To get the table out of Quint, step through the
    inputs in a tiny state machine and write it as a trace:
@@ -146,12 +124,12 @@ the specification. Pick the strongest you can afford:
 
 If the project's checker is not installed here (no Lean, no Java for
 `quint verify`), say so in your report: an oracle that cannot run checks
-nothing. Use what does run (mirror the spec in Quint, as a table or traces)
+nothing. Use what does run (mirror the specification in Quint, as a table or traces)
 and name the gap.
 
 **Make the oracle show its tests.** Run it verbosely (`go test -v -run
-'^TestConformance$'`, `pytest -v`, `cargo test -- --nocapture` is not needed,
-libtest names each test anyway). prova reads the oracle's output: a test that
+'^TestConformance$'`, `pytest -v`; plain `cargo test` already names each
+test). prova reads the oracle's output: a test that
 passed in the baseline's oracle must pass in the candidate's, or the
 candidate is rejected (a candidate can add code, such as its own `TestMain`
 or `conftest.py`, that makes the oracle exit 0 without checking anything).
@@ -193,7 +171,7 @@ prova run conformance --until done
 
 Improving a correct implementation (faster, fewer steps, more accurate):
 register the experiment **with the specification and the oracle**. prova
-freezes the spec files by hash, runs the oracle on both arms before any
+freezes the specification files by hash, runs the oracle on both arms before any
 trial, rejects a violating candidate without measuring it, and never accepts
 one.
 
@@ -211,7 +189,7 @@ Verdicts that mention the specification:
   the candidate; the reason names `prova exp log <experiment> oracle-candidate`,
   which shows what it printed. Fix correctness first; speed is irrelevant.
 - `... differs from the registered specification`: the candidate edited the
-  spec. Never weaken a spec to make a candidate pass. If the spec was wrong,
+  spec. Never weaken a specification to make a candidate pass. If the specification was wrong,
   say so to the human, fix it, commit, and start a new experiment.
 - `... did not pass in the candidate's (e.g. TestConformance): its checks
   were skipped`: the oracle exited 0 on the candidate without running a
@@ -225,5 +203,5 @@ Verdicts that mention the specification:
 ## Report
 
 State the specification file, what it requires in one sentence, the oracle,
-and the prova run or experiment id. "Satisfies the spec" without an oracle run
+and the prova run or experiment id. "Satisfies the specification" without an oracle run
 id is a claim, not evidence.
