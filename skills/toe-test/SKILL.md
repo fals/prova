@@ -14,7 +14,7 @@ needs attention.
 1. Start the run detached and wait for the first significant event:
 
    ```
-   toe run <suite> --detach          # prints the run id (only), so: r=$(toe run <suite> --detach)
+   toe run <suite> --detach          # the run id on stdout (hints on stderr): r=$(toe run <suite> --detach)
    toe wait <run> --max-wait 30s     # returns on first failure, slow test, stall, or end
    ```
 
@@ -29,6 +29,11 @@ needs attention.
      baseline.
    - `[new failure]`: the test passed before and fails now. Likely your
      change, unless the next hint says otherwise.
+   - `[has not passed yet]`, `[failed Nx before, with another message]`:
+     it was already failing before; not caused by your change alone.
+   - `UNFINISHED`: the test was still running when the run ended (cancel,
+     kill); it says nothing about the code. `ERROR`: the test errored
+     rather than failing an assertion.
    - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
      same code both passed and failed. Do not chase it as your bug;
      confirm with `toe history <test>` and report it.

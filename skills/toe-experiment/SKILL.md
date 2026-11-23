@@ -129,7 +129,12 @@ toe exp new route --hypothesis "A* expands fewer nodes than BFS, same paths" \
 ```
 
 - The spec files are frozen by content hash in the protocol. A candidate
-  that edits them is a violation.
+  that edits them is a violation. Freeze the oracle's own files too (its
+  conformance test, its reference table, the Makefile target): pass each
+  with `--spec`, or a candidate could weaken the check instead of the code.
+- `toe exp protocol <name> --spec <file>` (before the first trial) changes
+  only what it names and prints the resulting protocol; `toe exp status`
+  shows it too.
 - The oracle runs once per arm before any trial. A violating candidate is
   rejected without being measured; a violating baseline fails the
   comparison.

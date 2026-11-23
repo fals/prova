@@ -231,6 +231,43 @@ impl From<BetterArg> for experiment::Better {
     }
 }
 
+/// `toe exp protocol`: every option optional, so what is not given keeps
+/// its value (round 5: defaults silently replaced the protocol and dropped
+/// the oracle).
+#[derive(clap::Args)]
+struct ProtocolChange {
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(long, value_enum)]
+    better: Option<BetterArg>,
+    #[arg(long)]
+    unit: Option<String>,
+    #[arg(long)]
+    min_effect: Option<String>,
+    #[arg(long)]
+    alpha: Option<f64>,
+    #[arg(long)]
+    trials: Option<u32>,
+    #[arg(long)]
+    min_trials: Option<u32>,
+    #[arg(long)]
+    max_trials: Option<u32>,
+    #[arg(long)]
+    warmup: Option<u32>,
+    /// Replaces the guardrails (NAME or NAME:higher), repeatable.
+    #[arg(long = "guardrail")]
+    guardrails: Vec<String>,
+    #[arg(long)]
+    kill_after: Option<String>,
+    #[arg(long)]
+    setup: Option<String>,
+    /// Adds a specification file (repeatable).
+    #[arg(long = "spec")]
+    specs: Vec<PathBuf>,
+    #[arg(long)]
+    oracle: Option<String>,
+}
+
 #[derive(clap::Args)]
 struct ProtocolArgs {
     /// Primary metric: a JSON line {"metric": NAME, "value": N} the workload
@@ -295,11 +332,12 @@ enum ExpCmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Change the protocol (refused after the first trial).
+    /// Change the protocol (refused after the first trial). Only the options
+    /// given change; `--spec` adds files; the result is printed.
     Protocol {
         name: String,
         #[command(flatten)]
-        protocol: ProtocolArgs,
+        change: ProtocolChange,
     },
     /// Record a candidate: the working tree now (default) or a git ref.
     Candidate {
@@ -379,13 +417,8 @@ fn parse_effect(s: &str) -> Result<f64> {
     v.map_err(|_| anyhow!("invalid effect {s:?}; use e.g. 2% or 0.02"))
 }
 
-fn protocol_from(
-    a: &ProtocolArgs,
-    command: Vec<String>,
-    root: &Path,
-) -> Result<experiment::Protocol> {
-    let specs = a
-        .specs
+fn spec_files(files: &[PathBuf], root: &Path) -> Result<Vec<experiment::SpecFile>> {
+    files
         .iter()
         .map(|f| {
             let abs = std::fs::canonicalize(f)
@@ -398,10 +431,11 @@ fn protocol_from(
                 sha256: toe_core::ids::sha256_hex(&std::fs::read(&abs)?),
             })
         })
-        .collect::<Result<Vec<_>>>()?;
-    let guardrails = a
-        .guardrails
-        .iter()
+        .collect()
+}
+
+fn parse_guardrails(list: &[String]) -> Result<Vec<experiment::Guardrail>> {
+    list.iter()
         .map(|g| {
             let (m, better) = match g.split_once(':') {
                 Some((m, "higher")) => (m, experiment::Better::Higher),
@@ -416,7 +450,16 @@ fn protocol_from(
                 better,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+fn protocol_from(
+    a: &ProtocolArgs,
+    command: Vec<String>,
+    root: &Path,
+) -> Result<experiment::Protocol> {
+    let specs = spec_files(&a.specs, root)?;
+    let guardrails = parse_guardrails(&a.guardrails)?;
     Ok(experiment::Protocol {
         metric: a.metric.clone(),
         unit: a.unit.clone(),
@@ -729,11 +772,56 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             );
             Ok(exit::PASSED)
         }
-        ExpCmd::Protocol { name, protocol } => {
-            let current = experiment::get(&store, &name)?;
-            let p = protocol_from(&protocol, current.protocol.command.clone(), &root)?;
+        ExpCmd::Protocol { name, change: c } => {
+            let mut p = experiment::get(&store, &name)?.protocol;
+            if let Some(v) = c.metric {
+                p.metric = v;
+            }
+            if let Some(v) = c.better {
+                p.better = v.into();
+            }
+            if c.unit.is_some() {
+                p.unit = c.unit;
+            }
+            if let Some(v) = c.min_effect {
+                p.min_effect = parse_effect(&v)?;
+            }
+            if let Some(v) = c.alpha {
+                p.alpha = v;
+            }
+            if let Some(v) = c.trials {
+                p.trials = v;
+            }
+            if let Some(v) = c.min_trials {
+                p.min_trials = v;
+            }
+            if let Some(v) = c.max_trials {
+                p.max_trials = v;
+            }
+            if let Some(v) = c.warmup {
+                p.warmup = v;
+            }
+            if !c.guardrails.is_empty() {
+                p.guardrails = parse_guardrails(&c.guardrails)?;
+            }
+            if let Some(v) = c.kill_after {
+                p.kill_after_ms = parse_duration(&v)
+                    .ok_or_else(|| anyhow!("invalid --kill-after"))?
+                    .as_millis() as u64;
+            }
+            if c.setup.is_some() {
+                p.setup = c.setup;
+            }
+            for f in spec_files(&c.specs, &root)? {
+                p.specs.retain(|s| s.path != f.path);
+                p.specs.push(f);
+            }
+            if c.oracle.is_some() {
+                p.oracle = c.oracle;
+            }
             experiment::set_protocol(&store, &name, &p)?;
             println!("protocol of {name} updated (hash {})", p.hash());
+            println!("{}", render::protocol_line(&p));
             Ok(exit::PASSED)
         }
         ExpCmd::Candidate {
@@ -950,7 +1038,9 @@ fn print_output(
             .filter(|(d, _)| d.contains(name))
             .collect();
         if found.is_empty() {
-            bail!("no kept output for a failing test matching {name:?} in run {id}");
+            bail!(
+                "no kept output for a failing test matching {name:?} in run {id}: a test cut off before it finished, or a framework that printed nothing per test, has none; `toe output {id}` shows the run's kept output"
+            );
         }
         if json {
             let v: Vec<_> = found
@@ -1179,7 +1269,10 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let mut out = Vec::new();
             for k in toe_core::home::known_repos() {
                 let store = Store::open_dir(Path::new(&k.workspace), &k.dir)?;
-                let runs = store.recent_runs(5)?;
+                let mut runs = store.recent_runs(5)?;
+                if engine::reap_orphans(&store, &runs)? {
+                    runs = store.recent_runs(5)?;
+                }
                 if json {
                     out.push(serde_json::json!({ "repo": k, "runs": runs }));
                 } else if !runs.is_empty() {
@@ -1209,7 +1302,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     Ok(exit_code(&s))
                 }
                 None => {
-                    render::runs(&store.recent_runs(20)?, json);
+                    let mut runs = store.recent_runs(20)?;
+                    if engine::reap_orphans(&store, &runs)? {
+                        runs = store.recent_runs(20)?;
+                    }
+                    render::runs(&runs, json);
                     Ok(exit::PASSED)
                 }
             }
