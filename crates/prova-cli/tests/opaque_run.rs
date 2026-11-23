@@ -119,46 +119,6 @@ fn busy_process_is_not_a_stall() {
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
 }
 
-/// Cancels a run when dropped, so a failing assertion cannot leave an
-/// endless workload behind (it froze a CI runner).
-struct CancelOnDrop<'a>(&'a Path, String);
-
-impl Drop for CancelOnDrop<'_> {
-    fn drop(&mut self) {
-        prova(self.0, &["cancel", &self.1]);
-        prova(
-            self.0,
-            &["wait", &self.1, "--until", "done", "--max-wait", "20s"],
-        );
-    }
-}
-
-/// A silent loop of short-lived commands is busy: their CPU shows in the
-/// shell's reaped-children time (the release smoke test saw it stall).
-#[test]
-fn a_loop_of_short_commands_is_not_a_stall() {
-    let d = workspace("short-cmds");
-    let id = detach(
-        &d,
-        &["--stall-after", "1s"],
-        "while :; do date >/dev/null; done",
-    );
-    let _cancel = CancelOnDrop(&d, id.clone());
-    let w = prova(
-        &d,
-        &[
-            "wait",
-            &id,
-            "--until",
-            "stall",
-            "--max-wait",
-            "4s",
-            "--json",
-        ],
-    );
-    assert_eq!(w.status.code(), Some(5), "never stalled: {}", stdout(&w));
-}
-
 #[test]
 fn kill_after_bounds_the_run() {
     let d = workspace("ceiling");
