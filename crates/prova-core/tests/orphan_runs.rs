@@ -41,3 +41,32 @@ fn a_reused_pid_does_not_keep_a_run_alive() {
     assert_eq!(summary.status, Status::Aborted);
     assert!(summary.detail.unwrap().contains("supervisor exited"));
 }
+
+/// A run's process group id is reused by an unrelated group after the run
+/// (a fork-heavy CI job froze its runner): only processes carrying the
+/// run's id are killed.
+#[test]
+fn leftovers_are_killed_only_when_they_belong_to_the_run() {
+    use std::os::unix::process::CommandExt;
+    let spawn = |env: Option<&str>| {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30").process_group(0);
+        if let Some(run) = env {
+            c.env("PROVA_RUN_ID", run);
+        }
+        c.spawn().unwrap()
+    };
+    let mut foreign = spawn(None);
+    let pgid = foreign.id();
+    assert_eq!(prova_core::process::kill_run_processes(pgid, "r1"), 0);
+    assert!(
+        foreign.try_wait().unwrap().is_none(),
+        "an unrelated group was killed"
+    );
+    foreign.kill().unwrap();
+    foreign.wait().unwrap();
+
+    let mut ours = spawn(Some("r1"));
+    assert_eq!(prova_core::process::kill_run_processes(ours.id(), "r1"), 1);
+    assert!(!ours.wait().unwrap().success());
+}

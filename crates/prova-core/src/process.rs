@@ -110,6 +110,39 @@ pub fn signal_group(pgid: u32, sig: Signal) {
     }
 }
 
+/// Whether `pid` was started for `run`: prova gives every command it runs
+/// `PROVA_RUN_ID=<run>`, and children inherit it. A stored process group id
+/// can be reused by an unrelated group once the run's group is empty, so
+/// nothing is killed by stored id alone.
+#[cfg(target_os = "linux")]
+pub fn belongs_to_run(pid: u32, run: &str) -> bool {
+    let want = format!("PROVA_RUN_ID={run}");
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == want.as_bytes()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn belongs_to_run(pid: u32, run: &str) -> bool {
+    let want = format!("PROVA_RUN_ID={run}");
+    ps(&["-wwE", "-p", &pid.to_string(), "-o", "command="])
+        .is_some_and(|out| out.split_whitespace().any(|v| v == want))
+}
+
+/// SIGKILL each process of group `pgid` that belongs to `run`; returns how
+/// many were signalled.
+pub fn kill_run_processes(pgid: u32, run: &str) -> usize {
+    let mut n = 0;
+    for pid in sample_group(pgid).pids {
+        if belongs_to_run(pid, run)
+            && let Some(p) = Pid::from_raw(pid as i32)
+        {
+            let _ = rustix::process::kill_process(p, Signal::KILL);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn terminate_group(pgid: u32) {
     signal_group(pgid, Signal::TERM);
 }

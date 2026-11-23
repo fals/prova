@@ -1315,9 +1315,9 @@ fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     )
 }
 
-/// Kills the process group of a run's command if any of it is still alive
-/// (the command was started in its own group, whose id is its pid). Returns
-/// how many processes were found.
+/// Kills what is left of a run's command: the members of its process group
+/// (whose id is the command's pid) that carry the run's id. Returns how
+/// many were killed.
 pub fn kill_leftovers(store: &Store, run: &str) -> Result<usize> {
     use rusqlite::OptionalExtension;
     let payload: Option<String> = store
@@ -1334,11 +1334,9 @@ pub fn kill_leftovers(store: &Store, run: &str) -> Result<usize> {
     else {
         return Ok(0);
     };
-    let left = process::sample_group(pgid as u32).pids.len();
-    if left > 0 {
-        process::kill_group(pgid as u32);
-    }
-    Ok(left)
+    // Long after the run, the group id may belong to someone else: kill
+    // only what carries this run's id.
+    Ok(process::kill_run_processes(pgid as u32, run))
 }
 
 /// Blocks at most `max_wait` for the next significant event after `after`.
