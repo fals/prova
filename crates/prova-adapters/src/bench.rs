@@ -239,10 +239,23 @@ fn vitest(lines: &[&str], out: &mut Vec<Metric>) {
         let mut f = row.split_whitespace();
         let Some(name) = f.next() else { continue };
         let values: Vec<Option<f64>> = f.map(num).collect();
+        let hz = cols
+            .iter()
+            .zip(&values)
+            .find(|(c, _)| c.as_str() == "hz")
+            .and_then(|(_, v)| *v)
+            .filter(|h| *h > 0.0);
         for (col, v) in cols.iter().zip(values) {
             let Some(v) = v else { continue };
             match col.as_str() {
-                "mean" => out.push((format!("{name}.mean_ns"), v * 1e6, Some("ns".into()))),
+                // The mean column is milliseconds with 4 decimals: anything
+                // under ~100 ns reads as 0 (round 9: a cached candidate had
+                // median 0). ops/s is exact: the mean is 1e9 / hz.
+                "mean" => out.push((
+                    format!("{name}.mean_ns"),
+                    hz.map_or(v * 1e6, |h| 1e9 / h),
+                    Some("ns".into()),
+                )),
                 "hz" => out.push((format!("{name}.hz"), v, Some("ops/s".into()))),
                 _ => {}
             }
@@ -386,7 +399,8 @@ mod tests {
     #[test]
     fn vitest_bench_mean_and_hz() {
         let m = parse(&fixture("vitest-bench.txt"));
-        assert!((get(&m, "countPrimes.mean_ns") - 16_410_100.0).abs() < 1.0);
+        // From hz (60.9382 ops/s), not the rounded ms column.
+        assert!((get(&m, "countPrimes.mean_ns") - 1e9 / 60.9382).abs() < 1.0);
         assert!((get(&m, "countPrimes.hz") - 60.9382).abs() < 1e-9);
     }
 

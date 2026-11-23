@@ -166,6 +166,48 @@ pub fn reap_orphans() -> Vec<String> {
     Vec::new()
 }
 
+/// CPU ticks the whole machine spent busy, and those this process's
+/// waited-for children used: their difference over a trial is what other
+/// processes used meanwhile (round 9: load started outside the trial's tree,
+/// e.g. through systemd-run, slowed only the other arm).
+#[cfg(target_os = "linux")]
+pub fn cpu_ticks() -> (u64, u64) {
+    let busy = std::fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| {
+            let l = s.lines().next()?.to_owned();
+            let f: Vec<u64> = l
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            // user nice system idle iowait irq softirq steal
+            Some(
+                f.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != 3 && *i != 4)
+                    .map(|(_, v)| v)
+                    .sum(),
+            )
+        })
+        .unwrap_or(0);
+    let children = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let rest = &s[s.rfind(')')? + 2..];
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            // cutime, cstime are fields 16 and 17 (index 13 and 14 here)
+            Some(f.get(13)?.parse::<u64>().ok()? + f.get(14)?.parse::<u64>().ok()?)
+        })
+        .unwrap_or(0);
+    (busy, children)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cpu_ticks() -> (u64, u64) {
+    (0, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

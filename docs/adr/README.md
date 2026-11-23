@@ -28,5 +28,6 @@ All records below are **Accepted** (2026-11-22, or the date in the row). Later a
 | [0019](0019-one-command-per-intent.md) | One command per intent: `run --until`, harness-sized waits, no shell loops around prova; amends 0004, 0012 | no |
 | [0020](0020-oracle-evidence-and-stalls.md) | The oracle shows its work (baseline's oracle tests must pass on the candidate); a stall ends every wait; amends 0015, 0018, 0019 | no |
 | [0021](0021-verdicts-under-adversarial-candidates.md) | Verdicts under careless or adversarial candidates (scope, metric line counts, leaked processes); idle runtimes stall; amends 0004, 0007, 0015 | no |
+| [0022](0022-checkouts-load-and-impossible-results.md) | Read-only checked checkouts, hidden store, load checks, trusted references; impossible or skipped results are unverified; failing now beats flaky; amends 0006, 0017, 0021 | no |
 
 The deviations from the README were accepted with the records.

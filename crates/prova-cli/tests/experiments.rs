@@ -686,3 +686,99 @@ fn the_best_can_be_reset_with_a_reason() {
     let last = s["decisions"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["decision"], "reset", "{last}");
 }
+
+/// Round 9 red team: code that rewrote tracked files at run time (its own
+/// frozen reference table, the other arm's sources) was accepted.
+#[test]
+fn a_workload_that_rewrites_tracked_files_voids_the_comparison() {
+    let d = repo("tamper", "0.01");
+    std::fs::write(d.join("table"), "1\n").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm table",
+    );
+    new_exp(&d, &["--change", "**"]);
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nchmod u+w table 2>/dev/null; echo 2 >> table\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("changed tracked files") && reason.contains("table"),
+        "{reason}"
+    );
+}
+
+/// Round 9 red team: a no-op beat a discarded slower variant with
+/// `--against` and became best; `exp best` took any variant.
+#[test]
+fn only_the_baseline_or_a_kept_variant_can_be_the_reference() {
+    let d = repo("against", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.08").unwrap();
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "slow"])
+            .status
+            .success()
+    );
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    std::fs::write(d.join("delay"), "0.01").unwrap();
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "noop"])
+            .status
+            .success()
+    );
+    let o = prova(&d, &["exp", "run", "e", "--against", "slow"]);
+    assert_eq!(o.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot be the reference"));
+    let o = prova(&d, &["exp", "best", "e", "slow", "--reason", "x"]);
+    assert_eq!(o.status.code(), Some(4));
+}
+
+/// Round 9 red team: a trial's code rewrote the baseline's samples through
+/// PROVA_HOME; trials no longer see it.
+#[test]
+fn trials_do_not_see_prova_home() {
+    let d = std::env::temp_dir().join(format!("prova-exp-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\n[ -n \"$PROVA_HOME\" ] && exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
+    )
+    .unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "t",
+            "--trials",
+            "5",
+            "--warmup",
+            "0",
+            "--oracle",
+            "[ -z \"$PROVA_HOME\" ]",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("x"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "decided", "{r}");
+}

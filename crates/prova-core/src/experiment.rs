@@ -414,7 +414,10 @@ pub fn judge(
     // A change of three orders of magnitude is rarely what the code does:
     // caching across iterations, a smaller workload, or output the code
     // prints itself (round 8). Accepted, but flagged.
-    let implausible = if b > 0.0 && c > 0.0 && (b / c).max(c / b) >= 1000.0 {
+    // A zero median is as implausible (round 9: a cache read as 0 ns).
+    let implausible = if (b > 0.0 && c > 0.0 && (b / c).max(c / b) >= 1000.0)
+        || (b == 0.0) != (c == 0.0)
+    {
         "; warning: a change this large is rarely real: check that the workload still does the same work (no caching across iterations, same input) and that the numbers come from the benchmark, not from the code"
     } else {
         ""
@@ -835,6 +838,14 @@ pub fn start(store: &Store, exp: &str, candidate: &str, against: Option<&str>) -
     }
     variant(store, exp, candidate)?;
     variant(store, exp, &against)?;
+    // Only a fair reference: the original baseline or a kept variant that
+    // was not reset away from (round 9: a no-op beat a discarded slower
+    // variant and became best).
+    if !trusted_reference(store, exp, &against)? {
+        return refused(format!(
+            "{against:?} cannot be the reference: compare against the baseline or a variant that was kept (ACCEPT) and not reset; `prova exp status {exp}` lists them"
+        ));
+    }
     let running: Option<String> = store
         .conn()
         .query_row(
@@ -895,6 +906,8 @@ struct TrialResult {
     primary_lines: usize,
     /// Processes the workload left running after it ended (`pid comm`).
     leaked: Vec<String>,
+    /// CPU (ms) other processes on the machine used during the trial.
+    foreign_ms: f64,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -953,10 +966,13 @@ fn run_trial(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // The workload must not reach prova's own store (round 9).
+        .env_remove("PROVA_HOME")
         .process_group(0);
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
     }
+    let cpu_before = process::cpu_ticks();
     let start = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -968,6 +984,7 @@ fn run_trial(
                 metrics: vec![],
                 primary_lines: 0,
                 leaked: vec![],
+                foreign_ms: 0.0,
             });
         }
     };
@@ -1023,6 +1040,11 @@ fn run_trial(
     // a child subreaper: it would run on during the other arm's trials and
     // skew them (round 8). Kill it, and report it.
     let leaked = process::reap_orphans();
+    let cpu_after = process::cpu_ticks();
+    let foreign_ms = (cpu_after.0.saturating_sub(cpu_before.0) as f64
+        - cpu_after.1.saturating_sub(cpu_before.1) as f64)
+        .max(0.0)
+        * 10.0;
     for l in &leaked {
         writeln!(
             log,
@@ -1044,6 +1066,7 @@ fn run_trial(
         metrics,
         primary_lines,
         leaked,
+        foreign_ms,
     })
 }
 
@@ -1156,6 +1179,8 @@ fn work_comparison(
     // Primary-metric lines per trial, per arm; and the first leaked process.
     let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
+    // CPU other processes used per trial, per arm, with the trial's wall time.
+    let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     let run_one = |arm: Arm, warmup: bool| -> Result<bool> {
         counter.set(counter.get() + 1);
         let seq = counter.get();
@@ -1172,6 +1197,7 @@ fn work_comparison(
         )?;
         if !warmup {
             lines.borrow_mut()[i].push(r.primary_lines);
+            foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1212,6 +1238,7 @@ fn work_comparison(
             let ok = Command::new("sh")
                 .arg("-c")
                 .arg(setup)
+                .env_remove("PROVA_HOME")
                 .current_dir(&dirs[i])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -1229,6 +1256,32 @@ fn work_comparison(
             }
         }
     }
+    // Tracked files of both checkouts as they are before any oracle or
+    // trial: code that rewrites them (its own frozen reference table, the
+    // other arm's sources) voids the comparison (round 9).
+    // Snapshot checkouts are prova's own: make their tracked files read-only
+    // too, so a rewrite fails instead of being restored before the check.
+    for (i, (_, v)) in arms.iter().enumerate() {
+        if v.commit_sha.is_some() && dirs[i] != store.root() {
+            read_only_tracked(&dirs[i]);
+        }
+    }
+    let reference = [tracked_state(&dirs[0]), tracked_state(&dirs[1])];
+    let tampered = || -> Option<String> {
+        (0..2).find_map(|i| {
+            let now = tracked_state(&dirs[i]);
+            (now != reference[i]).then(|| {
+                let first = now
+                    .lines()
+                    .find(|l| !reference[i].lines().any(|x| x == *l))
+                    .or_else(|| reference[i].lines().find(|l| !now.lines().any(|x| x == *l)))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                format!("{} checkout ({first})", arms[i].0.as_str())
+            })
+        })
+    };
     // The candidate may change only what the protocol allows: test,
     // benchmark and build files decide the verdict (round 8).
     if let (Some(b), Some(cand)) = (&arms[0].1.commit_sha, &arms[1].1.commit_sha) {
@@ -1300,6 +1353,14 @@ fn work_comparison(
             return finish(store, &e, comparison, &cand_name, Verdict::Reject, result);
         }
     }
+    if let Some(where_) = tampered() {
+        c.reject_violation();
+        let result = serde_json::json!({
+            "reason": format!("candidate violates the specification: tracked files changed while the oracle ran, in the {where_}: code that rewrites the checkout (its spec, its reference data, the other arm) cannot be judged"),
+            "specification": "violated",
+        });
+        return finish(store, &e, comparison, &cand_name, Verdict::Reject, result);
+    }
     for _ in 0..p.warmup {
         for arm in [Arm::Baseline, Arm::Candidate] {
             if !run_one(arm, true)? {
@@ -1337,7 +1398,23 @@ fn work_comparison(
                 );
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
+            if let Some(where_) = tampered() {
+                let reason = format!(
+                    "trial {} changed tracked files in the {where_}: a workload must not rewrite code or data; the comparison is void",
+                    counter.get()
+                );
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
+            }
             c.trial(&fingerprint_of(store, comparison, counter.get())?);
+        }
+        // Load from outside the trials must not favour one arm: interleaving
+        // spreads background noise evenly, so a large difference is
+        // something aimed at one arm (round 9: systemd-run burner).
+        if let Some(reason) = {
+            let f = foreign.borrow();
+            load_imbalance(&f[0], &f[1])
+        } {
+            return end_failed(store, &exp, comparison, &cand_name, &reason);
         }
         // Each arm's workload must report the metric as often per trial as
         // the other: extra lines are forged output (a candidate's code can
@@ -1468,6 +1545,73 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Marks every tracked file of a checkout read-only (directories stay
+/// writable: builds create their outputs there).
+fn read_only_tracked(dir: &Path) {
+    let Ok(o) = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(dir)
+        .output()
+    else {
+        return;
+    };
+    for f in o.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+        let path = dir.join(String::from_utf8_lossy(f).as_ref());
+        if let Ok(m) = std::fs::symlink_metadata(&path)
+            && m.is_file()
+        {
+            let mut perm = m.permissions();
+            perm.set_readonly(true);
+            let _ = std::fs::set_permissions(&path, perm);
+        }
+    }
+}
+
+/// Whether other processes loaded the machine much more during one arm's
+/// trials than the other's: (CPU ms used by others, trial wall ms) per
+/// trial. Interleaving spreads background noise evenly; a large difference
+/// is aimed at one arm (round 9: a burner started through systemd-run).
+pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
+    fn median(mut x: Vec<f64>) -> f64 {
+        x.sort_by(f64::total_cmp);
+        x.get(x.len() / 2).copied().unwrap_or(0.0)
+    }
+    // Cores busy with other work: a longer trial collects more of the same
+    // background load, so compare rates.
+    let rate = |v: &[(f64, f64)]| {
+        median(
+            v.iter()
+                .filter(|(_, w)| *w > 0.0)
+                .map(|(ms, w)| ms / w)
+                .collect(),
+        )
+    };
+    let (b, c) = (rate(base), rate(cand));
+    // CPU time is counted in 10 ms ticks: under a second per trial the rate
+    // is noise, so only longer trials are judged.
+    let wall = median(base.iter().chain(cand).map(|(_, w)| *w).collect());
+    if wall < 1000.0 || (b - c).abs() <= 0.5f64.max(0.5 * b.max(c)) {
+        return None;
+    }
+    let busier = if b > c { "baseline" } else { "candidate" };
+    Some(format!(
+        "the machine was busier during the {busier}'s trials: other processes kept {:.1} cores busy there, {:.1} during the other arm's; something outside the trials disturbed one arm, so the comparison is void (rerun on a quiet machine)",
+        b.max(c),
+        b.min(c)
+    ))
+}
+
+/// `git status` of tracked files in a checkout (empty outside git).
+fn tracked_state(dir: &Path) -> String {
+    Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 /// Whether a variant satisfies the protocol's specification: its spec files
 /// are the registered ones, and the oracle succeeds in its directory.
 fn satisfies_spec(
@@ -1502,6 +1646,7 @@ fn satisfies_spec(
     let ok = Command::new("sh")
         .arg("-c")
         .arg(oracle)
+        .env_remove("PROVA_HOME")
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -1654,6 +1799,32 @@ fn finish(
         result["reason"] = serde_json::json!("invalid comparison");
     }
     let mut reason = result["reason"].as_str().unwrap_or("").to_owned();
+    // An ACCEPT against a reference that is not where the candidate came
+    // from measures everything between the two commits (round 9: a slowed
+    // down `--baseline` made unchanged code "faster").
+    if verdict == Verdict::Accept
+        && let Ok((b, c)) = store.conn().query_row(
+            "SELECT baseline, candidate FROM comparisons WHERE id = ?1",
+            params![comparison],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        // Kept variants are snapshots the next candidate does not descend
+        // from; only the original baseline must be an ancestor.
+        && b == "baseline"
+        && let (Ok(bv), Ok(cv)) = (variant(store, &e.name, &b), variant(store, &e.name, &c))
+        && let (Some(bs), Some(cs)) = (&bv.commit_sha, &cv.commit_sha)
+        && !Command::new("git")
+            .args(["merge-base", "--is-ancestor", bs, cs])
+            .current_dir(store.root())
+            .status()
+            .is_ok_and(|st| st.success())
+    {
+        reason.push_str(&format!(
+            "; warning: the reference {b} ({}) is not an ancestor of the candidate, so the difference includes everything between the two commits, not only the change",
+            &bs[..bs.len().min(12)]
+        ));
+        result["reason"] = serde_json::json!(reason.clone());
+    }
     // A revalidation (the kept best, again, against the original baseline)
     // says so in the decision log.
     let base: String = store.conn().query_row(
@@ -1693,12 +1864,36 @@ fn finish(
     Ok(())
 }
 
+/// Whether a variant may serve as a reference: the original baseline, or
+/// one an ACCEPT kept and no `exp best` reset turned away from.
+fn trusted_reference(store: &Store, exp: &str, name: &str) -> Result<bool> {
+    if name == "baseline" {
+        return Ok(true);
+    }
+    let kept: bool = store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM decisions WHERE experiment = ?1 AND candidate = ?2 AND decision = 'keep')",
+        params![exp, name],
+        |r| r.get(0),
+    )?;
+    let reset_away: bool = store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM best_resets WHERE experiment = ?1 AND from_best = ?2)",
+        params![exp, name],
+        |r| r.get(0),
+    )?;
+    Ok(kept && !reset_away)
+}
+
 /// Sets the best variant by hand (after an ACCEPT found wrong), with the
 /// reason recorded next to the decision log.
 pub fn reset_best(store: &Store, exp: &str, to: &str, reason: &str) -> Result<String> {
     let e = get(store, exp)?;
     if !existing_variant(store, exp, to)? {
         return refused(format!("no variant {to:?} in experiment {exp}"));
+    }
+    if !trusted_reference(store, exp, to)? {
+        return refused(format!(
+            "{to:?} cannot be the best: only the baseline or a variant that was kept (ACCEPT) and not reset away from"
+        ));
     }
     let tx = store.conn().unchecked_transaction()?;
     tx.execute(
@@ -1870,6 +2065,21 @@ pub fn wait(store: &Store, exp: &str, max_wait: Duration) -> Result<Report> {
 }
 
 use std::os::unix::process::CommandExt;
+
+#[cfg(test)]
+mod load_tests {
+    #[test]
+    fn a_burner_on_one_arm_voids_but_even_noise_does_not() {
+        let quiet = vec![(100.0, 2000.0); 5];
+        let burned = vec![(8000.0, 2000.0); 5];
+        assert!(super::load_imbalance(&quiet, &burned).is_some());
+        let busy = vec![(6000.0, 2000.0); 5];
+        let busy2 = vec![(5000.0, 1800.0); 5];
+        assert!(super::load_imbalance(&busy, &busy2).is_none());
+        // Short trials: too coarse to judge.
+        assert!(super::load_imbalance(&[(10.0, 20.0); 5], &[(60.0, 20.0); 5]).is_none());
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -142,8 +142,12 @@ impl Observer for Ladder {
             }
         }
         for (name, live) in self.live.seen.values() {
-            if let Some(file) = finals.get(name)
-                && file.is_failure() != live.is_failure()
+            if let Some(file) = finals.get(name).or_else(|| {
+                finals
+                    .iter()
+                    .find(|(d, _)| d.ends_with(&format!("::{name}")))
+                    .map(|(_, o)| o)
+            }) && file.is_failure() != live.is_failure()
             {
                 eprintln!(
                     "prova: recognizer disagreement for {name}: live {live:?}, result file {file:?}"
@@ -151,11 +155,20 @@ impl Observer for Ladder {
             }
         }
         report.events.retain(|e| match e {
-            EventKind::TestFinished { test, .. } => !live_names.contains(&test.display()),
+            // nextest's JUnit names `calc::tests::adds` what its stream
+            // calls `tests::adds` (round 9: every test counted twice).
+            EventKind::TestFinished { test, .. } => {
+                let d = test.display();
+                !live_names
+                    .iter()
+                    .any(|l| *l == d || d.ends_with(&format!("::{l}")))
+            }
             _ => true,
         });
         // `go test` without -v or -json prints failures only (round 5).
+        // (Not with -v: its `=== RUN` lines show it; round 9 noted it anyway.)
         if self.live.go_package_lines > 0
+            && self.live.go_run_lines == 0
             && !self
                 .live
                 .seen
@@ -222,7 +235,7 @@ impl Observer for Ladder {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \
                      passing tests are not recorded, so flaky detection and durations are incomplete. \
-                     Run the framework with verbose output or a JUnit report (`prova adopt` shows how).",
+                     Run the framework with verbose output or a JUnit report (`prova adopt --write` sets it up).",
                     self.live.total()
                 ),
             });

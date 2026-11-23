@@ -223,7 +223,10 @@ fn context(f: &prova_core::engine::Failure) -> String {
     } else if !c.flaky {
         parts.push("has not passed yet".to_owned());
     }
-    if c.flaky {
+    if c.failing_now {
+        // Whatever its past: it fails every time now (round 9).
+        parts.push("failing in each of its last 3 runs".to_owned());
+    } else if c.flaky {
         parts.push("FLAKY".to_owned());
     } else if c.suite_passed_on_same_code {
         parts.push("likely FLAKY: suite passed on this exact code before".to_owned());
@@ -276,7 +279,9 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         .filter(|r| r.outcome != Outcome::Skipped)
         .collect();
     if skipped > 0 {
-        println!("  ({skipped} skipped attempts not listed, e.g. runs that selected other tests)");
+        println!(
+            "  ({skipped} skipped attempts not listed: the test was ignored, or the run selected other tests)"
+        );
     }
     for r in shown.iter().take(15) {
         let retry = if r.attempts > 1 {
@@ -313,7 +318,12 @@ fn history_line(h: &serde_json::Value) -> String {
     // Same suite and same selection: a `--select` run is compared only
     // with runs of the same selection.
     let mut parts = vec![format!(
-        "{n} earlier run{} of this suite{}",
+        "{} earlier finished run{} of this suite{}",
+        if n == 0 {
+            "no".to_owned()
+        } else {
+            n.to_string()
+        },
         if n == 1 { "" } else { "s" },
         if h["selection"].is_string() {
             " with this selection"
@@ -332,7 +342,9 @@ fn history_line(h: &serde_json::Value) -> String {
             p["run"].as_str().unwrap_or(""),
             p["code"].as_str().unwrap_or("")
         )),
-        None => parts.push("none of them passed".into()),
+        // "None of them passed" about zero runs reads as a verdict (round 9).
+        None if n > 0 => parts.push("none of them passed".into()),
+        None => {}
     }
     let seen = h["same_failure_seen"].as_u64().unwrap_or(0);
     if seen > 0 {
@@ -449,7 +461,7 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
     }
 }
 
-pub fn runs(rows: &[RunRow], json: bool) {
+pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, json: bool) {
     if json {
         println!("{}", serde_json::to_string(rows).unwrap_or_default());
         return;
@@ -461,7 +473,11 @@ pub fn runs(rows: &[RunRow], json: bool) {
         return;
     }
     for r in rows {
-        let outcome = r.outcome.map(Outcome::as_str).unwrap_or("-");
+        // A thin pass is not a plain "passed" in the list either (round 9).
+        let outcome = match r.outcome {
+            Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
+            o => o.map(Outcome::as_str).unwrap_or("-"),
+        };
         let dur = match (r.started_ms, r.ended_ms) {
             (Some(a), Some(b)) => {
                 format_duration(std::time::Duration::from_millis(b.saturating_sub(a)))
@@ -660,6 +676,7 @@ mod label_tests {
                 flaky,
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
+                failing_now: false,
             }),
         })
     }
@@ -683,6 +700,7 @@ mod label_tests {
                 flaky: false,
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
+                failing_now: false,
             }),
         });
         assert_eq!(first, " [first time seen: no history yet]");
@@ -700,6 +718,7 @@ mod label_tests {
                 flaky: false,
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
+                failing_now: false,
             }),
         });
         assert_eq!(never, " [has not passed yet]", "never passed: not new");

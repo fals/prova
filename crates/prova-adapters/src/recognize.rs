@@ -49,6 +49,8 @@ pub struct Recognizers {
     pub no_tests_line: Option<String>,
     /// `go test` package result lines in text output ("ok  \tpkg", "FAIL\tpkg").
     pub go_package_lines: u64,
+    /// `=== RUN` lines: `go test -v`, which shows passing tests too.
+    pub go_run_lines: u64,
     /// A native stream reports pytest / Vitest (opt-in recipe): their
     /// human output is then ignored, so one source decides each test.
     pub pytest_stream: bool,
@@ -58,6 +60,9 @@ pub struct Recognizers {
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
+    /// `ignored` events seen since the suite started: those are already
+    /// accounted for in the suite's end count.
+    libtest_ignored_seen: usize,
     /// Failure messages, kept as a test's output when nothing richer is
     /// known (lowest priority).
     pub failure_fallback: Vec<(TestKey, String)>,
@@ -243,6 +248,7 @@ impl Recognizers {
             "collected 0 items",                         // pytest
             "[no test files]",                           // go
             "No tests found",                            // jest
+            " 0 tests run:",                             // nextest, selection matched nothing
             "No test files found",                       // vitest
             "No tests to run",                           // maven surefire
             "No test is available in",                   // vstest
@@ -401,13 +407,21 @@ impl Recognizers {
         if kind == "suite" {
             if event == "started" {
                 self.libtest_open.clear();
+                self.libtest_ignored_seen = 0;
             } else {
                 // nextest reports ignored tests as started, then only counts
                 // them in the suite's end event: those still open are them.
-                let ignored = v["ignored"].as_u64().unwrap_or(0) as usize;
-                let open = std::mem::take(&mut self.libtest_open);
-                if !open.is_empty() && open.len() <= ignored {
-                    for key in open {
+                // nextest runs tests in parallel: a test still running when
+                // another batch ends is open too (round 9: a 1.5 s test that
+                // passed was recorded as skipped). Only ignored tests not yet
+                // reported by their own event are the open ones.
+                let ignored = (v["ignored"].as_u64().unwrap_or(0) as usize)
+                    .saturating_sub(std::mem::take(&mut self.libtest_ignored_seen));
+                if ignored > 0
+                    && !self.libtest_open.is_empty()
+                    && self.libtest_open.len() <= ignored
+                {
+                    for key in std::mem::take(&mut self.libtest_open) {
                         self.finished(key, Outcome::Skipped, None, None, Level::Native, out);
                     }
                 }
@@ -447,6 +461,9 @@ impl Recognizers {
             return self.started(key, out);
         }
         self.libtest_open.retain(|k| k != &key);
+        if event == "ignored" {
+            self.libtest_ignored_seen += 1;
+        }
         let outcome = match event {
             "ok" => Outcome::Passed,
             "failed" => Outcome::Failed,
@@ -522,6 +539,7 @@ impl Recognizers {
     fn go_verbose(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_start();
         if let Some(name) = t.strip_prefix("=== RUN") {
+            self.go_run_lines += 1;
             let name = name.trim().to_owned();
             self.go_current = Some(name.clone());
             self.started(TestKey::new(Vec::new(), name), out);
@@ -618,9 +636,10 @@ impl Recognizers {
             return true;
         }
         // `cargo test --quiet` prints only failures: "path::name --- FAILED"
+        // (a doctest's name has spaces: "src/lib.rs - div (line 7)", round 9)
         if let Some(name) = line.strip_suffix(" --- FAILED")
             && !name.is_empty()
-            && !name.contains(char::is_whitespace)
+            && (!name.contains(char::is_whitespace) || is_doctest_name(name))
         {
             let key = self.libtest_key(name);
             self.finished(key, Outcome::Failed, None, None, Level::Recognized, out);
@@ -1733,6 +1752,11 @@ mod tests {
     }
 }
 
+/// A doctest's name as libtest prints it: `src/lib.rs - div (line 7)`.
+fn is_doctest_name(name: &str) -> bool {
+    name.contains(" - ") && name.trim_end().ends_with(')') && name.contains("(line ")
+}
+
 /// Tests that passed in a finished command's output (an experiment oracle):
 /// so prova can tell an oracle that checked from one that exited 0 without
 /// running its tests (round 7: a candidate's own `TestMain` skipped them).
@@ -1766,5 +1790,50 @@ mod passed_tests_tests {
         let out = "=== RUN   TestConformance\n--- PASS: TestConformance (0.01s)\nPASS\nok  \texample.com/calc\t0.02s\n";
         assert_eq!(super::passed_tests(out), vec!["TestConformance".to_owned()]);
         assert!(super::passed_tests("ok  \texample.com/calc\t0.02s\n").is_empty());
+    }
+
+    /// Round 9: nextest runs tests in parallel; a batch's end event counted
+    /// an ignored test that had its own `ignored` event, and the test still
+    /// running (which then passed) was recorded as skipped.
+    #[test]
+    fn a_running_test_is_not_taken_for_an_ignored_one() {
+        use super::Recognizers;
+        use prova_core::model::{EventKind, Outcome};
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in [
+            r#"{"type":"test","event":"started","name":"calc::calc$tests::slow"}"#,
+            r#"{"type":"test","event":"ignored","name":"calc::calc$tests::divides"}"#,
+            r#"{"type":"suite","event":"failed","passed":2,"failed":1,"ignored":1,"measured":0,"filtered_out":0}"#,
+            r#"{"type":"test","event":"ok","name":"calc::calc$tests::slow","exec_time":1.5}"#,
+        ] {
+            ev.extend(r.line(l));
+        }
+        let slow: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, outcome, .. } if test.name == "slow" => {
+                    Some(*outcome)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slow, vec![Outcome::Passed], "{ev:?}");
+    }
+
+    /// Round 9: a failing doctest in quiet mode was not named.
+    #[test]
+    fn a_quiet_doctest_failure_is_named() {
+        use super::Recognizers;
+        use prova_core::model::{EventKind, Outcome};
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in ["   Doc-tests calc", "src/lib.rs - div (line 7) --- FAILED"] {
+            ev.extend(r.line(l));
+        }
+        assert!(
+            ev.iter().any(|e| matches!(e, EventKind::TestFinished { test, outcome: Outcome::Failed, .. } if test.name.contains("div (line 7)"))),
+            "{ev:?}"
+        );
     }
 }

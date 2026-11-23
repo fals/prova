@@ -356,3 +356,68 @@ fn a_hung_run_without_live_tests_names_the_suspects() {
         "{s}"
     );
 }
+
+/// Round 9: `#[ignore]` on a test that passed in the last passing run gave
+/// a clean pass; a skipped test did not run.
+#[test]
+fn a_test_skipped_since_the_last_pass_makes_the_pass_unverified() {
+    let d = workspace("ignored");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"echo 'test calc::a ... ok'; if [ -f ign ]; then echo 'test calc::b ... ignored'; else echo 'test calc::b ... ok'; fi\"\n",
+    )
+    .unwrap();
+    assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
+    std::fs::write(d.join("ign"), "").unwrap();
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(
+        out.contains("PASSED (unverified") && out.contains("calc::b"),
+        "{out}"
+    );
+}
+
+/// Round 9: output that only looks like results (a Makefile that echoes
+/// `test x ... ok`) passed, though the test is known to take far longer.
+#[test]
+fn results_faster_than_the_test_ever_ran_are_unverified() {
+    let d = workspace("echoed");
+    // The test reports its own 0.6 s; faked, the line comes at once.
+    std::fs::write(d.join("r.sh"), "[ -f fake ] || sleep 0.6\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":0.6}'\n").unwrap();
+    std::fs::write(d.join("prova.toml"), "[suite.t]\nrun = \"sh r.sh\"\n").unwrap();
+    for _ in 0..2 {
+        assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
+    }
+    std::fs::write(d.join("fake"), "").unwrap();
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(
+        out.contains("PASSED (unverified")
+            && out.contains("did not come from running the tests now"),
+        "{out}"
+    );
+}
+
+/// Round 9: once flaky, always dismissed: an environment-dependent test
+/// that then failed every time read "only known flaky test(s) failed".
+#[test]
+fn a_flaky_test_failing_three_times_in_a_row_is_failing_now() {
+    let d = workspace("failingnow");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    let out = run(&d, "make", "fail");
+    assert!(
+        !out.contains("FLAKY") && !out.contains("only known flaky"),
+        "{out}"
+    );
+}
+
+/// Round 9: `prova status` showed an unverified pass as plain "passed".
+#[test]
+fn status_marks_an_unverified_pass() {
+    let d = workspace("statusq");
+    prova(&d, &["run", "--", "true"]);
+    let s = text(&prova(&d, &["status"]));
+    assert!(s.contains("passed?"), "{s}");
+}

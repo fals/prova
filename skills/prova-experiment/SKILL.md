@@ -128,9 +128,17 @@ improvement loop does not get lucky by trying many ideas.
   candidates are not compared against it.
 
 prova guards the verdict against changed tests and benchmarks, a skipped
-oracle, forged extra lines and leaked processes. It cannot judge code that
-detects the oracle or the benchmark and behaves differently there: read the
-candidate's diff before reporting a large win.
+oracle, forged extra lines, leaked processes, code that rewrites tracked
+files at run time (both checkouts are read-only and checked after every
+oracle and trial), load aimed at one arm from outside the trials (judged
+for trials of a second or more), and a weak reference: `--against` and
+`exp best` take only the baseline or a kept variant, and an ACCEPT against
+a baseline that is not an ancestor of the candidate says so. Trials do not
+see `PROVA_HOME`, and recorded samples cannot be changed.
+
+It cannot judge code that detects the oracle or the benchmark and behaves
+differently there, or that rewrites its own output in process: read the
+candidate's diff before reporting a win, large or not.
 
 Before reporting: `prova exp revalidate <name>` runs the best against the
 original baseline with fresh trials. `prova exp status <name>` shows the

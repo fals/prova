@@ -41,6 +41,9 @@ pub struct TestStats {
     /// Code versions on which the test both passed and failed.
     pub flips_on_same_code: usize,
     pub flaky: bool,
+    /// Failed its last 3 runs in a row: failing now, whatever its past.
+    #[serde(default)]
+    pub failing_now: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed_size: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +201,14 @@ fn stats_with(
     }
     let flips = by_code.values().filter(|s| s.len() == 2).count();
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
+    // A test that failed its last 3 runs in a row is failing now, whatever
+    // its past: "known flaky" must not hide a real break (round 9: an
+    // environment-dependent test, once flipped, was dismissed for good).
+    let failing_now = counted.len() >= 3
+        && counted
+            .iter()
+            .take(3)
+            .all(|r| r.outcome.is_failure() && !r.passed_on_retry);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -223,7 +234,8 @@ fn stats_with(
         transitions,
         passed_on_retry: retry,
         flips_on_same_code: flips,
-        flaky: retry > 0 || flips > 0,
+        flaky: (retry > 0 || flips > 0) && !failing_now,
+        failing_now,
         proposed_size: percentile(&durations, 95.0).map(proposed_size),
         p50_ms: percentile(&durations, 50.0),
         p95_ms: percentile(&durations, 95.0),
@@ -472,6 +484,9 @@ pub struct FailureContext {
     pub failed_before: usize,
     /// It passed in an earlier finished run.
     pub passed_before: bool,
+    /// Failed its last 3 runs in a row (this one included): no flaky hint.
+    #[serde(default)]
+    pub failing_now: bool,
     /// This run was cancelled or aborted: its failures are no evidence
     /// about the code (a killed test reports FAIL), so no label applies.
     pub run_cut_short: bool,
@@ -522,6 +537,7 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         failed_before,
         passed_before,
         run_cut_short,
+        failing_now: s.failing_now,
         flaky,
         last_passed_code,
         suite_passed_on_same_code: false,
