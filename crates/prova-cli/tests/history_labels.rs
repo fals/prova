@@ -448,6 +448,8 @@ fn status_marks_an_unverified_pass() {
 
 /// Round 10: an unverified pass (stale or echoed results) counted in the
 /// test's history and made a real, deterministic failure "FLAKY".
+// Needs the children's CPU time, which macOS does not give (getting started).
+#[cfg(target_os = "linux")]
 #[test]
 fn an_unverified_pass_is_no_evidence_about_a_test() {
     let d = workspace("thinpass");

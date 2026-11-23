@@ -90,12 +90,17 @@ fn parse_stat(stat: &str) -> Option<(u32, u64, bool)> {
     // after the last ')'.
     let rest = &stat[stat.rfind(')')? + 2..];
     let f: Vec<&str> = rest.split_whitespace().collect();
-    // rest[0] = state (field 3), pgrp = field 5, utime = 14, stime = 15
+    // rest[0] = state (field 3), pgrp = field 5, utime = 14, stime = 15,
+    // cutime = 16, cstime = 17: the CPU of children a member already
+    // reaped counts too (a shell loop of short-lived commands looked idle
+    // and stalled, because each command was gone before a sample saw it).
     let state = f.first()?;
     let pgrp = f.get(2)?.parse().ok()?;
-    let utime: u64 = f.get(11)?.parse().ok()?;
-    let stime: u64 = f.get(12)?.parse().ok()?;
-    Some((pgrp, utime + stime, *state == "Z" || *state == "X"))
+    let mut ticks = 0;
+    for i in 11..=14 {
+        ticks += f.get(i)?.parse::<u64>().ok()?;
+    }
+    Some((pgrp, ticks, *state == "Z" || *state == "X"))
 }
 
 pub fn signal_group(pgid: u32, sig: Signal) {
@@ -186,7 +191,10 @@ pub fn left_in_group(pgid: u32) -> Vec<String> {
     sample_group(pgid)
         .pids
         .into_iter()
-        .map(|p| p.to_string())
+        .map(|p| {
+            let name = ps(&["-p", &p.to_string(), "-o", "comm="]).unwrap_or_default();
+            format!("{p} {}", name.trim())
+        })
         .collect()
 }
 
@@ -311,6 +319,8 @@ mod tests {
         let line =
             "1234 (my (weird) cmd) S 1 4321 4321 0 -1 4194304 100 0 0 0 7 5 0 0 20 0 1 0 1 1 1";
         assert_eq!(parse_stat(line), Some((4321, 12, false)));
+        let reaped = "7 (sh) S 1 7 7 0 -1 0 0 0 0 0 1 1 30 20 20 0 1 0 1 1 1";
+        assert_eq!(parse_stat(reaped), Some((7, 52, false)));
         let zombie = "9 (x) Z 1 9 9 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 1 1 1";
         assert_eq!(parse_stat(zombie), Some((9, 2, true)));
     }
