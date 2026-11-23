@@ -617,13 +617,22 @@ fn observe_child(
         });
     }
     for key in closed {
-        let (name, attempt) = key.rsplit_once('#').unwrap_or((&key, "1"));
+        let (unique, attempt) = key.rsplit_once('#').unwrap_or((&key, "1"));
+        // The test keeps its real identity (ADR 0018 round 5: rebuilding it
+        // from the lifecycle key made a garbled duplicate test).
+        let (test, duration_ms) = match sup.running.get(unique) {
+            Some((t, started, _, _)) => (t.clone(), Some(started.elapsed().as_millis() as u64)),
+            None => (
+                TestKey::new(Vec::new(), unique.rsplit('\u{1f}').next().unwrap_or(unique)),
+                None,
+            ),
+        };
         sup.seq += 1;
         let kind = EventKind::TestFinished {
-            test: TestKey::new(Vec::new(), name),
+            test,
             attempt: attempt.parse().unwrap_or(1),
             outcome: Outcome::Errored,
-            duration_ms: None,
+            duration_ms,
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
         };
@@ -735,6 +744,8 @@ pub enum WaitReason {
 #[derive(Debug, Clone, Serialize)]
 pub struct Failure {
     pub test: String,
+    /// `failed` or `errored` (errored includes a test that never finished).
+    pub outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// History of this test: seen before, flaky, last passing code.
@@ -827,6 +838,16 @@ fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
 /// Supervisor gone while the run is not terminal: record it as aborted.
 /// The update is conditional, so a supervisor that just moved the run on
 /// is never overwritten.
+/// Reaps every run whose supervisor is gone, so lists never show a dead run
+/// as running (round 5: only `toe status <run>` did).
+pub fn reap_orphans(store: &Store, rows: &[RunRow]) -> Result<bool> {
+    let mut any = false;
+    for row in rows.iter().filter(|r| !r.status.is_terminal()) {
+        any |= reap_orphan(store, row)?;
+    }
+    Ok(any)
+}
+
 fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     let orphan = match row.status {
         Status::Running => row
@@ -934,6 +955,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // Tests started and not finished yet, in start order (ADR 0018: a stall
     // or slow report names what is running).
     let mut running: Vec<(String, String)> = Vec::new();
+    let mut started_at: BTreeMap<String, u64> = BTreeMap::new();
     for e in &events {
         match &e.kind {
             EventKind::TestFinished {
@@ -958,7 +980,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     test.unique(),
                     SlowTest {
                         test: test.display(),
-                        elapsed_ms: *elapsed_ms,
+                        // How long it has been running now, not when the
+                        // slow event fired (round 5: "running 1.0s" at 2.8s).
+                        elapsed_ms: started_at
+                            .get(&test.unique())
+                            .map(|t| now_ms().saturating_sub(*t))
+                            .unwrap_or(0)
+                            .max(*elapsed_ms),
                         budget_ms: *budget_ms,
                     },
                 );
@@ -966,6 +994,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
             EventKind::TestStarted { test } => {
                 stalled_ms = None;
+                started_at.insert(test.unique(), e.ts_ms);
                 if !running.iter().any(|(u, _)| *u == test.unique()) {
                     running.push((test.unique(), test.display()));
                 }
@@ -995,15 +1024,19 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
         .and_then(|s| s.selection);
-    let suite_passed_on_same_code = store
-        .suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?
-        .iter()
-        .any(|r| r.code == row.code && r.outcome == Some(Outcome::Passed));
+    // Only a run that finished can suggest flakiness: a cancelled or aborted
+    // run's unfinished tests say nothing about the code (ADR 0018).
+    let suite_passed_on_same_code = row.status == Status::Finished
+        && store
+            .suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?
+            .iter()
+            .any(|r| r.code == row.code && r.outcome == Some(Outcome::Passed));
     let mut failures = Vec::new();
-    for (key, _, message, _) in failing.iter().take(20).copied() {
+    for (key, outcome, message, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
         failures.push(Failure {
             test: key.display(),
+            outcome: *outcome,
             message: message.clone(),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
                 c.suite_passed_on_same_code = suite_passed_on_same_code;
