@@ -73,7 +73,7 @@ jobs:
   # the release image and the install script (tags publish them).
   package:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
