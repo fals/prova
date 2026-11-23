@@ -1017,6 +1017,14 @@ fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
     Ok((store, root, cwd))
 }
 
+fn until_name(u: UntilArg) -> &'static str {
+    match u {
+        UntilArg::Done => "the result",
+        UntilArg::Stall => "a stall",
+        UntilArg::FirstFailure => "the first failure",
+    }
+}
+
 /// How long one wait may last (ADR 0019): the caller's --max-wait, else 9
 /// minutes for the result (one tool call's usual limit is 10), else 30 s.
 fn wait_budget(until: UntilArg, max_wait: Option<&str>) -> Result<std::time::Duration> {
@@ -1243,7 +1251,14 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             if let Some(until) = until {
                 // One command for "run this and tell me" (ADR 0019).
                 let max = wait_budget(until, max_wait.as_deref())?;
-                let s = engine::wait(&store, &id, until.into(), 0, max)?;
+                if !json {
+                    eprintln!(
+                        "run {id} started; waiting up to {} for {}",
+                        prova_core::ids::format_duration(max),
+                        until_name(until)
+                    );
+                }
+                let s = wait_until(&store, &id, until, 0, max)?;
                 render::summary_until(&s, json, Some(until.into()));
                 return Ok(exit_code(&s));
             }
@@ -1273,7 +1288,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
             let max = wait_budget(until, max_wait.as_deref())?;
-            let s = engine::wait(&store, &id, until.into(), after, max)?;
+            let s = wait_until(&store, &id, until, after, max)?;
             render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
         }
@@ -1549,6 +1564,52 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
 }
 
 /// Attached run: wait loops until the end, reporting significant events.
+/// Waits for `until` within `budget` (ADR 0019). Short waits for the first
+/// failure return as they are; a wait for the result or a stall shows
+/// progress on stderr for the person watching: every new failure, slow
+/// test and stall as it happens, and one line every 30 s.
+fn wait_until(
+    store: &Store,
+    id: &str,
+    until: UntilArg,
+    after: u64,
+    budget: Duration,
+) -> Result<Summary> {
+    if matches!(until, UntilArg::FirstFailure) {
+        return Ok(engine::wait(store, id, Until::FirstFailure, after, budget)?);
+    }
+    let start = std::time::Instant::now();
+    let mut beat = std::time::Instant::now();
+    let mut cursor = after;
+    let mut reported: std::collections::BTreeSet<String> = Default::default();
+    loop {
+        let left = budget.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Ok(engine::summarize(store, id, WaitReason::Running, cursor)?);
+        }
+        let s = engine::wait(
+            store,
+            id,
+            Until::FirstFailure,
+            cursor,
+            left.min(Duration::from_secs(1)),
+        )?;
+        cursor = s.last_seq;
+        match s.reason {
+            WaitReason::Done => return Ok(s),
+            WaitReason::Stall if matches!(until, UntilArg::Stall) => return Ok(s),
+            WaitReason::Failure | WaitReason::Stall | WaitReason::Slow => {
+                render::progress(&s, &mut reported)
+            }
+            WaitReason::Running => {}
+        }
+        if beat.elapsed() >= Duration::from_secs(30) {
+            beat = std::time::Instant::now();
+            render::heartbeat(&s);
+        }
+    }
+}
+
 fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
     let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {

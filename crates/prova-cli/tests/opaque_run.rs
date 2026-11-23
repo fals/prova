@@ -446,3 +446,26 @@ fn run_until_done_is_one_command_and_continues_with_one() {
             == Some(2)
     );
 }
+
+/// ADR 0019: a long wait is not silent for the person watching: failures
+/// appear on stderr as they happen; the summary stays on stdout.
+#[test]
+fn a_long_wait_shows_failures_as_they_happen() {
+    let d = workspace("progress");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            "echo 'test a ... FAILED'; sleep 2; echo 'test b ... ok'; exit 1",
+        ],
+    );
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(err.contains("waiting up to 9m"), "{err}");
+    assert!(err.contains("FAIL a"), "the failure, before the end: {err}");
+    assert!(stdout(&o).contains("FAILED") && !stdout(&o).contains("waiting up to"));
+}

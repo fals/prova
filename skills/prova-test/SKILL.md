@@ -23,7 +23,9 @@ needs attention.
    per tool call. Never wrap prova in shell loops, pipes, `sleep` or output
    parsing: every intent has a command, and `--json` gives one object when
    you need fields. If your tool calls are shorter than 9 minutes, pass
-   `--max-wait`. Use `--detach` only to do other work meanwhile; then
+   `--max-wait`. While it waits, prova prints each new failure and a line
+   every 30 s on stderr, for the person watching; the result is on stdout.
+   Use `--detach` only to do other work meanwhile; then
    `prova wait <run>` (or `--until done`).
 
 2. Read the result. Each failure carries history:

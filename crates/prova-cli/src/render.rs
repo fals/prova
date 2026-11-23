@@ -309,6 +309,23 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
     }
 }
 
+/// One stderr line while a long wait goes on (ADR 0019): the run is alive.
+pub fn heartbeat(s: &Summary) {
+    let c = &s.counts;
+    let mut line = format!(
+        "... {}: {} passed, {} failed, {} skipped",
+        format_duration(std::time::Duration::from_millis(s.elapsed_ms)),
+        c.passed,
+        c.failed + c.errored,
+        c.skipped
+    );
+    if !s.running.is_empty() {
+        let names: Vec<String> = s.running.iter().take(3).map(|t| clean(t)).collect();
+        line.push_str(&format!("; running now: {}", names.join(", ")));
+    }
+    eprintln!("{line}");
+}
+
 pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) {
     match s.reason {
         WaitReason::Failure => {

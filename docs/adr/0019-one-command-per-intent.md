@@ -34,7 +34,13 @@ piece exists for a reason that prova should have handled:
    second line of `status`, and throws stdout and stderr away so the loop
    stays quiet. A changed message, a warning line or an error breaks it
    without a sound.
-4. **`-- sh -c '…'`** wrapped a command that is a configured suite, because
+4. **Nobody can see anything for minutes.** The loop throws all output away,
+   so the person watching the session sees a shell that hangs for a quarter
+   of an hour with no sign of life, no failing test, no progress, and cannot
+   tell a working run from a stuck one. prova is built for agents, but people
+   run it and watch it too; a tool that is silent while it works is poor
+   developer experience even when the agent reads only the end.
+5. **`-- sh -c '…'`** wrapped a command that is a configured suite, because
    the stable binary of the moment could not read the renamed config, and a
    quoted command slipped past the repository's test hook. Both were
    accidents of the session, and both are exactly the kind of drift the
@@ -59,14 +65,20 @@ reliable than either.
    both. When the budget ends first, prova exits 5 and prints the one
    command to continue (`next: prova wait <run> --until done`). Continuing is
    one more call to that command, never a loop.
-3. **Nothing has to be parsed from text.** `--json` prints one object;
+3. **A long wait shows progress, for people.** While `--until done` waits,
+   each new failure, slow test and stall is printed on stderr as it happens,
+   and one line every 30 s says how long the run has been going, what passed
+   and failed so far, and what is running now. The final summary goes to
+   stdout, so an agent that only reads the result is not disturbed; a person
+   sees a run that is alive.
+4. **Nothing has to be parsed from text.** `--json` prints one object;
    `--detach` prints only the run id; the exit code says passed, failed,
    stalled or still running (0, 1, 3, 5).
-4. **The skills teach the single commands** and say plainly: no shell loops,
+5. **The skills teach the single commands** and say plainly: no shell loops,
    pipes or `sleep` around prova. For work longer than a tool call, repeat
    the `next:` command, or run it with the harness's background facility
    when there is one.
-5. **When an agent reaches for a loop again, that is a prova bug.** It is
+6. **When an agent reaches for a loop again, that is a prova bug.** It is
    recorded as a `dogfood` issue with the loop, as AGENTS.md already asks for
    friction.
 
@@ -84,9 +96,9 @@ reliable than either.
 
 - **Longer default waits everywhere:** the first failure would arrive late,
   defeating 0004.
-- **A `--poll` loop inside prova that prints progress:** prova would still
-  block past the harness ceiling; progress lines nobody reads until the call
-  returns add nothing.
+- **Silence until the end:** cheaper to build, but a person watching cannot
+  tell a working run from a hung one; the progress lines cost one stderr line
+  per event and per 30 s.
 - **Leave it to the skills alone:** the skill can forbid loops, but without
   `--until` on `run` and a harness-sized budget the agent has no single
   command to use instead.
