@@ -1,6 +1,6 @@
 # 0005: Small, medium, large test sizes
 
-Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): sizes are observed first; declared sizes are an optional override.
+Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): sizes are observed first; declared sizes are an optional override. Amended by [0025](0025-sizes-by-resources.md): size is the processes and network a test used; disk, sleep and duration do not decide it.
 
 ## Context
 

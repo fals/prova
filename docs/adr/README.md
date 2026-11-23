@@ -3,7 +3,7 @@
 Format: one file per decision, `NNNN-title.md`, sections Status, Context, Decision, Consequences, Alternatives.
 Status values: Proposed, Accepted, Superseded by NNNN. An accepted ADR is never edited in substance; it is superseded.
 
-All records, 0001 to 0024, are **Accepted**, on the date in the row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
+All records, 0001 to 0025, are **Accepted**, on the date in the row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
 
 | # | Decision | Status | Deviates from README? |
 |---|---|---|---|
@@ -31,5 +31,6 @@ All records, 0001 to 0024, are **Accepted**, on the date in the row. Later amend
 | [0022](0022-checkouts-load-and-impossible-results.md) | Read-only checked checkouts, hidden store, load checks, trusted references; impossible or skipped results are unverified; failing now beats flaky; amends 0006, 0017, 0021 | Accepted 2026-11-23 | no |
 | [0023](0023-evidence-hygiene-and-experiment-isolation.md) | Unverified runs are no evidence; more unverified causes; build failure lines; failing-now scaled to the flake rate; `--change` adds; more arm isolation, drift check; amends 0017, 0021, 0022 | Accepted 2026-11-23 | no |
 | [0024](0024-sandbox-retries-and-abba.md) | Sandboxed experiment arms (bubblewrap); retries decided by the last attempt; nextest early-exit detection; ABBA trials; amends 0002, 0007, 0017, 0023 | Accepted 2026-11-23 | no |
+| [0025](0025-sizes-by-resources.md) | Test sizes come from the resources a test used (processes, network), never from its duration; amends 0005, 0013 | Accepted 2026-11-23 | no |
 
 The deviations from the README were accepted with the records.
