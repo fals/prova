@@ -378,6 +378,9 @@ pub struct RunDiff {
     pub newly_failing: Vec<String>,
     pub fixed: Vec<String>,
     pub still_failing: Vec<String>,
+    /// Known flaky tests whose result changed: neither fixed nor broken by
+    /// the change (round 7: a flaky pass was listed as "fixed").
+    pub flaky: Vec<String>,
     pub added: Vec<String>,
     pub removed: Vec<String>,
     /// (test, base ms, head ms) where head is >50% and >100ms slower.
@@ -424,7 +427,7 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
             Some((oa, da)) => {
                 match (oa.is_failure(), ob.is_failure()) {
                     (false, true) => d.newly_failing.push(name.clone()),
-                    (true, false) => d.fixed.push(name.clone()),
+                    (true, false) if *ob == Outcome::Passed => d.fixed.push(name.clone()),
                     (true, true) => d.still_failing.push(name.clone()),
                     _ => {}
                 }
@@ -438,6 +441,21 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
         }
     }
     d.removed = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
+    if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
+        let known: Vec<String> = flaky(store, None, 50)?
+            .into_iter()
+            .map(|s| s.display)
+            .collect();
+        for list in [&mut d.fixed, &mut d.newly_failing] {
+            list.retain(|t| {
+                let f = known.contains(t);
+                if f {
+                    d.flaky.push(t.clone());
+                }
+                !f
+            });
+        }
+    }
     Ok(d)
 }
 
@@ -468,9 +486,10 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
     let Some(s) = stats_with(store, test_id, 50, Some(run))? else {
         return Ok(None);
     };
-    // Flakiness from evidence only: a run still going, or cut off, adds
-    // none (round 5: a cancelled hang was labelled FLAKY).
-    let flaky = stats(store, test_id, 50)?.is_some_and(|h| h.flaky);
+    // Flakiness counts this run's own result too, so the label shown live
+    // and the one in the final summary agree (round 7: "new failure" live,
+    // FLAKY at the end). A run cut short is answered before this is used.
+    let flaky = s.flaky;
     let this = s.recent.iter().find(|r| r.run == run);
     let first_seen = !s.recent.iter().any(|r| r.run != run);
     let run_cut_short = matches!(

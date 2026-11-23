@@ -78,7 +78,7 @@ enum Cmd {
         max_wait: Option<String>,
         /// Run it N times in a row and report each test's tally (is it
         /// flaky?), within one --max-wait budget (default 9m).
-        #[arg(long, conflicts_with_all = ["detach", "until"])]
+        #[arg(long, conflicts_with = "detach")]
         repeat: Option<u32>,
         /// Report a stall after this long without activity (e.g. 30s).
         /// Default: the suite's `stall_after`, else by size (small 30s,
@@ -707,7 +707,13 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             .events_after(&s.run, 0)?
             .into_iter()
             .filter_map(|e| match e.kind {
-                prova_core::model::EventKind::TestFinished { test, .. } => Some(test.display()),
+                // A test the filter skipped did not run: Vitest `-t` and
+                // others report the rest as skipped (round 7).
+                prova_core::model::EventKind::TestFinished { test, outcome, .. }
+                    if outcome != Outcome::Skipped =>
+                {
+                    Some(test.display())
+                }
                 _ => None,
             })
             .collect();
@@ -944,10 +950,17 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                 .filter(|(n, _)| entry.as_deref().is_none_or(|e| e == n))
                 .collect();
             if shown.is_empty() {
-                println!("nothing kept for comparison {c}: logs are kept only for what failed");
+                println!(
+                    "nothing kept for comparison {c}: logs are kept for the oracle and for what failed"
+                );
             }
             for (n, e) in shown {
-                println!("== {n}");
+                // Trials are kept by number: say what the number is.
+                if n.chars().all(|ch| ch.is_ascii_digit()) {
+                    println!("== trial {n}");
+                } else {
+                    println!("== {n}");
+                }
                 print!("{}", e.render());
             }
             Ok(exit::PASSED)
@@ -965,6 +978,24 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                 String::from_utf8_lossy(&out.stderr)
             );
             let mut metrics = prova_adapters::bench::parse(&text);
+            // A benchmark that throws can vanish while the command exits 0
+            // (Vitest bench does, round 7): never let wall time alone pass
+            // for a benchmark result.
+            if metrics.is_empty() {
+                eprintln!(
+                    "warning: no benchmark result was read, only the wall time; if this command runs benchmarks, they may have failed without a non-zero exit"
+                );
+                for l in text
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.contains("Error") || t.starts_with("FAIL") || t.contains("Traceback")
+                    })
+                    .take(3)
+                {
+                    eprintln!("  {}", render::clean(l.trim()));
+                }
+            }
             metrics.push((
                 "wall_ms".into(),
                 start.elapsed().as_secs_f64() * 1000.0,
@@ -1216,6 +1247,18 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     .to_string_lossy()
                     .into_owned();
                 let rel = if rel.is_empty() { ".".to_owned() } else { rel };
+                // The same command as a configured suite runs without the
+                // suite's injections and settings: point to it (round 7).
+                let joined = command.join(" ");
+                if let Some((name, _)) = cfg
+                    .suite
+                    .iter()
+                    .find(|(_, s)| s.run.trim() == joined.trim())
+                {
+                    eprintln!(
+                        "prova: note: suite `{name}` in prova.toml runs this command with its own settings (more detail): prova run {name}"
+                    );
+                }
                 let spec = RunSpec {
                     command: CommandSpec::Argv(command.clone()),
                     size: None,
@@ -1271,6 +1314,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 extra_env: cfg.env.clone(),
             };
             if let Some(n) = repeat {
+                // Each repeat runs to its end: `--until done` says the same
+                // (the skills teach it everywhere, round 7); others do not fit.
+                if until.is_some_and(|u| !matches!(u, UntilArg::Done)) {
+                    bail!("--repeat runs each run to its end; use it alone or with --until done");
+                }
                 return repeat_runs(&store, &request, n, max_wait.as_deref(), json);
             }
             let id = engine::create_run(&store, &request)?;
@@ -1303,9 +1351,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
                 return Ok(exit::PASSED);
             }
-            let code = attached(&store, &id, json);
-            let _ = child.wait();
-            code
+            let (code, done) = attached(&store, &id, json)?;
+            // On a stall the run goes on, detached; wait for the supervisor
+            // only when the run ended.
+            if done {
+                let _ = child.wait();
+            }
+            Ok(code)
         }
         Cmd::Wait {
             run,
@@ -1334,7 +1386,14 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 return Ok(exit::PASSED);
             }
             store.request_cancel(&id)?;
-            println!("cancel requested for run {id}");
+            // Most runs end within a second or two: wait that long, so the
+            // next `status` does not still say RUNNING (round 7).
+            let s = engine::wait(&store, &id, Until::Done, 0, Duration::from_secs(5))?;
+            if s.reason == WaitReason::Done {
+                render::summary(&s, false);
+                return Ok(exit::PASSED);
+            }
+            println!("cancel requested for run {id}; it is still stopping");
             println!("next: prova wait {id} --until done");
             Ok(exit::PASSED)
         }
@@ -1549,6 +1608,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     ("newly failing", &d.newly_failing),
                     ("fixed", &d.fixed),
                     ("still failing", &d.still_failing),
+                    ("changed, but known flaky", &d.flaky),
                     ("added", &d.added),
                     ("removed", &d.removed),
                 ] {
@@ -1587,7 +1647,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             comparison,
         } => {
             let store = Store::open_dir(&root, &dir)?;
-            experiment::work(&store, &comparison, &prova_adapters::bench::parse)?;
+            experiment::work(
+                &store,
+                &comparison,
+                &prova_adapters::bench::parse,
+                &prova_adapters::recognize::passed_tests,
+            )?;
             Ok(exit::PASSED)
         }
         Cmd::Supervise { root, dir, run } => {
@@ -1760,7 +1825,9 @@ fn wait_until(
     }
 }
 
-fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
+/// Follows a run in the foreground; returns its exit code, and whether it
+/// ended (a stall returns while it goes on).
+fn attached(store: &Store, id: &str, json: bool) -> Result<(u8, bool)> {
     let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let flag = interrupted.clone();
@@ -1790,7 +1857,14 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<u8> {
         match s.reason {
             WaitReason::Done => {
                 render::summary(&s, json);
-                return Ok(exit_code(&s));
+                return Ok((exit_code(&s), true));
+            }
+            // A stall ends the attached wait too (ADR 0004: no long waits;
+            // round 7: a hang blocked a bare `prova run -- cmd` forever).
+            // The run goes on; the summary says to cancel it.
+            WaitReason::Stall if !cancel_sent => {
+                render::summary(&s, json);
+                return Ok((exit_code(&s), false));
             }
             WaitReason::Failure | WaitReason::Stall | WaitReason::Slow if !json => {
                 render::progress(&s, &mut reported)

@@ -144,9 +144,9 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         out.push(Framework {
             language: "ts",
             base: "vitest",
-            run: "npx vitest run --reporter=verbose",
-            select: "npx vitest run --reporter=verbose -t {filter}",
-            why: "vitest in package.json".into(),
+            run: "npx vitest run --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\"",
+            select: "npx vitest run --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\" -t {filter}",
+            why: "vitest in package.json; prova's reporter streams every test live (native)".into(),
         });
     } else if pkg.contains("\"jest\"") {
         out.push(Framework {
@@ -351,6 +351,11 @@ pub fn to_toml(p: &Proposal) -> String {
         let python = suite.run.contains("pytest")
             || (p.languages.iter().any(|l| l == "python")
                 && p.existing.as_deref() == Some(suite.run.as_str()));
+        // The Vitest reporter ships with prova: no install, so native it is.
+        if suite.run.contains("PROVA_VITEST_REPORTER") {
+            s.push_str("inject = [\"vitest-stream\"]\n");
+            continue;
+        }
         if p.reportlog && python {
             s.push_str("# pytest-reportlog is installed: every test is read live (native)\ninject = [\"pytest-reportlog\"]\n");
             continue;
@@ -531,6 +536,11 @@ mod tests {
             &[("package.json", r#"{"devDependencies":{"vitest":"3"}}"#)],
         )));
         assert!(t.contains("inject = [\"vitest-stream\"]"), "{t}");
+        // Round 7: native by default, not a hint to edit by hand.
+        assert!(
+            t.contains("\ninject = [\"vitest-stream\"]") && t.contains("$PROVA_VITEST_REPORTER"),
+            "{t}"
+        );
     }
 
     #[test]

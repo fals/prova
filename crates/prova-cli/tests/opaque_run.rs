@@ -510,3 +510,29 @@ fn a_stall_ends_a_wait_for_the_result() {
         .to_owned();
     prova(&d, &["cancel", &id]);
 }
+
+/// Round 7: a bare attached `prova run -- cmd` waited forever on a hang.
+#[test]
+fn an_attached_run_returns_on_a_stall() {
+    let d = workspace("attachedstall");
+    let started = std::time::Instant::now();
+    let o = prova(
+        &d,
+        &["run", "--stall-after", "1s", "--", "sh", "-c", "sleep 30"],
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "returned on the stall"
+    );
+    assert_eq!(o.status.code(), Some(3), "{}", stdout(&o));
+    assert!(stdout(&o).contains("prova cancel"), "{}", stdout(&o));
+    let id = stdout(&o)
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    prova(&d, &["cancel", &id]);
+}

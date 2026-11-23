@@ -653,6 +653,7 @@ impl Recognizers {
                 test: self.libtest_key(name.trim()),
                 elapsed_ms: 60_000,
                 budget_ms: 60_000,
+                budget_from: prova_core::model::BudgetFrom::Runner,
             });
             return true;
         }
@@ -899,6 +900,7 @@ impl Recognizers {
                         test: key,
                         elapsed_ms: ms,
                         budget_ms: ms,
+                        budget_from: prova_core::model::BudgetFrom::Runner,
                     });
                 }
             }
@@ -1728,5 +1730,41 @@ mod tests {
         );
         assert!(ev.is_empty(), "{ev:?}");
         assert_eq!(r.level, None);
+    }
+}
+
+/// Tests that passed in a finished command's output (an experiment oracle):
+/// so prova can tell an oracle that checked from one that exited 0 without
+/// running its tests (round 7: a candidate's own `TestMain` skipped them).
+pub fn passed_tests(output: &str) -> Vec<String> {
+    let mut r = Recognizers::default();
+    let mut events = Vec::new();
+    for line in output.lines() {
+        events.extend(r.line(line));
+    }
+    events.extend(r.finish());
+    let mut passed: Vec<String> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                outcome: Outcome::Passed,
+                ..
+            } => Some(test.display()),
+            _ => None,
+        })
+        .collect();
+    passed.sort();
+    passed.dedup();
+    passed
+}
+
+#[cfg(test)]
+mod passed_tests_tests {
+    #[test]
+    fn reads_passes_of_a_finished_output() {
+        let out = "=== RUN   TestConformance\n--- PASS: TestConformance (0.01s)\nPASS\nok  \texample.com/calc\t0.02s\n";
+        assert_eq!(super::passed_tests(out), vec!["TestConformance".to_owned()]);
+        assert!(super::passed_tests("ok  \texample.com/calc\t0.02s\n").is_empty());
     }
 }

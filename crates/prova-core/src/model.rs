@@ -159,6 +159,29 @@ pub enum StallBasis {
     TestEvents,
 }
 
+/// Origin of a slow-test budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetFrom {
+    /// The test runner's own warning (libtest's 60 s, nextest's SLOW).
+    #[default]
+    Runner,
+    /// Three times the test's usual duration (p95 of its history).
+    History,
+    /// The suite's size default: the test has no history yet.
+    Default,
+}
+
+impl BudgetFrom {
+    pub fn describe(self) -> &'static str {
+        match self {
+            BudgetFrom::Runner => "the test runner's own warning",
+            BudgetFrom::History => "3x its usual time",
+            BudgetFrom::Default => "the suite's default; no history yet",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -172,6 +195,9 @@ pub enum EventKind {
         test: TestKey,
         elapsed_ms: u64,
         budget_ms: u64,
+        /// Where the budget came from, so the report can say (round 7).
+        #[serde(default)]
+        budget_from: BudgetFrom,
     },
     TestFinished {
         test: TestKey,
@@ -257,6 +283,7 @@ mod tests {
                 test: t.clone(),
                 elapsed_ms: 10,
                 budget_ms: 5,
+                budget_from: BudgetFrom::History,
             },
             EventKind::TestFinished {
                 test: t,

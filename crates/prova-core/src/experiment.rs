@@ -305,7 +305,13 @@ pub fn measure(
         Better::Higher => 1.0,
     };
     let scale = if bm != 0.0 { bm.abs() } else { 1.0 };
-    let (a, b) = (sign * hl.lower / scale, sign * hl.upper / scale);
+    let (mut a, mut b) = (sign * hl.lower / scale, sign * hl.upper / scale);
+    // A non-negative quantity cannot shrink by more than 100%: an interval
+    // reaching past it reads as an error (round 7: "+139.3%").
+    if better == Better::Lower && base.iter().chain(cand).all(|v| *v >= 0.0) {
+        a = a.min(1.0);
+        b = b.min(1.0);
+    }
     MetricResult {
         metric: metric.to_owned(),
         better,
@@ -350,7 +356,8 @@ pub fn judge(
             );
         }
     }
-    let ci = format!("[{}, {}]", pct(lo), pct(hi));
+    // Positive means better in either direction: say so next to the numbers.
+    let ci = format!("[{}, {}], positive = better", pct(lo), pct(hi));
     // The change as a ratio of medians ("37.6x"), easier to read than +97%.
     let (b, c) = (primary.baseline_median, primary.candidate_median);
     let ratio = if b > 0.0 && c > 0.0 && b.is_finite() && c.is_finite() {
@@ -426,8 +433,16 @@ pub fn judge(
 }
 
 /// A number with about 4 significant digits, for messages.
-fn short(v: f64) -> String {
-    if v.abs() >= 1000.0 {
+/// A number for people: 17588480 reads as 17.59M (round 7).
+pub fn short(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e9 {
+        format!("{:.2}G", v / 1e9)
+    } else if a >= 1e6 {
+        format!("{:.2}M", v / 1e6)
+    } else if a >= 1e4 {
+        format!("{:.1}k", v / 1e3)
+    } else if a >= 1000.0 {
         format!("{v:.0}")
     } else {
         format!("{v:.4}")
@@ -679,10 +694,20 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
         }
         let mut add = vec!["add", "-A", "--", ".", ":(exclude,glob)**/.prova/**"];
         // A store kept inside the repository is prova's own, never a candidate.
+        // When git already ignores it, naming it makes `git add` refuse
+        // (round 7), and it is left out anyway.
         let inside = store
             .dir()
             .strip_prefix(&top)
             .ok()
+            .filter(|p| {
+                !Command::new("git")
+                    .args(["check-ignore", "-q", "--"])
+                    .arg(p)
+                    .current_dir(&top)
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
             .map(|p| format!(":(exclude){}", p.display()));
         if let Some(x) = &inside {
             add.push(x);
@@ -856,6 +881,8 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
 /// Turns a trial's whole output into metrics (name, value, unit); the
 /// benchmark recognizers live in prova-adapters.
 pub type MetricParser = dyn Fn(&str) -> Vec<(String, f64, Option<String>)>;
+/// Reads the tests that passed in a finished command's output (the oracle's).
+pub type TestReader = dyn Fn(&str) -> Vec<String>;
 
 fn run_trial(
     dir: &Path,
@@ -954,23 +981,27 @@ fn fingerprint() -> String {
 // ------------------------------------------------------------ worker
 
 /// Body of `prova __exp`: runs trials and decides.
-pub fn work(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()> {
-    let result = work_comparison(store, comparison, parse);
+pub fn work(
+    store: &Store,
+    comparison: &str,
+    parse: &MetricParser,
+    tests: &TestReader,
+) -> Result<()> {
+    let result = work_comparison(store, comparison, parse, tests);
     let cleaned = keep_failed_logs(store, comparison);
     result.and(cleaned)
 }
 
 /// After a comparison (ADR 0016): the logs of what failed (a trial, the
-/// setup, the oracle) are kept as excerpts in the store; the log directory
+/// setup) and the oracle's logs are kept as excerpts in the store; the log directory
 /// and the baseline worktrees are removed.
 fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
     let logs = store.dir().join("experiments").join(comparison);
-    let (exp, base, cand, status, result): (String, String, String, String, Option<String>) =
-        store.conn().query_row(
-            "SELECT experiment, baseline, candidate, status, result FROM comparisons WHERE id = ?1",
-            params![comparison],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )?;
+    let (exp, base, cand, status): (String, String, String, String) = store.conn().query_row(
+        "SELECT experiment, baseline, candidate, status FROM comparisons WHERE id = ?1",
+        params![comparison],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
     let failed_trials: Vec<u32> = {
         let mut stmt = store
             .conn()
@@ -978,17 +1009,14 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
         stmt.query_map(params![comparison], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
-    let violated = result
-        .as_deref()
-        .is_some_and(|r| r.contains("\"specification\":\"violated\""));
     let mut keep: Vec<String> = failed_trials.iter().map(|s| s.to_string()).collect();
     for arm in ["baseline", "candidate"] {
         if status == "failed" {
             keep.push(format!("setup-{arm}"));
         }
-        if status == "failed" || violated {
-            keep.push(format!("oracle-{arm}"));
-        }
+        // The oracle's log is what a "holds" rests on: keep it always
+        // (round 7), as an excerpt like any other.
+        keep.push(format!("oracle-{arm}"));
     }
     for name in keep {
         if let Some(ex) = crate::output::distill_file(&logs.join(format!("{name}.log")), false)
@@ -1020,7 +1048,12 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
     Ok(())
 }
 
-fn work_comparison(store: &Store, comparison: &str, parse: &MetricParser) -> Result<()> {
+fn work_comparison(
+    store: &Store,
+    comparison: &str,
+    parse: &MetricParser,
+    tests: &TestReader,
+) -> Result<()> {
     let (exp, base_name, cand_name): (String, String, String) = store.conn().query_row(
         "SELECT experiment, baseline, candidate FROM comparisons WHERE id = ?1",
         params![comparison],
@@ -1109,8 +1142,29 @@ fn work_comparison(store: &Store, comparison: &str, parse: &MetricParser) -> Res
         }
     }
     let mut c = Comparison::new(p.min_trials, p.max_trials);
+    // Tests the baseline's oracle ran: the candidate's must run them too.
+    // An oracle exit code alone is no proof: a candidate can add code that
+    // skips the checks and still exit 0 (round 7).
+    let mut oracle_tests: Vec<String> = Vec::new();
     for (i, (arm, _)) in arms.iter().enumerate() {
-        let verdict = satisfies_spec(p, &dirs[i], &logs, *arm)?;
+        let verdict = satisfies_spec(p, &dirs[i], &logs, *arm)?.and_then(|()| {
+            let Some(oracle) = &p.oracle else { return Ok(()) };
+            let name = format!("oracle-{}", arm.as_str());
+            let out = std::fs::read_to_string(logs.join(format!("{name}.log"))).unwrap_or_default();
+            let passed = tests(&out);
+            if *arm == Arm::Baseline {
+                oracle_tests = passed;
+                return Ok(());
+            }
+            let missing: Vec<&String> = oracle_tests.iter().filter(|t| !passed.contains(t)).collect();
+            match missing.first() {
+                None => Ok(()),
+                Some(first) => Err(format!(
+                    "oracle `{oracle}` exited 0, but {} test(s) that passed in the baseline's oracle did not pass in the candidate's (e.g. {first}): its checks were skipped (`prova exp log <experiment> {name}`)",
+                    missing.len()
+                )),
+            }
+        });
         c.check_spec(*arm, verdict.is_ok());
         if let Err(why) = verdict {
             let why = why.replace("<experiment>", &exp);
@@ -1170,8 +1224,16 @@ fn work_comparison(store: &Store, comparison: &str, parse: &MetricParser) -> Res
         // Say that the specification was checked, not only when it failed
         // (ADR 0018): both arms satisfied it before any trial ran.
         if let Some(oracle) = &p.oracle {
-            result["specification"] =
-                serde_json::json!(format!("holds on both arms (oracle `{oracle}`)"));
+            result["specification"] = serde_json::json!(if oracle_tests.is_empty() {
+                format!(
+                    "holds on both arms by exit code only (oracle `{oracle}` showed no individual test; make it verbose so skipped checks are caught)"
+                )
+            } else {
+                format!(
+                    "holds on both arms (oracle `{oracle}`: the same {} test(s) passed on each)",
+                    oracle_tests.len()
+                )
+            });
         } else if !p.specs.is_empty() {
             result["specification"] =
                 serde_json::json!("specification files unchanged on both arms (no oracle)");

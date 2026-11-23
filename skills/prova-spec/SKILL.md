@@ -144,6 +144,20 @@ the specification. Pick the strongest you can afford:
    fast-check, jqwik, FsCheck, Go's `testing/quick`).
 4. **Proofs** (Lean): `lake build` is the oracle.
 
+If the project's checker is not installed here (no Lean, no Java for
+`quint verify`), say so in your report: an oracle that cannot run checks
+nothing. Use what does run (mirror the spec in Quint, as a table or traces)
+and name the gap.
+
+**Make the oracle show its tests.** Run it verbosely (`go test -v -run
+'^TestConformance$'`, `pytest -v`, `cargo test -- --nocapture` is not needed,
+libtest names each test anyway). prova reads the oracle's output: a test that
+passed in the baseline's oracle must pass in the candidate's, or the
+candidate is rejected (a candidate can add code, such as its own `TestMain`
+or `conftest.py`, that makes the oracle exit 0 without checking anything).
+An oracle that prints no test is judged by its exit code only, and the
+verdict says so: `holds on both arms by exit code only`.
+
 Wrap it as one command, e.g. `make conformance`, and add a prova suite so
 `prova run conformance` works in the test loop:
 
@@ -182,6 +196,12 @@ Verdicts that mention the specification:
 - `... differs from the registered specification`: the candidate edited the
   spec. Never weaken a spec to make a candidate pass. If the spec was wrong,
   say so to the human, fix it, commit, and start a new experiment.
+- `... did not pass in the candidate's (e.g. TestConformance): its checks
+  were skipped`: the oracle exited 0 on the candidate without running a
+  check the baseline ran. Treat it as a violation: find what skips it.
+- `specification: holds on both arms (oracle ...: the same N test(s) passed
+  on each)`: the strong form. `prova exp log <experiment> oracle-candidate`
+  shows what the oracle printed.
 - Failed comparison, `baseline violates the specification`: the committed
   code does not satisfy the spec. Make it correct first.
 

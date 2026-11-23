@@ -63,6 +63,11 @@
     {
       "type": "object",
       "properties": {
+        "budget_from": {
+          "description": "Where the budget came from, so the report can say (round 7).",
+          "$ref": "#/$defs/BudgetFrom",
+          "default": "runner"
+        },
         "budget_ms": {
           "type": "integer",
           "format": "uint64",
@@ -259,6 +264,26 @@
     "ts_ms"
   ],
   "$defs": {
+    "BudgetFrom": {
+      "description": "Origin of a slow-test budget.",
+      "oneOf": [
+        {
+          "description": "The test runner's own warning (libtest's 60 s, nextest's SLOW).",
+          "type": "string",
+          "const": "runner"
+        },
+        {
+          "description": "Three times the test's usual duration (p95 of its history).",
+          "type": "string",
+          "const": "history"
+        },
+        {
+          "description": "The suite's size default: the test has no history yet.",
+          "type": "string",
+          "const": "default"
+        }
+      ]
+    },
     "Level": {
       "description": "Fidelity ladder (ADR 0013). Ordered: higher knows more.",
       "oneOf": [

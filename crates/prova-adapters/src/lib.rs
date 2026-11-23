@@ -164,7 +164,7 @@ impl Observer for Ladder {
             && finals.is_empty()
         {
             report.events.push(EventKind::RunNote {
-                message: "`go test` without -v or -json prints only failures: passing tests are not recorded, so flaky detection is blind; run `go test -json` (prova adopt proposes it)".into(),
+                message: "`go test` without -v or -json prints only failures: passing tests are not recorded, so flaky detection is blind; run `go test -json` (prova adopt proposes it; if prova.toml has such a suite, run that suite)".into(),
             });
         }
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
