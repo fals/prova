@@ -1080,8 +1080,16 @@ fn run_trial(
     // A process that left the group (setsid) was reparented to this worker,
     // a child subreaper: it would run on during the other arm's trials and
     // skew them (round 8). Kill it, and report it.
-    let mut leaked = process::reap_orphans();
-    leaked.extend(in_group);
+    let mut leaked = in_group;
+    for l in process::reap_orphans() {
+        // A group member may still be dying when orphans are reaped.
+        if !leaked
+            .iter()
+            .any(|x| x.split(' ').next() == l.split(' ').next())
+        {
+            leaked.push(l);
+        }
+    }
     let cpu_after = process::cpu_ticks();
     let foreign_ms = (cpu_after.0.saturating_sub(cpu_before.0) as f64
         - cpu_after.1.saturating_sub(cpu_before.1) as f64)

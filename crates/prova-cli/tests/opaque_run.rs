@@ -119,6 +119,48 @@ fn busy_process_is_not_a_stall() {
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
 }
 
+/// Cancels a run when dropped, so a failing assertion cannot leave an
+/// endless workload behind (it froze a CI runner).
+struct CancelOnDrop<'a>(&'a Path, String);
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        prova(self.0, &["cancel", &self.1]);
+        prova(
+            self.0,
+            &["wait", &self.1, "--until", "done", "--max-wait", "20s"],
+        );
+    }
+}
+
+/// A silent loop of short-lived commands is busy: their CPU shows in the
+/// shell's reaped-children time (the release smoke test saw it stall).
+/// (It once froze the arm64 runner: not itself, but by pushing pids past
+/// 10000, where another test's `kill -9 -<pgid>` became `kill -1`.)
+#[test]
+fn a_loop_of_short_commands_is_not_a_stall() {
+    let d = workspace("short-cmds");
+    let id = detach(
+        &d,
+        &["--stall-after", "1s"],
+        "while :; do date >/dev/null; done",
+    );
+    let _cancel = CancelOnDrop(&d, id.clone());
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "4s",
+            "--json",
+        ],
+    );
+    assert_eq!(w.status.code(), Some(5), "never stalled: {}", stdout(&w));
+}
+
 #[test]
 fn kill_after_bounds_the_run() {
     let d = workspace("ceiling");
@@ -196,11 +238,17 @@ fn dead_supervisor_leaves_run_aborted_not_running() {
         ],
     ));
     assert_eq!(s["status"], "aborted");
-    // The test process outlives its supervisor in its own group; clean up.
-    Command::new("kill")
-        .args(["-9", &format!("-{pgid}")])
-        .status()
-        .unwrap();
+    // The command outlived its supervisor; prova killed what carries the
+    // run's id when it found the run orphaned (`cancel` would too). (A shell `kill -9 -<pgid>` was
+    // misread by the arm64 runner's util-linux as `kill(-1, SIGKILL)` for
+    // ids starting with 1, killing the whole runner.)
+    prova(&d, &["cancel", &id]);
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pgid}")).exists() || {
+            let st = std::fs::read_to_string(format!("/proc/{pgid}/stat")).unwrap_or_default();
+            st.contains(") Z ")
+        }
+    );
 }
 
 fn run_started_pid(d: &Path, id: &str) -> u64 {

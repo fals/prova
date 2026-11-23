@@ -652,7 +652,8 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
         assert_eq!(r["comparison"]["status"], "failed", "{r}");
         let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
         assert!(
-            reason.contains("left process") && reason.contains("sleep"),
+            // The leftover may not have exec'd `sleep` yet (sh, setsid).
+            reason.contains("left process"),
             "{reason}"
         );
     }

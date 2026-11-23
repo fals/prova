@@ -210,25 +210,30 @@ fn ps_ticks(time: &str) -> Option<u64> {
     Some((secs * 100.0).round() as u64)
 }
 
-/// Members still in group `pgid`, as pids: where no subreaper collects
-/// escaped processes (macOS), what a workload left running is found in its
-/// own group before the group is killed. Linux finds them with
-/// `reap_orphans`, so this is empty there.
-#[cfg(target_os = "linux")]
-pub fn left_in_group(_pgid: u32) -> Vec<String> {
-    Vec::new()
-}
-
-#[cfg(not(target_os = "linux"))]
+/// Members still in group `pgid`, as `pid name`: what a workload left
+/// running in its own group, found before the group is killed (round 11
+/// on arm64: a background process that had not yet called setsid when its
+/// shell exited was killed with the group and never reported).
 pub fn left_in_group(pgid: u32) -> Vec<String> {
     sample_group(pgid)
         .pids
         .into_iter()
-        .map(|p| {
-            let name = ps(&["-p", &p.to_string(), "-o", "comm="]).unwrap_or_default();
-            format!("{p} {}", name.trim())
-        })
+        .map(|p| format!("{p} {}", process_name(p)))
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_name(pid: u32) -> String {
+    ps(&["-p", &pid.to_string(), "-o", "comm="])
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// Makes this process the reaper of its orphaned descendants, so a process
