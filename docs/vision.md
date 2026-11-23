@@ -1,7 +1,8 @@
 # Vision
 
-The original problem statement for toe, as written by its author. The
-[README](../README.md) summarises what toe does today.
+The original problem statement for prova, as written by its author when the
+project was still called toe ("Test oriented experimentation"); only the name
+is updated here. The [README](../README.md) summarises what prova does today.
 
 
 ## Test
@@ -26,4 +27,4 @@ Lean might be a good candidate to formalize what we need in the engine, should r
 
 ## The system we want to build
 
-Toe (Test oriented experimentation) will be writen probably rust as is best. This should be easy to deploy so always container. It should have a proper storage that will support the data contracts we need, and analysis engine that will keep track record of statistics the model will need overtime, a set of skill that will work with most known programing laguages to teach how to implement and use toe in the current system under test and last a fast eventfull conduit that harness will use to communicate with this system, today MCP is the best but we must keep in mind the constraints I refered, if is the best option, for fast feedback.
+Prova will be writen probably rust as is best. This should be easy to deploy so always container. It should have a proper storage that will support the data contracts we need, and analysis engine that will keep track record of statistics the model will need overtime, a set of skill that will work with most known programing laguages to teach how to implement and use prova in the current system under test and last a fast eventfull conduit that harness will use to communicate with this system, today MCP is the best but we must keep in mind the constraints I refered, if is the best option, for fast feedback.

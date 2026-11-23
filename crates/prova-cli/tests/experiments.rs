@@ -1,0 +1,421 @@
+//! Medium tests for experiments (ADR 0007): real git worktrees, real
+//! workloads, real verdicts. Workloads sleep a few ms; trials are few.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const PROVA: &str = env!("CARGO_BIN_EXE_prova");
+
+fn prova(dir: &Path, args: &[&str]) -> Output {
+    Command::new(PROVA)
+        .args(args)
+        .current_dir(dir)
+        .env("PROVA_HOME", home_of(dir))
+        .output()
+        .expect("run prova")
+}
+
+fn json(o: &Output) -> serde_json::Value {
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    })
+}
+
+fn sh(dir: &Path, script: &str) {
+    assert!(
+        Command::new("sh")
+            .args(["-c", script])
+            .current_dir(dir)
+            .env("PROVA_HOME", home_of(dir))
+            .status()
+            .unwrap()
+            .success(),
+        "{script}"
+    );
+}
+
+/// Git repo whose workload sleeps for the number of seconds in `delay`.
+fn repo(name: &str, delay: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("delay"), delay).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nsleep $(cat delay)\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    d
+}
+
+fn new_exp(d: &Path, extra: &[&str]) {
+    let mut a = vec![
+        "exp",
+        "new",
+        "e",
+        "--hypothesis",
+        "h",
+        "--trials",
+        "5",
+        "--max-trials",
+        "6",
+        "--warmup",
+        "0",
+        "--guardrail",
+        "mem_kb",
+    ];
+    a.extend_from_slice(extra);
+    a.extend_from_slice(&["--", "./work.sh"]);
+    let o = prova(d, &a);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn faster_candidate_is_accepted_and_becomes_best() {
+    let d = repo("accept", "0.06");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "accept");
+    assert_eq!(r["best"], "c1");
+    assert_eq!(r["decisions"][0]["decision"], "keep");
+    assert!(
+        r["comparison"]["result"]["primary"]["improvement"]
+            .as_f64()
+            .unwrap()
+            > 0.3
+    );
+    // Revalidation runs the best against the original baseline afresh.
+    let v = json(&prova(&d, &["exp", "revalidate", "e", "--json"]));
+    assert_eq!(v["comparison"]["candidate"], "c1");
+    assert_eq!(v["comparison"]["baseline"], "baseline");
+    assert_eq!(
+        v["comparison"]["result"]["comparisons_in_family"], 2,
+        "Holm family grows"
+    );
+}
+
+#[test]
+fn same_code_is_not_an_improvement() {
+    let d = repo("noeffect", "0.02");
+    new_exp(&d, &["--min-effect", "20%"]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(1), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "reject");
+    assert_eq!(r["best"], "baseline");
+    assert_eq!(r["decisions"][0]["decision"], "discard");
+}
+
+#[test]
+fn protocol_is_frozen_after_the_first_trial() {
+    let d = repo("frozen", "0.01");
+    new_exp(&d, &[]);
+    assert!(
+        prova(
+            &d,
+            &["exp", "protocol", "e", "--trials", "6", "--max-trials", "8"]
+        )
+        .status
+        .success(),
+        "before trials: allowed"
+    );
+    std::fs::write(d.join("delay"), "0.005").unwrap();
+    prova(&d, &["exp", "candidate", "e"]);
+    std::fs::write(d.join("delay"), "0.007").unwrap(); // edited after recording: harmless
+    prova(&d, &["exp", "run", "e"]);
+    let frozen = prova(&d, &["exp", "protocol", "e", "--min-effect", "0.5%"]);
+    assert_eq!(frozen.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&frozen.stderr).contains("protocol frozen"));
+}
+
+#[test]
+fn crashing_candidate_is_logged_as_crash() {
+    let d = repo("crash", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("work.sh"), "#!/bin/sh\nexit 3\n").unwrap();
+    prova(&d, &["exp", "candidate", "e"]);
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed");
+    assert_eq!(r["decisions"][0]["decision"], "crash");
+}
+
+/// Isolated prova home for a test workspace, outside it (ADR 0014).
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
+}
+
+/// Repo for a non-speed experiment: the workload reports `steps`; the
+/// specification says the answer must be 42, and the oracle checks it.
+fn spec_repo(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("steps"), "100").unwrap();
+    std::fs::write(d.join("answer"), "42").unwrap();
+    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$(cat steps)}\"\n",
+    )
+    .unwrap();
+    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "fewer steps, same answer",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--spec",
+            "spec.txt",
+            "--oracle",
+            "test \"$(cat answer)\" = 42 || { echo \"answer $(cat answer), spec says 42\"; exit 1; }",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    d
+}
+
+#[test]
+fn deterministic_metric_under_a_specification_is_accepted() {
+    let d = spec_repo("spec-accept");
+    std::fs::write(d.join("steps"), "60").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    assert_eq!(
+        r["comparison"]["result"]["primary"]["candidate_median"],
+        60.0
+    );
+    // ADR 0018: the verdict says the oracle ran and held on both arms.
+    let spec = r["comparison"]["result"]["specification"].as_str().unwrap();
+    assert!(spec.starts_with("holds on both arms (oracle `"), "{spec}");
+}
+
+#[test]
+fn candidate_violating_the_specification_is_rejected_unmeasured() {
+    let d = spec_repo("spec-violation");
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(1), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "reject");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "never measured");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("violates the specification"), "{reason}");
+    assert!(
+        reason.contains("prova exp log e oracle-candidate"),
+        "{reason}"
+    );
+    // The oracle's log is kept in the store; the log directory is gone.
+    let log = prova(&d, &["exp", "log", "e", "oracle-candidate"]);
+    let log = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        log.starts_with("== oracle-candidate\nanswer 41, spec says 42"),
+        "{log}"
+    );
+    let store = home_of(&d);
+    let leftovers = std::process::Command::new("find")
+        .arg(&store)
+        .args(["-path", "*/experiments/*", "-o", "-path", "*/worktrees/*"])
+        .output()
+        .unwrap();
+    assert!(
+        leftovers.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&leftovers.stdout)
+    );
+}
+
+#[test]
+fn the_specification_cannot_move() {
+    let d = spec_repo("spec-moved");
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("spec.txt"), "answer = anything\n").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("spec.txt differs"), "{reason}");
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn a_broken_edit_after_an_accept_is_rejected_and_the_best_still_runs_as_recorded() {
+    // Why medium: needs real worktrees and a persisted best across comparisons.
+    let d = spec_repo("snap-broken");
+    std::fs::write(d.join("steps"), "60").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["best"], "c1", "{r}");
+    // A deliberately broken edit, recorded as a new candidate.
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(
+        r["comparison"]["status"], "decided",
+        "best must hold its recorded spec: {r}"
+    );
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    assert_eq!(r["comparison"]["candidate_trials"], 0, "{r}");
+    assert_eq!(r["best"], "c1");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("violates the specification"), "{reason}");
+}
+
+#[test]
+fn edits_after_recording_do_not_change_what_is_measured() {
+    let d = repo("snap-edit", "0.06");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    std::fs::write(d.join("delay"), "0.5").unwrap(); // edited after recording
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(o.status.code(), Some(0), "{r}");
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    // The live tree is never measured: it still holds the edit.
+    assert_eq!(std::fs::read_to_string(d.join("delay")).unwrap(), "0.5");
+}
+
+#[test]
+fn recording_a_candidate_leaves_the_users_git_state_alone() {
+    let d = repo("snap-state", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.005").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t stash push -q -m mine",
+    );
+    std::fs::write(d.join("delay"), "0.004").unwrap();
+    std::fs::write(d.join("new.txt"), "untracked\n").unwrap();
+    std::fs::write(d.join("staged.txt"), "staged\n").unwrap();
+    sh(&d, "git add staged.txt");
+    let state = |d: &Path| {
+        (
+            git_out(d, &["rev-parse", "HEAD"]),
+            git_out(d, &["symbolic-ref", "HEAD"]),
+            git_out(d, &["stash", "list"]),
+            git_out(d, &["status", "--porcelain=v1"]),
+            git_out(d, &["diff", "--cached"]),
+        )
+    };
+    let before = state(&d);
+    assert!(before.2.contains("mine"), "stash entry exists");
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "idea"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        state(&d),
+        before,
+        "HEAD, branch, stash, index and tree untouched"
+    );
+    // The snapshot is a commit kept alive by a ref, holds untracked files, no .prova.
+    let sha = git_out(&d, &["rev-parse", "refs/prova/candidates/e/idea"]);
+    let sha = sha.trim();
+    assert_eq!(git_out(&d, &["show", &format!("{sha}:delay")]), "0.004");
+    assert_eq!(
+        git_out(&d, &["show", &format!("{sha}:new.txt")]),
+        "untracked\n"
+    );
+    let files = git_out(&d, &["ls-tree", "-r", "--name-only", sha]);
+    assert!(!files.lines().any(|f| f.starts_with(".prova")), "{files}");
+    assert_eq!(
+        git_out(&d, &["rev-parse", &format!("{sha}^")]).trim(),
+        before.0.trim()
+    );
+}
+
+#[test]
+fn candidates_work_in_a_repository_without_commits() {
+    let d = std::env::temp_dir().join(format!("prova-exp-snap-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("delay"), "0.06").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nsleep $(cat delay)\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    sh(&d, "chmod +x work.sh && git init -q");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+}
+
+/// Round 5: `prova exp protocol --spec X` reset the metric, the effect and the
+/// trials to their defaults and dropped the oracle, silently.
+#[test]
+fn a_protocol_change_keeps_what_it_does_not_name() {
+    let d = spec_repo("protocol-merge");
+    std::fs::write(d.join("extra.txt"), "x").unwrap();
+    sh(
+        &d,
+        "git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm extra",
+    );
+    let o = prova(&d, &["exp", "protocol", "e", "--spec", "extra.txt"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let shown = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        shown.contains("metric steps") && shown.contains("oracle `"),
+        "{shown}"
+    );
+    let r = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    let p = &r["protocol"];
+    assert_eq!(p["metric"], "steps");
+    assert_eq!(p["trials"], 5);
+    assert!(p["oracle"].as_str().unwrap().contains("cat answer"));
+    assert_eq!(p["specs"].as_array().unwrap().len(), 2);
+}

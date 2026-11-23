@@ -3,7 +3,7 @@ name = "calc"
 version = "0.1.0"
 edition = "2021"
 
-# Standalone: not part of the toe workspace.
+# Standalone: not part of the prova workspace.
 [workspace]
 
 [dev-dependencies]

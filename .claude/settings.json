@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/require-toe.sh",
-            "statusMessage": "Checking tests run through toe"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/require-prova.sh",
+            "statusMessage": "Checking tests run through prova"
           }
         ]
       }

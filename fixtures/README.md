@@ -1,8 +1,8 @@
 # Brownfield fixtures
 
-One small project per language toe claims, each run the way real projects
-run their tests, with no toe configuration. Used by the large tests
-(`toe run large`) and by usability checks (a fresh agent adopts one with
+One small project per language prova claims, each run the way real projects
+run their tests, with no prova configuration. Used by the large tests
+(`prova run large`) and by usability checks (a fresh agent adopts one with
 only the skills).
 
 | Fixture | Language, framework | Own command | Where it runs in large tests |
@@ -30,7 +30,7 @@ changes to the primes module (stored as `.txt` so no tool picks them up):
 `faster` (a sieve), `same` (a comment only) and `slower` (no even skipping).
 Each fixture's `experiments/README.md` gives the command and the metric.
 
-| Fixture | Benchmark tool | toe metric |
+| Fixture | Benchmark tool | prova metric |
 |---|---|---|
 | `rust-make` | criterion | `count_primes.time_ns` |
 | `go-make` | `go test -bench` | `BenchmarkCountPrimes.ns_per_op` |
@@ -42,17 +42,17 @@ Each fixture's `experiments/README.md` gives the command and the metric.
 `go-make` also carries a Lean specification of the workload
 (`spec/Primes.lean`: an executable definition plus checked theorems) and a
 fourth change, `wrong`: a faster sieve that miscounts. With `--spec` and
-`--oracle`, toe accepts the correct sieve and rejects the wrong one before
+`--oracle`, prova accepts the correct sieve and rejects the wrong one before
 measuring it (`faster=accept wrong=reject(spec)`, image
 `docker/lean.Dockerfile`).
 
 `exp-check.sh` registers the experiment on the committed baseline and runs
 the three changes against it. The large tests assert, for each language,
-that toe finds the bug per test (not just "the run failed") with an
+that prova finds the bug per test (not just "the run failed") with an
 explanation, that a hang is reported as a stall with no configuration, and
 that the experiments end `faster=accept same=reject slower=reject`, with
 the metric read from the native benchmark output.
 
 `docker/` holds one Dockerfile per toolchain image: the official image
-plus `COPY --from=toe:dev /toe /usr/local/bin/toe`, the deployment pattern
-toe documents for containers. Dependencies are cached in the `toe-fixture-cache` volume.
+plus `COPY --from=prova:dev /prova /usr/local/bin/prova`, the deployment pattern
+prova documents for containers. Dependencies are cached in the `prova-fixture-cache` volume.

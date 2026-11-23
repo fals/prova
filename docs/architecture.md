@@ -1,7 +1,7 @@
 # Architecture
 
-This document explains how toe works, for people and for coding agents.
-It describes what toe does and why it is built that way.
+This document explains how prova works, for people and for coding agents.
+It describes what prova does and why it is built that way.
 
 - [The idea in one picture](#the-idea-in-one-picture)
 - [Components and code map](#components-and-code-map)
@@ -18,7 +18,7 @@ It describes what toe does and why it is built that way.
 ## The idea in one picture
 
 Agents run tests badly: ad hoc shell commands, output dumped to files, long
-timeouts, no memory of what failed before. toe puts one small binary between
+timeouts, no memory of what failed before. prova puts one small binary between
 the agent and the project's own test command. It runs that command, watches it,
 tells the agent as soon as something needs attention, and remembers every run.
 
@@ -27,15 +27,15 @@ flowchart LR
     subgraph Harness["Agent harness (Claude Code, Codex, Cursor, ...)"]
         A[Agent]
     end
-    subgraph Toe["toe (one binary)"]
-        CLI["CLI<br/>toe run / wait / exp"]
-        MCP["MCP facade<br/>toe mcp"]
+    subgraph Prova["prova (one binary)"]
+        CLI["CLI<br/>prova run / wait / exp"]
+        MCP["MCP facade<br/>prova mcp"]
         ENG["Engine<br/>supervise, liveness, verdicts"]
         ADP["Adapters<br/>recognizers, result files"]
     end
-    SK["Skills + AGENTS.md<br/>how to use toe"]
+    SK["Skills + AGENTS.md<br/>how to use prova"]
     SUT["Project's own test command<br/>make test, cargo test, pytest, ..."]
-    HOME[("toe home<br/>~/.local/share/toe<br/>one SQLite file per repository")]
+    HOME[("prova home<br/>~/.local/share/prova<br/>one SQLite file per repository")]
 
     A -- reads --> SK
     A -- shell --> CLI
@@ -48,28 +48,28 @@ flowchart LR
     ENG <--> HOME
 ```
 
-There is no daemon. `toe run` starts one supervisor process per run; every
+There is no daemon. `prova run` starts one supervisor process per run; every
 other command reads and writes the same store directly.
 
 ## Components and code map
 
 | Component | Code | Owns |
 |---|---|---|
-| Contract types | `crates/toe-core/src/model.rs`, `schemas/` | events, outcomes, fidelity levels; JSON Schema is generated and checked in CI |
-| Lifecycle | `crates/toe-core/src/lifecycle.rs`, `spec/run.qnt` | which run transitions are legal; mirrors the Quint spec |
-| Engine | `crates/toe-core/src/engine.rs` | creating runs, the supervisor, `wait`, summaries |
-| Process control | `crates/toe-core/src/process.rs` | process groups, CPU and child sampling from `/proc`, signals |
-| Store | `crates/toe-core/src/store.rs`, `migrations/` | SQLite schema and triggers that re-enforce the spec |
-| Home and identity | `crates/toe-core/src/home.rs`, `identity.rs` | where data lives, repository identity, code identity, run origin |
-| Analysis | `crates/toe-core/src/analysis.rs` | history, flake statistics, run diffs, observed sizes |
-| Experiments | `crates/toe-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, trials, Mann-Whitney + Hodges-Lehmann verdicts |
-| Adapters | `crates/toe-adapters/src/` | recognizing live output, JUnit/TRX parsing, `toe adopt` detection, opt-in injection |
-| CLI | `crates/toe-cli/src/main.rs`, `render.rs` | commands, exit codes, compact output |
-| MCP facade | `crates/toe-cli/src/mcp.rs` | five tools that call the CLI with `--json` |
-| Skills | `skills/`, embedded by `crates/toe-cli/src/skills.rs` | instructions agents load: workflows and one per language |
+| Contract types | `crates/prova-core/src/model.rs`, `schemas/` | events, outcomes, fidelity levels; JSON Schema is generated and checked in CI |
+| Lifecycle | `crates/prova-core/src/lifecycle.rs`, `spec/run.qnt` | which run transitions are legal; mirrors the Quint spec |
+| Engine | `crates/prova-core/src/engine.rs` | creating runs, the supervisor, `wait`, summaries |
+| Process control | `crates/prova-core/src/process.rs` | process groups, CPU and child sampling from `/proc`, signals |
+| Store | `crates/prova-core/src/store.rs`, `migrations/` | SQLite schema and triggers that re-enforce the spec |
+| Home and identity | `crates/prova-core/src/home.rs`, `identity.rs` | where data lives, repository identity, code identity, run origin |
+| Analysis | `crates/prova-core/src/analysis.rs` | history, flake statistics, run diffs, observed sizes |
+| Experiments | `crates/prova-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, trials, Mann-Whitney + Hodges-Lehmann verdicts |
+| Adapters | `crates/prova-adapters/src/` | recognizing live output, JUnit/TRX parsing, `prova adopt` detection, opt-in injection |
+| CLI | `crates/prova-cli/src/main.rs`, `render.rs` | commands, exit codes, compact output |
+| MCP facade | `crates/prova-cli/src/mcp.rs` | five tools that call the CLI with `--json` |
+| Skills | `skills/`, embedded by `crates/prova-cli/src/skills.rs` | instructions agents load: workflows and one per language |
 | Fixtures | `fixtures/` | one realistic project per supported language, used by large tests |
 
-Dependency direction: `toe-cli` → `toe-adapters` → `toe-core`. The engine knows
+Dependency direction: `prova-cli` → `prova-adapters` → `prova-core`. The engine knows
 nothing about frameworks; adapters plug in through the `Observer` trait.
 
 ## The test loop
@@ -80,12 +80,12 @@ The loop an agent runs, and what happens underneath:
 sequenceDiagram
     autonumber
     participant A as Agent
-    participant T as toe CLI
+    participant T as prova CLI
     participant S as Supervisor (one per run)
     participant P as Test process group
     participant D as Store
 
-    A->>T: toe run small --detach
+    A->>T: prova run small --detach
     T->>D: create run (inputs frozen: command, code identity, env)
     T->>S: start detached
     T-->>A: run id (immediately)
@@ -95,22 +95,22 @@ sequenceDiagram
         S->>S: recognize test results, sample CPU and children
         S->>D: append events (test_started, test_finished, test_slow, run_stalled)
     end
-    A->>T: toe wait <run> --max-wait 30s
+    A->>T: prova wait <run> --max-wait 30s
     T->>D: poll for the next significant event
     D-->>T: first failure (run still going)
     T-->>A: FAIL m::b [new failure] + message, exit 1
     A->>A: fix the code
-    A->>T: toe cancel <run> or let it finish
-    A->>T: toe run small --select m::b
+    A->>T: prova cancel <run> or let it finish
+    A->>T: prova run small --select m::b
 ```
 
-`toe wait` never blocks longer than `--max-wait`. It returns on the first
+`prova wait` never blocks longer than `--max-wait`. It returns on the first
 failure, a slow test, a stall, or the end, and tells the agent the next command
 to run.
 
 ## Seeing tests: the fidelity ladder
 
-toe works on any command with zero configuration and climbs as high as the
+prova works on any command with zero configuration and climbs as high as the
 output allows. Every result says
 which level it reached, so the agent knows what it can trust.
 
@@ -119,14 +119,14 @@ flowchart BT
     L0["Level 0: opaque<br/>exit code, output tail, process tree"]
     L1["Level 1: result files<br/>JUnit XML or TRX written during the run"]
     L2["Level 2: recognized output<br/>libtest, go test -v, pytest -v, Vitest, VSTest, TAP"]
-    L3["Level 3: native stream<br/>go test -json, nextest / libtest JSON,<br/>pytest-reportlog, toe's Vitest reporter"]
+    L3["Level 3: native stream<br/>go test -json, nextest / libtest JSON,<br/>pytest-reportlog, prova's Vitest reporter"]
     L0 --> L1 --> L2 --> L3
 ```
 
 - Live levels (2, 3) give the first failure while the run is still going.
 - Result files (1) fill in tests the live output did not show, and never double count.
-- When the framework's own totals exceed what toe saw (quiet output), the summary says so.
-- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (toe's reporter; add `--reporter="$TOE_VITEST_REPORTER"` to the suite command), `go-nocache`.
+- When the framework's own totals exceed what prova saw (quiet output), the summary says so.
+- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command), `go-nocache`.
 - Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output, and kept as an artifact of the run.
 
 ## Liveness: slow, stalled, killed
@@ -139,8 +139,8 @@ flowchart LR
     R -->|no CPU, output or new process<br/>for stall_after| ST["run_stalled event"]
     SL --> AG{agent decides}
     ST --> AG
-    AG -->|toe cancel| K["SIGTERM to the group,<br/>grace, SIGKILL"]
-    AG -->|toe wait --after N| R
+    AG -->|prova cancel| K["SIGTERM to the group,<br/>grace, SIGKILL"]
+    AG -->|prova wait --after N| R
     R -->|kill_after reached| K
 ```
 
@@ -161,7 +161,7 @@ of uncommitted changes). Each failure in a summary carries context:
 | `likely FLAKY` | the whole suite passed on exactly this code before |
 | `last passed at tree:…` | the last code where this test was green |
 
-`toe history <test>`, `toe flaky`, `toe diff <a> <b>` and `toe sizes` read the
+`prova history <test>`, `prova flaky`, `prova diff <a> <b>` and `prova sizes` read the
 same data.
 
 ## Experiments
@@ -172,9 +172,9 @@ answer, interleaved trials, and a verdict.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Declared: toe exp new (hypothesis, metric, min effect, trials, spec, oracle)
-    Declared --> Declared: toe exp protocol (allowed until the first trial)
-    Declared --> Checked: toe exp run (protocol frozen), oracle on both arms
+    [*] --> Declared: prova exp new (hypothesis, metric, min effect, trials, spec, oracle)
+    Declared --> Declared: prova exp protocol (allowed until the first trial)
+    Declared --> Checked: prova exp run (protocol frozen), oracle on both arms
     Checked --> Reject: candidate violates the specification (never measured)
     Checked --> Failed: baseline violates the specification
     Checked --> Running: both satisfy it
@@ -192,9 +192,9 @@ stateDiagram-v2
 
 Every arm runs in its own detached worktree. A baseline is a git ref; a
 candidate is a snapshot commit of the working tree (tracked and untracked
-files, `.gitignore` respected, `.toe/` excluded) built with a temporary index,
+files, `.gitignore` respected, `.prova/` excluded) built with a temporary index,
 so the user's branch, index and stash are untouched, and kept alive by
-`refs/toe/candidates/<experiment>/<label>`. What is measured is what was
+`refs/prova/candidates/<experiment>/<label>`. What is measured is what was
 recorded, however the tree changes afterwards (`spec/experiment.qnt`,
 `measuredIsRecorded`). Files ignored by git are absent from worktrees: use the
 protocol's `--setup` to rebuild them. Statistics:
@@ -206,7 +206,7 @@ fixed dataset, step counts) are valid samples.
 `{"metric": .., "value": .., "unit": ..}`, or the native benchmark tools
 `go test -bench`, criterion, pytest-benchmark, Vitest bench, JMH and
 BenchmarkDotNet (times normalized to nanoseconds; `go test -count N` repeats
-reduced to their median). `wall_ms` is always recorded. `toe exp metrics --
+reduced to their median). `wall_ms` is always recorded. `prova exp metrics --
 <cmd>` lists what a command yields.
 
 **Specification first.** `--spec <file>` freezes the problem's specification
@@ -215,19 +215,19 @@ reduced to their median). `wall_ms` is always recorded. `toe exp metrics --
 proof build) runs once in each variant before any trial. Only implementations
 that satisfy the specification are measured; a violator can never be
 accepted. The gate is part of the experiment lifecycle spec
-(`spec/experiment.qnt`). The `toe-spec` skill teaches writing the
+(`spec/experiment.qnt`). The `prova-spec` skill teaches writing the
 specification, checking it, and turning it into an oracle.
 
 ## Storage
 
-One toe home per user; the project's folder keeps nothing, and a finished
+One prova home per user; the project's folder keeps nothing, and a finished
 run is rows in one SQLite file per repository: no log files pile up.
 
 ```text
-~/.local/share/toe/            (TOE_HOME)
+~/.local/share/prova/            (PROVA_HOME)
   catalog.db                   repositories and where they were seen
   repos/<repo-id>/
-    toe.db                     runs, events, tests, attempts, experiments,
+    prova.db                     runs, events, tests, attempts, experiments,
                                and the kept output (compressed)
     runs/<run>/output.log      only while the run is live (owner-only)
     experiments/<id>/          only while a comparison runs
@@ -246,14 +246,14 @@ What is kept of the output once a run ends:
 
 Kept output is compressed and shares a 64 MB budget per repository; the
 oldest is dropped first, and results and history are never dropped. Read it
-with `toe output <run>` (text), `toe output <run> --test <name>`, `--json`
-(sections and elided counts for agents), and `toe exp log <experiment>`.
-`toe run --keep-output` keeps the whole output of one run.
+with `prova output <run>` (text), `prova output <run> --test <name>`, `--json`
+(sections and elided counts for agents), and `prova exp log <experiment>`.
+`prova run --keep-output` keeps the whole output of one run.
 
 - The repository id comes from its first commit, so clones and worktrees share
   one history.
-- Each run records where it ran: host, pod, node and actor (`TOE_ACTOR`, CI job or user).
-- `toe status --all` and `toe flaky --all` read every repository in the home.
+- Each run records where it ran: host, pod, node and actor (`PROVA_ACTOR`, CI job or user).
+- `prova status --all` and `prova flaky --all` read every repository in the home.
 
 ```mermaid
 erDiagram
@@ -270,14 +270,14 @@ erDiagram
 
 ## Deployment
 
-| Where the tests run | How toe gets there |
+| Where the tests run | How prova gets there |
 |---|---|
 | A developer machine or agent sandbox | `cargo install`, or the release tarball |
-| A container (devcontainer, CI image) | `COPY --from=ghcr.io/fals/toe:<version> /toe /usr/local/bin/toe` |
-| CI (GitHub Actions, GitLab) | install or copy the binary; keep `TOE_HOME` in the job and persist it with the CI cache or artifacts |
-| Pods in Kubernetes | same image copy; `TOE_HOME` on a volume with one writer at a time (no server; SQLite must not have several writers over network storage) |
+| A container (devcontainer, CI image) | `COPY --from=ghcr.io/fals/prova:<version> /prova /usr/local/bin/prova` |
+| CI (GitHub Actions, GitLab) | install or copy the binary; keep `PROVA_HOME` in the job and persist it with the CI cache or artifacts |
+| Pods in Kubernetes | same image copy; `PROVA_HOME` on a volume with one writer at a time (no server; SQLite must not have several writers over network storage) |
 
-toe always runs next to the tests, because only there can it watch and stop
+prova always runs next to the tests, because only there can it watch and stop
 the processes.
 
 ## Contracts for agents
@@ -288,14 +288,14 @@ These are stable interfaces; changing them is a breaking change.
 
 | Command | Purpose |
 |---|---|
-| `toe run <suite> [--select <test>] [--detach]` / `toe run -- <cmd>` | start a run |
-| `toe wait <run> [--until first-failure\|stall\|done] [--after <seq>] [--max-wait 30s]` | next significant event |
-| `toe cancel <run>` | stop the process group |
-| `toe status [<run>] [--all]`, `toe output <run> [--tail N] [--test <name>] [--json]`, `toe events <run>` | inspect |
-| `toe history <test>`, `toe flaky`, `toe diff <a> <b>`, `toe sizes` | memory |
-| `toe exp new\|candidate\|run\|wait\|status\|revalidate` | experiments |
-| `toe init`, `toe adopt [--write] [--verify <suite> --filter <test>]` | adoption |
-| `toe mcp` | MCP tools `run_start`, `run_wait`, `run_status`, `run_cancel`, `test_history` |
+| `prova run <suite> [--select <test>] [--detach]` / `prova run -- <cmd>` | start a run |
+| `prova wait <run> [--until first-failure\|stall\|done] [--after <seq>] [--max-wait 30s]` | next significant event |
+| `prova cancel <run>` | stop the process group |
+| `prova status [<run>] [--all]`, `prova output <run> [--tail N] [--test <name>] [--json]`, `prova events <run>` | inspect |
+| `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes` | memory |
+| `prova exp new\|candidate\|run\|wait\|status\|revalidate` | experiments |
+| `prova init`, `prova adopt [--write] [--verify <suite> --filter <test>]` | adoption |
+| `prova mcp` | MCP tools `run_start`, `run_wait`, `run_status`, `run_cancel`, `test_history` |
 
 **Exit codes:**
 
@@ -305,8 +305,8 @@ These are stable interfaces; changing them is a breaking change.
 | 1 | test failure, or evidence against a pass (or experiment rejected) |
 | 2 | usage error |
 | 3 | stall, slow test, cancelled or killed |
-| 4 | toe or infrastructure error; the test command could not start (exit 126/127) |
-| 5 | still running: call `toe wait <run> --after <seq>` |
+| 4 | prova or infrastructure error; the test command could not start (exit 126/127) |
+| 5 | still running: call `prova wait <run> --after <seq>` |
 
 **History is per test, not per suite.** The same test (same file and full
 name) run by different suites shares one history; only runs that finished
@@ -316,7 +316,7 @@ whichever runner reports them (cargo, nextest).
 
 **No false passes.** A pass must be earned. The run fails, whatever the exit
 code, when a test errored or never finished, when the framework's own summary
-counts more failures than toe recorded, when the framework says no test ran
+counts more failures than prova recorded, when the framework says no test ran
 (or a selection matched none), or when the suite ran tests in its last
 passing run and observed none now. A pass that proved little stays a pass
 with `verified: false` and `warnings`: no test observed, every test skipped,
@@ -327,9 +327,9 @@ that runs no tests on purpose declares `expect_tests = false`.
 `run_started`, `test_started`, `test_slow`, `test_finished`, `run_stalled`,
 `run_note`, `run_finished`. Each has `run`, a monotonic `seq` and `ts_ms`.
 
-**Configuration** is optional: `toe.toml` names suites (`run`, `select` with
+**Configuration** is optional: `prova.toml` names suites (`run`, `select` with
 `{filter}`, `size`, `stall_after`, `kill_after`, `results`, `inject`).
-Environment: `TOE_HOME`, `TOE_ACTOR`.
+Environment: `PROVA_HOME`, `PROVA_ACTOR`.
 
 ## Invariants and where they are enforced
 
