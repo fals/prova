@@ -58,7 +58,8 @@ other command reads and writes the same store directly.
 | Contract types | `crates/prova-core/src/model.rs`, `schemas/` | events, outcomes, fidelity levels; JSON Schema is generated and checked in CI |
 | Lifecycle | `crates/prova-core/src/lifecycle.rs`, `spec/run.qnt` | which run transitions are legal; mirrors the Quint spec |
 | Engine | `crates/prova-core/src/engine.rs` | creating runs, the supervisor, `wait`, summaries |
-| Process control | `crates/prova-core/src/process.rs` | process groups, CPU and child sampling from `/proc`, signals |
+| Process control | `crates/prova-core/src/process.rs` | process groups and trees, CPU and child sampling from `/proc`, signals |
+| Resources | `crates/prova-core/src/resources.rs` | processes and sockets per sample, test sizes (ADR 0025) |
 | Store | `crates/prova-core/src/store.rs`, `migrations/` | SQLite schema and triggers that re-enforce the spec |
 | Home and identity | `crates/prova-core/src/home.rs`, `identity.rs` | where data lives, repository identity, code identity, run origin |
 | Output | `crates/prova-core/src/output.rs` | distilling a run's output into SQLite at its end; the 64 MB budget per repository |
@@ -93,7 +94,7 @@ sequenceDiagram
     loop while the tests run
         P-->>S: output lines
         S->>S: recognize test results, sample CPU and children
-        S->>D: append events (test_started, test_finished, test_slow, run_stalled, run_totals, run_warning)
+        S->>D: append events (test_started, test_finished, test_size, test_slow, run_stalled, run_totals, run_warning)
     end
     T->>D: wait for the next significant event (30 s budget)
     alt a test failed
@@ -167,6 +168,30 @@ flowchart LR
   stall. Under 2% of one core counts as idle, so a hung test in an idle JVM
   or .NET runtime is still a stall.
 - Processes that outlive the run are reported as leaked and killed.
+- The tree is the group plus every descendant, even one in a group of its
+  own: nextest starts each test so.
+
+## Test sizes
+
+A test's size is what it used, never how long it took
+([ADR 0025](adr/0025-sizes-by-resources.md), after Software Engineering at
+Google, ch. 11): one process and no network is small; more processes or
+`localhost` is medium; another host is large.
+
+- Each sample records the run's process tree and the sockets it holds
+  (`/proc/<pid>/fd` against `/proc/net/{tcp,tcp6,udp,udp6,unix}` on Linux,
+  `lsof` on macOS), each socket as local or another host.
+- A test is held to what it used when prova can tell: its own process and
+  descendants (a process whose arguments name it, as nextest's `--exact`),
+  or what was first seen while it was the only test running, in a sample
+  taken well inside its start and finish lines (the program may already be
+  in the next test when a line is read).
+- Observations are lower bounds: what lives between two samples is missed.
+  Small needs 3 attributed runs that saw nothing more; medium and large are
+  decided by one. A test never attributed shows the run's size as an upper
+  bound, or is unknown.
+- A suite's declared `size` is checked: a test that uses more gets a run note
+  naming what it used.
 
 ## Memory: history and flaky tests
 
@@ -189,7 +214,7 @@ like secrets are left out. Each failure in a summary carries context:
 | `run cancelled or aborted: no evidence about the code` | the run was cut short; nothing else is said |
 
 `prova history <test>`, `prova flaky`, `prova diff <a> <b>` and `prova sizes` read the
-same data.
+same data; history also shows the test's size and why.
 
 ## Experiments
 
@@ -340,6 +365,7 @@ erDiagram
     RUNS ||--o| RUN_OUTPUT : "excerpt"
     RUNS ||--o{ TEST_OUTPUT : "failing tests' output"
     RUNS ||--o| FORGOTTEN : "out of history, with reason"
+    RUNS ||--o{ TEST_SIZES : "what each test used"
     EXPERIMENTS ||--o{ VARIANTS : "baseline, candidates"
     EXPERIMENTS ||--o{ COMPARISONS : ""
     EXPERIMENTS ||--o{ BEST_RESETS : "prova exp best"
@@ -425,7 +451,7 @@ no tests on purpose declares `expect_tests = false`.
 
 **Events** are JSON Lines with schema [`schemas/event.v1.json`](../schemas/event.v1.json):
 `run_started`, `test_started`, `test_slow`, `test_finished`, `run_stalled`,
-`run_note`, `run_warning`, `run_totals`, `run_finished`. Each has `run`, a
+`run_note`, `run_warning`, `run_totals`, `test_size`, `run_size`, `run_finished`. Each has `run`, a
 monotonic `seq` and `ts_ms`.
 
 **Configuration** is optional: `prova.toml` names suites (`run`, `select` with

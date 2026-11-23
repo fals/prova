@@ -205,12 +205,137 @@ struct Supervisor<'a> {
     terminating: bool,
     /// Running tests: (key, started, slow budget, slow reported).
     running: BTreeMap<String, (TestKey, Instant, (Duration, BudgetFrom), bool)>,
+    /// The command's process group, once started (0 before).
+    pgid: u32,
+    /// What each running test was seen to use (ADR 0025).
+    sizes: BTreeMap<String, SizeTrack>,
+    /// Everything the command's group was seen to hold, for its own size.
+    run_usage: crate::resources::Usage,
+    /// The last snapshot and when it was taken: reused for 20 ms, so a
+    /// burst of short tests does not rescan the process table each time.
+    last_usage: Option<(Instant, crate::resources::Usage)>,
+    /// Every pid and socket seen so far: a test is held only to what was
+    /// first seen after its start (anything older is another test's or the
+    /// runner's).
+    known_pids: std::collections::BTreeSet<u32>,
+    known_sockets: std::collections::BTreeSet<u64>,
+    /// Processes that run a single test (`--exact`), with what their
+    /// subtree was seen to use: matched to the test when it finishes, so a
+    /// runner that reports starts late (nextest) still gets sizes.
+    one_test_procs: BTreeMap<u32, (String, crate::resources::Seen)>,
+    /// The suite's declared size, checked against what tests use.
+    declared: Option<crate::config::Size>,
 }
+
+/// One running test's size observation (ADR 0025).
+struct SizeTrack {
+    /// The test's name as a runner would pass it to its own process.
+    name: String,
+    /// Pids and sockets seen up to its start.
+    base_pids: std::collections::BTreeSet<u32>,
+    base_sockets: std::collections::BTreeSet<u64>,
+    /// It has been the only running test since it started.
+    solo: bool,
+    /// Its own process, when the runner started one for it.
+    own: Option<u32>,
+    seen: crate::resources::Seen,
+    /// When its start line was read.
+    started: Instant,
+    /// The latest sample's observation, kept until it is known to fall
+    /// inside the test: the program may already be in the next test when
+    /// prova reads a line, so a sample counts only when taken
+    /// `SIZE_GUARD` after the start line and before the finish line.
+    pending: Option<(Instant, crate::resources::Seen)>,
+}
+
+/// How far from a test's start and finish lines a sample must be to count
+/// for that test (ADR 0025 §5: a missed resource is a lower bound, a
+/// misattributed one is wrong).
+const SIZE_GUARD: Duration = Duration::from_millis(50);
 
 impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
         if let EventKind::RunTotals { tests, .. } = &kind {
             self.framework_total = Some(*tests);
+        }
+        // Sizes (ADR 0025): a snapshot at each test's start and finish.
+        let mut sized: Option<(TestKey, u32)> = None;
+        match &kind {
+            EventKind::TestStarted { test } if self.pgid != 0 => {
+                // Everything seen up to now is not this test's. (A process it
+                // started at once may be in this snapshot and be missed: a
+                // lower bound, never another test's.)
+                let _ = self.usage_now();
+                let alone = self.running.is_empty();
+                if !alone {
+                    for t in self.sizes.values_mut() {
+                        t.solo = false;
+                    }
+                }
+                self.sizes.insert(
+                    test.unique(),
+                    SizeTrack {
+                        name: test.display(),
+                        base_pids: self.known_pids.clone(),
+                        base_sockets: self.known_sockets.clone(),
+                        solo: alone,
+                        own: None,
+                        seen: Default::default(),
+                        started: Instant::now(),
+                        pending: None,
+                    },
+                );
+            }
+            EventKind::TestFinished { test, attempt, .. }
+                if !self.sizes.contains_key(&test.unique()) =>
+            {
+                // No start seen (nextest reports it with the result): its own
+                // process, if a sample saw one, still tells.
+                let name = test.display();
+                let mine: Vec<u32> = self
+                    .one_test_procs
+                    .iter()
+                    .filter(|(_, (cmd, _))| crate::resources::names_test(cmd, &name))
+                    .map(|(p, _)| *p)
+                    .collect();
+                if !mine.is_empty() {
+                    let mut seen = crate::resources::Seen::default();
+                    for p in mine {
+                        if let Some((_, s)) = self.one_test_procs.remove(&p) {
+                            seen.absorb(&s);
+                        }
+                    }
+                    self.sizes.insert(
+                        test.unique(),
+                        SizeTrack {
+                            name,
+                            base_pids: Default::default(),
+                            base_sockets: Default::default(),
+                            solo: false,
+                            own: Some(0),
+                            seen,
+                            started: Instant::now(),
+                            pending: None,
+                        },
+                    );
+                    sized = Some((test.clone(), *attempt));
+                }
+            }
+            EventKind::TestFinished { test, attempt, .. }
+                if self.sizes.contains_key(&test.unique()) =>
+            {
+                // Not observed now: the program may already be in the next
+                // test. Only a sample taken well before this line counts.
+                if let Some(t) = self.sizes.get_mut(&test.unique())
+                    && let Some((at, seen)) = t.pending.take()
+                    && at.elapsed() >= SIZE_GUARD
+                {
+                    t.seen.absorb(&seen);
+                }
+                let _ = self.usage_now();
+                sized = Some((test.clone(), *attempt));
+            }
+            _ => {}
         }
         if self.terminating
             && let EventKind::TestFinished {
@@ -273,6 +398,30 @@ impl Supervisor<'_> {
             ts_ms: now_ms(),
             kind,
         });
+        if let Some((test, attempt)) = sized
+            && let Some(t) = self.sizes.remove(&test.unique())
+            && (t.own.is_some() || t.solo)
+        {
+            let size = t.seen.size();
+            let evidence = t.seen.evidence();
+            if let Some(declared) = self.declared
+                && size > declared
+            {
+                self.emit(EventKind::RunNote {
+                    message: format!(
+                        "{} is declared {} but {evidence} (ADR 0025: size is what a test uses)",
+                        test.display(),
+                        declared.as_str()
+                    ),
+                });
+            }
+            self.emit(EventKind::TestSize {
+                test,
+                attempt,
+                size,
+                evidence,
+            });
+        }
     }
 
     /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
@@ -326,6 +475,64 @@ impl Supervisor<'_> {
         }
         for e in slow {
             self.emit(e);
+        }
+    }
+
+    /// A snapshot of the command's group, reused when under 50 ms old.
+    fn usage_now(&mut self) -> crate::resources::Usage {
+        if let Some((at, u)) = &self.last_usage
+            && at.elapsed() < Duration::from_millis(20)
+        {
+            return u.clone();
+        }
+        let u = crate::resources::sample(self.pgid);
+        self.run_usage.procs.extend(u.procs.clone());
+        self.run_usage.sockets.extend(u.sockets.clone());
+        self.known_pids.extend(u.procs.keys().copied());
+        self.known_sockets.extend(u.sockets.keys().copied());
+        for (pid, (_, cmd)) in &u.procs {
+            if crate::resources::runs_one_test(cmd) {
+                let e = self
+                    .one_test_procs
+                    .entry(*pid)
+                    .or_insert_with(|| (cmd.clone(), Default::default()));
+                e.1.absorb(&crate::resources::seen_in_subtree(&u, *pid));
+            }
+        }
+        self.last_usage = Some((Instant::now(), u.clone()));
+        u
+    }
+
+    /// Adds what each running test can be held to (ADR 0025 §4): the
+    /// subtree of a process that names it, or, while it runs alone,
+    /// whatever appeared in the group since it started.
+    fn observe_sizes(&mut self, now: &crate::resources::Usage) {
+        let alone = self.running.len() <= 1;
+        for t in self.sizes.values_mut() {
+            if t.own.is_none() {
+                t.own = now
+                    .procs
+                    .iter()
+                    .find(|(_, (_, cmd))| crate::resources::names_test(cmd, &t.name))
+                    .map(|(pid, _)| *pid);
+            }
+            if let Some(own) = t.own {
+                // A process tree cannot belong to the next test.
+                t.seen.absorb(&crate::resources::seen_in_subtree(now, own));
+            } else if !alone {
+                t.solo = false;
+                t.pending = None;
+            } else if t.solo && t.started.elapsed() >= SIZE_GUARD {
+                // The previous sample was followed by this one inside the
+                // test: it counts. This one waits for the next.
+                if let Some((_, seen)) = t.pending.take() {
+                    t.seen.absorb(&seen);
+                }
+                t.pending = Some((
+                    Instant::now(),
+                    crate::resources::seen_new(&t.base_pids, &t.base_sockets, now),
+                ));
+            }
         }
     }
 
@@ -405,6 +612,14 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         partial: Default::default(),
         framework_total: None,
         cpu_start: None,
+        pgid: 0,
+        sizes: BTreeMap::new(),
+        run_usage: Default::default(),
+        last_usage: None,
+        known_pids: Default::default(),
+        known_sockets: Default::default(),
+        one_test_procs: BTreeMap::new(),
+        declared: spec.size,
     };
     store.set_level(run, sup.level)?;
 
@@ -457,6 +672,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let pgid = child.id();
+    sup.pgid = pgid;
     sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
     if !injected.is_empty() {
@@ -522,7 +738,7 @@ fn observe_child(
     let start = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_sample = Instant::now();
-    let mut sample = process::sample_group(pgid);
+    let mut sample = process::sample_tree(pgid);
     let mut recent_ticks: VecDeque<(Instant, u64)> = VecDeque::new();
     let mut stalled = false;
     let mut terminating: Option<(Instant, Status, String)> = None;
@@ -556,7 +772,11 @@ fn observe_child(
         let now = Instant::now();
         if now.duration_since(last_sample) >= SAMPLE_EVERY {
             last_sample = now;
-            let s = process::sample_group(pgid);
+            let usage = sup.usage_now();
+            sup.observe_sizes(&usage);
+            // The whole tree: a runner may start tests in groups of their
+            // own (nextest), and their CPU is the run's activity.
+            let s = process::sample_tree(pgid);
             recent_ticks.push_back((now, s.cpu_ticks.saturating_sub(sample.cpu_ticks)));
             while recent_ticks
                 .front()
@@ -624,6 +844,15 @@ fn observe_child(
     if !leaked.is_empty() {
         process::kill_group(pgid);
         drain(sup, &mut open_streams, observer);
+    }
+    // The whole command's size (ADR 0025): the bound for tests prova
+    // could not attribute.
+    if !sup.run_usage.procs.is_empty() {
+        let seen = crate::resources::run_seen(&sup.run_usage, pgid);
+        sup.emit(EventKind::RunSize {
+            size: seen.size(),
+            evidence: seen.evidence(),
+        });
     }
 
     let report = observer.on_exit(Path::new(store.root()), started_ms);

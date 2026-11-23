@@ -945,14 +945,16 @@ fn trials_get_private_caches_and_no_secrets() {
 /// git ignores replace objects, so the baseline is the commit itself.
 #[test]
 fn replace_objects_do_not_change_what_runs() {
-    let d = repo("replace", "0.01");
+    // The candidate is twice as slow as the real baseline, five times as
+    // fast as the replaced one: only measuring the replacement accepts it
+    // (gaps far above timing noise on shared macOS runners).
+    let d = repo("replace", "0.05");
     new_exp(&d, &[]);
-    // Replace the baseline's `delay` blob with a slower one.
     sh(
         &d,
-        "orig=$(git rev-parse HEAD:delay); slow=$(printf 0.08 | git hash-object -w --stdin); git replace $orig $slow",
+        "orig=$(git rev-parse HEAD:delay); slow=$(printf 0.5 | git hash-object -w --stdin); git replace $orig $slow",
     );
-    std::fs::write(d.join("delay"), "0.012").unwrap();
+    std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_ne!(
@@ -986,9 +988,10 @@ fn a_checkout_changed_by_a_git_filter_is_refused() {
 /// `exp status` re-derives every ACCEPT from the samples.
 #[test]
 fn an_edited_verdict_shows_in_status() {
-    let d = repo("edited", "0.01");
+    // Clearly slower, so the honest verdict is never an accept.
+    let d = repo("edited", "0.05");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.011").unwrap();
+    std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_ne!(r["comparison"]["verdict"], "accept", "{r}");

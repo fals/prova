@@ -271,6 +271,9 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
         println!("duration p50 {p50}ms  p95 {p95}ms");
     }
+    if let Some(size) = &s.size {
+        println!("size: {}", clean(&size.label));
+    }
     // Skips (another test's `--select` run) say nothing about this test:
     // count them instead of listing them (round 7).
     let skipped = s

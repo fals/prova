@@ -11,5 +11,6 @@ pub mod lifecycle;
 pub mod model;
 pub mod output;
 pub mod process;
+pub mod resources;
 pub mod stats;
 pub mod store;
