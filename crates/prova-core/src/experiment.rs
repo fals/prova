@@ -1552,7 +1552,7 @@ fn work_comparison(
         }
         if !process::MACHINE_COUNTERS {
             caveats.push(
-                "this OS gives prova no machine-wide CPU counters or subreaper: load from other processes, and processes that left a trial's or oracle's process group, were not checked".into(),
+                "this OS gives prova no CPU counters for the machine or for finished children, and no subreaper: load from other processes, an arm stopped from outside, and processes that left a trial's or oracle's process group were not checked".into(),
             );
         }
         if !caveats.is_empty() {

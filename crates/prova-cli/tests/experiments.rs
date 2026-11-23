@@ -83,9 +83,9 @@ fn new_exp(d: &Path, extra: &[&str]) {
 
 #[test]
 fn faster_candidate_is_accepted_and_becomes_best() {
-    let d = repo("accept", "0.06");
+    let d = repo("accept", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
     let r = json(&o);
@@ -601,7 +601,7 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ -f leak ] && setsid sleep 37.125 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\nif [ -f leak ]; then if command -v setsid >/dev/null; then setsid sleep 37.125; else sleep 37.125; fi >/dev/null 2>&1 < /dev/null & fi\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -691,9 +691,9 @@ fn an_uncommitted_spec_is_refused_at_creation() {
 /// decision log says so.
 #[test]
 fn the_best_can_be_reset_with_a_reason() {
-    let d = repo("reset-best", "0.06");
+    let d = repo("reset-best", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.01").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["best"], "c1", "{r}");

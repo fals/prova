@@ -279,11 +279,9 @@ pub fn cpu_ticks() -> (u64, u64) {
     (busy, children_ticks().unwrap_or(0))
 }
 
-/// No machine-wide counter here (0); this process's reaped children's CPU
-/// from `ps -S` (own time plus exited children) minus its own time.
 #[cfg(not(target_os = "linux"))]
 pub fn cpu_ticks() -> (u64, u64) {
-    (0, children_ticks().unwrap_or(0))
+    (0, 0)
 }
 
 /// CPU ticks of this process's waited-for children, when the OS says.
@@ -296,12 +294,12 @@ pub fn children_ticks() -> Option<u64> {
     Some(f.get(13)?.parse::<u64>().ok()? + f.get(14)?.parse::<u64>().ok()?)
 }
 
+/// macOS has no unprivileged way to read children's CPU time without
+/// `getrusage` (unsafe FFI): not measured, so checks built on it are
+/// skipped rather than guessed (`ps -S` did not include them).
 #[cfg(not(target_os = "linux"))]
 pub fn children_ticks() -> Option<u64> {
-    let me = std::process::id().to_string();
-    let with = ps_ticks(&ps(&["-S", "-p", &me, "-o", "time="])?)?;
-    let own = ps_ticks(&ps(&["-p", &me, "-o", "time="])?)?;
-    Some(with.saturating_sub(own))
+    None
 }
 
 #[cfg(test)]
