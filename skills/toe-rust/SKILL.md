@@ -16,7 +16,10 @@ description: toe setup details for Rust projects (cargo test, cargo-nextest). Us
   ```
 
   The format is experimental upstream; `--message-format-version 0.1` pins
-  it. Nightly `cargo test -- -Z unstable-options --format json` is read the
+  it. nextest writes that JSON only when a test binary ends, so toe also
+  reads nextest's own status lines (`PASS`, `FAIL`, `SLOW`) as they print:
+  the first failure arrives while the run goes on, and nextest's `SLOW`
+  line makes `toe wait` return on a hung test. Nightly `cargo test -- -Z unstable-options --format json` is read the
   same way.
 - `cargo test` output is recognized live (level `recognized output`):
   `test path::name ... ok|FAILED|ignored`. Nothing to configure.

@@ -757,7 +757,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             experiment::add_variant(&store, &name, &label, git_ref.as_deref(), &map)?;
             let v = experiment::variant(&store, &name, &label)?;
             println!("candidate {label} recorded at {}", v.code);
-            println!("next: toe exp run {name} --candidate {label}");
+            println!("next: toe exp run {name}");
             Ok(exit::PASSED)
         }
         ExpCmd::Run {

@@ -1154,6 +1154,16 @@ fn work_comparison(store: &Store, comparison: &str, parse: &MetricParser) -> Res
             continue;
         }
         let verdict = c.decide(outcome).unwrap_or(Verdict::Invalid);
+        let mut result = result;
+        // Say that the specification was checked, not only when it failed
+        // (ADR 0018): both arms satisfied it before any trial ran.
+        if let Some(oracle) = &p.oracle {
+            result["specification"] =
+                serde_json::json!(format!("holds on both arms (oracle `{oracle}`)"));
+        } else if !p.specs.is_empty() {
+            result["specification"] =
+                serde_json::json!("specification files unchanged on both arms (no oracle)");
+        }
         return finish(store, &e, comparison, &cand_name, verdict, result);
     }
 }
@@ -1343,7 +1353,22 @@ fn finish(
     {
         result["reason"] = serde_json::json!("invalid comparison");
     }
-    let reason = result["reason"].as_str().unwrap_or("").to_owned();
+    let mut reason = result["reason"].as_str().unwrap_or("").to_owned();
+    // A revalidation (the kept best, again, against the original baseline)
+    // says so in the decision log.
+    let base: String = store.conn().query_row(
+        "SELECT baseline FROM comparisons WHERE id = ?1",
+        params![comparison],
+        |r| r.get(0),
+    )?;
+    let kept_before: bool = store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM decisions WHERE experiment = ?1 AND candidate = ?2 AND decision = 'keep')",
+        params![e.name, candidate],
+        |r| r.get(0),
+    )?;
+    if kept_before && base == "baseline" {
+        reason = format!("revalidation: {reason}");
+    }
     let tx = store.conn().unchecked_transaction()?;
     tx.execute(
         "UPDATE comparisons SET status = 'decided', verdict = ?2, result = ?3, ended_ms = ?4 WHERE id = ?1",

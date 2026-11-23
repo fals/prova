@@ -308,6 +308,12 @@ These are stable interfaces; changing them is a breaking change.
 | 4 | toe or infrastructure error; the test command could not start (exit 126/127) |
 | 5 | still running: call `toe wait <run> --after <seq>` |
 
+**History is per test, not per suite.** The same test (same file and full
+name) run by different suites shares one history; only runs that finished
+count. Labels: `first time seen` (no history yet), `new failure` (passed
+before), `seen Nx before`, `FLAKY`. Rust test binaries are named by target,
+whichever runner reports them (cargo, nextest).
+
 **No false passes.** A pass must be earned. The run fails, whatever the exit
 code, when a test errored or never finished, when the framework's own summary
 counts more failures than toe recorded, when the framework says no test ran

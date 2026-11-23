@@ -75,9 +75,17 @@ pub fn summary(s: &Summary, json: bool) {
     line.push_str(&format!("  level {}  code {}", level_name(s.level), s.code));
     println!("{line}");
     let c = &s.counts;
-    if c.passed + c.failed + c.skipped + c.errored > 0 {
+    let seen = c.passed + c.failed + c.skipped + c.errored;
+    // When the framework counted more than toe saw, say both (ADR 0018).
+    let counted = match s.framework {
+        Some((n, f)) if n > seen => {
+            format!(" seen individually; the framework counted {n} ({f} failed)")
+        }
+        _ => String::new(),
+    };
+    if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {} errored, {} skipped",
+            "tests: {} passed, {} failed, {} errored, {} skipped{counted}",
             c.passed, c.failed, c.errored, c.skipped
         );
     }
@@ -97,6 +105,10 @@ pub fn summary(s: &Summary, json: bool) {
             "stalled: no activity for {}",
             format_duration(std::time::Duration::from_millis(ms))
         );
+    }
+    if !s.running.is_empty() && s.reason != WaitReason::Failure {
+        let names: Vec<String> = s.running.iter().map(|t| clean(t)).collect();
+        println!("running now: {}", names.join(", "));
     }
     for t in &s.slow {
         println!(
@@ -135,8 +147,11 @@ fn context(f: &toe_core::engine::Failure) -> String {
         return String::new();
     };
     let mut parts = Vec::new();
-    // A test known to be flaky is not a "new failure", whatever its message.
-    if c.seen_before > 0 {
+    // A test known to be flaky is not a "new failure", whatever its message;
+    // a test with no earlier result anywhere is neither new nor old yet.
+    if c.first_seen {
+        parts.push("first time seen: no history yet".to_owned());
+    } else if c.seen_before > 0 {
         parts.push(format!("seen {}x before", c.seen_before));
     } else if !c.flaky {
         parts.push("new failure".to_owned());
@@ -158,13 +173,13 @@ pub fn test_stats(s: &toe_core::analysis::TestStats, json: bool) {
         return;
     }
     println!(
-        "{}  (suite {}, id {})",
+        "{}  (suite{} {}; history shared across them)",
         clean(&s.display),
-        s.suite,
-        s.test_id
+        if s.suites.len() > 1 { "s" } else { "" },
+        s.suites.join(", ")
     );
     println!(
-        "{} runs, {} failed ({:.0}%), {} transitions, {} passed on retry, {} flips on same code{}",
+        "{} finished runs, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s){}",
         s.runs,
         s.failures,
         s.failure_rate * 100.0,
@@ -357,6 +372,9 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
             if let Some(reason) = res["reason"].as_str() {
                 println!("reason: {}", clean(reason));
             }
+            if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
+                println!("specification: {}", clean(spec));
+            }
             let p = &res["primary"];
             if p.is_object() {
                 println!(
@@ -374,7 +392,11 @@ pub fn experiment(r: &toe_core::experiment::Report, json: bool) {
                 let outl = p["outliers_baseline"].as_array().map_or(0, Vec::len)
                     + p["outliers_candidate"].as_array().map_or(0, Vec::len);
                 if outl > 0 {
-                    println!("outliers flagged (kept): {outl}");
+                    println!(
+                        "outliers flagged (kept): baseline {}, candidate {}",
+                        p["outliers_baseline"].as_array().map_or(0, Vec::len),
+                        p["outliers_candidate"].as_array().map_or(0, Vec::len)
+                    );
                 }
             }
         }
@@ -451,6 +473,7 @@ mod label_tests {
             test: "t".into(),
             message: None,
             context: Some(FailureContext {
+                first_seen: false,
                 seen_before,
                 flaky,
                 last_passed_code: None,
@@ -465,5 +488,18 @@ mod label_tests {
         assert_eq!(label(0, true), " [FLAKY]");
         assert_eq!(label(0, false), " [new failure]");
         assert_eq!(label(2, true), " [seen 2x before, FLAKY]");
+        let mut first = super::context(&Failure {
+            test: "t".into(),
+            message: None,
+            context: Some(FailureContext {
+                first_seen: true,
+                seen_before: 0,
+                flaky: false,
+                last_passed_code: None,
+                suite_passed_on_same_code: false,
+            }),
+        });
+        assert_eq!(first, " [first time seen: no history yet]");
+        first.clear();
     }
 }
