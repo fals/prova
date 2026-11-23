@@ -29,6 +29,9 @@ pub struct Proposal {
 /// with the format version pinned so a change upstream cannot silently
 /// change what prova reads.
 const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1";
+/// nextest does not run doctests (round 9: a failing doctest gave a clean
+/// PASS while `make test` failed): a crate with a library runs them after.
+const NEXTEST_JSON_DOC: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1; s=$?; cargo test --doc || exit 1; exit $s";
 const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}";
 
 /// `cargo nextest --version` output, if nextest is installed.
@@ -92,15 +95,19 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
     if root.join("Cargo.toml").exists() {
         let nextest = nextest(root);
         out.push(match nextest.as_deref().filter(|v| nextest_has_libtest_json(v)) {
-            Some(v) => Framework {
-                language: "rust",
-            base: "cargo test",
-                run: NEXTEST_JSON,
-                select: NEXTEST_JSON_SELECT,
-                why: format!(
-                    "Cargo.toml and {v}; its libtest JSON stream is read live (native; experimental format pinned to 0.1)"
-                ),
-            },
+            Some(v) => {
+                let lib = root.join("src/lib.rs").exists();
+                Framework {
+                    language: "rust",
+                    base: "cargo test",
+                    run: if lib { NEXTEST_JSON_DOC } else { NEXTEST_JSON },
+                    select: NEXTEST_JSON_SELECT,
+                    why: format!(
+                        "Cargo.toml and {v}; its libtest JSON stream is read live (native; experimental format pinned to 0.1){}",
+                        if lib { "; nextest skips doctests, so `cargo test --doc` runs them after" } else { "" }
+                    ),
+                }
+            }
             None => Framework {
                 language: "rust",
             base: "cargo test",
@@ -352,7 +359,14 @@ pub fn to_toml(p: &Proposal) -> String {
             || (p.languages.iter().any(|l| l == "python")
                 && p.existing.as_deref() == Some(suite.run.as_str()));
         // The Vitest reporter ships with prova: no install, so native it is.
-        if suite.run.contains("PROVA_VITEST_REPORTER") {
+        // Either command may load the reporter (round 9: `run = "npm test"`
+        // with a reporter in `select` crashed without the injection).
+        if suite.run.contains("PROVA_VITEST_REPORTER")
+            || suite
+                .select
+                .as_deref()
+                .is_some_and(|x| x.contains("PROVA_VITEST_REPORTER"))
+        {
             s.push_str("inject = [\"vitest-stream\"]\n");
             continue;
         }
@@ -406,6 +420,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         for (f, c) in files {
+            if let Some(parent) = d.join(f).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             std::fs::write(d.join(f), c).unwrap();
         }
         d
@@ -463,6 +480,43 @@ mod tests {
         assert_eq!(p.suites[0].run, "cargo test");
         assert_eq!(p.suites[1].run, "make test");
         assert!(p.notes[0].contains("quiet"), "{:?}", p.notes);
+    }
+
+    /// Round 9: nextest skips doctests; a failing doctest gave a clean pass.
+    #[test]
+    fn a_rust_library_runs_its_doctests_after_nextest() {
+        let d = dir(
+            "doctests",
+            &[
+                ("Cargo.toml", "[package]\nname = \"x\""),
+                ("src/lib.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON_DOC);
+        assert!(p.suites[0].why.contains("doctests"));
+    }
+
+    /// Round 9: a suite whose `select` loads prova's Vitest reporter must get
+    /// the injection, even when `run` is the project's own `npm test`.
+    #[test]
+    fn a_vitest_select_with_the_reporter_gets_the_injection() {
+        let t = to_toml(&propose(&dir(
+            "vitest-select",
+            &[(
+                "package.json",
+                r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"3"}}"#,
+            )],
+        )));
+        for block in t.split("[suite.").skip(1) {
+            if block.contains("PROVA_VITEST_REPORTER")
+                && !block
+                    .lines()
+                    .any(|l| l.starts_with('#') && l.contains("PROVA_VITEST_REPORTER"))
+            {
+                assert!(block.contains("\ninject = [\"vitest-stream\"]"), "{block}");
+            }
+        }
     }
 
     #[test]

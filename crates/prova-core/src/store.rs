@@ -34,6 +34,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_origin.sql"),
     include_str!("migrations/0005_output.sql"),
     include_str!("migrations/0006_best_resets.sql"),
+    include_str!("migrations/0007_immutable_samples.sql"),
 ];
 
 pub struct Store {
@@ -577,6 +578,20 @@ impl Store {
             row_to_run,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Which of these runs passed with warnings (unverified, ADR 0017).
+    pub fn unverified(&self, runs: &[String]) -> Result<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'run_warning' LIMIT 1")?;
+        for r in runs {
+            if stmt.exists(rusqlite::params![r])? {
+                out.insert(r.clone());
+            }
+        }
+        Ok(out)
     }
 
     pub fn events_after(&self, run: &str, after: u64) -> Result<Vec<Event>> {

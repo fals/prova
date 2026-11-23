@@ -186,6 +186,8 @@ struct Supervisor<'a> {
     level: Level,
     suite: String,
     default_slow: Duration,
+    /// The framework's own test count, when it printed one.
+    framework_total: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
     partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
@@ -197,6 +199,9 @@ struct Supervisor<'a> {
 
 impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
+        if let EventKind::RunTotals { tests, .. } = &kind {
+            self.framework_total = Some(*tests);
+        }
         if self.terminating
             && let EventKind::TestFinished {
                 outcome, message, ..
@@ -259,7 +264,28 @@ impl Supervisor<'_> {
     /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
     fn slow_budget(&self, test: &TestKey) -> (Duration, BudgetFrom) {
         let id = crate::store::test_id(&self.suite, test);
-        match crate::analysis::stats(self.store, &id, 20) {
+        // The history is shared across suites (ADR 0018): a test this suite
+        // has not recorded yet may be known from another (round 9: 60 s
+        // default in `make` while `default` knew it takes 3 ms).
+        let known = match crate::analysis::stats(self.store, &id, 20) {
+            Ok(Some(s)) => Ok(Some(s)),
+            _ => {
+                let other: Option<String> = self
+                    .store
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM tests WHERE display = ?1 LIMIT 1",
+                        rusqlite::params![test.display()],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                match other {
+                    Some(o) => crate::analysis::stats(self.store, &o, 20),
+                    None => Ok(None),
+                }
+            }
+        };
+        match known {
             Ok(Some(s)) if s.p95_ms.is_some() => (
                 Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000)),
                 BudgetFrom::History,
@@ -363,6 +389,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         running: BTreeMap::new(),
         terminating: false,
         partial: Default::default(),
+        framework_total: None,
     };
     store.set_level(run, sup.level)?;
 
@@ -411,7 +438,14 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     let pgid = child.id();
     sup.emit(EventKind::RunStarted { pid: pgid });
     if !injected.is_empty() {
-        let vars: Vec<String> = injected.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // Short: the temporary paths are noise in every summary (round 9).
+        let vars: Vec<String> = injected
+            .iter()
+            .map(|(k, v)| match v.find('/') {
+                Some(i) => format!("{k}={}…", &v[..i]),
+                None => format!("{k}={v}"),
+            })
+            .collect();
         sup.emit(EventKind::RunNote {
             message: format!("injected by prova.toml (opt-in): {}", vars.join("; ")),
         });
@@ -606,17 +640,21 @@ fn observe_child(
         }
         if spec.selection.is_none() {
             sup.flush()?; // this run's results must be in the store to compare
+            // A skipped test did not run (round 9: `#[ignore]` on a test
+            // that passed before gave a clean pass).
             let current: Vec<String> = {
-                let mut stmt = store
-                    .conn()
-                    .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+                let mut stmt = store.conn().prepare(
+                    "SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1 AND outcome <> 'skipped'",
+                )?;
                 stmt.query_map(rusqlite::params![run], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?
             };
             if let Some((prev, missing, total)) =
                 missing_since_last_pass(store, run, &sup.suite, &current)?
             {
-                if current.is_empty() && observed == 0 {
+                // Quiet output can hide every test while the framework counted
+                // them: that is not "none ran" (round 9).
+                if current.is_empty() && observed == 0 && sup.framework_total.unwrap_or(0) == 0 {
                     // Say why when the output does (a compile error, round 8).
                     let cause = (exit_code != Some(0))
                         .then(|| sup.distiller.first_crash())
@@ -634,7 +672,7 @@ fn observe_child(
                 } else if !missing.is_empty() {
                     let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
                     warnings.push(format!(
-                        "{} test(s) from the last passing run {prev} did not run: {}{}",
+                        "{} test(s) from the last passing run {prev} did not run (missing or skipped): {}{}",
                         missing.len(),
                         names.join(", "),
                         if missing.len() > names.len() {
@@ -645,6 +683,52 @@ fn observe_child(
                     ));
                 }
             }
+        }
+    }
+    // Results that cannot come from this run: a test reported (or known
+    // from history) to take longer than the whole run (round 9: a Makefile
+    // that echoes `test x ... ok`, a stale JUnit file refreshed by touch).
+    if status == Status::Finished && spec.expects_tests() {
+        sup.flush()?;
+        let wall = now_ms().saturating_sub(started_ms);
+        let mut stmt = store.conn().prepare(
+            "SELECT t.display, a.duration_ms,
+                    (SELECT MIN(h.duration_ms) FROM attempts h JOIN runs r ON r.id = h.run_id
+                      WHERE h.test_id = a.test_id AND h.run_id <> a.run_id AND r.status = 'finished'
+                        AND h.outcome = 'passed' AND h.duration_ms IS NOT NULL),
+                    (SELECT COUNT(*) FROM attempts h JOIN runs r ON r.id = h.run_id
+                      WHERE h.test_id = a.test_id AND h.run_id <> a.run_id AND r.status = 'finished'
+                        AND h.outcome = 'passed' AND h.duration_ms IS NOT NULL)
+               FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id = ?1 AND a.outcome = 'passed'",
+        )?;
+        let rows: Vec<(String, Option<i64>, Option<i64>, i64)> = stmt
+            .query_map(rusqlite::params![run], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let limit = wall as i64 + 200;
+        let impossible = rows.iter().find_map(|(name, own, fastest, n)| {
+            if own.is_some_and(|d| d > limit) {
+                Some(format!(
+                    "{name} reports {} but the whole run took {}",
+                    crate::ids::format_duration(Duration::from_millis(own.unwrap_or(0) as u64)),
+                    crate::ids::format_duration(Duration::from_millis(wall))
+                ))
+            } else if *n >= 2 && fastest.is_some_and(|d| d > limit) {
+                Some(format!(
+                    "{name} never took less than {} before, but the whole run took {}",
+                    crate::ids::format_duration(Duration::from_millis(fastest.unwrap_or(0) as u64)),
+                    crate::ids::format_duration(Duration::from_millis(wall))
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some(why) = impossible {
+            warnings.push(format!(
+                "{why}: these results did not come from running the tests now (printed or stale output?)"
+            ));
         }
     }
     // A run cut short where prova saw no test running (result files come
@@ -827,7 +911,12 @@ fn missing_since(
             "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished'
                AND (?3 = 0 OR outcome = 'passed')
                AND json_extract(spec, '$.selection') IS NULL
-               AND EXISTS (SELECT 1 FROM attempts a WHERE a.run_id = runs.id)
+               -- only a verified pass is a baseline (round 9: a forged pass
+               -- became the reference and failed honest runs after it)
+               AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id = runs.id AND e.kind = 'run_warning'))
+               -- a reference that saw passing tests: quiet output shows only
+               -- failures, and named the wrong suspect (round 9)
+               AND EXISTS (SELECT 1 FROM attempts a WHERE a.run_id = runs.id AND a.outcome = 'passed')
              ORDER BY created_ms DESC LIMIT 1",
             rusqlite::params![suite, run, passed_only as i64],
             |r| r.get(0),
@@ -836,7 +925,7 @@ fn missing_since(
     let Some(prev) = prev else { return Ok(None) };
     let mut stmt = store.conn().prepare(
         "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.run_id = ?1 GROUP BY a.test_id ORDER BY t.display",
+         WHERE a.run_id = ?1 AND a.outcome <> 'skipped' GROUP BY a.test_id ORDER BY t.display",
     )?;
     let earlier: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![prev], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -998,6 +1087,9 @@ fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
     if !orphan {
         return Ok(false);
     }
+    // The supervisor died, but the command may not have: kill what is left
+    // of its process group (round 9: nextest and a hung test ran on).
+    kill_leftovers(store, &row.id)?;
     store.abort_orphan(
         &row.id,
         row.status,
@@ -1005,6 +1097,32 @@ fn reap_orphan(store: &Store, row: &RunRow) -> Result<bool> {
         now_ms(),
         "supervisor exited without ending the run",
     )
+}
+
+/// Kills the process group of a run's command if any of it is still alive
+/// (the command was started in its own group, whose id is its pid). Returns
+/// how many processes were found.
+pub fn kill_leftovers(store: &Store, run: &str) -> Result<usize> {
+    use rusqlite::OptionalExtension;
+    let payload: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT payload FROM events WHERE run_id = ?1 AND kind = 'run_started' LIMIT 1",
+            rusqlite::params![run],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(pgid) = payload
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+        .and_then(|v| v["pid"].as_u64().or(v["kind"]["pid"].as_u64()))
+    else {
+        return Ok(0);
+    };
+    let left = process::sample_group(pgid as u32).pids.len();
+    if left > 0 {
+        process::kill_group(pgid as u32);
+    }
+    Ok(left)
 }
 
 /// Blocks at most `max_wait` for the next significant event after `after`.

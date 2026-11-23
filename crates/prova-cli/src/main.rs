@@ -883,8 +883,13 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                 Some(baseline.as_str())
             };
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
+            // The baseline as a commit, not only a ref name (round 9).
+            let sha = experiment::variant(&store, &name, "baseline")?
+                .commit_sha
+                .map(|s| format!(" ({})", &s[..s.len().min(12)]))
+                .unwrap_or_default();
             println!(
-                "experiment {name} created (protocol {}), baseline = {baseline}",
+                "experiment {name} created (protocol {}), baseline = {baseline}{sha}",
                 p.hash()
             );
             println!(
@@ -1233,6 +1238,13 @@ fn print_output(
         } else {
             for (d, t) in found {
                 println!("== {d}\n{t}");
+                // A one-line excerpt cut with "..." is the framework's own
+                // short summary (pytest -q), not the test's output (round 9).
+                if t.trim().lines().count() <= 1 && t.trim_end().ends_with("...") {
+                    println!(
+                        "note: this is the framework's shortened summary line, not the test's own output; `prova output {id}` has the run's output, and a verbose suite (`prova adopt --write`) keeps the full failure"
+                    );
+                }
             }
         }
         return Ok(exit::PASSED);
@@ -1321,6 +1333,9 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 "--stall-after",
                 "--kill-after",
                 "--keep-output",
+                "--until",
+                "--max-wait",
+                "--repeat",
             ];
             if let Some(f) = command
                 .iter()
@@ -1331,8 +1346,26 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 );
             }
             let (suite_name, mut spec, run_cwd) = if !command.is_empty() {
-                if suite.is_some() || select.is_some() {
+                if suite.is_some() {
                     bail!("give either a suite name or a command after --, not both");
+                }
+                // --select needs a suite's select template (round 9: the
+                // old message talked about a suite nobody gave).
+                if select.is_some() {
+                    let with: Vec<&String> = cfg
+                        .suite
+                        .iter()
+                        .filter(|(_, s)| s.select.is_some())
+                        .map(|(n, _)| n)
+                        .collect();
+                    match with.first() {
+                        Some(n) => bail!(
+                            "--select runs one test through a suite's select template, not a command after --: prova run {n} --select <test>"
+                        ),
+                        None => bail!(
+                            "--select runs one test through a suite's select template; there is none yet: `prova adopt --write` proposes one"
+                        ),
+                    }
                 }
                 let rel = cwd
                     .strip_prefix(&root)
@@ -1475,7 +1508,16 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             let row = store.run(&id)?;
             if row.status.is_terminal() {
-                println!("run {id} already {}", row.status.as_str());
+                // An aborted run's command may outlive its supervisor.
+                let killed = engine::kill_leftovers(&store, &id)?;
+                if killed > 0 {
+                    println!(
+                        "run {id} already {}; killed {killed} process(es) it left running",
+                        row.status.as_str()
+                    );
+                } else {
+                    println!("run {id} already {}", row.status.as_str());
+                }
                 return Ok(exit::PASSED);
             }
             store.request_cancel(&id)?;
@@ -1504,7 +1546,8 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     out.push(serde_json::json!({ "repo": k, "runs": runs }));
                 } else if !runs.is_empty() {
                     println!("== {}  ({})", k.name, k.workspace);
-                    render::runs(&runs, false);
+                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+                    render::runs(&runs, &store.unverified(&ids)?, false);
                 }
             }
             if json {
@@ -1533,7 +1576,8 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     if engine::reap_orphans(&store, &runs)? {
                         runs = store.recent_runs(20)?;
                     }
-                    render::runs(&runs, json);
+                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+                    render::runs(&runs, &store.unverified(&ids)?, json);
                     Ok(exit::PASSED)
                 }
             }
@@ -1855,6 +1899,20 @@ fn repeat_runs(
             println!("  every test passed every time");
         } else if steady > 0 {
             println!("  {steady} other test(s) passed every time");
+        }
+        // A known flaky test that passed every time here proves little
+        // (round 9: "every test passed every time" for a 22% flake).
+        for f in analysis::flaky(store, None, 50)? {
+            if let Some((p, 0)) = tally.get(&f.display)
+                && *p > 0
+            {
+                println!(
+                    "  note: {} passed {p} of {p} here, but history knows it as flaky ({:.0}% of {} runs failed): {p} passes are weak evidence",
+                    render::clean(&f.display),
+                    f.failure_rate * 100.0,
+                    f.runs
+                );
+            }
         }
         if done < n {
             println!(

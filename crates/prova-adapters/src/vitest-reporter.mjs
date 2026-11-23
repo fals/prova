@@ -10,6 +10,8 @@ export default class ProvaReporter {
   onInit(vitest) {
     this.root = vitest.config.root;
     this.out = process.env.PROVA_STREAM;
+    this.started = new Set();
+    this.order = new Map(); // module id -> its tests, in run order
   }
 
   write(event) {
@@ -24,11 +26,35 @@ export default class ProvaReporter {
     };
   }
 
-  onTestCaseReady(testCase) {
+  start(testCase) {
+    if (this.started.has(testCase.id)) return;
+    this.started.add(testCase.id);
     this.write({ ...this.base(testCase), event: "started" });
   }
 
+  onTestCaseReady(testCase) {
+    this.start(testCase);
+  }
+
+  // Vitest batches "ready" updates from the worker: a test that hangs may
+  // never have its own reach the reporter. Tests of one file run in order,
+  // so when one finishes the next one has started (prova round 9).
+  onTestModuleCollected(testModule) {
+    const tests = [...testModule.children.allTests()].filter((t) => t.options?.mode !== "skip" && t.options?.mode !== "todo");
+    this.order.set(testModule.moduleId, tests);
+    if (tests.length && !tests[0].options?.concurrent) this.start(tests[0]);
+  }
+
+  next(testCase) {
+    const tests = this.order.get(testCase.module.moduleId) ?? [];
+    const i = tests.findIndex((t) => t.id === testCase.id);
+    const n = i >= 0 ? tests[i + 1] : undefined;
+    if (n && !n.options?.concurrent) this.start(n);
+  }
+
   onTestCaseResult(testCase) {
+    this.started.add(testCase.id);
+    this.next(testCase);
     const result = testCase.result();
     const event = { passed: "ok", failed: "failed", skipped: "ignored" }[result.state];
     if (!event) return;

@@ -52,6 +52,9 @@ const CACHES: &[&str] = &[
     ":(exclude,glob)**/obj/**",
     ":(exclude,glob)**/bin/Debug/**",
     ":(exclude,glob)**/bin/Release/**",
+    // Core dumps from a crashing test (round 9).
+    ":(exclude,glob)**/core",
+    ":(exclude,glob)**/core.[0-9]*",
     // prova's own config and folder are not the code under test: adding
     // prova.toml must not make the same code look like a new version.
     ":(exclude,top)prova.toml",

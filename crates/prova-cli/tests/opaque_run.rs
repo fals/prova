@@ -576,3 +576,52 @@ fn an_unfinished_line_is_in_the_live_output() {
     assert!(stdout(&out).contains("...."), "{}", stdout(&out));
     prova(&d, &["cancel", &id]);
 }
+
+/// Round 9: when the supervisor died, the command ran on and `cancel` said
+/// only "already aborted".
+#[test]
+fn a_dead_supervisor_does_not_leave_the_command_running() {
+    let d = workspace("deadsup");
+    let id = detach(&d, &[], "exec sleep 31.4159");
+    let runs: serde_json::Value =
+        serde_json::from_str(&stdout(&prova(&d, &["status", "--json"]))).unwrap();
+    let sup = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .and_then(|r| r["supervisor_pid"].as_u64())
+        .expect("supervisor pid");
+    std::process::Command::new("kill")
+        .args(["-9", &sup.to_string()])
+        .status()
+        .unwrap();
+    // Wait (bounded) until the supervisor is gone.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::path::Path::new(&format!("/proc/{sup}")).exists()
+        && std::fs::read_to_string(format!("/proc/{sup}/stat")).is_ok_and(|s| !s.contains(") Z "))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    prova(&d, &["status"]); // reaps the orphan
+    let left = std::process::Command::new("pgrep")
+        .args(["-f", "sleep 31.4159"])
+        .output()
+        .unwrap();
+    assert!(
+        left.stdout.is_empty(),
+        "left running: {}",
+        String::from_utf8_lossy(&left.stdout)
+    );
+}
+
+/// Round 9: `--select` with a command said "give either a suite name or a
+/// command, not both" though no suite was given.
+#[test]
+fn select_with_a_command_says_what_it_needs() {
+    let d = workspace("selcmd");
+    let o = prova(&d, &["run", "--select", "x", "--", "true"]);
+    assert_eq!(o.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("prova adopt --write"));
+}
