@@ -237,7 +237,7 @@ fn events_are_json_lines_in_order() {
 }
 
 #[test]
-fn suite_from_toe_toml_with_selection() {
+fn suite_from_prova_toml_with_selection() {
     let d = workspace("suite");
     std::fs::write(
         d.join("prova.toml"),

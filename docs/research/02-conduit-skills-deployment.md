@@ -54,7 +54,7 @@ CLI versus MCP evidence (blogs and vendor write-ups, indicative only): CLI cheap
 - **Limits (Claude Code)**: description truncated at 1 536 chars; keep `SKILL.md` under 500 lines; non-standard frontmatter is Claude-only.
 - **Distribution**: Claude Code plugin marketplace (git repo with `.claude-plugin/marketplace.json`); Codex plugins; community `skills` CLI.
 - **AGENTS.md**: plain Markdown, no schema, read natively by Codex, Cursor, Copilot. Claude Code reads `CLAUDE.md` **[unverified]**; workaround is `CLAUDE.md` containing `@AGENTS.md`.
-- **Packaging advice**: one repo; standard-only frontmatter; workflow skills (`toe-test`, `toe-experiment`, `toe-improve`) plus short language skills (`toe-rust`, `toe-go`, `toe-python`, `toe-ts`, `toe-java`, `toe-csharp`) with details in `references/`; ship as a Claude Code plugin, mirror into `.agents/skills` via `toe init`, plus an AGENTS.md snippet.
+- **Packaging advice**: one repo; standard-only frontmatter; workflow skills (`prova-test`, `prova-experiment`, `prova-improve`) plus short language skills (`prova-rust`, `prova-go`, `prova-python`, `prova-ts`, `prova-java`, `prova-csharp`) with details in `references/`; ship as a Claude Code plugin, mirror into `.agents/skills` via `prova init`, plus an AGENTS.md snippet.
 
 ## 5. Rust
 
@@ -70,13 +70,13 @@ CLI versus MCP evidence (blogs and vendor write-ups, indicative only): CLI cheap
 | Tool inside dev environment | devcontainers **[unverified]** | works only if the system under test already lives there |
 | Static host binary, container optional | typical Rust CLI | sees host toolchains, zero path mapping; needs per-OS builds |
 
-The harness shell and the system under test's toolchains are on the host. A container-only toe cannot run `cargo test` or `go test` against host toolchains without a host-side runner.
+The harness shell and the system under test's toolchains are on the host. A container-only prova cannot run `cargo test` or `go test` against host toolchains without a host-side runner.
 
 ## Recommendation: CLI core plus thin MCP facade
 
-1. `toe` is a static host binary: runner and event source, JSONL output, documented exit codes. Container image carries toe for containerized workspaces (devcontainer, CI) and any optional long-lived service.
-2. Primary conduit is the CLI: `toe run --detach` returns `run_id`; `toe wait <id> --until first-failure|hang|done --max-wait 30s`; `toe events <id> --follow`; `toe cancel <id>`.
-3. `toe mcp` is a thin facade (stdio first), about five tools mirroring the CLI, with `outputSchema`, small results, `max_wait` at or below 45 s. Never depend on progress, subscriptions, channels or tasks for correctness.
+1. `prova` is a static host binary: runner and event source, JSONL output, documented exit codes. Container image carries prova for containerized workspaces (devcontainer, CI) and any optional long-lived service.
+2. Primary conduit is the CLI: `prova run --detach` returns `run_id`; `prova wait <id> --until first-failure|hang|done --max-wait 30s`; `prova events <id> --follow`; `prova cancel <id>`.
+3. `prova mcp` is a thin facade (stdio first), about five tools mirroring the CLI, with `outputSchema`, small results, `max_wait` at or below 45 s. Never depend on progress, subscriptions, channels or tasks for correctness.
 4. Skills teach the loop (start, wait, fix, rerun) and carry per-language knowledge.
 
 Why not MCP only: 60 s defaults, model-invisible progress, tasks only in one harness. Why not CLI only: MCP adds typed schemas, permission scoping, and reach into shell-less clients at low cost.

@@ -16,49 +16,16 @@ use serde::Serialize;
 use crate::ids::{now_ms, sha256_hex};
 
 /// `PROVA_HOME`, else `$XDG_DATA_HOME/prova`, else `~/.local/share/prova`.
-/// A default home left by toe (prova's former name, ADR 0019) is moved here
-/// once.
 pub fn prova_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("PROVA_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(h));
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(x).join("prova"));
+    }
+    std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })?;
-    let home = base.join("prova");
-    move_toe_home(&base.join("toe"), &home);
-    Some(home)
-}
-
-/// ADR 0019: moves a toe home to the prova home once, when only the old
-/// one exists, and renames each repository's `toe.db` to `prova.db`. Run
-/// ids and history are unchanged. Best effort: a failure leaves the old
-/// home where it was, and prova starts a new one.
-pub fn move_toe_home(old: &Path, new: &Path) {
-    if new.exists() || !old.is_dir() || std::fs::rename(old, new).is_err() {
-        return;
-    }
-    if let Ok(repos) = std::fs::read_dir(new.join("repos")) {
-        for r in repos.flatten() {
-            rename_store_files(&r.path());
-        }
-    }
-}
-
-/// `toe.db` (with its `-wal` and `-shm`) becomes `prova.db` in `dir`.
-pub fn rename_store_files(dir: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let old = dir.join(format!("toe.db{suffix}"));
-        let new = dir.join(format!("prova.db{suffix}"));
-        if old.exists() && !new.exists() {
-            let _ = std::fs::rename(&old, &new);
-        }
-    }
+        .map(|h| PathBuf::from(h).join(".local/share/prova"))
 }
 
 /// Which repository a workspace belongs to.

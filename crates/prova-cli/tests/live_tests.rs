@@ -128,7 +128,7 @@ exit 1"#;
 
 /// Regressions from the M5 usability session (fresh agent, rust fixture).
 #[test]
-fn quiet_output_says_what_toe_could_not_see() {
+fn quiet_output_says_what_prova_could_not_see() {
     let d = workspace("quiet");
     let script = "echo '.F.'; echo 'm::b --- FAILED'; echo 'test result: FAILED. 2 passed; 1 failed; 0 ignored'; exit 101";
     let s = json(&prova(&d, &["run", "--json", "--", "sh", "-c", script]));

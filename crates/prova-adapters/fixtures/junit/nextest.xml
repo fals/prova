@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="nextest-run" tests="2" failures="1" errors="0" uuid="x" timestamp="2026-11-22T10:00:00.000+00:00" time="0.4">
-    <testsuite name="toe-core" tests="2" disabled="0" errors="0" failures="1">
-        <testcase name="store::tests::opens" classname="toe-core" timestamp="2026-11-22T10:00:00.000+00:00" time="0.010">
+    <testsuite name="prova-core" tests="2" disabled="0" errors="0" failures="1">
+        <testcase name="store::tests::opens" classname="prova-core" timestamp="2026-11-22T10:00:00.000+00:00" time="0.010">
         </testcase>
-        <testcase name="engine::tests::races" classname="toe-core" timestamp="2026-11-22T10:00:00.000+00:00" time="0.030">
+        <testcase name="engine::tests::races" classname="prova-core" timestamp="2026-11-22T10:00:00.000+00:00" time="0.030">
             <failure type="test failure">thread 'engine::tests::races' panicked at src/engine.rs:10:5</failure>
             <rerunFailure timestamp="2026-11-22T10:00:00.100+00:00" time="0.020" type="test failure">panicked again</rerunFailure>
             <rerunFailure timestamp="2026-11-22T10:00:00.200+00:00" time="0.020" type="test failure">panicked a third time</rerunFailure>

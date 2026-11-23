@@ -25,8 +25,5 @@ All records below are **Accepted** (2026-11-22, or the date in the row). Later a
 | [0016](0016-distilled-output-no-log-files.md) | Distilled output: everything in SQLite, no log files after a run; supersedes raw-output parts of 0001, 0008, 0013 | no |
 | [0017](0017-no-false-passes.md) | No false passes: a pass needs evidence; amends 0004, 0013 | no |
 | [0018](0018-honest-history-and-live-nextest.md) | Honest history labels (one history per test, finished runs only) and live nextest; amends 0006, 0017 | no |
-| [0019](0019-rename-to-prova.md) | Rename prova to prova, accepted 2026-11-23 (binary, crates, config, home, skills, image); history migrated, no aliases | **yes**: the name |
 
 The deviations from the README were accepted with the records.
-
-**prova** is the former name of **prova** (ADR 0019). Records 0001 to 0018 and `../research/` keep the old name.

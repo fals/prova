@@ -38,6 +38,6 @@ CREATE TABLE artifacts (
     run_id TEXT NOT NULL REFERENCES runs (id),
     kind   TEXT NOT NULL,
     source TEXT NOT NULL,                     -- original path, relative to root
-    sha256 TEXT NOT NULL,                     -- stored at .toe/artifacts/<sha256>
+    sha256 TEXT NOT NULL,                     -- stored at .prova/artifacts/<sha256>
     PRIMARY KEY (run_id, source)
 ) STRICT;

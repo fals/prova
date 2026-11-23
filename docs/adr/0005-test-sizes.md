@@ -8,7 +8,7 @@ Models write broad, slow, flaky tests. Google's size taxonomy constrains what a 
 
 ## Decision
 
-Every suite in `toe.toml` declares a size. Sizes are defined by allowed resources:
+Every suite in `prova.toml` declares a size. Sizes are defined by allowed resources:
 
 | | small | medium | large |
 |---|---|---|---|
@@ -19,13 +19,13 @@ Every suite in `toe.toml` declares a size. Sizes are defined by allowed resource
 | Slow budget default | 1 s per test | 30 s per test | 300 s per test |
 | Hard ceiling per test | 60 s | 300 s | 900 s |
 
-Ceilings follow Bazel's size-to-timeout mapping. Slow budget defaults are toe's own starting values, replaced by history once it exists ([0004](0004-liveness-and-fail-fast.md)).
+Ceilings follow Bazel's size-to-timeout mapping. Slow budget defaults are prova's own starting values, replaced by history once it exists ([0004](0004-liveness-and-fail-fast.md)).
 
 Rules:
 
 1. Size is **declared** per suite, optionally overridden per test through the framework's native tagging where the adapter can read it.
-2. toe **reports violations it can observe cheaply**: a small test that exceeds the small ceiling or leaks a child process is flagged. Network and disk sandboxing are not enforced in v1.
-3. `toe run` defaults to small suites; medium and large are named explicitly. This steers the inner loop to the fast tests.
+2. prova **reports violations it can observe cheaply**: a small test that exceeds the small ceiling or leaks a child process is flagged. Network and disk sandboxing are not enforced in v1.
+3. `prova run` defaults to small suites; medium and large are named explicitly. This steers the inner loop to the fast tests.
 4. Analysis reports the size distribution and warns when it drifts far from a small-heavy shape (rough guideline 80/15/5).
 5. Skills instruct agents to write the smallest test that can fail for the right reason, and to justify any medium or large test.
 

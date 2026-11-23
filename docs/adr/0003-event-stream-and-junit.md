@@ -1,4 +1,4 @@
-# 0003: toe event stream as core contract, JUnit XML as ingest and export
+# 0003: prova event stream as core contract, JUnit XML as ingest and export
 
 Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): adapters are levels of a fidelity ladder, below them sit opaque runs and output recognizers.
 
@@ -10,11 +10,11 @@ Fast feedback needs per-test events during the run. JUnit XML alone cannot give 
 
 ## Decision
 
-1. **Core contract is the toe event stream**: JSON Lines, one event per line, kinds from [0002](0002-formal-model.md). Versioned (`"v": 1`). Schema published as JSON Schema generated from the Rust types.
-2. **Adapters** convert native framework output into toe events. Two tiers:
+1. **Core contract is the prova event stream**: JSON Lines, one event per line, kinds from [0002](0002-formal-model.md). Versioned (`"v": 1`). Schema published as JSON Schema generated from the Rust types.
+2. **Adapters** convert native framework output into prova events. Two tiers:
    - **Streaming adapter**: reads the framework's live output. Gives first-failure and stall detection.
    - **JUnit fallback adapter**: runs any command, then ingests the JUnit XML file(s) it wrote. Lenient parser accepting the superset of known flavors. Gives history and statistics, but only run-level liveness.
-3. **Every finished run can be exported as JUnit XML** (`toe report --junit`), using the Surefire-style `flakyFailure`/`rerunFailure` elements for retries, so existing CI tooling keeps working.
+3. **Every finished run can be exported as JUnit XML** (`prova report --junit`), using the Surefire-style `flakyFailure`/`rerunFailure` elements for retries, so existing CI tooling keeps working.
 4. Field names borrow from CTRF where a concept matches. CTRF and OpenTelemetry are possible export targets later, not part of v1.
 5. Raw framework output is kept as an artifact, so an adapter bug never loses information.
 

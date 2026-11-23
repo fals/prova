@@ -8,13 +8,13 @@ The fourth cold-agent check (three agents on the fixtures, after ADR 0017)
 found no false pass, but several labels that point the wrong way, and one
 path that stopped being live:
 
-- **"New failure" without history.** On a project's first toe run, a failure
+- **"New failure" without history.** On a project's first prova run, a failure
   that existed before the agent touched anything reads `[new failure]`, which
   the skill defines as "likely your change".
 - **History split by suite.** A test run through `make test`, through the
-  `default` suite and through an ad-hoc `toe run -- ...` has three histories,
+  `default` suite and through an ad-hoc `prova run -- ...` has three histories,
   because `test_id` hashes the suite (0006). The same flaky test was `[new
-  failure]` in one suite while `toe flaky` listed it as flaky; `toe history`
+  failure]` in one suite while `prova flaky` listed it as flaky; `prova history`
   silently picked one suite.
 - **Cancelled runs make tests flaky.** A test that hung (`HANG=1`) and was
   cancelled was closed as errored; that errored attempt then counted as a flip
@@ -27,7 +27,7 @@ path that stopped being live:
 - **nextest is not live.** nextest writes its libtest JSON only when a test
   binary finishes, so a one-binary project showed nothing until the end, and
   a hung test was never reported: nextest's own `SLOW [> 60s]` lines were
-  ignored, and as output they kept resetting toe's stall timer. toe's own
+  ignored, and as output they kept resetting prova's stall timer. prova's own
   suites run this way.
 - **Contradicting counts.** A quiet run printed `0 passed` and `warning: no
   test was observed` next to `note: the framework reported 5 tests`.
@@ -39,14 +39,14 @@ path that stopped being live:
    "seen before" and "last passed" are computed over every suite that ran it.
    Two results are the same test when their file (normalised, below) and full
    name are equal. `test_id` stays per suite (selection and suite statistics
-   still use it); the shared key is `(file, display)`. `toe history <name>`
+   still use it); the shared key is `(file, display)`. `prova history <name>`
    shows every suite where the name ran, or asks to be more specific.
 2. **Rust test binaries are named by target.** cargo's deps file stem
    (`calc` from `target/debug/deps/calc-1a2b`), nextest's binary id (last
-   segment: `calc::calc` and `calc` give `calc`, `toe-cli::live` gives
+   segment: `calc::calc` and `calc` give `calc`, `prova-cli::live` gives
    `live`). Doc-tests stay `doctests <crate>`. Histories recorded under the
    old names stay, under those names.
-3. **Labels say what toe knows:**
+3. **Labels say what prova knows:**
    - no earlier result of this test anywhere: `first time seen`, never `new
      failure`; with earlier results that all passed: `new failure`;
    - `FLAKY` and `new failure` are never shown together.
@@ -58,11 +58,11 @@ path that stopped being live:
 5. **nextest is read live.** Its human status lines (`PASS`, `FAIL`, `SKIP`,
    `SLOW`, `TIMEOUT`, retries) are recognized as they print, with the
    duration they carry and the failure output nextest prints under a `FAIL`;
-   its `SLOW` line becomes toe's slow-test event, so `toe wait` returns on a
+   its `SLOW` line becomes prova's slow-test event, so `prova wait` returns on a
    hung test. The JSON that follows at the end of each binary confirms the
    same tests (same identity) at native level.
 6. **Counts never contradict each other.** When the framework reports tests
-   toe could not see individually, the summary says `framework counted N (M
+   prova could not see individually, the summary says `framework counted N (M
    failed)`, and the thin-pass warning says the tests were not visible, not
    that none ran.
 7. **Experiments say their oracle ran.** A comparison under a specification
@@ -83,7 +83,7 @@ path that stopped being live:
 - Identity collisions: two Rust test binaries with the same target name in
   one workspace, or same-named tests with no file attribute in different
   places, share a history. Rare; the price of one history per test.
-- The environment is still not compared: a failure caused by a variable toe
+- The environment is still not compared: a failure caused by a variable prova
   does not record can still look flaky if the run finished. Recorded
   variables and the cancel rule cover the cases seen so far.
 

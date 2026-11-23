@@ -87,11 +87,6 @@ impl Store {
     /// home (ADR 0014). A store left in `<root>/.prova` by an older prova is
     /// imported on first use.
     pub fn open(root: &Path) -> Result<Store> {
-        // ADR 0019: a workspace `.toe/` (prova's former name) becomes `.prova/`.
-        let (old, new) = (root.join(".toe"), root.join(".prova"));
-        if old.is_dir() && !new.exists() && std::fs::rename(&old, &new).is_ok() {
-            crate::home::rename_store_files(&new);
-        }
         let loc = crate::home::locate(root);
         let mut store = Store::open_dir(root, &loc.dir)?;
         store.repo = Some(loc.repo.clone());

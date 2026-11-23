@@ -6,7 +6,7 @@
 import { appendFileSync } from "node:fs";
 import { relative } from "node:path";
 
-export default class ToeReporter {
+export default class ProvaReporter {
   onInit(vitest) {
     this.root = vitest.config.root;
     this.out = process.env.PROVA_STREAM;

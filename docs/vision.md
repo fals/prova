@@ -1,8 +1,6 @@
 # Vision
 
-The original problem statement for prova, as written by its author when the
-project was still called toe ("Test oriented experimentation"); only the name
-is updated here. The [README](../README.md) summarises what prova does today.
+The original problem statement for prova, as written by its author. The [README](../README.md) summarises what prova does today.
 
 
 ## Test

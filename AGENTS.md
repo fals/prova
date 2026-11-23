@@ -4,7 +4,7 @@ Guide for every agent, human or model, working on prova. Read it fully before ch
 
 ## What prova is
 
-prova (formerly toe; Portuguese and Italian for test, trial and proof) gives coding agents one structured way to run tests and experiments on a system under test, get fast event-driven feedback, and keep a history of what ran, with which inputs, and what happened. Vision: [README.md](README.md). Decisions: [docs/adr/](docs/adr/README.md). Evidence: [docs/research/](docs/research/).
+prova (Portuguese and Italian for test, trial and proof) gives coding agents one structured way to run tests and experiments on a system under test, get fast event-driven feedback, and keep a history of what ran, with which inputs, and what happened. Vision: [README.md](README.md). Decisions: [docs/adr/](docs/adr/README.md). Evidence: [docs/research/](docs/research/).
 
 prova is built with prova. As soon as a usable version exists, every test run and every performance claim in this repository goes through it (see [Dogfooding](#dogfooding)).
 

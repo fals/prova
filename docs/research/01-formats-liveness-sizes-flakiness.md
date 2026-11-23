@@ -24,7 +24,7 @@ Date: 2026-11-22. Web-researched by a subagent. Items marked **[unverified]** co
 **Conclusion**
 - Best universal ingest format: JUnit XML, parsed leniently (superset of flavors).
 - Best live streaming: no cross-language winner. Each ecosystem has its own.
-- Realistic design: native streaming adapters per framework normalised into toe's own event schema, with JUnit XML as fallback and cross-check. CTRF is a good source of field names and an export target, not an ingest baseline.
+- Realistic design: native streaming adapters per framework normalised into prova's own event schema, with JUnit XML as fallback and cross-check. CTRF is a good source of field names and an export target, not an ingest baseline.
 
 ## 2. Fail-fast and hang detection
 

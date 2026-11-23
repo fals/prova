@@ -153,10 +153,6 @@ tests, run the trials, keep the proof. The mark is a lowercase p drawn with
 nine dots, after the Portuguese *prova dos nove*, the conclusive check: eight
 green runs and the red one the agent came for.
 
-The project started as **toe**, because coding agents kept stubbing their toe
-on tests: no memory of earlier runs, output dumped to files, absurd timeouts.
-The early design records ([docs/adr](docs/adr/README.md)) still use that name.
-
 ## Documentation
 
 - [Getting started](docs/getting-started.md): install, adopt a project, the loop

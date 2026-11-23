@@ -400,7 +400,7 @@ mod tests {
         );
         assert_eq!(
             cases[1].key.path,
-            vec!["toe-core".to_string()],
+            vec!["prova-core".to_string()],
             "captured output keeps its old name"
         );
     }

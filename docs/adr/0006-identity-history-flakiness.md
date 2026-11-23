@@ -10,7 +10,7 @@ Agents iterate without memory: what was run, what failed before, whether a failu
 
 **Identity.** `test_id = hash(suite, framework, file, suite path, name, normalised parameters)`. Environment is not part of identity; it is a variant dimension on the run. Renames produce a new identity (no rename tracking in v1).
 
-**Code identity.** Git tree hash, plus a hash of the uncommitted diff when the tree is dirty. Two runs are "same code" only when both match. Outside git, a content hash of the tracked files declared in `toe.toml`.
+**Code identity.** Git tree hash, plus a hash of the uncommitted diff when the tree is dirty. Two runs are "same code" only when both match. Outside git, a content hash of the tracked files declared in `prova.toml`.
 
 **Run record.** Command, arguments, selection, selected environment variables, toolchain versions, machine fingerprint, code identity, start and end, per-attempt outcomes and durations.
 
@@ -25,7 +25,7 @@ Agents iterate without memory: what was run, what failed before, whether a failu
 - duration p50 and p95, and regression against the previous window;
 - first-seen and last-seen per failure fingerprint.
 
-**Agent-facing answers.** On a failure, toe states: new or seen before (fingerprint), flaky or consistent on this code, and which code identity last passed. `toe history <test>` and `toe diff <run> <run>` expose the rest.
+**Agent-facing answers.** On a failure, prova states: new or seen before (fingerprint), flaky or consistent on this code, and which code identity last passed. `prova history <test>` and `prova diff <run> <run>` expose the rest.
 
 ## Consequences
 

@@ -13,7 +13,7 @@ use crate::ids::{parse_duration, sha256_hex};
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "{0} is the old name of this file (prova was called toe): rename it to prova.toml; prova does not read toe.toml"
+        "{0} is the old name of this file (prova was called prova): rename it to prova.toml; prova does not read prova.toml"
     )]
     OldName(PathBuf),
     #[error("reading {0}: {1}")]
@@ -172,11 +172,6 @@ pub fn find_root(start: &Path) -> PathBuf {
 pub fn load(root: &Path) -> Result<Config, ConfigError> {
     let path = root.join("prova.toml");
     if !path.exists() {
-        // ADR 0019: the old name is detected, never read.
-        let old = root.join("toe.toml");
-        if old.exists() {
-            return Err(ConfigError::OldName(old));
-        }
         return Ok(Config::default());
     }
     let text = std::fs::read_to_string(&path).map_err(|e| ConfigError::Read(path.clone(), e))?;
