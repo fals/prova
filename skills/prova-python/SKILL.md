@@ -28,5 +28,7 @@ Then:
   matches substrings of test names; node ids also work as the filter.
 - Use the project's virtualenv: `run = ".venv/bin/python -m pytest -v -rfE"`.
 - Fail fast in the fix loop: add `-x` to `select`.
-- Sizes: mark slow or network tests (`@pytest.mark.integration`) and run
-  them as a separate suite with `-m integration`.
+- Sizes are what a test uses, not how long it takes: a test that starts
+  a server, a database or a subprocess, or opens a socket, is medium (large
+  if it reaches another host). Mark those (`@pytest.mark.medium`) and run
+  them as a separate suite with `-m medium`; a slow pure test stays small.
