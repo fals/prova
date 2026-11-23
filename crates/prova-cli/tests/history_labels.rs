@@ -378,6 +378,25 @@ fn a_test_skipped_since_the_last_pass_makes_the_pass_unverified() {
     );
 }
 
+/// A deleted or renamed test is reported once, not on every run after:
+/// the run that reported it becomes the reference (production check:
+/// a renamed test made every later run unverified).
+#[test]
+fn a_removed_test_is_reported_once() {
+    let d = workspace("removed");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test calc::a ... ok'; [ -f gone ] || echo 'test calc::b ... ok'\"\n",
+    )
+    .unwrap();
+    assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
+    std::fs::write(d.join("gone"), "").unwrap();
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(out.contains("PASSED (unverified") && out.contains("calc::b"), "{out}");
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(out.contains("PASSED  "), "{out}");
+}
+
 /// Round 9: output that only looks like results (a Makefile that echoes
 /// `test x ... ok`) passed, though the test is known to take far longer.
 #[test]

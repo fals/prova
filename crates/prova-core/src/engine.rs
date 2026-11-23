@@ -1122,9 +1122,13 @@ fn missing_since(
             "SELECT id FROM runs WHERE suite = ?1 AND id <> ?2 AND status = 'finished'
                AND (?3 = 0 OR outcome = 'passed')
                AND json_extract(spec, '$.selection') IS NULL
-               -- only a verified pass is a baseline (round 9: a forged pass
-               -- became the reference and failed honest runs after it)
-               AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id = runs.id AND e.kind = 'run_warning'))
+               -- a pass whose results are discredited is no baseline (round 9:
+               -- a forged pass became the reference and failed honest runs
+               -- after it); other warnings do not stop a run from becoming
+               -- the reference, or one removed test would be reported on
+               -- every run after it
+               AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM events e WHERE e.run_id = runs.id AND e.kind = 'run_warning'
+                                            AND e.payload LIKE '%; no evidence about the tests%'))
                -- a reference that saw passing tests: quiet output shows only
                -- failures, and named the wrong suspect (round 9)
                AND EXISTS (SELECT 1 FROM attempts a WHERE a.run_id = runs.id AND a.outcome = 'passed')
