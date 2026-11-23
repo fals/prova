@@ -11,14 +11,16 @@ shipped binary has passed on its own platform.
 2. The release workflow's builds passed on the last PR that touched the
    release path (`release.yml`, `Dockerfile.release`, `install.sh`,
    `Cargo.lock`).
-3. The version in `Cargo.toml` (`[workspace.package]`) is the one to tag.
+3. The version in `Cargo.toml` (`[workspace.package]`) is the one to tag:
+   bump it (and the `vX.Y.Z` pins in README, getting started and
+   `llms.txt`) in a PR before tagging; the release refuses a mismatch.
 
 ## Tag
 
 ```sh
 git switch main && git pull
-git tag -a v0.1.0 -m "prova 0.1.0"
-git push origin v0.1.0
+git tag -a vX.Y.Z -m "prova X.Y.Z"
+git push origin vX.Y.Z
 ```
 
 The release workflow then, in order:

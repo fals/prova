@@ -72,7 +72,7 @@ With Docker: the image `ghcr.io/fals/prova` holds only the static binary
 runs your project's own test command:
 
 ```dockerfile
-COPY --from=ghcr.io/fals/prova:v0.1.0 /prova /usr/local/bin/prova
+COPY --from=ghcr.io/fals/prova:v0.1.1 /prova /usr/local/bin/prova
 ```
 
 Release tarballs with checksums are on the
