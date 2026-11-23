@@ -1,6 +1,6 @@
 # 0025: Test sizes come from the resources a test uses, never from its duration
 
-Status: Proposed (2026-11-23). Amends [0005](0005-test-sizes.md) and [0013](0013-black-box-adoption.md) §4.
+Status: Accepted (2026-11-23). Amends [0005](0005-test-sizes.md) and [0013](0013-black-box-adoption.md) §4.
 
 ## Context
 
@@ -49,9 +49,9 @@ What makes a test fast and deterministic is what it touches. Size must say that.
 - Suites that run tests in parallel within one process (pytest-xdist workers, Go's `t.Parallel`, a Vitest worker pool) get per-test sizes only for tests seen alone. Many tests there will show only an upper bound, and prova says so.
 - Skills (prova-test, the language skills) and AGENTS.md describe sizes by resources only.
 
-## Open question
+## Disk and sleep
 
-0005 also forbids disk access and sleep in small tests. This record defines size by processes and network only, as the owner stated. Disk and sleep would then no longer decide a size. If they should, the table gains a column; that needs file observation per test, which /proc does not give cheaply. To be settled before acceptance.
+[0005](0005-test-sizes.md) also forbade disk access and sleep in small tests. Accepted as stated: size is processes and network only, so disk and sleep no longer decide a size. A slow test is still caught by its budget ([0004](0004-liveness-and-fail-fast.md)), whatever its size.
 
 ## Alternatives
 
