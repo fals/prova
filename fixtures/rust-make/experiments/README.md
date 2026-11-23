@@ -4,7 +4,7 @@ Benchmark command (criterion; `make test` does not run benchmarks):
 
     cargo bench --bench primes -- --warm-up-time 1 --measurement-time 2 --noplot
 
-toe metric: `count_primes.time_ns`, criterion's point estimate normalized to
+prova metric: `count_primes.time_ns`, criterion's point estimate normalized to
 nanoseconds (lower is better).
 
 Overlays replace `src/primes.rs` (copy the file and strip the `.txt` extension):

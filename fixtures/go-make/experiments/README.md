@@ -4,7 +4,7 @@ Benchmark command (Go's own `testing.B`; `make test` does not run benchmarks):
 
     go test -run '^$' -bench CountPrimes -count 3 .
 
-toe metric: `BenchmarkCountPrimes.ns_per_op` (lower is better; median of the
+prova metric: `BenchmarkCountPrimes.ns_per_op` (lower is better; median of the
 three counts). Also available: `.bytes_per_op`, `.allocs_per_op`.
 
 Overlays replace `primes.go` (copy the file and strip the `.txt` extension):
@@ -23,7 +23,7 @@ time (the count grows by one exactly at primes, never decreases, excludes
 answer for every n below 3000 and `go run ./cmd/conform` compares
 `CountPrimes` with each.
 
-    toe exp new primes --spec spec/Primes.lean --oracle "sh spec/oracle.sh" \
+    prova exp new primes --spec spec/Primes.lean --oracle "sh spec/oracle.sh" \
       --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- \
       go test -run '^$' -bench CountPrimes -count 3 .
 
@@ -32,4 +32,4 @@ answer for every n below 3000 and `go run ./cmd/conform` compares
   Faster still, and wrong whenever n is prime: rejected by the oracle
   without a single trial (`CountPrimes(3) = 2, specification says 1`).
 
-Needs Lean 4 (`elan`) and Go; the `toe-fixture-lean` image has both.
+Needs Lean 4 (`elan`) and Go; the `prova-fixture-lean` image has both.

@@ -423,6 +423,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "prova-adapters"
+version = "0.1.0"
+dependencies = [
+ "prova-core",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "prova-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "prova-adapters",
+ "prova-core",
+ "serde_json",
+]
+
+[[package]]
+name = "prova-core"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "rusqlite",
+ "rustix",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,45 +698,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "toe-adapters"
-version = "0.1.0"
-dependencies = [
- "quick-xml",
- "serde",
- "serde_json",
- "thiserror",
- "toe-core",
- "toml",
-]
-
-[[package]]
-name = "toe-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "serde_json",
- "toe-adapters",
- "toe-core",
-]
-
-[[package]]
-name = "toe-core"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "rusqlite",
- "rustix",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "toml",
 ]
 
 [[package]]

@@ -4,13 +4,13 @@ Status: Accepted (2026-11-22). Amends [0004](0004-liveness-and-fail-fast.md) (ho
 
 ## Context
 
-An agent trusts `PASSED`. If toe says it when nothing was verified, the agent
-ships a bug with toe's endorsement. Today the run outcome is the exit code,
-lowered to failed when a recognized test failed. Probing toe with commands
-that print what real frameworks print (2026-11-22, toe at f1d7a87) shows the
+An agent trusts `PASSED`. If prova says it when nothing was verified, the agent
+ships a bug with prova's endorsement. Today the run outcome is the exit code,
+lowered to failed when a recognized test failed. Probing prova with commands
+that print what real frameworks print (2026-11-22, prova at f1d7a87) shows the
 ways a run can look green while hiding a problem:
 
-| # | Command prints / does | Exit | toe says | Problem |
+| # | Command prints / does | Exit | prova says | Problem |
 |---|---|---|---|---|
 | 1 | nothing | 0 | PASSED, 0 tests | nothing verified, no warning |
 | 2 | libtest `running 0 tests` (all filtered out) | 0 | PASSED | nothing ran |
@@ -40,7 +40,7 @@ The run outcome is decided from all the evidence, and a pass must be earned.
 1. **Contradictions fail the run** (outcome `failed`, exit 1), whatever the
    exit code:
    - a test errored or never finished (case 8);
-   - the framework's own summary reports more failures than toe recorded
+   - the framework's own summary reports more failures than prova recorded
      (case 9): the framework is believed over its exit code;
    - the framework says no test ran (cases 2 to 6, 14), or a selection
      matched no test;
@@ -74,7 +74,7 @@ The run outcome is decided from all the evidence, and a pass must be earned.
   whose summary disagrees with its exit code no longer passes.
 - A command that legitimately runs no tests (a lint step) still passes, marked
   `verified: false`; a suite meant to run no tests can say so with
-  `expect_tests = false` in `toe.toml`.
+  `expect_tests = false` in `prova.toml`.
 - Outcomes depend on the suite's history (cases 12, 13), so the same command
   can pass in a fresh repository and fail after its tests disappear. The
   summary always names the earlier run it compared with.

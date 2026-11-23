@@ -19,17 +19,17 @@ So the fast path cannot rely on MCP streaming. It must rely on calls that return
 1. **The CLI is the primary conduit.**
 
    ```
-   toe run <suite> [--detach]         # start; prints run id
-   toe wait <run> --until first-failure|stall|done --max-wait 30s
-   toe events <run> --follow          # JSONL stream, for harnesses that can monitor stdout
-   toe cancel <run>
-   toe status | report | history | diff
-   toe exp ...                        # experiments, same pattern
+   prova run <suite> [--detach]         # start; prints run id
+   prova wait <run> --until first-failure|stall|done --max-wait 30s
+   prova events <run> --follow          # JSONL stream, for harnesses that can monitor stdout
+   prova cancel <run>
+   prova status | report | history | diff
+   prova exp ...                        # experiments, same pattern
    ```
 
-   Output is compact, structured (JSON with `--json`, short text otherwise), with documented exit codes ([0004](0004-liveness-and-fail-fast.md)). `toe run` without `--detach` is `run --detach` followed by `wait` loops, for humans and simple cases.
+   Output is compact, structured (JSON with `--json`, short text otherwise), with documented exit codes ([0004](0004-liveness-and-fail-fast.md)). `prova run` without `--detach` is `run --detach` followed by `wait` loops, for humans and simple cases.
 
-2. **`toe mcp` is a thin facade** over the same engine: stdio transport, about five tools (`run_start`, `run_wait`, `run_status`, `run_cancel`, `run_report`) with output schemas and a `max_wait` capped below 45 s. It never depends on progress notifications, subscriptions, or the tasks extension for correctness. Built after the CLI is proven.
+2. **`prova mcp` is a thin facade** over the same engine: stdio transport, about five tools (`run_start`, `run_wait`, `run_status`, `run_cancel`, `run_report`) with output schemas and a `max_wait` capped below 45 s. It never depends on progress notifications, subscriptions, or the tasks extension for correctness. Built after the CLI is proven.
 
 3. **Results are small by default**: failures first, passing tests summarised as counts, full detail on request by run id.
 

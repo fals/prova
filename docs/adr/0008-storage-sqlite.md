@@ -1,26 +1,26 @@
 # 0008: Storage: SQLite single file
 
-Status: Accepted (2026-11-22). Location superseded by [0014](0014-central-store-and-server.md): one central store under `TOE_HOME`, one SQLite file per repository.
+Status: Accepted (2026-11-22). Location superseded by [0014](0014-central-store-and-server.md): one central store under `PROVA_HOME`, one SQLite file per repository.
 
 ## Context
 
-Needs: append-heavy event log, relational entities (runs, tests, attempts, experiments, trials, samples), analytical queries over history, local single file, concurrent access from several `toe` processes (a run supervisor writing while a `wait` reads), works on a container volume. Comparison in [03](../research/03-formalization-experiments-storage.md).
+Needs: append-heavy event log, relational entities (runs, tests, attempts, experiments, trials, samples), analytical queries over history, local single file, concurrent access from several `prova` processes (a run supervisor writing while a `wait` reads), works on a container volume. Comparison in [03](../research/03-formalization-experiments-storage.md).
 
 ## Decision
 
-SQLite, one file at `.toe/toe.db`, via `rusqlite` with the bundled library.
+SQLite, one file at `.prova/prova.db`, via `rusqlite` with the bundled library.
 
 - WAL mode, `synchronous=NORMAL`, `busy_timeout` 5 s, `foreign_keys=ON`.
 - STRICT tables with CHECK constraints mirroring the invariants of [0002](0002-formal-model.md) and [0007](0007-experiments.md).
 - Append-only `event` table: `(run_id, seq)` primary key, kind, timestamp, JSON payload.
 - Writers use short `BEGIN IMMEDIATE` transactions; events are batched per flush.
 - Readers waiting for new events poll cheaply (`PRAGMA data_version`), no extra IPC channel.
-- Large payloads (raw output, JUnit files) go to content-addressed files under `.toe/artifacts/`, referenced by hash.
+- Large payloads (raw output, JUnit files) go to content-addressed files under `.prova/artifacts/`, referenced by hash.
 - Migrations with `rusqlite_migration` (`user_version`), embedded in the binary.
 - On a filesystem where WAL is unsafe (network mounts), fall back to `journal_mode=DELETE` and warn.
 - Percentiles and statistical tests are computed in Rust over query results.
 
-Retention: `toe gc` prunes raw events and artifacts older than a configured age while keeping per-run aggregates.
+Retention: `prova gc` prunes raw events and artifacts older than a configured age while keeping per-run aggregates.
 
 ## Consequences
 

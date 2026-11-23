@@ -1,6 +1,6 @@
 # 0004: Liveness from events, not wall-clock waits
 
-Status: Accepted (2026-11-22). Amended by [0013](0013-black-box-adoption.md): at level 0, stall is defined on process-tree activity.
+Status: Accepted (2026-11-22). Amended by [0019](0019-one-command-per-intent.md): waits for the result default to 9 min. Amended by [0013](0013-black-box-adoption.md): at level 0, stall is defined on process-tree activity.
 
 ## Context
 

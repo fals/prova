@@ -1,2 +1,2 @@
 FROM node:22
-COPY --from=toe:dev /toe /usr/local/bin/toe
+COPY --from=prova:dev /prova /usr/local/bin/prova

@@ -14,11 +14,11 @@ are asked many other questions about a change:
 
 Two things are missing.
 
-1. **Objectives other than time.** toe already reads any metric a workload
+1. **Objectives other than time.** prova already reads any metric a workload
    prints, but deterministic metrics (accuracy on a fixed set, step counts)
    broke the rank test: with zero variance it divided by zero. Native
    benchmark tools (`go test -bench`, criterion, pytest-benchmark, Vitest,
-   JMH, BenchmarkDotNet) print results toe did not read.
+   JMH, BenchmarkDotNet) print results prova did not read.
 2. **Correctness defined before the work starts.** An agent that writes the
    code, the tests and the success criterion in one sitting can always
    declare success. Pre-registration (0007) freezes the metric and the
@@ -35,14 +35,14 @@ statement against each other.
    specification: state, allowed transitions, invariants and properties, and
    the objective metric. Quint is recommended (model checker, random
    simulation, ITF traces for conformance). Lean is accepted when a property
-   needs a proof rather than bounded checking. Any checker works: for toe a
+   needs a proof rather than bounded checking. Any checker works: for prova a
    specification is a set of files plus a command that decides.
-2. **The specification is registered with the protocol.** `toe exp new
+2. **The specification is registered with the protocol.** `prova exp new
    --spec <file>` (repeatable) stores each file's path and sha256 in the
    protocol, so the protocol hash covers the specification. The file must be
    committed; a variant whose copy differs is a violation. Changing the
    specification means a new experiment.
-3. **The oracle gates measurement.** `toe exp new --oracle "<command>"`
+3. **The oracle gates measurement.** `prova exp new --oracle "<command>"`
    runs once in each variant's directory before any trial:
    - baseline violates it: the comparison fails without a verdict (only
      implementations that satisfy the specification are compared);
@@ -58,15 +58,15 @@ statement against each other.
    divergence. Model checking the spec, property tests derived from its
    invariants, and `lake build` for Lean proofs fit the same slot.
 5. **Any objective.** The metric is whatever the workload prints as a JSON
-   metric line or a native benchmark tool reports (`toe exp metrics -- <cmd>`
+   metric line or a native benchmark tool reports (`prova exp metrics -- <cmd>`
    lists them). Deterministic metrics are valid: identical samples give
    p = 1; constant but different arms are decided by the rank test with the
    usual minimum of five trials per arm. `--better higher` for accuracy.
-6. **Skills carry the method.** `toe-spec` teaches formalizing a problem,
+6. **Skills carry the method.** `prova-spec` teaches formalizing a problem,
    checking the spec, writing the driver and registering the experiment;
-   `toe-experiment` covers objectives, benchmark tools and the gate.
+   `prova-experiment` covers objectives, benchmark tools and the gate.
 
-toe does not parse, generate or interpret specifications. It freezes them,
+prova does not parse, generate or interpret specifications. It freezes them,
 runs the oracle, and refuses to measure what does not satisfy them.
 
 ## Consequences
@@ -76,16 +76,16 @@ runs the oracle, and refuses to measure what does not satisfy them.
 - Speed, accuracy and step counts are judged by one procedure, and only among
   correct implementations.
 - The first implementation of a problem has no correct baseline to compare
-  against: it is checked with `toe run` on the oracle (or a suite running
+  against: it is checked with `prova run` on the oracle (or a suite running
   it), and experiments start from the first correct version.
 - Projects need the checker's toolchain (Quint needs Node; Lean needs elan).
-  toe needs neither.
+  prova needs neither.
 
 ## Alternatives
 
 - Correctness as a guardrail metric (`violations = 0`): measured, so a
   violating candidate costs full trials and the rank test could still
   call a tiny violation rate "no effect".
-- toe generating specifications: out of scope; the agent writes them with
+- prova generating specifications: out of scope; the agent writes them with
   the skill, the human reviews them.
 - Embedding a Quint or Lean runtime: large footprint, one checker forever.

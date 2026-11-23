@@ -32,7 +32,7 @@ Items marked **[unverified]** come from background knowledge and were not re-che
 - TLA+/PlusCal, Alloy 6, P: viable, no first-class Rust trace-replay bridge **[unverified]**.
 - Data contracts: JSON Schema via `schemars`, TypeSpec or protobuf **[unverified]**.
 
-**Cost/benefit.** toe's risk is lifecycle legality (no verdict without baseline, trials immutable after completion, resume idempotence) and statistical misuse, not deep algorithmic correctness. Model checking plus property tests cover lifecycle risk at a small fraction of the cost of proofs.
+**Cost/benefit.** prova's risk is lifecycle legality (no verdict without baseline, trials immutable after completion, resume idempotence) and statistical misuse, not deep algorithmic correctness. Model checking plus property tests cover lifecycle risk at a small fraction of the cost of proofs.
 
 ## 2. Experiment formalization prior art
 
@@ -40,7 +40,7 @@ Items marked **[unverified]** come from background knowledge and were not re-che
 - **W&B, DVC, Aim, Sacred [unverified]**: same shape. DVC ties experiments to git refs. Sacred captures config, host info, source snapshot.
 - **Optuna**: Study contains Trials; `TrialState` is RUNNING, WAITING, COMPLETE, PRUNED, FAIL; NaN becomes FAIL. https://optuna.readthedocs.io/en/latest/reference/generated/optuna.trial.TrialState.html
 - **Pre-registration [unverified, standard practice]**: declare before data the hypothesis with direction, one primary metric, guardrail metrics, minimum detectable effect, sample size, stopping rule, analysis method. Immutable after first trial.
-- **Karpathy autoresearch**: appends `results.tsv` (`commit, val_bpb, memory_gb, status, description`), status keep/discard/crash. Keep if and only if metric beats best so far, otherwise `git reset`. Single-run strict comparison, no statistics. This is the gap toe fills. (Secondary sources: deepwiki.com/karpathy/autoresearch.)
+- **Karpathy autoresearch**: appends `results.tsv` (`commit, val_bpb, memory_gb, status, description`), status keep/discard/crash. Keep if and only if metric beats best so far, otherwise `git reset`. Single-run strict comparison, no statistics. This is the gap prova fills. (Secondary sources: deepwiki.com/karpathy/autoresearch.)
 - **OpenEvolve/AlphaEvolve**: island model with MAP-Elites archive. **AIDE**: solution tree with Draft, Debug, Improve. **AI Scientist v2**: best-first tree search. (Secondary sources.)
 
 ## 3. Benchmark statistics
@@ -85,7 +85,7 @@ Sources: https://github.com/bheisler/criterion.rs (book/src/analysis.md), https:
 ## Recommendations
 
 **Formalization.**
-1. No Lean in v1: second toolchain and language, while toe's bugs will live in IO and statistics.
+1. No Lean in v1: second toolchain and language, while prova's bugs will live in IO and statistics.
 2. Run and experiment lifecycles as a Quint spec with invariants: no verdict without baseline and at least N trials; protocol frozen after first trial; terminal states absorbing; resume idempotent.
 3. Model-check, then replay traces against Rust via `quint-connect`; fall back to `proptest` state-machine tests against a Rust reference model if the crate proves immature.
 4. Data contracts: Rust types with `serde` + `schemars` producing JSON Schema; SQLite STRICT tables with CHECK constraints.

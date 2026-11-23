@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Reference vectors for crates/toe-core/src/stats.rs, from SciPy.
+"""Reference vectors for crates/prova-core/src/stats.rs, from SciPy.
 
-Usage: python3 scripts/stats-reference.py > crates/toe-core/tests/stats_reference.json
+Usage: python3 scripts/stats-reference.py > crates/prova-core/tests/stats_reference.json
 Hodges-Lehmann intervals follow R's wilcox.test(conf.int=TRUE) formula,
 with the exact null distribution of U enumerated by brute force.
 """

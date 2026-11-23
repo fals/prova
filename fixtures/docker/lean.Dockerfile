@@ -6,4 +6,4 @@ RUN curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-ini
       | sh -s -- -y --no-modify-path --default-toolchain leanprover/lean4:v4.19.0 \
  && lean --version \
  && chmod -R a+rX /opt/elan
-COPY --from=toe:dev /toe /usr/local/bin/toe
+COPY --from=prova:dev /prova /usr/local/bin/prova

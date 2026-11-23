@@ -25,17 +25,17 @@ jobs:
           targets: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked -p toe-cli --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p prova-cli --target ${{ matrix.target }}
       - name: Package
         run: |
-          name=toe-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=prova-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/toe README.md "$name"/
+          cp target/${{ matrix.target }}/release/prova README.md "$name"/
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: softprops/action-gh-release@v2
         with:
-          files: toe-*.tar.gz*
+          files: prova-*.tar.gz*
 
   image:
     runs-on: ubuntu-latest

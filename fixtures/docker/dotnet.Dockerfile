@@ -1,2 +1,2 @@
 FROM mcr.microsoft.com/dotnet/sdk:9.0
-COPY --from=toe:dev /toe /usr/local/bin/toe
+COPY --from=prova:dev /prova /usr/local/bin/prova

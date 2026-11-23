@@ -1,6 +1,6 @@
 # 0011: Formalization: Quint spec, Lean deferred
 
-Status: Accepted (2026-11-22). Amended by [0015](0015-spec-first-experiments.md): projects may use Lean as an oracle; toe's own specs stay in Quint. **Deviates from the README**, which names Lean as a candidate to research.
+Status: Accepted (2026-11-22). Amended by [0015](0015-spec-first-experiments.md): projects may use Lean as an oracle; prova's own specs stay in Quint. **Deviates from the README**, which names Lean as a candidate to research.
 
 ## Context
 
@@ -10,7 +10,7 @@ The goal is a formal contract for the engine, so that skills, adapters and any t
 - data contracts: events, run records, protocol;
 - the statistical verdict procedure.
 
-Lean 4 findings ([03](../research/03-formalization-experiments-storage.md)): the proven way to combine Lean with Rust is AWS Cedar's: an executable Lean model, differentially fuzzed against the Rust code, test-only. It works and it is expensive: a second language and toolchain for every contributor and agent, and non-trivial build integration. toe's likely defects are in process handling, IO and statistics usage, not in theorems about a small state machine.
+Lean 4 findings ([03](../research/03-formalization-experiments-storage.md)): the proven way to combine Lean with Rust is AWS Cedar's: an executable Lean model, differentially fuzzed against the Rust code, test-only. It works and it is expensive: a second language and toolchain for every contributor and agent, and non-trivial build integration. prova's likely defects are in process handling, IO and statistics usage, not in theorems about a small state machine.
 
 Quint is a typed, programmer-readable specification language with TLA+ semantics, a model checker, and a Rust bridge (`quint-connect`) that replays spec traces against an implementation. The bridge is young.
 
@@ -30,7 +30,7 @@ Quint is a typed, programmer-readable specification language with TLA+ semantics
 
 ## Alternatives
 
-- Lean 4 now: strongest guarantees, highest cost, aimed at a risk toe barely has.
+- Lean 4 now: strongest guarantees, highest cost, aimed at a risk prova barely has.
 - TLA+ or Alloy: mature, no Rust trace bridge.
 - Kani or Verus on the Rust code: useful later for small arithmetic kernels.
 - No formal spec: invariants drift between code, docs and skills.
@@ -41,7 +41,7 @@ The Quint below is illustrative: it has not been compiled yet, and the exact `qu
 
 ### Example 1: cancel races with a finishing test
 
-Scenario: the agent sees the first failure and calls `toe cancel`. At the same moment the supervisor is still writing results. What ends up in the store?
+Scenario: the agent sees the first failure and calls `prova cancel`. At the same moment the supervisor is still writing results. What ends up in the store?
 
 Spec, `spec/run.qnt`, with a deliberate hole:
 
@@ -148,13 +148,13 @@ val protocolFrozen =
 What the agent sees at runtime, because the engine enforces the same rules:
 
 ```
-$ toe exp verdict parser-speed
+$ prova exp verdict parser-speed
 error: verdict refused: candidate has 3 of 10 required trials
-next:  toe exp trial parser-speed --arm candidate
+next:  prova exp trial parser-speed --arm candidate
 
-$ toe exp protocol set parser-speed --min-effect 0.5%
+$ prova exp protocol set parser-speed --min-effect 0.5%
 error: protocol frozen at first trial (hash 9f3c...)
-next:  toe exp new --from parser-speed
+next:  prova exp new --from parser-speed
 ```
 
 ### Where each rule lives

@@ -47,5 +47,5 @@ jobs:
         run: |
           scripts/spec-traces.sh "$RUNNER_TEMP/run" 60 "" run
           scripts/spec-traces.sh "$RUNNER_TEMP/exp" 60 "" experiment
-          TOE_TRACE_DIR="$RUNNER_TEMP/run" cargo test -p toe-core --test spec_replay
-          TOE_TRACE_DIR_EXP="$RUNNER_TEMP/exp" cargo test -p toe-core --test spec_replay_experiment
+          PROVA_TRACE_DIR="$RUNNER_TEMP/run" cargo test -p prova-core --test spec_replay
+          PROVA_TRACE_DIR_EXP="$RUNNER_TEMP/exp" cargo test -p prova-core --test spec_replay_experiment

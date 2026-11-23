@@ -155,7 +155,7 @@
       ]
     },
     {
-      "description": "Something the agent should know about how much toe could see.",
+      "description": "Something the agent should know about how much prova could see.",
       "type": "object",
       "properties": {
         "kind": {
@@ -172,7 +172,7 @@
       ]
     },
     {
-      "description": "What the framework's own summary counted (ADR 0018), shown next to\nthe tests toe saw individually so the counts never contradict.",
+      "description": "What the framework's own summary counted (ADR 0018), shown next to\nthe tests prova saw individually so the counts never contradict.",
       "type": "object",
       "properties": {
         "failed": {
