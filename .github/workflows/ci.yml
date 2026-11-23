@@ -25,7 +25,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # A step limit, unlike cancelling, keeps the log: a hung test is then
+      # named by libtest's "has been running for over 60 seconds".
       - run: cargo test --no-fail-fast
+        timeout-minutes: 8
 
   spec:
     runs-on: ubuntu-latest
