@@ -12,7 +12,7 @@ toe is built with toe. As soon as a usable version exists, every test run and ev
 
 - Phase: M0 to M7 merged to main. **Dogfooding Stage B is active**: run tests through toe.
 - Open: GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
-- ADRs 0001 to 0017 are **Accepted** (2026-11-22). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
+- ADRs 0001 to 0018 are **Accepted** (2026-11-22/23). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
 - [0013](docs/adr/0013-black-box-adoption.md) amends 0001, 0003, 0004, 0005 and 0012: `toe run -- <existing command>` works with zero config, fidelity rises from opaque process to result files to output recognizers to native streams, and test size is observed before it is declared. Where they conflict, 0013 wins.
 - Work is tracked as GitHub milestones M0 to M7 with issues.
 

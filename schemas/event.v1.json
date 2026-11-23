@@ -172,6 +172,31 @@
       ]
     },
     {
+      "description": "What the framework's own summary counted (ADR 0018), shown next to\nthe tests toe saw individually so the counts never contradict.",
+      "type": "object",
+      "properties": {
+        "failed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "run_totals"
+        },
+        "tests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "tests",
+        "failed"
+      ]
+    },
+    {
       "description": "The run passed but verified little (ADR 0017): no test observed,\nevery test skipped, tests missing since the last pass, or error\noutput outside any test. A run with a warning is not `verified`.",
       "type": "object",
       "properties": {

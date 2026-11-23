@@ -191,6 +191,12 @@ pub enum EventKind {
     RunNote {
         message: String,
     },
+    /// What the framework's own summary counted (ADR 0018), shown next to
+    /// the tests toe saw individually so the counts never contradict.
+    RunTotals {
+        tests: u64,
+        failed: u64,
+    },
     /// The run passed but verified little (ADR 0017): no test observed,
     /// every test skipped, tests missing since the last pass, or error
     /// output outside any test. A run with a warning is not `verified`.
@@ -219,6 +225,7 @@ impl EventKind {
             EventKind::RunStalled { .. } => "run_stalled",
             EventKind::RunNote { .. } => "run_note",
             EventKind::RunWarning { .. } => "run_warning",
+            EventKind::RunTotals { .. } => "run_totals",
             EventKind::RunFinished { .. } => "run_finished",
         }
     }

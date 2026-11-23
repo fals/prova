@@ -23,7 +23,11 @@ needs attention.
 
 2. Read the result. Each failure carries history:
 
-   - `[new failure]`: toe has not seen this failure before. Likely your
+   - `[first time seen: no history yet]`: toe has never seen this test
+     before (a new project, or a new test). It cannot tell whether your
+     change caused it: run the suite once before changing code to get a
+     baseline.
+   - `[new failure]`: the test passed before and fails now. Likely your
      change, unless the next hint says otherwise.
    - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
      same code both passed and failed. Do not chase it as your bug;
@@ -32,6 +36,12 @@ needs attention.
    - `last passed at tree:...`: the last code where it was green.
    - `note:` lines say what toe could not see (e.g. quiet output hides
      passing tests). Take them seriously: flaky detection depends on it.
+   - A test's history is shared by every suite that runs it (`make`,
+     `default`, an ad-hoc `toe run -- ...`). Cancelled or aborted runs never
+     count as evidence: cancelling a hung test does not make it flaky.
+   - `running now:` names the tests still running when a run stalls or a
+     test is slow; `framework counted N` gives the framework's own count
+     when its output hid individual tests.
 
    - `PASSED (unverified: ...)` with `warning:` lines: the command
      succeeded but proved little: no test was observed, every test was

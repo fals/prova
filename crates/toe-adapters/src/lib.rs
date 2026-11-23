@@ -155,6 +155,12 @@ impl Observer for Ladder {
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
         let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
         let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
+        if self.live.summary_seen {
+            report.events.push(EventKind::RunTotals {
+                tests: self.live.total(),
+                failed: self.live.failed_reported(),
+            });
+        }
         // ADR 0017: evidence against a pass, and passes that verified little.
         let mut outcomes: std::collections::BTreeMap<String, toe_core::model::Outcome> = self
             .live
@@ -178,6 +184,10 @@ impl Observer for Ladder {
                 None if self.live.summary_seen && self.live.total() == 0 => report
                     .contradictions
                     .push("the framework's summary counts 0 tests: nothing ran".into()),
+                None if self.live.total() > 0 => report.warnings.push(format!(
+                    "the framework counted {} test(s), but none was visible individually (quiet output): only its counts and the exit code back this pass",
+                    self.live.total()
+                )),
                 None => report
                     .warnings
                     .push("no test was observed: this verdict rests on the exit code only".into()),

@@ -222,6 +222,9 @@ fn deterministic_metric_under_a_specification_is_accepted() {
         r["comparison"]["result"]["primary"]["candidate_median"],
         60.0
     );
+    // ADR 0018: the verdict says the oracle ran and held on both arms.
+    let spec = r["comparison"]["result"]["specification"].as_str().unwrap();
+    assert!(spec.starts_with("holds on both arms (oracle `"), "{spec}");
 }
 
 #[test]

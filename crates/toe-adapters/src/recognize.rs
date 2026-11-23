@@ -47,6 +47,8 @@ pub struct Recognizers {
     pub summary_seen: bool,
     /// A line in which the framework says that no test ran.
     pub no_tests_line: Option<String>,
+    /// nextest: a FAIL line held while its captured output follows.
+    nextest_pending: Option<(TestKey, Option<u64>, Vec<String>)>,
     /// libtest JSON: tests started in the current suite (one test binary)
     /// and not finished yet.
     libtest_open: Vec<TestKey>,
@@ -246,8 +248,25 @@ impl Recognizers {
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
-        self.totals(line);
         let mut out = Vec::new();
+        // nextest: output captured under a FAIL line belongs to that test
+        // (its echoed libtest summary must not count as the run's totals).
+        if self.nextest_pending.is_some() {
+            if nextest_status(line).is_none()
+                && !line.trim_start().starts_with("────")
+                && !line.trim_start().starts_with("Summary [")
+            {
+                if let Some((_, _, lines)) = self.nextest_pending.as_mut() {
+                    lines.push(line.to_owned());
+                }
+                return out;
+            }
+            self.flush_nextest(&mut out);
+        }
+        if self.nextest(line, &mut out) {
+            return out;
+        }
+        self.totals(line);
         if self.dotnet_message.is_some() {
             if self.dotnet_collect(line) {
                 return out;
@@ -399,7 +418,7 @@ impl Recognizers {
         } else if let Some((binary, test)) = name.split_once('$') {
             let (path, leaf) = split_rust_path(test);
             TestKey {
-                file: Some(binary.to_owned()),
+                file: Some(nextest_binary(binary)),
                 path,
                 name: leaf,
             }
@@ -575,7 +594,7 @@ impl Recognizers {
         // "   Doc-tests toe_core": tests of different binaries may share names.
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("Running ") {
-            self.libtest_binary = Some(rest.split(" (").next().unwrap_or(rest).trim().to_owned());
+            self.libtest_binary = Some(cargo_binary(rest));
             return true;
         }
         if let Some(rest) = t.strip_prefix("Doc-tests ") {
@@ -827,6 +846,81 @@ impl Recognizers {
         self.structured_total.unwrap_or(self.reported_total)
     }
 
+    // ------------------------------------------------------------- nextest
+
+    /// nextest's human status lines, printed live (ADR 0018):
+    /// `PASS [   0.004s] (1/5) calc tests::adds`, `SLOW [> 60.000s] ...`.
+    fn nextest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        let Some((status, dur, binary, test)) = nextest_status(line) else {
+            return false;
+        };
+        let (path, name) = split_rust_path(test);
+        let key = TestKey {
+            file: Some(nextest_binary(binary)),
+            path,
+            name,
+        };
+        let ms = dur
+            .trim_start_matches('>')
+            .trim()
+            .trim_end_matches('s')
+            .parse::<f64>()
+            .ok()
+            .map(|s| (s * 1000.0).round() as u64);
+        match status {
+            "SLOW" => {
+                self.started(key.clone(), out);
+                if let Some(ms) = ms {
+                    out.push(EventKind::TestSlow {
+                        test: key,
+                        elapsed_ms: ms,
+                        budget_ms: ms,
+                    });
+                }
+            }
+            "PASS" | "LEAK" => {
+                self.finished(key, Outcome::Passed, ms, None, Level::Recognized, out)
+            }
+            "SKIP" => self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out),
+            _ => {
+                // FAIL, TIMEOUT, SIGSEGV, ABORT, LEAK-FAIL: hold for the output.
+                self.flush_nextest(out);
+                self.nextest_pending = Some((key, ms, Vec::new()));
+            }
+        }
+        true
+    }
+
+    fn flush_nextest(&mut self, out: &mut Vec<EventKind>) {
+        let Some((key, ms, lines)) = self.nextest_pending.take() else {
+            return;
+        };
+        // Keep what the test printed, not nextest's frame or libtest's echo.
+        let body: Vec<String> = lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.ends_with("───")
+                    && !l.starts_with("running ")
+                    && !l.starts_with("test ")
+                    && !l.starts_with("failures:")
+                    && !l.starts_with("note: run with `RUST_BACKTRACE")
+            })
+            .take_while(|l| !l.starts_with("error: test run failed"))
+            .map(str::to_owned)
+            .collect();
+        let body: Vec<String> = body
+            .into_iter()
+            .filter(|l| !l.contains("::") || l.contains("panicked"))
+            .collect();
+        if !body.is_empty() {
+            self.failure_output.push((key.clone(), body.join("\n")));
+        }
+        let msg = message(&body);
+        self.finished(key, Outcome::Failed, ms, msg, Level::Recognized, out);
+    }
+
     fn close_libtest_block(&mut self) {
         if let Some((key, lines)) = self.libtest_block.take() {
             let text = lines.join("\n").trim().to_owned();
@@ -840,6 +934,7 @@ impl Recognizers {
     pub fn finish(&mut self) -> Vec<EventKind> {
         self.close_libtest_block();
         let mut out = Vec::new();
+        self.flush_nextest(&mut out);
         self.flush_vitest(&mut out);
         out
     }
@@ -919,6 +1014,76 @@ fn reportlog_text(longrepr: &serde_json::Value) -> String {
         }
     }
     lines.join("\n").trim().to_owned()
+}
+
+/// A nextest status line: (status, duration text, binary id, test name).
+fn nextest_status(line: &str) -> Option<(&str, &str, &str, &str)> {
+    const STATUSES: &[&str] = &[
+        "PASS",
+        "FAIL",
+        "SKIP",
+        "SLOW",
+        "TIMEOUT",
+        "SIGSEGV",
+        "SIGABRT",
+        "ABORT",
+        "LEAK",
+        "LEAK-FAIL",
+    ];
+    let t = line.trim_start();
+    let t = match t.strip_prefix("TRY ") {
+        // Retries: only the final verdict counts ("TRY 2 PASS").
+        Some(r) => r
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start(),
+        None => t,
+    };
+    let (status, rest) = t.split_once(' ')?;
+    if !STATUSES.contains(&status) {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix('[')?;
+    let (dur, rest) = rest.split_once(']')?;
+    let mut words = rest.split_whitespace();
+    let mut binary = words.next()?;
+    if binary.starts_with('(') {
+        // "(1/5)" progress counter, possibly with a space inside.
+        while !binary.ends_with(')') {
+            binary = words.next()?;
+        }
+        binary = words.next()?;
+    }
+    let test = words.next()?;
+    if words.next().is_some() || test.contains('/') && !test.contains("::") {
+        return None;
+    }
+    Some((status, dur.trim(), binary, test))
+}
+
+/// Rust test binaries are named by target (ADR 0018): nextest's binary id
+/// keeps its last segment (`calc::calc` and `calc` give `calc`,
+/// `toe-cli::live` gives `live`, `crate::bin/tool` gives `tool`).
+fn nextest_binary(id: &str) -> String {
+    let last = id.rsplit("::").next().unwrap_or(id);
+    last.trim_start_matches("bin/").replace('-', "_")
+}
+
+/// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
+/// the deps file stem without its hash (`calc`), as nextest names it.
+fn cargo_binary(rest: &str) -> String {
+    if let Some((_, path)) = rest.rsplit_once(" (")
+        && let Some(file) = path.trim_end_matches(')').rsplit(['/', '\\']).next()
+    {
+        let stem = file.trim_end_matches(".exe");
+        if let Some((name, hash)) = stem.rsplit_once('-')
+            && !hash.is_empty()
+            && hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return name.replace('-', "_");
+        }
+        return stem.replace('-', "_");
+    }
+    rest.split(" (").next().unwrap_or(rest).trim().to_owned()
 }
 
 fn split_rust_path(name: &str) -> (Vec<String>, String) {
@@ -1105,7 +1270,7 @@ mod tests {
             } if test.name == "slow_integration" => {
                 assert_eq!(
                     test.file.as_deref(),
-                    Some("unittests src/lib.rs"),
+                    Some("calc"),
                     "binary from cargo's Running line"
                 );
                 assert!(message.is_none());
@@ -1169,7 +1334,11 @@ mod tests {
             EventKind::TestFinished { test, .. } => test.file.clone(),
             _ => None,
         });
-        assert_eq!(file.as_deref(), Some("calc::calc"));
+        assert_eq!(
+            file.as_deref(),
+            Some("calc"),
+            "same name as cargo gives the binary"
+        );
         assert_eq!(r.total(), 5, "echoed text totals do not add up");
     }
 
@@ -1191,7 +1360,7 @@ mod tests {
         let (key, text) = r.failure_output.last().unwrap();
         assert_eq!(
             (key.name.as_str(), key.file.as_deref()),
-            ("divides", Some("unittests src/lib.rs"))
+            ("divides", Some("calc"))
         );
         assert!(
             text.starts_with("thread 'tests::divides' panicked") && text.ends_with("right: 4"),
@@ -1230,6 +1399,73 @@ mod tests {
             "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out",
         );
         assert_eq!((r.total(), r.summary_seen), (0, true));
+    }
+
+    /// ADR 0018: nextest's human lines are read live; the JSON that arrives
+    /// when the binary ends confirms the same tests without counting twice.
+    #[test]
+    fn nextest_human_lines_are_live_and_match_the_json() {
+        let mut r = Recognizers::default();
+        let ev = r.line("        PASS [   0.004s] (1/5) calc tests::adds");
+        assert!(
+            matches!(
+                &ev[..],
+                [EventKind::TestFinished {
+                    duration_ms: Some(4),
+                    ..
+                }]
+            ),
+            "{ev:?}"
+        );
+        assert!(
+            r.line("        FAIL [   0.004s] (4/5) calc tests::divides")
+                .is_empty(),
+            "held for output"
+        );
+        r.line("  output ───");
+        r.line("    running 1 test");
+        r.line("    thread 'tests::divides' (1) panicked at src/lib.rs:23:9:");
+        r.line("      left: 16");
+        r.line("    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s");
+        let ev = r.line("        PASS [   1.504s] (5/5) calc tests::slow_integration");
+        let msg = ev.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                message,
+                outcome: Outcome::Failed,
+                ..
+            } if test.name == "divides" => message.clone(),
+            _ => None,
+        });
+        assert!(msg.unwrap().contains("left: 16"));
+        assert_eq!(r.total(), 0, "echoed libtest totals are not the run's");
+        // The JSON at the end of the binary: same keys, no new results.
+        let ev = r.line(r#"{"type":"test","event":"failed","name":"calc::calc$tests::divides","exec_time":0.004,"stdout":"x"}"#);
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, EventKind::TestFinished { .. }))
+        );
+        assert_eq!(r.level, Some(Level::Native));
+        let ev = r.line("        SLOW [> 60.000s] calc tests::hangs_when_asked");
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestSlow {
+                    elapsed_ms: 60000,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
+        assert!(
+            nextest_status("     Summary [   1.504s] 5 tests run: 4 passed, 1 failed").is_none()
+        );
+        assert_eq!(
+            cargo_binary("tests/live.rs (target/debug/deps/live-0123abcd)"),
+            "live"
+        );
+        assert_eq!(nextest_binary("toe-cli::live"), "live");
+        assert_eq!(nextest_binary("toe-cli::bin/toe"), "toe");
     }
 
     #[test]
@@ -1380,7 +1616,11 @@ mod tests {
         let EventKind::TestFinished { test, .. } = &ev[1] else {
             panic!()
         };
-        assert_eq!(test.file.as_deref(), Some("tests/it.rs"));
+        assert_eq!(
+            test.file.as_deref(),
+            Some("it"),
+            "named by target, as nextest names it"
+        );
     }
 
     #[test]

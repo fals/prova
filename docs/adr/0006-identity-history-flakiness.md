@@ -1,6 +1,6 @@
 # 0006: Test identity, history, flake statistics
 
-Status: Accepted (2026-11-22)
+Status: Accepted (2026-11-22). Amended by [0018](0018-honest-history-and-live-nextest.md): one history per test across suites; only finished runs count.
 
 ## Context
 
