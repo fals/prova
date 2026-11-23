@@ -770,6 +770,12 @@ pub struct Summary {
     pub last_seq: u64,
     pub elapsed_ms: u64,
     pub counts: Counts,
+    /// Tests running now (started, not finished), oldest first; at most 10.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub running: Vec<String>,
+    /// The framework's own count (tests, failed), when it printed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<(u64, u64)>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<Failure>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -923,7 +929,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let mut leaked = Vec::new();
     let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut framework: Option<(u64, u64)> = None;
     let mut warnings: Vec<String> = Vec::new();
+    // Tests started and not finished yet, in start order (ADR 0018: a stall
+    // or slow report names what is running).
+    let mut running: Vec<(String, String)> = Vec::new();
     for e in &events {
         match &e.kind {
             EventKind::TestFinished {
@@ -932,6 +942,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 message,
                 ..
             } => {
+                running.retain(|(u, _)| *u != test.unique());
                 slow.remove(&test.unique());
                 finals.insert(
                     test.unique(),
@@ -953,10 +964,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 );
             }
             EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
-            EventKind::TestStarted { .. } => stalled_ms = None,
+            EventKind::TestStarted { test } => {
+                stalled_ms = None;
+                if !running.iter().any(|(u, _)| *u == test.unique()) {
+                    running.push((test.unique(), test.display()));
+                }
+            }
             EventKind::RunFinished { leaked: l, .. } => leaked = l.clone(),
             EventKind::RunNote { message } => notes.push(message.clone()),
             EventKind::RunWarning { message } => warnings.push(message.clone()),
+            EventKind::RunTotals { tests, failed } => framework = Some((*tests, *failed)),
             _ => {}
         }
     }
@@ -1029,6 +1046,12 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         last_seq,
         elapsed_ms: end.saturating_sub(row.started_ms.unwrap_or(row.created_ms)),
         counts,
+        running: if row.status.is_terminal() {
+            Vec::new()
+        } else {
+            running.into_iter().map(|(_, d)| d).take(10).collect()
+        },
+        framework,
         failures,
         stalled_ms,
         slow: if row.status.is_terminal() {
@@ -1080,10 +1103,14 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let same_code_outcomes: Vec<Outcome> = prev
+    // A cancelled or aborted run is named as such, not by an outcome.
+    let same_code_outcomes: Vec<String> = prev
         .iter()
         .filter(|r| r.code == row.code)
-        .filter_map(|r| r.outcome)
+        .map(|r| match r.status {
+            Status::Finished => r.outcome.map(|o| o.as_str().to_owned()).unwrap_or_default(),
+            s => s.as_str().to_owned(),
+        })
         .collect();
     Ok(Some(serde_json::json!({
         "previous_runs": prev.len(),

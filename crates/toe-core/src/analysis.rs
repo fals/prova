@@ -30,13 +30,15 @@ pub struct TestStats {
     pub test_id: String,
     pub display: String,
     pub suite: String,
+    /// Every suite that ran this test (its history is shared, ADR 0018).
+    pub suites: Vec<String>,
     pub runs: usize,
     pub failures: usize,
     pub failure_rate: f64,
     /// Outcome changes between consecutive runs, oldest to newest.
     pub transitions: usize,
     pub passed_on_retry: usize,
-    /// Code identities on which the test both passed and failed.
+    /// Code versions on which the test both passed and failed.
     pub flips_on_same_code: usize,
     pub flaky: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,16 +63,35 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 }
 
 /// Per-run results of a test, newest first, at most `limit` runs.
+/// One test's results, newest first, over every suite that ran it (ADR 0018:
+/// the same file and full name are the same test). Only runs that finished
+/// count; `current`, a run still going or just ended, is included too.
 pub fn test_runs(store: &Store, test_id: &str, limit: usize) -> Result<Vec<TestRun>> {
+    test_runs_with(store, test_id, limit, None)
+}
+
+pub fn test_runs_with(
+    store: &Store,
+    test_id: &str,
+    limit: usize,
+    current: Option<&str>,
+) -> Result<Vec<TestRun>> {
     let mut stmt = store.conn().prepare(
-        "SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
+        "WITH same AS (
+             SELECT t2.id FROM tests t1 JOIN tests t2
+               ON COALESCE(t2.file, '') = COALESCE(t1.file, '') AND t2.display = t1.display
+             WHERE t1.id = ?1),
+         counted AS (
+             SELECT r.id, r.created_ms FROM runs r
+             WHERE (r.status = 'finished' OR r.id = ?3)
+               AND r.id IN (SELECT run_id FROM attempts WHERE test_id IN (SELECT id FROM same)))
+         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint
          FROM attempts a JOIN runs r ON r.id = a.run_id
-         WHERE a.test_id = ?1 AND a.run_id IN (
-             SELECT DISTINCT a2.run_id FROM attempts a2 JOIN runs r2 ON r2.id = a2.run_id
-             WHERE a2.test_id = ?1 ORDER BY r2.created_ms DESC LIMIT ?2)
-         ORDER BY r.created_ms DESC, a.attempt ASC",
+         WHERE a.test_id IN (SELECT id FROM same)
+           AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
+         ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
-    let rows = stmt.query_map(params![test_id, limit as i64], |r| {
+    let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -115,6 +136,15 @@ pub fn test_runs(store: &Store, test_id: &str, limit: usize) -> Result<Vec<TestR
 }
 
 pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestStats>> {
+    stats_with(store, test_id, window, None)
+}
+
+fn stats_with(
+    store: &Store,
+    test_id: &str,
+    window: usize,
+    current: Option<&str>,
+) -> Result<Option<TestStats>> {
     let meta: Option<(String, String)> = store
         .conn()
         .query_row(
@@ -126,7 +156,16 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
     let Some((display, suite)) = meta else {
         return Ok(None);
     };
-    let recent = test_runs(store, test_id, window)?;
+    let recent = test_runs_with(store, test_id, window, current)?;
+    let suites: Vec<String> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
+               ON COALESCE(t2.file, '') = COALESCE(t1.file, '') AND t2.display = t1.display
+             WHERE t1.id = ?1 ORDER BY t2.suite",
+        )?;
+        stmt.query_map(params![test_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
     let counted: Vec<&TestRun> = recent
         .iter()
         .filter(|r| r.outcome != Outcome::Skipped)
@@ -159,6 +198,7 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
         test_id: test_id.to_owned(),
         display,
         suite,
+        suites,
         runs: counted.len(),
         failures,
         failure_rate: if counted.is_empty() {
@@ -225,10 +265,14 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
     let ids: Vec<String> = stmt
         .query_map(params![suite], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut out = Vec::new();
+    let mut out: Vec<TestStats> = Vec::new();
     for id in ids {
         if let Some(s) = stats(store, &id, window)?
             && s.flaky
+            && !out.iter().any(|o| {
+                o.display == s.display
+                    && o.recent.first().map(|r| &r.run) == s.recent.first().map(|r| &r.run)
+            })
         {
             out.push(s);
         }
@@ -371,6 +415,9 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
 /// What history says about one failing test in a run.
 #[derive(Debug, Clone, Serialize)]
 pub struct FailureContext {
+    /// No earlier result of this test anywhere (ADR 0018): it cannot be
+    /// called new or old yet.
+    pub first_seen: bool,
     /// Earlier runs where this test failed with the same fingerprint.
     pub seen_before: usize,
     pub flaky: bool,
@@ -382,10 +429,11 @@ pub struct FailureContext {
 }
 
 pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option<FailureContext>> {
-    let Some(s) = stats(store, test_id, 50)? else {
+    let Some(s) = stats_with(store, test_id, 50, Some(run))? else {
         return Ok(None);
     };
     let this = s.recent.iter().find(|r| r.run == run);
+    let first_seen = !s.recent.iter().any(|r| r.run != run);
     let fp = this.and_then(|r| r.fingerprint.clone());
     let seen_before = s
         .recent
@@ -398,6 +446,7 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         .find(|r| r.run != run && r.outcome == Outcome::Passed)
         .map(|r| r.code.clone());
     Ok(Some(FailureContext {
+        first_seen,
         seen_before,
         flaky: s.flaky,
         last_passed_code,
