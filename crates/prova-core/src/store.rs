@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0006_best_resets.sql"),
     include_str!("migrations/0007_immutable_samples.sql"),
     include_str!("migrations/0008_forgotten_runs.sql"),
+    include_str!("migrations/0009_test_sizes.sql"),
 ];
 
 pub struct Store {
@@ -356,6 +357,27 @@ impl Store {
         let mut suite: Option<String> = None;
         for e in events {
             insert_event(&tx, &e.run, e.seq, e.ts_ms, &e.kind)?;
+            if let EventKind::TestSize {
+                test,
+                attempt,
+                size,
+                evidence,
+            } = &e.kind
+            {
+                if suite.is_none() {
+                    suite = Some(tx.query_row(
+                        "SELECT suite FROM runs WHERE id = ?1",
+                        params![e.run],
+                        |r| r.get(0),
+                    )?);
+                }
+                let id = test_id(suite.as_deref().unwrap_or_default(), test);
+                tx.execute(
+                    "INSERT OR IGNORE INTO test_sizes (run_id, test_id, attempt, size, evidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![e.run, id, attempt, serde_json::to_value(size)?.as_str().unwrap_or("small"), evidence],
+                )?;
+            }
             if let EventKind::TestFinished {
                 test,
                 attempt,

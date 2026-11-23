@@ -219,6 +219,58 @@
       ]
     },
     {
+      "description": "What a test used, when prova could attribute it (ADR 0025): its own\nprocess and descendants, or the run's group while it was the only\ntest running. The size follows from processes and network only.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "test_size"
+        },
+        "size": {
+          "$ref": "#/$defs/Size"
+        },
+        "test": {
+          "$ref": "#/$defs/TestKey"
+        }
+      },
+      "required": [
+        "kind",
+        "test",
+        "attempt",
+        "size",
+        "evidence"
+      ]
+    },
+    {
+      "description": "What the whole command used (ADR 0025): the upper bound for tests\nprova could not attribute.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "run_size"
+        },
+        "size": {
+          "$ref": "#/$defs/Size"
+        }
+      },
+      "required": [
+        "kind",
+        "size",
+        "evidence"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "exit_code": {
@@ -316,6 +368,14 @@
         "failed",
         "skipped",
         "errored"
+      ]
+    },
+    "Size": {
+      "type": "string",
+      "enum": [
+        "small",
+        "medium",
+        "large"
       ]
     },
     "StallBasis": {

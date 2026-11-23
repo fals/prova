@@ -229,6 +229,21 @@ pub enum EventKind {
     RunWarning {
         message: String,
     },
+    /// What a test used, when prova could attribute it (ADR 0025): its own
+    /// process and descendants, or the run's group while it was the only
+    /// test running. The size follows from processes and network only.
+    TestSize {
+        test: TestKey,
+        attempt: u32,
+        size: crate::config::Size,
+        evidence: String,
+    },
+    /// What the whole command used (ADR 0025): the upper bound for tests
+    /// prova could not attribute.
+    RunSize {
+        size: crate::config::Size,
+        evidence: String,
+    },
     RunFinished {
         status: Status,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +267,8 @@ impl EventKind {
             EventKind::RunNote { .. } => "run_note",
             EventKind::RunWarning { .. } => "run_warning",
             EventKind::RunTotals { .. } => "run_totals",
+            EventKind::TestSize { .. } => "test_size",
+            EventKind::RunSize { .. } => "run_size",
             EventKind::RunFinished { .. } => "run_finished",
         }
     }
