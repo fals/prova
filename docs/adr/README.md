@@ -26,5 +26,6 @@ All records below are **Accepted** (2026-11-22, or the date in the row). Later a
 | [0017](0017-no-false-passes.md) | No false passes: a pass needs evidence; amends 0004, 0013 | no |
 | [0018](0018-honest-history-and-live-nextest.md) | Honest history labels (one history per test, finished runs only) and live nextest; amends 0006, 0017 | no |
 | [0019](0019-one-command-per-intent.md) | One command per intent: `run --until`, harness-sized waits, no shell loops around prova; amends 0004, 0012 | no |
+| [0020](0020-oracle-evidence-and-stalls.md) | The oracle shows its work (baseline's oracle tests must pass on the candidate); a stall ends every wait; amends 0015, 0018, 0019 | no |
 
 The deviations from the README were accepted with the records.
