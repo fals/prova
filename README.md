@@ -27,8 +27,8 @@ $ prova run --until first-failure -- make test
 run 3fa9c1d2  suite cmd:38dcb90d  `make test`
 FAILING (run still going)  1.2s  level recognized output  code tree:4e1f0c..+dirty:9a2b..
   FAIL calc::divides [new failure, last passed at tree:4e1f0c..]: expected 4, got 16
-  FAIL calc::flaky_clock [seen 3x before, FLAKY]: clock tick landed on a bad boundary
-next: fix and rerun, or `prova cancel 3fa9c1d2`
+  FAIL calc::flaky_clock [failed 3x before, FLAKY]: clock tick landed on a bad boundary
+next: fix and rerun, or `prova cancel 3fa9c1d2`; `prova wait 3fa9c1d2 --after 14` to keep watching
 ```
 
 ## Highlights
@@ -39,17 +39,17 @@ next: fix and rerun, or `prova cancel 3fa9c1d2`
 - **No long timeouts.** Runs detach; `prova wait` returns within seconds on the
   first failure, a slow test (named) or a stall. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
 - **Memory.** Every attempt is stored with the exact code it ran on: new
-  failure, seen before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
+  failure, failed before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
 - **Experiments, not anecdotes.** Any objective (time, steps, accuracy),
   read straight from `go test -bench`, criterion, pytest-benchmark, Vitest,
-  JMH or BenchmarkDotNet. Pre-registered protocol, interleaved trials,
-  Mann-Whitney test and confidence interval, accept/reject verdict.
+  JMH or BenchmarkDotNet. Pre-registered protocol, interleaved
+  (ABBA) trials, Mann-Whitney test and confidence interval, accept/reject verdict.
   ([experiments](docs/architecture.md#experiments))
 - **Specification first.** State the problem formally (Quint, Lean, any
   checker), check it, then let it judge: a candidate that violates it is
   rejected before it is measured. ([skill](skills/prova-spec/SKILL.md))
 - **Built for agents.** Skills for six languages, compact output with the next
-  command, JSON everywhere, stable exit codes, MCP tools. ([for agents](#for-agents))
+  command, JSON output, stable exit codes, MCP tools. ([for agents](#for-agents))
 - **One history per repository.** Clones and worktrees share it; every run
   records where it ran. ([storage](docs/architecture.md#storage))
 - **Formally specified.** Run and experiment lifecycles are Quint specs,
@@ -102,8 +102,8 @@ More in [Getting started](docs/getting-started.md).
 
 ## For agents
 
-Run `prova init` in a repository: it installs the skills into `.agents/skills`
-(and `.claude/skills`), adds a short section to `AGENTS.md`, and ignores
+Run `prova init` in a repository: it installs the workflow skills, plus the
+skills of the languages it detects, into `.agents/skills` (and `.claude/skills`), adds a short section to `AGENTS.md`, and ignores
 prova's files. Then the agent knows the loop:
 
 ```text
@@ -116,8 +116,9 @@ prova exp ...                     any "is it better?" claim, gated by the spec
 
 - **Exit codes:** 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
   4 infrastructure, 5 still running.
-- **JSON:** every command takes `--json`; events are JSON Lines with a
-  [schema](schemas/event.v1.json).
+- **JSON:** `run`, `wait`, `status`, `output`, `history`, `flaky`, `diff`,
+  `sizes`, `adopt` and the `exp` reports take `--json`; events are JSON Lines
+  with a [schema](schemas/event.v1.json).
 - **MCP:** `claude mcp add prova -- prova mcp` (tools `run_start`, `run_wait`,
   `run_status`, `run_cancel`, `test_history`). The CLI is the primary
   interface: it is cheaper in context and works in every harness.

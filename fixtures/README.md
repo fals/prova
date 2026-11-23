@@ -14,9 +14,10 @@ only the skills).
 | `java-maven` | Java, JUnit 5 + Surefire | `mvn -q test` | `maven:3.9-eclipse-temurin-21` |
 | `csharp-dotnet` | C#, xUnit + VSTest | `dotnet test` | `mcr.microsoft.com/dotnet/sdk:9.0` |
 
-Every fixture has the same four tests, and the same benchmark workload for
+Every fixture has the same five tests, and the same benchmark workload for
 experiments (see below):
 
+- a passing test: `add`;
 - a real bug: `div` multiplies, so the division test fails until fixed;
 - a flaky test: fails on roughly one run in three (clock based);
 - a slow test: about 1.5 s;
@@ -56,3 +57,5 @@ the metric read from the native benchmark output.
 `docker/` holds one Dockerfile per toolchain image: the official image
 plus `COPY --from=prova:dev /prova /usr/local/bin/prova`, the deployment pattern
 prova documents for containers. Dependencies are cached in the `prova-fixture-cache` volume.
+The images have no bubblewrap, so experiments inside them run without a
+sandbox and their verdicts say the arms were not isolated.

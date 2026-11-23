@@ -11,8 +11,8 @@ prova is built with prova. As soon as a usable version exists, every test run an
 ## Current state
 
 - Phase: M0 to M7 merged to main. **Dogfooding Stage B is active**: run tests through prova.
-- Open: GitHub Actions blocked by account billing (`scripts/ci.sh` is the gate).
-- ADRs 0001 to 0018 are **Accepted** (2026-11-22/23). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
+- CI is GitHub Actions (`.github/workflows/ci.yml`: jobs rust, spec, package); `scripts/ci.sh` is the local mirror of the rust and spec jobs.
+- ADRs 0001 to 0024 are **Accepted** (2026-11-22/23). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
 - [0013](docs/adr/0013-black-box-adoption.md) amends 0001, 0003, 0004, 0005 and 0012: `prova run -- <existing command>` works with zero config, fidelity rises from opaque process to result files to output recognizers to native streams, and test size is observed before it is declared. Where they conflict, 0013 wins.
 - Work is tracked as GitHub milestones M0 to M7 with issues.
 
@@ -37,8 +37,16 @@ skills/           Agent Skills shipped with the binary (prova-test, prova-adopt,
 fixtures/         sample projects per language, used by integration and large tests
 docs/adr/         decisions
 docs/research/    sourced research
-prova.toml          prova's own suites, once dogfooding starts
+schemas/          generated JSON Schemas of public contracts (event.v1.json)
+scripts/          ci.sh (local mirror of CI), spec trace generation, statistics reference values
+.github/workflows/  ci.yml (rust, spec, package), release.yml (binaries and image on v* tags)
+install.sh        install script for release binaries
+Dockerfile, Dockerfile.release   container images
+llms.txt          machine-readable index of the docs
+prova.toml        prova's own suites: small, medium, spec, large
 ```
+
+Large tests live in `crates/prova-cli/tests/fixtures_large.rs`, ignored by default and run by `prova run large`.
 
 Create directories when the first file needs them, not before.
 
@@ -51,7 +59,7 @@ cargo build
 cargo install cargo-nextest --locked                      # once: small and medium run under nextest
 cargo install --path crates/prova-cli --root .prova/stable   # refresh stable prova from green main
 .prova/stable/bin/prova run small                             # inner loop
-scripts/ci.sh                                             # full local gate (mirror of CI)
+scripts/ci.sh                                             # local mirror of CI's rust and spec jobs (or: prova run spec)
 ```
 
 Test commands depend on the dogfooding stage, below.
@@ -66,6 +74,7 @@ Test commands depend on the dogfooding stage, below.
 prova run small --until first-failure   # inner loop
 prova run medium --until done           # before opening a PR
 prova run large --until done            # fixtures; repeat the printed `next:` once if it says so
+prova run spec --until done             # scripts/ci.sh: fmt, clippy, tests, Quint, trace replay
 prova history <test>       # before calling a failure new or flaky
 ```
 
@@ -83,7 +92,7 @@ Sizes follow [0005](docs/adr/0005-test-sizes.md).
 |---|---|---|
 | small | one process, no disk, no network, no sleep | unit tests next to the code |
 | medium | subprocesses, temp dirs, SQLite file, localhost | `crates/*/tests/` |
-| large | real fixture projects, real toolchains, containers | `tests/large/`, opt-in |
+| large | real fixture projects, real toolchains, containers | `crates/prova-cli/tests/fixtures_large.rs`, ignored by default, opt-in (`prova run large`) |
 
 - Write the smallest test that can fail for the right reason. A medium or large test needs one line explaining why a smaller one cannot do it.
 - No `sleep` to wait for something to happen. Wait on an event or a condition with a bound.
@@ -130,7 +139,7 @@ Each milestone ends with something an agent can actually use.
 | M4 | Experiments | `prova exp` with frozen protocol, interleaved trials, Mann-Whitney plus effect interval, verdicts; `spec/experiment.qnt` |
 | M5 | Adoption | `prova init`, skills `prova-adopt`, `prova-test`, `prova-rust`; an agent adopts a fixture project with no human help |
 | M6 | Reach | MCP facade; pytest and Vitest adapters; remaining language skills |
-| M7 | Release | static binaries, container image, install docs |
+| M7 | Release | static binaries, container image, install docs (release workflow and install script are in place) |
 
 **Usable** means: an agent with no prior knowledge of prova, given only the skills, adopts an existing project whose tests run via `make test`, runs the fix loop, and gets the first failure without waiting for the suite to end. This is checked on the fixtures by an agent session, with the run recorded in prova.
 
@@ -145,8 +154,8 @@ Each milestone ends with something an agent can actually use.
 
 ## Git
 
-- Default branch `main`, protected by convention: changes arrive through PRs, except docs-only commits the owner asks for directly.
-- GitHub Actions cannot currently start jobs on this account (billing). Until fixed, `scripts/ci.sh` is the merge gate; paste its last line in the PR.
+- Default branch `main` is protected: changes arrive through PRs only.
+- CI must be green on the PR. Run `scripts/ci.sh` (`prova run spec`) locally first.
 - Commit messages: imperative subject under 72 characters, body explaining why.
 - Model-authored commits end with the `Co-Authored-By` line given by the harness.
 - Never commit `.prova/`, `target/`, secrets, or machine-specific paths.

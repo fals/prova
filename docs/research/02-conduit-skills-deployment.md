@@ -75,7 +75,7 @@ The harness shell and the system under test's toolchains are on the host. A cont
 ## Recommendation: CLI core plus thin MCP facade
 
 1. `prova` is a static host binary: runner and event source, JSONL output, documented exit codes. Container image carries prova for containerized workspaces (devcontainer, CI) and any optional long-lived service.
-2. Primary conduit is the CLI: `prova run --detach` returns `run_id`; `prova wait <id> --until first-failure|hang|done --max-wait 30s`; `prova events <id> --follow`; `prova cancel <id>`.
+2. Primary conduit is the CLI: `prova run --detach` returns `run_id`; `prova wait <id> --until first-failure|hang|done --max-wait 30s`; `prova events <id> --follow`; `prova cancel <id>`. (The CLI as built names this `--until stall`, not `hang`.)
 3. `prova mcp` is a thin facade (stdio first), about five tools mirroring the CLI, with `outputSchema`, small results, `max_wait` at or below 45 s. Never depend on progress, subscriptions, channels or tasks for correctness.
 4. Skills teach the loop (start, wait, fix, rerun) and carry per-language knowledge.
 

@@ -1,6 +1,6 @@
 ---
 name: prova-test
-description: Run and fix tests through prova with fast feedback and memory of past runs. Use whenever running, debugging or fixing tests in a project that has prova.toml or a .prova directory, instead of running test commands directly.
+description: Run and fix tests through prova with fast feedback and memory of past runs. Use whenever running, debugging or fixing tests in a project that has prova.toml or a prova section in AGENTS.md, instead of running test commands directly.
 ---
 
 # Test loop with prova
@@ -81,15 +81,18 @@ needs attention.
      whole run, the results equal an earlier run's to the millisecond
      (stale files), the command used no CPU at all (results printed, not
      run), another run in the same directory may have written the result
-     files, or the output shows a crash outside any test. Such a run is no
-     evidence about any test's history. `prova status` lists such a run as `passed?`. Do not report "tests pass" on an
+     files, the output shows a crash outside any test, or a test passed only
+     on a retry. A warning that ends with "no evidence about the tests"
+     (impossible or identical durations, no CPU, shared result files,
+     replayed output) keeps the run out of every test's history.
+     `prova status` lists an unverified run as `passed?`. Do not report "tests pass" on an
      unverified run; read the warnings and make the suite run its tests.
      In `--json`, `verified` is `true` only for a clean pass.
    - A run fails, even with exit 0, when the framework or build tool says it
      failed (`BUILD FAILURE`, a crashed test JVM) or ran nothing (`detail:` names the reason), when a test never
      finished, or when the suite's tests vanished since its last pass.
 
-   Exit codes: 0 passed, 1 test failure, 3 stall/slow/killed, 4 prova or
+   Exit codes: 0 passed, 1 test failure, 2 usage error, 3 stall/slow/killed, 4 prova or
    infrastructure error (also: the test command could not start), 5 still
    running (call `prova wait <run> --after <seq>`).
 

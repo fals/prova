@@ -392,7 +392,10 @@ fn a_removed_test_is_reported_once() {
     assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
     std::fs::write(d.join("gone"), "").unwrap();
     let out = text(&prova(&d, &["run", "t"]));
-    assert!(out.contains("PASSED (unverified") && out.contains("calc::b"), "{out}");
+    assert!(
+        out.contains("PASSED (unverified") && out.contains("calc::b"),
+        "{out}"
+    );
     let out = text(&prova(&d, &["run", "t"]));
     assert!(out.contains("PASSED  "), "{out}");
 }

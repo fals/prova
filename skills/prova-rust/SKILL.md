@@ -11,9 +11,12 @@ description: prova setup details for Rust projects (cargo test, cargo-nextest). 
 
   ```toml
   [suite.default]
-  run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1"
-  select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}"
+  run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc || exit 1; exit $s"
+  select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
   ```
+
+  (The doctest tail is added for a crate with a library; without one, `run`
+  ends at `--success-output final`.)
 
   The format is experimental upstream; `--message-format-version 0.1` pins
   it. nextest writes that JSON only when a test binary ends, so prova also
@@ -35,7 +38,8 @@ description: prova setup details for Rust projects (cargo test, cargo-nextest). 
   `prova adopt` proposes running `cargo test` directly as the default suite
   and keeps `make test` as a separate suite.
 - Plain `cargo test` reports no per-test durations; `prova sizes` and slow
-  budgets need nextest's JUnit report (below).
+  budgets need nextest (its libtest JSON stream above, or its JUnit report
+  below).
 - Single test: `select = "cargo test -- {filter}"` (substring match on the
   test path). Add `--exact` only if names are fully qualified.
 - cargo-nextest: JUnit output is ingested automatically when enabled in

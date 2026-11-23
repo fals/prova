@@ -40,10 +40,21 @@ project's test scripts, Makefile or CI config to adopt prova.
    iteration reruns the whole suite.
 
 4. If step 1 stayed at level opaque, prova sees only pass/fail of the whole
-   run. Propose to the user (do not apply silently) one change that raises
-   the level, as a separate commit they can refuse, for example enabling
-   the framework's JUnit XML reporter or verbose output. See the
-   `prova-<language>` skill for the exact flag.
+   run. First try an injection recipe: it raises the level through the
+   environment, with no edit to the project. Add it to the suite in
+   `prova.toml` (`inject = ["pytest-reportlog"]`) or try it once with
+   `prova run --inject <recipe> -- <command>`:
+
+   - `pytest-reportlog`: every pytest test live (needs the pytest-reportlog plugin);
+   - `pytest-junit`: pytest writes a JUnit report prova reads;
+   - `vitest-stream`: prova's Vitest reporter; also add
+     `--reporter=default --reporter="$PROVA_VITEST_REPORTER"` to the suite command;
+   - `go-nocache`: `go test` reruns tests instead of replaying cached results.
+
+   Only if no recipe fits, propose to the user (do not apply silently) one
+   change that raises the level, as a separate commit they can refuse, for
+   example enabling the framework's JUnit XML reporter or verbose output.
+   See the `prova-<language>` skill for the exact flag.
 
 5. `.prova/` must be in `.gitignore` (`prova init` does it). `prova.toml`
    belongs in version control; commit it when the user's workflow allows.

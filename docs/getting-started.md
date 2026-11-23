@@ -47,7 +47,12 @@ prova run default --until first-failure   # first failure, slow test, stall, or 
 prova run default --until done            # the result; `next:` continues if it takes longer
 prova run default --select <test>
 prova history <test>            # new failure, flaky, or pre-existing?
+prova output <run>              # the kept excerpt; --test <name> for one failing test's output
+prova run default --repeat 5    # is it flaky? each test's tally over 5 runs
 ```
+
+A run whose results were not real (a broken fixture, a stale report) can be
+taken out of every test's history: `prova forget <run> --reason "..."`.
 
 Hidden detail behind the project's own command (`pytest -q`, Go's test
 cache)? Opt in per suite, never by default:
@@ -79,14 +84,27 @@ prova exp new speed --hypothesis "sieve beats trial division" \
   --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- go test -run '^$' -bench . -count 3
 # change code (uncommitted; baseline is HEAD)
 prova exp candidate speed
-prova exp run speed             # interleaved trials, Mann-Whitney + Hodges-Lehmann CI, verdict
+prova exp run speed             # ABBA trials, Mann-Whitney + Hodges-Lehmann CI, verdict
+prova exp log speed             # what failed: a trial, the setup, the oracle
 ```
 
 Native benchmark output is read directly (`go test -bench`, criterion,
 pytest-benchmark, Vitest bench, JMH, BenchmarkDotNet); anything else prints
 `{"metric": "accuracy", "value": 0.93}` lines. Use `--better higher` for
-accuracy or throughput, `--setup "npm ci"` when the baseline checkout needs
-dependencies installed.
+accuracy or throughput, `--setup "npm ci"` when the checkouts need
+dependencies installed: it runs once in each variant's checkout (the
+baseline's and the candidate's snapshots), with network.
+
+By default a candidate may change anything but tests, benchmarks, build and
+runner files. When the change needs one of those (a new dependency in
+`go.mod`), allow it with `--change go.mod` (a glob, repeatable);
+`--change-only` limits the candidate to those paths. Trials and the oracle
+run without network (loopback only) when the arms are sandboxed; pass
+`--allow-network` when the workload or the oracle needs it.
+
+An ACCEPT makes the candidate the new best only if it beats the current
+best. To go back after one that turned out wrong:
+`prova exp best speed baseline --reason "..."`.
 
 ## Specification first
 

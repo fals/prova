@@ -169,6 +169,12 @@ The oracle runs in a checkout whose tracked files are read-only: it must not
 rewrite them (`go generate` into the tree fails); generate into a temporary
 directory instead.
 
+When the arms are sandboxed (bubblewrap), the oracle runs without network:
+loopback only. An oracle that downloads (`npx quint`, `go mod download`)
+fails there; install its tools in `--setup` (which keeps the network) or
+pass `--allow-network` to `prova exp new`. An oracle that leaves a process
+running after it ends is a violation.
+
 Wrap it as one command, e.g. `make conformance`, and add a prova suite so
 `prova run conformance` works in the test loop:
 
@@ -182,7 +188,7 @@ run = "make conformance"
 First correct implementation: run the oracle through prova until it passes.
 
 ```sh
-prova run conformance --detach && prova wait <run>
+prova run conformance --until done
 ```
 
 Improving a correct implementation (faster, fewer steps, more accurate):
@@ -202,8 +208,8 @@ prova exp candidate ipam-fast && prova exp run ipam-fast
 Verdicts that mention the specification:
 
 - `REJECT ... candidate violates the specification`: the oracle failed on
-  the candidate (log path in the reason). Fix correctness first; speed is
-  irrelevant.
+  the candidate; the reason names `prova exp log <experiment> oracle-candidate`,
+  which shows what it printed. Fix correctness first; speed is irrelevant.
 - `... differs from the registered specification`: the candidate edited the
   spec. Never weaken a spec to make a candidate pass. If the spec was wrong,
   say so to the human, fix it, commit, and start a new experiment.

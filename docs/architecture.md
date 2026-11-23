@@ -61,9 +61,10 @@ other command reads and writes the same store directly.
 | Process control | `crates/prova-core/src/process.rs` | process groups, CPU and child sampling from `/proc`, signals |
 | Store | `crates/prova-core/src/store.rs`, `migrations/` | SQLite schema and triggers that re-enforce the spec |
 | Home and identity | `crates/prova-core/src/home.rs`, `identity.rs` | where data lives, repository identity, code identity, run origin |
+| Output | `crates/prova-core/src/output.rs` | distilling a run's output into SQLite at its end; the 64 MB budget per repository |
 | Analysis | `crates/prova-core/src/analysis.rs` | history, flake statistics, run diffs, observed sizes |
-| Experiments | `crates/prova-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, trials, Mann-Whitney + Hodges-Lehmann verdicts |
-| Adapters | `crates/prova-adapters/src/` | recognizing live output, JUnit/TRX parsing, `prova adopt` detection, opt-in injection |
+| Experiments | `crates/prova-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, checkouts, the bubblewrap sandbox for arms, trials, Mann-Whitney + Hodges-Lehmann verdicts; one hidden `prova __exp` worker per comparison |
+| Adapters | `crates/prova-adapters/src/` | recognizing live output, JUnit/TRX parsing, `prova adopt` detection (`adopt.rs`), opt-in injection recipes (`inject.rs`), benchmark metrics (`bench.rs`) |
 | CLI | `crates/prova-cli/src/main.rs`, `render.rs` | commands, exit codes, compact output |
 | MCP facade | `crates/prova-cli/src/mcp.rs` | five tools that call the CLI with `--json` |
 | Skills | `skills/`, embedded by `crates/prova-cli/src/skills.rs` | instructions agents load: workflows and one per language |
@@ -85,28 +86,44 @@ sequenceDiagram
     participant P as Test process group
     participant D as Store
 
-    A->>T: prova run small --detach
+    A->>T: prova run small --until first-failure
     T->>D: create run (inputs frozen: command, code identity, env)
     T->>S: start detached
-    T-->>A: run id (immediately)
     S->>P: spawn in its own process group
     loop while the tests run
         P-->>S: output lines
         S->>S: recognize test results, sample CPU and children
-        S->>D: append events (test_started, test_finished, test_slow, run_stalled)
+        S->>D: append events (test_started, test_finished, test_slow, run_stalled, run_totals, run_warning)
     end
-    A->>T: prova wait <run> --max-wait 30s
-    T->>D: poll for the next significant event
-    D-->>T: first failure (run still going)
-    T-->>A: FAIL m::b [new failure] + message, exit 1
+    T->>D: wait for the next significant event (30 s budget)
+    alt a test failed
+        D-->>T: first failure (run still going)
+        T-->>A: FAIL m::b [new failure] + message, exit 1
+    else budget ran out
+        T-->>A: RUNNING + next: prova wait <run> --after <seq>, exit 5
+    end
     A->>A: fix the code
     A->>T: prova cancel <run> or let it finish
-    A->>T: prova run small --select m::b
+    A->>T: prova run small --select m::b --until first-failure
+    Note over S,D: when the run ends
+    S->>D: distill output into SQLite (excerpt, failing tests' output), delete the spool
+    S->>D: decide the verdict from all evidence (contradictions fail, warnings make a pass unverified)
 ```
 
-`prova wait` never blocks longer than `--max-wait`. It returns on the first
-failure, a slow test, a stall, or the end, and tells the agent the next command
-to run.
+One command per intent ([ADR 0019](adr/0019-one-command-per-intent.md)):
+`prova run <suite> --until ...` starts the run and waits in the same call.
+
+- `--until first-failure` (the default for `prova wait`, 30 s budget) returns
+  on the first failure, a slow test, a stall, or the end.
+- `--until done` (9 min budget) returns only at the end, or on a stall: a
+  stall ends every wait ([ADR 0020](adr/0020-oracle-evidence-and-stalls.md)).
+- When the budget runs out, the command exits 5 and prints a `next:` line
+  with the command that continues the wait.
+
+At the end, the output is distilled into SQLite and the spool file deleted
+([ADR 0016](adr/0016-distilled-output-no-log-files.md)), and the verdict is
+decided from all the evidence: a contradiction fails the run, a warning
+makes a pass unverified ([ADR 0017](adr/0017-no-false-passes.md)).
 
 ## Seeing tests: the fidelity ladder
 
@@ -118,7 +135,7 @@ which level it reached, so the agent knows what it can trust.
 flowchart BT
     L0["Level 0: opaque<br/>exit code, output tail, process tree"]
     L1["Level 1: result files<br/>JUnit XML or TRX written during the run"]
-    L2["Level 2: recognized output<br/>libtest, go test -v, pytest -v, Vitest, VSTest, TAP"]
+    L2["Level 2: recognized output<br/>libtest, nextest status lines, go test -v,<br/>pytest -v, Vitest, VSTest, TAP"]
     L3["Level 3: native stream<br/>go test -json, nextest / libtest JSON,<br/>pytest-reportlog, prova's Vitest reporter"]
     L0 --> L1 --> L2 --> L3
 ```
@@ -127,7 +144,7 @@ flowchart BT
 - Result files (1) fill in tests the live output did not show, and never double count.
 - When the framework's own totals exceed what prova saw (quiet output), the summary says so.
 - Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command), `go-nocache`.
-- Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output, and kept as an artifact of the run.
+- Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output; their results become rows, and the file is not kept ([ADR 0016](adr/0016-distilled-output-no-log-files.md)).
 
 ## Liveness: slow, stalled, killed
 
@@ -144,22 +161,32 @@ flowchart LR
     R -->|kill_after reached| K
 ```
 
-- Slow budget per test: three times its historical p95, else a default by size.
-- Stall is measured on the whole process tree, so a busy compile is never a stall.
+- Slow budget per test: three times its historical p95, else a default by
+  size, or the runner's own SLOW warning (nextest).
+- Stall is measured on the whole process tree, so a busy compile is never a
+  stall. Under 2% of one core counts as idle, so a hung test in an idle JVM
+  or .NET runtime is still a stall.
 - Processes that outlive the run are reported as leaked and killed.
 
 ## Memory: history and flaky tests
 
 Every attempt is stored with the code identity it ran on (git tree, plus a hash
-of uncommitted changes). Each failure in a summary carries context:
+of uncommitted changes) and an environment fingerprint: each variable's name
+with a short hash of its value. Values are never stored, and names that look
+like secrets are left out. Each failure in a summary carries context:
 
 | Tag | Meaning |
 |---|---|
-| `[new failure]` | not seen before with this message fingerprint |
-| `[seen 3x before]` | a known, pre-existing failure |
-| `FLAKY` | passed and failed on the same code, or passed on retry |
+| `first time seen: no history yet` | no earlier result for this test anywhere |
+| `new failure` | its earlier results all passed |
+| `failed 3x before` | a known, pre-existing failure, whatever its message |
+| `has not passed yet` | earlier results exist, but none passed |
+| `FLAKY` | passed and failed on the same code and the same environment, or passed only on a retry |
 | `likely FLAKY` | the whole suite passed on exactly this code before |
+| `failing now: more failures in a row than its flakiness explains` | a flaky test that fails every time now |
+| `environment-dependent, not flaky` | passed on this code with a different environment (the differing variables are named) |
 | `last passed at tree:…` | the last code where this test was green |
+| `run cancelled or aborted: no evidence about the code` | the run was cut short; nothing else is said |
 
 `prova history <test>`, `prova flaky`, `prova diff <a> <b>` and `prova sizes` read the
 same data.
@@ -168,27 +195,51 @@ same data.
 
 For any claim that a change is better: faster, fewer steps, more accurate. A
 protocol frozen before data, an optional specification that defines a correct
-answer, interleaved trials, and a verdict.
+answer, ABBA trials, and a verdict.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Declared: prova exp new (hypothesis, metric, min effect, trials, spec, oracle)
+    [*] --> Declared: prova exp new (hypothesis, metric, min effect, trials, spec, oracle, scope)
     Declared --> Declared: prova exp protocol (allowed until the first trial)
+    Declared --> Reject: candidate changes files outside its scope (never measured)
     Declared --> Checked: prova exp run (protocol frozen), oracle on both arms
     Checked --> Reject: candidate violates the specification (never measured)
     Checked --> Failed: baseline violates the specification
     Checked --> Running: both satisfy it
-    Running --> Running: baseline, candidate, baseline, ... (ABAB)
+    Running --> Running: pairs AB, BA, AB, ... (ABBA)
     Running --> Running: inconclusive, add trials up to max
     Running --> Accept: improvement CI clears min effect, guardrails hold
     Running --> Reject: worse, no practical effect, or guardrail regressed
     Running --> Invalid: trials on different machines
-    Running --> Failed: a trial crashed
-    Accept --> [*]: candidate becomes the new best
+    Running --> Failed: a trial crashed, leaked a process or changed tracked files
+    Running --> Failed: load or a stop hit one arm, a variant drifted, metric counts differ
+    Accept --> [*]: candidate becomes the new best if it beats the current best
     Reject --> [*]
     Invalid --> [*]
     Failed --> [*]
 ```
+
+- **Scope.** By default a candidate may change anything but tests,
+  benchmarks, build and runner files. `--change <glob>` allows more paths;
+  `--change-only` allows only those. A candidate out of scope is rejected
+  before it is measured.
+- **Specification.** The candidate is rejected when its oracle fails a test
+  that the baseline's oracle passed, or when tracked files change while the
+  oracle runs.
+- **Trials** run in pairs, and the pairs alternate which arm goes first
+  (ABBA), so a drift within a pair does not favour one arm.
+- **Failed** covers a trial that crashed or left a process running, a trial
+  that changed tracked files, load from outside aimed at one arm, an arm
+  that was stopped or starved, a variant whose median drifted far from its
+  own history, and a workload that reported the metric a different number of
+  times per trial on each arm.
+- **Accept.** The candidate becomes the new best only when it beats the
+  current best; with `--against baseline` the best stays.
+
+A verdict says what it rests on: a `sandbox:` line (isolated or not), `caveat:`
+lines, and `specification: holds ...` (the same tests passed on each arm, or
+by exit code only). `prova exp status` re-derives every ACCEPT from its
+samples and warns when one no longer follows from them.
 
 Every arm runs in its own detached worktree. A baseline is a git ref; a
 candidate is a snapshot commit of the working tree (tracked and untracked
@@ -197,7 +248,27 @@ so the user's branch, index and stash are untouched, and kept alive by
 `refs/prova/candidates/<experiment>/<label>`. What is measured is what was
 recorded, however the tree changes afterwards (`spec/experiment.qnt`,
 `measuredIsRecorded`). Files ignored by git are absent from worktrees: use the
-protocol's `--setup` to rebuild them. Statistics:
+protocol's `--setup` to rebuild them. Each checkout is verified against the
+commit's own blobs: git replace objects are ignored, and a smudge filter that
+changes what runs is detected and refused.
+
+Arms are isolated from each other and from the user's files:
+
+- When bubblewrap works, every trial, setup and oracle runs in a sandbox:
+  the whole filesystem read-only, shared toolchain caches included; the
+  arm's checkout, its private state directory and a private `/tmp` writable;
+  its own PID namespace; no network but loopback unless `--allow-network`
+  (setup keeps the network). Otherwise the verdict says the arms were not
+  isolated.
+- Each arm has its own build caches (`GOCACHE`, the XDG cache, npm's cache,
+  Python bytecode), and environment variables with secret-like names are
+  removed.
+- Tracked files in the checkouts are read-only, and re-checked after each
+  oracle run and each trial.
+- A foreground `prova exp run` waits at most 9 min, then prints the
+  `prova exp wait` command that continues.
+
+Statistics:
 exact Mann-Whitney U, Hodges-Lehmann interval, Holm correction across an
 improvement loop, verified against SciPy. Deterministic metrics (accuracy on a
 fixed dataset, step counts) are valid samples.
@@ -212,9 +283,11 @@ reduced to their median). `wall_ms` is always recorded. `prova exp metrics --
 **Specification first.** `--spec <file>` freezes the problem's specification
 (Quint, Lean, a labelled dataset) by content hash in the protocol;
 `--oracle <cmd>` (model checker plus trace conformance, property tests, a
-proof build) runs once in each variant before any trial. Only implementations
-that satisfy the specification are measured; a violator can never be
-accepted. The gate is part of the experiment lifecycle spec
+proof build) runs once in each variant before any trial. Every test that
+passed in the baseline's oracle must pass in the candidate's; an oracle that
+shows no individual test holds by its exit code only, and the verdict says
+so. Only implementations that satisfy the specification are measured; a
+violator can never be accepted. The gate is part of the experiment lifecycle spec
 (`spec/experiment.qnt`). The `prova-spec` skill teaches writing the
 specification, checking it, and turning it into an oracle.
 
@@ -232,6 +305,8 @@ run is rows in one SQLite file per repository: no log files pile up.
     runs/<run>/output.log      only while the run is live (owner-only)
     experiments/<id>/          only while a comparison runs
     worktrees/<commit>/        only while a comparison runs
+$XDG_RUNTIME_DIR/prova-arm-<hash>/   one experiment arm's private state and
+                               caches (the temp dir without XDG_RUNTIME_DIR)
 ```
 
 What is kept of the output once a run ends:
@@ -260,10 +335,14 @@ erDiagram
     RUNS ||--o{ EVENTS : "ordered stream"
     RUNS ||--o{ ATTEMPTS : "per test"
     TESTS ||--o{ ATTEMPTS : ""
-    RUNS ||--o{ ARTIFACTS : "result files"
+    RUNS ||--o| RUN_OUTPUT : "excerpt"
+    RUNS ||--o{ TEST_OUTPUT : "failing tests' output"
+    RUNS ||--o| FORGOTTEN : "out of history, with reason"
     EXPERIMENTS ||--o{ VARIANTS : "baseline, candidates"
     EXPERIMENTS ||--o{ COMPARISONS : ""
-    COMPARISONS ||--o{ TRIALS : "interleaved"
+    EXPERIMENTS ||--o{ BEST_RESETS : "prova exp best"
+    COMPARISONS ||--o{ TRIALS : "ABBA"
+    COMPARISONS ||--o{ COMPARISON_OUTPUT : "failed trial, setup, oracle"
     TRIALS ||--o{ SAMPLES : "metric values"
     COMPARISONS ||--o| DECISIONS : "keep, discard, crash"
 ```
@@ -272,7 +351,7 @@ erDiagram
 
 | Where the tests run | How prova gets there |
 |---|---|
-| A developer machine or agent sandbox | `cargo install`, or the release tarball |
+| A developer machine or agent sandbox | the install script (`curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh \| sh`), the release tarball, or `cargo install` from source |
 | A container (devcontainer, CI image) | `COPY --from=ghcr.io/fals/prova:<version> /prova /usr/local/bin/prova` |
 | CI (GitHub Actions, GitLab) | install or copy the binary; keep `PROVA_HOME` in the job and persist it with the CI cache or artifacts |
 | Pods in Kubernetes | same image copy; `PROVA_HOME` on a volume with one writer at a time (no server; SQLite must not have several writers over network storage) |
@@ -284,52 +363,77 @@ the processes.
 
 These are stable interfaces; changing them is a breaking change.
 
-**Commands** (all accept `--json`):
+**Commands:**
 
 | Command | Purpose |
 |---|---|
-| `prova run <suite> [--select <test>] [--detach]` / `prova run -- <cmd>` | start a run |
-| `prova wait <run> [--until first-failure\|stall\|done] [--after <seq>] [--max-wait 30s]` | next significant event |
+| `prova run <suite> [--select <test>] [--until first-failure\|stall\|done] [--max-wait <d>] [--detach]` / `prova run -- <cmd>` | start a run, and wait in the same command with `--until` |
+| `prova run ... [--repeat N] [--stall-after <d>] [--kill-after <d>] [--inject <recipe>] [--keep-output]` | repeat to tally flakiness, liveness limits, opt-in injection, keep the whole output |
+| `prova wait <run> [--until first-failure\|stall\|done] [--after <seq>] [--max-wait <d>]` | next significant event |
 | `prova cancel <run>` | stop the process group |
-| `prova status [<run>] [--all]`, `prova output <run> [--tail N] [--test <name>] [--json]`, `prova events <run>` | inspect |
+| `prova status [<run>] [--all]`, `prova output <run> [--tail N] [--test <name>]`, `prova events <run> [--after <seq>] [--follow]` | inspect |
 | `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes` | memory |
-| `prova exp new\|candidate\|run\|wait\|status\|revalidate` | experiments |
+| `prova forget <run> --reason <text>` | take a run out of every test's history |
+| `prova exp new [--change <glob>] [--change-only] [--allow-network] ...` | declare an experiment |
+| `prova exp protocol\|candidate\|cancel\|list\|log\|metrics\|best\|revalidate\|wait\|status` | experiments |
+| `prova exp run <exp> [--candidate <c>] [--against <variant>] [--detach]` | trials and a verdict |
 | `prova init`, `prova adopt [--write] [--verify <suite> --filter <test>]` | adoption |
 | `prova mcp` | MCP tools `run_start`, `run_wait`, `run_status`, `run_cancel`, `test_history` |
+
+`--max-wait` defaults to 30 s, and to 9 min with `--until done`.
+`--json` is taken by `run`, `wait`, `status`, `output`, `history`, `flaky`,
+`diff`, `sizes`, `adopt`, and `exp run`, `revalidate`, `wait`, `status`,
+`metrics`; `events` always prints JSON Lines.
 
 **Exit codes:**
 
 | Code | Meaning |
 |---|---|
 | 0 | passed (or the command succeeded); check `verified` |
-| 1 | test failure, or evidence against a pass (or experiment rejected) |
+| 1 | test failure, or evidence against a pass |
 | 2 | usage error |
 | 3 | stall, slow test, cancelled or killed |
 | 4 | prova or infrastructure error; the test command could not start (exit 126/127) |
-| 5 | still running: call `prova wait <run> --after <seq>` |
+| 5 | still running: run the printed `next:` command (`prova wait <run> --after <seq>`, `prova wait <run> --until done`, or `prova exp wait <exp>`) |
+
+Experiment commands: 0 accept (or no comparison yet), 1 reject, inconclusive
+or invalid, 3 cancelled, 4 failed, 5 still running.
 
 **History is per test, not per suite.** The same test (same file and full
 name) run by different suites shares one history; only runs that finished
-count. Labels: `first time seen` (no history yet), `new failure` (passed
-before), `seen Nx before`, `FLAKY`. Rust test binaries are named by target,
-whichever runner reports them (cargo, nextest).
+count. Runs with a warning ending "no evidence about the tests", and runs
+taken out with `prova forget`, count nowhere. Labels are listed under
+[Memory](#memory-history-and-flaky-tests). Rust test binaries are named by
+target, whichever runner reports them (cargo, nextest).
 
 **No false passes.** A pass must be earned. The run fails, whatever the exit
 code, when a test errored or never finished, when the framework's own summary
 counts more failures than prova recorded, when the framework says no test ran
-(or a selection matched none), or when the suite ran tests in its last
-passing run and observed none now. A pass that proved little stays a pass
-with `verified: false` and `warnings`: no test observed, every test skipped,
-tests from the last passing run missing, or a crash in the output. A suite
-that runs no tests on purpose declares `expect_tests = false`.
+(or a selection matched none), when the suite ran tests in its last passing
+run and observed none now, when a test process ended early or a libtest
+binary stopped before its summary, or when the build says it failed. A pass
+that proved little stays a pass with `verified: false` and `warnings`: no
+test observed, every test skipped, tests from the last passing run missing, a
+test that last passed now skipped, a crash in the output, or a test that
+passed only on a retry (flaky, not green). Impossible or replayed results
+(a test longer than the whole run, durations identical to an earlier run's,
+no CPU used, result files another run may have written at the same time)
+make the pass unverified and keep the run out of history. A suite that runs
+no tests on purpose declares `expect_tests = false`.
 
 **Events** are JSON Lines with schema [`schemas/event.v1.json`](../schemas/event.v1.json):
 `run_started`, `test_started`, `test_slow`, `test_finished`, `run_stalled`,
-`run_note`, `run_finished`. Each has `run`, a monotonic `seq` and `ts_ms`.
+`run_note`, `run_warning`, `run_totals`, `run_finished`. Each has `run`, a
+monotonic `seq` and `ts_ms`.
 
 **Configuration** is optional: `prova.toml` names suites (`run`, `select` with
-`{filter}`, `size`, `stall_after`, `kill_after`, `results`, `inject`).
-Environment: `PROVA_HOME`, `PROVA_ACTOR`.
+`{filter}`, `size`, `stall_after`, `kill_after`, `results`, `adapter`,
+`inject`, `expect_tests`), and a top-level `env = [...]` lists extra
+environment variables whose values are recorded with each run.
+Environment read by prova: `PROVA_HOME`, `PROVA_ACTOR`. Given to the
+command: `PROVA_RUN_ID`, `PROVA_FILTER` (the selection), and
+`PROVA_VITEST_REPORTER` with the `vitest-stream` recipe; experiment
+workloads get `PROVA_PARAM_<KEY>` from `prova exp candidate --param`.
 
 ## Invariants and where they are enforced
 
@@ -343,7 +447,14 @@ Each rule is stated once in a spec and checked again at runtime.
 | No verdict before the minimum trials on both arms | `spec/experiment.qnt` | `Comparison::decide` | — |
 | Protocol frozen at the first trial | `spec/experiment.qnt` | `experiment::set_protocol` | trigger `experiments_protocol_frozen` |
 | Trials from different machines give no verdict | `spec/experiment.qnt` | `Comparison::decide` | — |
-| Trials and attempts are immutable | — | — | triggers `trials_immutable`, `attempts_immutable` |
+| A pass is earned: exit 0, no failed or errored test, no contradiction | `spec/run.qnt` `passIsEarned` | `Lifecycle::end` | — |
+| The verdict exists exactly when the run ended | `spec/run.qnt` `verdictAtEnd` | `Lifecycle::end` | — |
+| A test starts again only after its last attempt failed | `spec/run.qnt` `retriesFollowFailures` | `Lifecycle` | — |
+| A command that could not start (126, 127) is an error, not a test failure | `spec/run.qnt` `couldNotStartIsAnError` | `Lifecycle` | — |
+| A candidate that violates the specification is never accepted | `spec/experiment.qnt` `violatorNeverAccepted` | `Comparison::reject_violation` | — |
+| No trial before the specification holds on both arms | `spec/experiment.qnt` `trialsNeedTheSpec` | `Comparison::check_spec` | — |
+| Arms alternate (ABBA pairs) | `spec/experiment.qnt` `armsInterleaved` | `Comparison::next_arm` | — |
+| Trials, samples and attempts are immutable | — | — | triggers `trials_immutable`, `samples_immutable_update`, `samples_immutable_delete`, `attempts_immutable` |
 
 CI model-checks both specs and replays generated traces against the Rust state
 machines.
