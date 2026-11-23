@@ -315,7 +315,9 @@ fn exp_check_docker(lang: &str, fixture: &str, prepare: &str, args: &str) {
 
 fn exp_check_docker_expect(lang: &str, fixture: &str, prepare: &str, args: &str, expected: &str) {
     let tag = image(lang);
-    let d = copy_fixture_as(fixture, &format!("{fixture}-exp"));
+    // Per image: tests run in parallel, and two experiments may use one
+    // fixture (go-make on the host and in the Lean image).
+    let d = copy_fixture_as(fixture, &format!("{fixture}-exp-{lang}"));
     std::fs::copy(repo().join("fixtures/exp-check.sh"), d.join("exp-check.sh")).unwrap();
     let o = in_container(&tag, &d, prepare, &format!("sh exp-check.sh {args}"));
     let out = String::from_utf8_lossy(&o.stdout);
