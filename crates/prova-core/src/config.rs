@@ -216,8 +216,12 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         format!("{head}#{leaf}")
     } else if command.contains("FullyQualifiedName") {
         format!("{head}.{leaf}")
-    } else if command.contains(" -run ") || command.contains(" -k ") || command.contains(" -t ") {
-        // go test -run, pytest -k, vitest -t: the test's own name.
+    } else if command.contains(" -t ") {
+        // vitest -t matches the full name, describe blocks joined by spaces
+        // (round 11: prova's `calc > divides` matched nothing).
+        leaf.replace(" > ", " ")
+    } else if command.contains(" -run ") || command.contains(" -k ") {
+        // go test -run, pytest -k: the test's own name.
         leaf.to_owned()
     } else {
         filter.to_owned()

@@ -496,3 +496,52 @@ fn a_test_skipped_now_that_passed_in_another_command_is_unverified() {
 }
 
 const WORK_SH: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; ";
+
+/// Round 11: a test that fails only when a variable is set was labelled
+/// FLAKY after one pass/fail pair, and "nothing else failed" hid it.
+#[test]
+fn a_failure_that_depends_on_the_environment_is_not_flaky() {
+    let d = workspace("envdep");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.t]\nrun = \"{WORK_SH}if [ -n \\\"$BADENV\\\" ]; then echo 'test calc::e ... FAILED'; exit 1; else echo 'test calc::e ... ok'; fi\"\n"),
+    )
+    .unwrap();
+    prova(&d, &["run", "t"]);
+    let o = Command::new(PROVA)
+        .args(["run", "t"])
+        .current_dir(&d)
+        .env("PROVA_HOME", format!("{}.home", d.display()))
+        .env("BADENV", "1")
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert!(
+        out.contains("environment-dependent") && out.contains("BADENV") && !out.contains("FLAKY"),
+        "{out}"
+    );
+}
+
+/// Round 11: a poisoned run made a real bug "flaky" for good; `prova
+/// forget` takes it out of history.
+#[test]
+fn a_forgotten_run_no_longer_counts() {
+    let d = workspace("forget");
+    suites(&d);
+    run(&d, "make", "pass");
+    let bad: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["status", "last", "--json"]))).unwrap();
+    run(&d, "make", "fail");
+    assert!(text(&prova(&d, &["flaky"])).contains("calc::x"));
+    let o = prova(
+        &d,
+        &[
+            "forget",
+            bad["run"].as_str().unwrap(),
+            "--reason",
+            "results were echoed",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&prova(&d, &["flaky"])).contains("calc::x"));
+}

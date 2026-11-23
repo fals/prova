@@ -151,9 +151,11 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Starts a test once, or again after a failed attempt: a retry
+    /// (spec/run.qnt, ADR 0024).
     pub fn test_started(&mut self, test: &str) -> Result<(), LifecycleError> {
         self.reject_late()?;
-        if self.open.contains(test) || self.outcomes.contains_key(test) {
+        if self.open.contains(test) || self.outcomes.get(test).is_some_and(|o| !o.is_failure()) {
             return Err(LifecycleError::DuplicateTest);
         }
         self.open.insert(test.to_owned());
@@ -162,9 +164,10 @@ impl Lifecycle {
 
     /// Records an outcome. Frameworks that report only results (no start
     /// event) are accepted: the start is implied.
+    /// A retry's start may be implied too: after a failed attempt.
     pub fn test_finished(&mut self, test: &str, outcome: Outcome) -> Result<(), LifecycleError> {
         self.reject_late()?;
-        if !self.open.remove(test) && self.outcomes.contains_key(test) {
+        if !self.open.remove(test) && self.outcomes.get(test).is_some_and(|o| !o.is_failure()) {
             return Err(LifecycleError::DuplicateTest);
         }
         self.outcomes.insert(test.to_owned(), outcome);
@@ -278,6 +281,18 @@ mod tests {
             l.test_finished("x", Outcome::Failed),
             Err(LifecycleError::DuplicateTest)
         );
+    }
+
+    /// ADR 0024: a failed test may run again; its last attempt decides.
+    #[test]
+    fn a_retry_after_a_failure_replaces_it() {
+        let mut l = Lifecycle::new();
+        l.start().unwrap();
+        l.test_finished("x", Outcome::Failed).unwrap();
+        l.test_finished("x", Outcome::Passed).unwrap();
+        l.exited(Some(0)).unwrap();
+        l.end(Status::Finished).unwrap();
+        assert_eq!(l.verdict(), Some(Outcome::Passed));
     }
 
     #[test]

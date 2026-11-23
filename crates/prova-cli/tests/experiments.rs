@@ -600,7 +600,7 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ -f leak ] && setsid sleep 30 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\n[ -f leak ] && setsid sleep 37.125 >/dev/null 2>&1 < /dev/null &\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -629,12 +629,32 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::write(d.join("leak"), "").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_eq!(r["comparison"]["status"], "failed", "{r}");
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("left process") && reason.contains("sleep"),
-        "{reason}"
-    );
+    let sandboxed = r["comparison"]["result"]["sandbox"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("bubblewrap"));
+    if sandboxed {
+        // ADR 0024: the process dies with the trial's sandbox; nothing runs on.
+        // The namespace is torn down asynchronously: wait (bounded) for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let left = loop {
+            let o = Command::new("pgrep")
+                .args(["-fx", "sleep 37.125"])
+                .output()
+                .unwrap();
+            if o.stdout.is_empty() || std::time::Instant::now() > deadline {
+                break o.stdout;
+            }
+            std::thread::yield_now();
+        };
+        assert!(left.is_empty(), "left running: {r}");
+    } else {
+        assert_eq!(r["comparison"]["status"], "failed", "{r}");
+        let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("left process") && reason.contains("sleep"),
+            "{reason}"
+        );
+    }
 }
 
 /// Round 8: a spec edited but not committed was frozen as edited, and every
@@ -869,4 +889,121 @@ fn trials_run_without_the_python_user_site() {
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["status"], "decided", "{r}");
+}
+
+/// Round 11 red team: the shared Go build cache let a candidate patch the
+/// baseline's compiled test; secrets reached trials. Each arm gets its own
+/// caches, and secret-named variables are removed.
+#[test]
+fn trials_get_private_caches_and_no_secrets() {
+    let d = std::env::temp_dir().join(format!("prova-exp-caches-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\ncase \"$GOCACHE\" in *prova-arm-*) ;; *) exit 3;; esac\n[ -z \"$MY_API_TOKEN\" ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
+    )
+    .unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let run = |args: &[&str]| {
+        Command::new(PROVA)
+            .args(args)
+            .current_dir(&d)
+            .env("PROVA_HOME", home_of(&d))
+            .env("MY_API_TOKEN", "s3cret")
+            .output()
+            .unwrap()
+    };
+    let o = run(&[
+        "exp",
+        "new",
+        "e",
+        "--hypothesis",
+        "h",
+        "--metric",
+        "t",
+        "--trials",
+        "5",
+        "--warmup",
+        "0",
+        "--",
+        "./work.sh",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("x"), "").unwrap();
+    assert!(run(&["exp", "candidate", "e"]).status.success());
+    let r = json(&run(&["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "decided", "{r}");
+}
+
+/// Round 11 red team: `git replace` swapped the baseline's content; prova's
+/// git ignores replace objects, so the baseline is the commit itself.
+#[test]
+fn replace_objects_do_not_change_what_runs() {
+    let d = repo("replace", "0.01");
+    new_exp(&d, &[]);
+    // Replace the baseline's `delay` blob with a slower one.
+    sh(
+        &d,
+        "orig=$(git rev-parse HEAD:delay); slow=$(printf 0.08 | git hash-object -w --stdin); git replace $orig $slow",
+    );
+    std::fs::write(d.join("delay"), "0.012").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_ne!(
+        r["comparison"]["verdict"], "accept",
+        "a slowed baseline was measured: {r}"
+    );
+}
+
+/// Round 11 red team: a local smudge filter rewrote the baseline at
+/// checkout; the checkout is verified against the commit's own bytes.
+#[test]
+fn a_checkout_changed_by_a_git_filter_is_refused() {
+    let d = repo("smudge", "0.01");
+    new_exp(&d, &[]);
+    sh(
+        &d,
+        "git config filter.slow.smudge 'sed s/0.01/0.08/' && git config filter.slow.clean cat && echo 'delay filter=slow' > .git/info/attributes",
+    );
+    std::fs::write(d.join("other"), "x").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("differs from commit"), "{text}");
+}
+
+/// Round 11 red team: editing prova.db turned a REJECT into an ACCEPT;
+/// `exp status` re-derives every ACCEPT from the samples.
+#[test]
+fn an_edited_verdict_shows_in_status() {
+    let d = repo("edited", "0.01");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.011").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
+    let db = std::fs::read_dir(home_of(&d).join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("prova.db");
+    let ok = Command::new("sqlite3")
+        .arg(&db)
+        .arg("UPDATE comparisons SET verdict = 'accept'; UPDATE experiments SET best = 'c1';")
+        .status();
+    if ok.is_err() {
+        return; // no sqlite3 here: nothing to edit with
+    }
+    let s = String::from_utf8_lossy(&prova(&d, &["exp", "status", "e"]).stdout).into_owned();
+    assert!(s.contains("the record was changed"), "{s}");
 }

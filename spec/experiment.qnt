@@ -90,13 +90,18 @@ module experiment {
   }
 
   // Trials alternate arms (interleaving); the next arm is the one behind.
+  // When even, pairs alternate which arm goes first (ABBA, ADR 0024): a
+  // drift between a pair's two trials then favours neither arm.
+  pure def baselineNext(b: int, c: int): bool =
+    if (b == c) b % 2 == 0 else b < c
+
   action trial(fp: int): bool = all {
     verdict == NoVerdict or verdict == Inconclusive,
     baseSpec == Holds,
     candSpec == Holds,
     total(baseTrials, candTrials) < 2 * MAX_TRIALS,
     fingerprints' = fingerprints.union(Set(fp)),
-    if (baseTrials <= candTrials)
+    if (baselineNext(baseTrials, candTrials))
       all { baseTrials' = baseTrials + 1, candTrials' = candTrials }
     else
       all { baseTrials' = baseTrials, candTrials' = candTrials + 1 },
@@ -164,7 +169,7 @@ module experiment {
     total(baseTrials, candTrials) > 0 implies protocol == frozenProtocol
 
   val armsInterleaved =
-    baseTrials - candTrials <= 1 and candTrials <= baseTrials
+    baseTrials - candTrials <= 1 and candTrials - baseTrials <= 1
 
   val mixedMachinesAreInvalid =
     (verdict != NoVerdict and fingerprints.size() > 1) implies verdict == Invalid

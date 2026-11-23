@@ -119,6 +119,13 @@ enum Cmd {
     },
     /// Cancel a run (process group: SIGTERM, grace, SIGKILL).
     Cancel { run: String },
+    /// Take a run out of every test's history (a run whose results were
+    /// not real), with the reason; flaky labels it caused go away.
+    Forget {
+        run: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Show one run, or recent runs.
     Status {
         run: Option<String>,
@@ -340,6 +347,10 @@ struct ProtocolArgs {
     /// With --change: the candidate may change only those paths.
     #[arg(long = "change-only", requires = "scope")]
     scope_only: bool,
+    /// Let trials and the oracle use the network (by default a sandboxed
+    /// arm has only loopback).
+    #[arg(long)]
+    allow_network: bool,
 }
 
 #[derive(Subcommand)]
@@ -514,6 +525,7 @@ fn protocol_from(
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
         scope_only: a.scope_only,
+        allow_network: a.allow_network,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -605,12 +617,23 @@ fn exp_start(
         }
         return Ok(exit::PASSED);
     }
+    // Bounded like `prova run --until done` (round 11: a foreground
+    // comparison blocked with no limit): 9 minutes, then the command to
+    // continue; the comparison goes on in the background.
+    let deadline = std::time::Instant::now() + Duration::from_secs(9 * 60);
     loop {
         let r = experiment::wait(store, name, Duration::from_secs(30))?;
         if exp_exit(&r) != exit::RUNNING {
             let _ = child.wait();
             render::experiment(&r, json);
             return Ok(exp_exit(&r));
+        }
+        if std::time::Instant::now() >= deadline {
+            render::experiment(&r, json);
+            if !json {
+                println!("next: prova exp wait {name} --max-wait 9m");
+            }
+            return Ok(exit::RUNNING);
         }
         if !json {
             render::exp_progress(&r);
@@ -887,6 +910,13 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             } else {
                 Some(baseline.as_str())
             };
+            if p.alpha > 0.1 || p.min_effect < 0.01 {
+                eprintln!(
+                    "warning: alpha {} and minimum effect {:.1}% make a lucky ACCEPT likely; every verdict will say so",
+                    p.alpha,
+                    p.min_effect * 100.0
+                );
+            }
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
             // The baseline as a commit, not only a ref name (round 9).
             let sha = experiment::variant(&store, &name, "baseline")?
@@ -1356,8 +1386,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 .iter()
                 .find(|a| OWN_FLAGS.contains(&a.split('=').next().unwrap_or(a)))
             {
-                eprintln!(
-                    "prova: note: {f} comes after `--`, so it goes to the command, not to prova; put prova's flags before `--`"
+                // Refuse instead of running a command we already know is
+                // wrong (round 11: `make test --until first-failure` ran and
+                // left a bogus failed run in history).
+                bail!(
+                    "{f} comes after `--`, so it would go to the command, not to prova: put prova's flags before `--` (to pass it to the command on purpose, wrap it: prova run -- sh -c '...')"
                 );
             }
             let (suite_name, mut spec, run_cwd) = if !command.is_empty() {
@@ -1514,6 +1547,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
         }
+        Cmd::Forget { run, reason } => {
+            let (store, _, _) = open_here()?;
+            let id = store.resolve_run(&run)?;
+            store.forget(&id, &reason)?;
+            println!("run {id} no longer counts in any test's history ({reason})");
+            Ok(exit::PASSED)
+        }
         Cmd::Cancel { run } => {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
@@ -1634,6 +1674,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         } => {
             let (store, _, _) = open_here()?;
             let found = analysis::find_tests(&store, &test, suite.as_deref())?;
+            // Exact names win over partial ones (round 10: 16 matches for a
+            // name that is exact in every suite, next to an old renamed one).
+            let found: Vec<_> = {
+                let exact: Vec<_> = found.iter().filter(|t| t.1 == test).cloned().collect();
+                if exact.is_empty() { found } else { exact }
+            };
             let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
             // Same name in several suites: take the one that ran most recently.
             let displays: std::collections::BTreeSet<&str> =

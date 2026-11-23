@@ -141,7 +141,8 @@ fn quiet_output_says_what_prova_could_not_see() {
 fn failure_on_code_where_the_suite_passed_is_flagged_likely_flaky() {
     let d = workspace("same-code");
     std::fs::write(d.join("state"), "pass").unwrap();
-    let script = "if [ \"$(cat state)\" = pass ]; then echo 'test m::a ... ok'; else echo 'test m::a ... FAILED'; exit 1; fi";
+    // Real work first: an echoed pass with no CPU is unverified (round 10).
+    let script = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; if [ \"$(cat state)\" = pass ]; then echo 'test m::a ... ok'; else echo 'test m::a ... FAILED'; exit 1; fi";
     prova(&d, &["run", "--json", "--", "sh", "-c", script]);
     std::fs::write(d.join("state"), "fail").unwrap();
     let s = json(&prova(&d, &["run", "--json", "--", "sh", "-c", script]));

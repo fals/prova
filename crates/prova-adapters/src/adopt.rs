@@ -28,11 +28,11 @@ pub struct Proposal {
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
 /// with the format version pinned so a change upstream cannot silently
 /// change what prova reads.
-const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1";
+const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final";
 /// nextest does not run doctests (round 9: a failing doctest gave a clean
 /// PASS while `make test` failed): a crate with a library runs them after.
-const NEXTEST_JSON_DOC: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1; s=$?; cargo test --doc || exit 1; exit $s";
-const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 {filter}";
+const NEXTEST_JSON_DOC: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc || exit 1; exit $s";
+const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}";
 
 /// `cargo nextest --version` output, if nextest is installed.
 fn nextest_version(root: &Path) -> Option<String> {
@@ -305,9 +305,19 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                     why: "the project's own command, exactly as CI runs it".into(),
                 });
             } else {
+                // The project's own command, plus prova's Vitest reporter when
+                // it is an npm script running vitest (round 11: `npm test`
+                // alone ran blind once the reporter was injected).
+                let run = match &existing {
+                    Some(cmd) if f.base == "vitest" && cmd.starts_with("npm ") => {
+                        format!("{cmd} -- --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\"")
+                    }
+                    Some(cmd) => cmd.clone(),
+                    None => f.run.into(),
+                };
                 p.suites.push(SuiteProposal {
                     name: "default".into(),
-                    run: existing.clone().unwrap_or_else(|| f.run.into()),
+                    run,
                     select: Some(f.select.into()),
                     why: match &existing {
                         Some(cmd) => {

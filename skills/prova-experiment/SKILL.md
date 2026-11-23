@@ -133,6 +133,17 @@ improvement loop does not get lucky by trying many ideas.
   "..."` sets the best back (recorded in the decision log), so later
   candidates are not compared against it.
 
+Where bubblewrap is installed, each arm runs sandboxed (`sandbox:` line in
+the verdict): it can write only its own checkout, a private state directory
+and a private `/tmp`, with no network for trials and the oracle unless the
+protocol has `--allow-network`. Each arm has its own build caches, and
+secret-named variables are not passed. Without bubblewrap, the verdict says
+the arms were not isolated. Trials run in ABBA order. `caveat:` lines flag a
+weak protocol or other experiments on the same baseline. `exp status`
+re-checks every ACCEPT against its samples and warns if the record was
+changed. A foreground `exp run` waits at most 9 minutes; continue with
+`prova exp wait`.
+
 prova guards the verdict against changed tests and benchmarks, a skipped
 oracle, forged extra lines, leaked processes, code that rewrites tracked
 files at run time (both checkouts are read-only and checked after every

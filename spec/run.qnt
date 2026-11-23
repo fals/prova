@@ -78,10 +78,15 @@ module runLifecycle {
     exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
+  pure def isFailure(o: Outcome): bool = o == Failed or o == Errored
+
+  // A test starts once, or again after it failed: a retry (ADR 0024). The
+  // retry's outcome replaces the failed one; whether a pass on retry is
+  // trusted is decided outside the lifecycle (it is flagged, not green).
   action testStarted(t: str): bool = all {
     status == Running,
     not(open.contains(t)),
-    not(outcomes.keys().contains(t)),
+    not(outcomes.keys().contains(t)) or isFailure(outcomes.get(t)),
     log' = log.append(TestStarted(t)),
     open' = open.union(Set(t)),
     status' = status, outcomes' = outcomes,
@@ -196,6 +201,25 @@ module runLifecycle {
   val outcomesOnlyForStarted =
     outcomes.keys().forall(t => log.indices().exists(i => log[i] == TestStarted(t)))
 
+  // A test starts again only after a failed attempt: the last result
+  // recorded for it before each start is a failure.
+  pure def finishedOf(e: Ev, t: str): bool = match e {
+    | TestFinished(f) => f.test == t
+    | _ => false
+  }
+  pure def failedEv(e: Ev): bool = match e {
+    | TestFinished(f) => isFailure(f.outcome)
+    | _ => false
+  }
+  val retriesFollowFailures =
+    log.indices().forall(i => match log[i] {
+      | TestStarted(t) => log.indices().forall(j =>
+          (j < i and finishedOf(log[j], t)
+            and not(log.indices().exists(k => k > j and k < i and finishedOf(log[k], t))))
+          implies failedEv(log[j]))
+      | _ => true
+    })
+
   // Inputs never change after creation.
   val inputsFrozen = status != Created implies inputs == frozenInputs
 
@@ -225,6 +249,7 @@ module runLifecycle {
     terminalHasNoOpenTests,
     outcomesOnlyForStarted,
     inputsFrozen,
+    retriesFollowFailures,
   }
 
   // Regression: the cancel-versus-late-result race from ADR 0011.
@@ -256,6 +281,19 @@ module runLifecycle {
   run notFoundIsAnErrorTest =
     init.then(start).then(exited(127)).then(end(Finished))
       .then(all { assert(verdict == Error), late("a", Passed) })
+
+  // ADR 0024: a test that failed and then passed on a retry passes; the
+  // run's verdict follows each test's last attempt.
+  run retryPassTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Failed))
+      .then(testStarted("a")).then(testFinished("a", Passed))
+      .then(exited(0)).then(end(Finished))
+      .then(all { assert(verdict == Pass), assert(safety), late("a", Passed) })
+
+  // A passed test does not start again.
+  run noRestartAfterPassTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(testStarted("a")).fail()
 
   run cleanPassTest =
     init.then(start).then(testStarted("a")).then(testFinished("a", Passed))

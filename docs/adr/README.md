@@ -30,5 +30,6 @@ All records below are **Accepted** (2026-11-22, or the date in the row). Later a
 | [0021](0021-verdicts-under-adversarial-candidates.md) | Verdicts under careless or adversarial candidates (scope, metric line counts, leaked processes); idle runtimes stall; amends 0004, 0007, 0015 | no |
 | [0022](0022-checkouts-load-and-impossible-results.md) | Read-only checked checkouts, hidden store, load checks, trusted references; impossible or skipped results are unverified; failing now beats flaky; amends 0006, 0017, 0021 | no |
 | [0023](0023-evidence-hygiene-and-experiment-isolation.md) | Unverified runs are no evidence; more unverified causes; build failure lines; failing-now scaled to the flake rate; `--change` adds; more arm isolation, drift check; amends 0017, 0021, 0022 | no |
+| [0024](0024-sandbox-retries-and-abba.md) | Sandboxed experiment arms (bubblewrap); retries decided by the last attempt; nextest early-exit detection; ABBA trials; amends 0002, 0007, 0017, 0023 | no |
 
 The deviations from the README were accepted with the records.

@@ -223,7 +223,12 @@ fn context(f: &prova_core::engine::Failure) -> String {
     } else if !c.flaky {
         parts.push("has not passed yet".to_owned());
     }
-    if c.failing_now {
+    if !c.env_dependent.is_empty() {
+        parts.push(format!(
+            "passed on this code with a different environment ({}): environment-dependent, not flaky",
+            c.env_dependent.join(", ")
+        ));
+    } else if c.failing_now {
         // Whatever its past: it fails every time now (round 9).
         parts.push("failing now: more failures in a row than its flakiness explains".to_owned());
     } else if c.flaky {
@@ -405,7 +410,11 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             let confirm = if s.suite.starts_with("cmd:") {
                 format!("`prova history {t}`")
             } else {
-                format!("`prova run {} --select '{t}' --repeat 5`", s.suite)
+                // Not every suite can select (round 11: `make` cannot).
+                format!(
+                    "`prova run {} --select '{t}' --repeat 5` (or `--repeat 5` alone if the suite cannot select)",
+                    s.suite
+                )
             };
             format!(
                 "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
@@ -568,6 +577,12 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
             }
+            if let Some(sb) = res["sandbox"].as_str() {
+                println!("sandbox: {}", clean(sb));
+            }
+            for c in res["caveats"].as_array().into_iter().flatten() {
+                println!("caveat: {}", clean(c.as_str().unwrap_or("")));
+            }
             let p = &res["primary"];
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
@@ -637,6 +652,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             r.experiment
         );
     }
+    for w in &r.integrity {
+        println!("warning: {}", clean(w));
+    }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).
         let skip = r.decisions.len().saturating_sub(5);
@@ -692,6 +710,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         })
     }
@@ -716,6 +735,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         });
         assert_eq!(first, " [first time seen: no history yet]");
@@ -734,6 +754,7 @@ mod label_tests {
                 last_passed_code: None,
                 suite_passed_on_same_code: false,
                 failing_now: false,
+                env_dependent: vec![],
             }),
         });
         assert_eq!(never, " [has not passed yet]", "never passed: not new");

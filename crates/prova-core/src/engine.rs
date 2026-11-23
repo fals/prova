@@ -26,6 +26,10 @@ use crate::store::{NewRun, RunRow, Store, StoreError};
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 const TICK: Duration = Duration::from_millis(100);
+/// Ends the warnings whose run is no evidence about any test (its results
+/// may not come from running them): history leaves such runs out.
+pub const NO_EVIDENCE: &str = "; no evidence about the tests";
+
 const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 /// CPU use that counts as activity: at least this many clock ticks (1/100 s
 /// each) within `BUSY_WINDOW`, i.e. 2% of one core. An idle JVM or .NET
@@ -76,6 +80,9 @@ pub struct ExitReport {
     pub contradictions: Vec<String>,
     /// A pass that verified little (ADR 0017): shown with the pass.
     pub warnings: Vec<String>,
+    /// Tests reported passed whose pass is known to be false (their harness
+    /// never reported): recorded as errored, so history does not count them.
+    pub not_passed: Vec<String>,
 }
 
 /// Observer that sees nothing: a level-0 run.
@@ -231,8 +238,9 @@ impl Supervisor<'_> {
                     .insert(test.unique(), (test.clone(), Instant::now(), budget, false));
                 let n = self.attempts.entry(test.unique()).or_insert(0);
                 *n += 1;
-                let key = format!("{}#{}", test.unique(), n);
-                self.lifecycle.test_started(&key).is_ok()
+                // One lifecycle entry per test: a retry restarts it after a
+                // failure, and its last attempt decides (ADR 0024).
+                self.lifecycle.test_started(&test.unique()).is_ok()
             }
             EventKind::TestFinished {
                 test,
@@ -241,8 +249,11 @@ impl Supervisor<'_> {
                 ..
             } => {
                 self.running.remove(&test.unique());
-                let key = format!("{}#{attempt}", test.unique());
-                let ok = self.lifecycle.test_finished(&key, *outcome).is_ok();
+                let _ = attempt;
+                let ok = self
+                    .lifecycle
+                    .test_finished(&test.unique(), *outcome)
+                    .is_ok();
                 if ok && outcome.is_failure() {
                     self.any_test_failed = true;
                 }
@@ -645,12 +656,39 @@ fn observe_child(
         ),
     };
     // ADR 0017: the verdict is decided from all the evidence.
+    let not_passed = report.not_passed;
     let mut contradictions = report.contradictions;
+    // A test whose harness never reported, in a run that ended on its own:
+    // the run fails (a contradiction), and none of its results is evidence
+    // (attempts are immutable, so the run is marked, not rewritten). A run
+    // that was killed or cancelled cut the output itself (round 11).
+    if status == Status::Finished {
+        if !not_passed.is_empty() {
+            sup.emit(EventKind::RunWarning {
+                message: format!(
+                    "{} test(s) were reported passed but their harness never finished, e.g. {}{NO_EVIDENCE}",
+                    not_passed.len(),
+                    not_passed[0]
+                ),
+            });
+        }
+    } else {
+        contradictions.retain(|c| !c.contains("never reported a result"));
+    }
     let mut warnings = report.warnings;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
     if spec.expects_tests() && status == Status::Finished {
+        // A selection that only skipped tests ran none (round 11: vitest -t
+        // reports the rest as skipped; 0 passed, 5 skipped exited 0).
+        let ran = sup
+            .lifecycle
+            .outcomes()
+            .values()
+            .filter(|o| **o != Outcome::Skipped)
+            .count()
+            + sup.lifecycle.open().len();
         if let Some(sel) = &spec.selection
-            && observed == 0
+            && (observed == 0 || ran == 0)
             && sup.level > Level::Opaque
         {
             contradictions.push(format!(
@@ -712,11 +750,14 @@ fn observe_child(
         let wall = now_ms().saturating_sub(started_ms);
         let mut stmt = store.conn().prepare(
             "SELECT t.display, a.duration_ms,
+                    -- the same code only: changed code may be faster
                     (SELECT MIN(h.duration_ms) FROM attempts h JOIN runs r ON r.id = h.run_id
                       WHERE h.test_id = a.test_id AND h.run_id <> a.run_id AND r.status = 'finished'
+                        AND r.code = (SELECT code FROM runs WHERE id = a.run_id)
                         AND h.outcome = 'passed' AND h.duration_ms IS NOT NULL),
                     (SELECT COUNT(*) FROM attempts h JOIN runs r ON r.id = h.run_id
                       WHERE h.test_id = a.test_id AND h.run_id <> a.run_id AND r.status = 'finished'
+                        AND r.code = (SELECT code FROM runs WHERE id = a.run_id)
                         AND h.outcome = 'passed' AND h.duration_ms IS NOT NULL)
                FROM attempts a JOIN tests t ON t.id = a.test_id
               WHERE a.run_id = ?1 AND a.outcome = 'passed'",
@@ -746,7 +787,7 @@ fn observe_child(
         });
         if let Some(why) = impossible {
             warnings.push(format!(
-                "{why}: these results did not come from running the tests now (printed or stale output?)"
+                "{why}: these results did not come from running the tests now (printed or stale output?){NO_EVIDENCE}"
             ));
         }
         // A test skipped now that last passed, in any suite, did not run: the
@@ -765,6 +806,21 @@ fn observe_child(
             let mut was_passing = Vec::new();
             for (id, display) in skipped {
                 if warnings.iter().any(|w| w.contains(&display)) {
+                    continue;
+                }
+                // Skipped here last time too: this suite does not run it (a
+                // medium suite ignoring large tests), not a test switched off.
+                let skipped_here_before: bool = store
+                    .conn()
+                    .query_row(
+                        "SELECT a.outcome = 'skipped' FROM attempts a JOIN runs r ON r.id = a.run_id
+                          WHERE a.test_id = ?1 AND a.run_id <> ?2 AND r.status = 'finished'
+                          ORDER BY r.created_ms DESC LIMIT 1",
+                        rusqlite::params![id, run],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if skipped_here_before {
                     continue;
                 }
                 let last = crate::analysis::stats(store, &id, 20)?.and_then(|st| {
@@ -804,7 +860,7 @@ fn observe_child(
             )?;
             if passed > 0 {
                 warnings.push(format!(
-                "{passed} test(s) passed, but the command used no CPU time at all: the results were printed, not produced by running tests"
+                "{passed} test(s) passed, but the command used no CPU time at all: the results were printed, not produced by running tests{NO_EVIDENCE}"
             ));
             }
         }
@@ -824,7 +880,7 @@ fn observe_child(
             .ok();
             if let Some(other) = overlapping {
                 warnings.push(format!(
-                "run {other} ran in this checkout at the same time, and this run's results come from result files that either may have written"
+                "run {other} ran in this checkout at the same time, and this run's results come from result files that either may have written{NO_EVIDENCE}"
             ));
             }
         }
@@ -838,7 +894,12 @@ fn observe_child(
             stmt.query_map(rusqlite::params![run], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        if mine.len() >= 2 {
+        // Fast tests repeat the same coarse durations by nature: only a
+        // run with real time in it is identifiable this way.
+        // Three or more tests of 10 ms or more: the same results by
+        // coincidence would need every one of them to match (round 11:
+        // a 1.5 s sleep and four 3 ms tests matched once).
+        if mine.iter().filter(|(_, d)| *d >= 10).count() >= 3 {
             let mut stmt = store.conn().prepare(
                 "SELECT DISTINCT run_id FROM attempts WHERE test_id = ?1 AND duration_ms = ?2 AND run_id <> ?3",
             )?;
@@ -854,7 +915,7 @@ fn observe_child(
                     .collect::<rusqlite::Result<_>>()?;
                 if theirs == mine {
                     warnings.push(format!(
-                        "every test's duration equals run {other}'s to the millisecond: these are the same results read again (stale result files?), not a new run"
+                        "every test's duration equals run {other}'s to the millisecond: these are the same results read again (stale result files?), not a new run{NO_EVIDENCE}"
                     ));
                     break;
                 }
@@ -915,6 +976,25 @@ fn observe_child(
                 text.trim().chars().take(160).collect::<String>()
             ));
         }
+        // A test that passed only on a retry is flaky: the run passes (its
+        // last attempt decides, ADR 0024) but the pass is not a green one.
+        sup.flush()?;
+        let rerun: Vec<String> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                  WHERE a.run_id = ?1 GROUP BY a.test_id
+                 HAVING SUM(a.outcome IN ('failed','errored')) > 0",
+            )?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if !rerun.is_empty() {
+            warnings.push(format!(
+                "{} test(s) failed, then passed on a retry: flaky, not green: {}",
+                rerun.len(),
+                rerun.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
         for w in &warnings {
             sup.emit(EventKind::RunWarning { message: w.clone() });
         }
@@ -942,7 +1022,8 @@ fn observe_child(
         });
     }
     for key in closed {
-        let (unique, attempt) = key.rsplit_once('#').unwrap_or((&key, "1"));
+        let unique = key.as_str();
+        let attempt = sup.attempts.get(unique).copied().unwrap_or(1).to_string();
         // The test keeps its real identity (ADR 0018 round 5: rebuilding it
         // from the lifecycle key made a garbled duplicate test).
         let (test, duration_ms) = match sup.running.get(unique) {
@@ -983,34 +1064,6 @@ fn observe_child(
     )?;
     for (test, text) in &report.test_outputs {
         crate::output::keep_test(store, run, &crate::store::test_id(&sup.suite, test), text)?;
-    }
-    // A run failed only by tests that passed on a rerun: say so (round 10:
-    // `-Dsurefire.rerunFailingTestsCount` gave FAILED with nothing failing).
-    if outcome == Outcome::Failed && reason.is_none() {
-        sup.flush()?;
-        let rerun: Vec<String> = {
-            let mut stmt = store.conn().prepare(
-                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-                  WHERE a.run_id = ?1 GROUP BY a.test_id
-                 HAVING SUM(a.outcome IN ('failed','errored')) > 0
-                    AND MAX(CASE WHEN a.outcome = 'passed' THEN a.attempt END) = MAX(a.attempt)",
-            )?;
-            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let still_failing: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM (SELECT a.test_id FROM attempts a WHERE a.run_id = ?1 GROUP BY a.test_id
-               HAVING MAX(CASE WHEN a.outcome IN ('failed','errored') THEN a.attempt END) = MAX(a.attempt))",
-            rusqlite::params![run],
-            |r| r.get(0),
-        )?;
-        if !rerun.is_empty() && still_failing == 0 {
-            reason = Some(format!(
-                "{} test(s) failed and then passed on a rerun, which counts as a failure (flaky, not green): {}",
-                rerun.len(),
-                rerun.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
     }
     let tail: Vec<String> = sup.tail.iter().cloned().collect();
     let fingerprint = (outcome != Outcome::Passed)
@@ -1450,11 +1503,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         .and_then(|s| s.selection);
     // Only a run that finished can suggest flakiness: a cancelled or aborted
     // run's unfinished tests say nothing about the code (ADR 0018).
-    let suite_passed_on_same_code = row.status == Status::Finished
-        && store
-            .suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?
-            .iter()
-            .any(|r| r.code == row.code && r.outcome == Some(Outcome::Passed));
+    // Only a verified pass is evidence the suite can pass on this code
+    // (round 11: an echoed pass made a real failure "likely flaky").
+    let suite_passed_on_same_code = row.status == Status::Finished && {
+        let prev = store.suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?;
+        let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
+        let thin = store.unverified(&ids)?;
+        prev.iter().any(|r| {
+            r.code == row.code && r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id)
+        })
+    };
     let mut failures = Vec::new();
     for (key, outcome, message, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
@@ -1628,6 +1686,11 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .iter()
         .filter(|r| r.code == row.code)
         .map(|r| match r.status {
+            // An unverified pass is not a plain "passed" (round 11: "none of
+            // them passed; on this exact code: passed").
+            Status::Finished if r.outcome == Some(Outcome::Passed) && thin.contains(&r.id) => {
+                "passed?".to_owned()
+            }
             Status::Finished => r.outcome.map(|o| o.as_str().to_owned()).unwrap_or_default(),
             s => s.as_str().to_owned(),
         })

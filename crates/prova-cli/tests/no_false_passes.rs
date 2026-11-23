@@ -278,7 +278,7 @@ fn a_package_without_tests_next_to_an_ok_one_is_not_a_failure() {
 #[test]
 fn results_identical_to_an_earlier_run_are_unverified() {
     let d = workspace("samefiles");
-    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"a\" time=\"0.013\"/><testcase classname=\"s\" name=\"b\" time=\"0.027\"/></testsuite>";
+    let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"a\" time=\"0.130\"/><testcase classname=\"s\" name=\"b\" time=\"0.270\"/><testcase classname=\"s\" name=\"c\" time=\"0.050\"/></testsuite>";
     std::fs::write(d.join("j.xml"), junit).unwrap();
     let script =
         format!("{WORK}mkdir -p build/test-results; cp j.xml build/test-results/junit.xml");
@@ -294,23 +294,85 @@ fn results_identical_to_an_earlier_run_are_unverified() {
     );
 }
 
-/// Round 10: a run that failed only because a test needed a rerun said
-/// nothing about why.
+/// ADR 0024: a test that passed only on a retry: the run passes (its last
+/// attempt decides) but unverified, with the reason.
 #[test]
-fn a_run_failed_by_a_rerun_pass_says_so() {
+fn a_retry_pass_is_an_unverified_pass() {
     let d = workspace("rerun");
     let junit = "<testsuite name=\"s\"><testcase classname=\"s\" name=\"c\" time=\"0.002\"><flakyFailure message=\"race\"/></testcase></testsuite>";
     std::fs::write(d.join("j.xml"), junit).unwrap();
-    let (_, s) = run_sh(
+    let (code, s) = run_sh(
         &d,
         "mkdir -p build/test-results; cp j.xml build/test-results/junit.xml",
     );
-    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("passed"), Some(0)),
+        "{s}"
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(
+        s["warnings"].to_string().contains("passed on a retry"),
+        "{s}"
+    );
+}
+
+/// Round 11: `exit(0)` inside a test under `cargo test --test-threads=1`:
+/// the binary announced 2 tests, reported 1 and stopped before its summary.
+#[test]
+fn a_test_binary_that_stops_before_its_summary_fails() {
+    let d = workspace("stopped");
+    let (code, s) = run_sh(
+        &d,
+        "echo 'running 2 tests'; echo 'test tests::adds ... ok'; echo 'test tests::divides ... '",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
     assert!(
         s["detail"]
             .as_str()
             .unwrap_or("")
-            .contains("passed on a rerun"),
+            .contains("stopped after 1 of 2 tests"),
         "{s}"
+    );
+}
+
+/// Round 11: saved test output replayed with a little CPU work passed as
+/// verified; its own summary says it took longer than the whole run.
+#[test]
+fn a_replayed_summary_longer_than_the_run_is_unverified() {
+    let d = workspace("replayed");
+    let (_, s) = run_sh(
+        &d,
+        "echo 'running 1 test'; echo 'test tests::slow ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.50s'",
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(
+        s["warnings"].to_string().contains("output was replayed"),
+        "{s}"
+    );
+}
+
+/// Round 11: the `exit(0)` detection crashed the supervisor (attempts are
+/// immutable) and left the test recorded as passed.
+#[test]
+fn a_nextest_pass_whose_harness_never_reported_fails_cleanly() {
+    let d = workspace("harnessdied");
+    let (code, s) = run_sh(
+        &d,
+        "echo '        PASS [   0.004s] (1/1) calc tests::divides'; echo '  output ───'; echo '    running 1 test'; echo '     Summary [   0.004s] 1 test run: 1 passed'",
+    );
+    assert_eq!(
+        (s["status"].as_str(), s["outcome"].as_str(), code),
+        (Some("finished"), Some("failed"), Some(1)),
+        "{s}"
+    );
+    let h = String::from_utf8_lossy(&prova(&d, &["history", "tests::divides"]).stdout).into_owned();
+    assert!(
+        h.contains("0 runs with a result"),
+        "no evidence in history: {h}"
     );
 }
