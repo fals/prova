@@ -57,7 +57,10 @@ module runLifecycle {
         and out.keys().exists(t => out.get(t) == Failed or out.get(t) == Errored)
         and out.keys().forall(t =>
           (out.get(t) != Failed and out.get(t) != Errored)
-          or (q.contains(t) and out.get(t) == Failed)))
+          or (q.contains(t) and out.get(t) == Failed))
+        // Something else was verified: a run of only quarantined tests
+        // that failed passes nothing (round 14).
+        and out.keys().exists(t => out.get(t) == Passed and not(q.contains(t))))
       Pass
     else v
 
@@ -262,6 +265,9 @@ module runLifecycle {
         outcomes.keys().forall(t =>
           (outcomes.get(t) != Failed and outcomes.get(t) != Errored)
           or (QUARANTINED.contains(t) and outcomes.get(t) == Failed)),
+        // A pass the quarantine granted verified some other test.
+        verdict != Pass implies
+          outcomes.keys().exists(t => outcomes.get(t) == Passed and not(QUARANTINED.contains(t))),
       }
 
   // A command that could not start is not a test failure.
@@ -347,6 +353,15 @@ module runLifecycle {
       .then(all {
         assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
         late("a", Passed),
+      })
+
+  // Round 14: only the quarantined test ran, and failed: no pass.
+  run onlyQuarantinedFailingIsNoPassTest =
+    init.then(start).then(testStarted("b")).then(testFinished("b", Failed))
+      .then(exited(1)).then(end(Finished))
+      .then(all {
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
+        late("b", Failed),
       })
 
   run cleanPassTest =

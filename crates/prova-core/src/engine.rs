@@ -1444,7 +1444,24 @@ fn observe_child(
     // pass without them only if they explain everything that went wrong
     // (round 14: a build failure, a panic or a data race elsewhere hid
     // behind a quarantined failure).
-    let set_aside = quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code);
+    let first_seen = |d: &str| -> Option<u64> {
+        store
+            .conn()
+            .query_row(
+                "SELECT MIN(first_seen_ms) FROM tests WHERE display = ?1",
+                rusqlite::params![d],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    };
+    let set_aside = quarantined_only_failures(
+        sup.lifecycle.outcomes(),
+        &quarantine,
+        exit_code,
+        &first_seen,
+    );
     if let Some(names) = &set_aside {
         if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -1490,8 +1507,12 @@ fn observe_child(
         && closed.is_empty()
         && contradictions.is_empty()
         && sup.level >= Level::Recognized
-        && let Some(names) =
-            quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code)
+        && let Some(names) = quarantined_only_failures(
+            sup.lifecycle.outcomes(),
+            &quarantine,
+            exit_code,
+            &first_seen,
+        )
     {
         outcome = Outcome::Passed;
         sup.emit(EventKind::RunNote {
@@ -1709,26 +1730,55 @@ fn key_display(key: &str) -> &str {
 /// quarantined and plainly `failed` (not errored), and the command's exit
 /// code is a test failure's (not 126/127 or a signal): the quarantined
 /// failures are then the run's only problem (ADR 0027 §4). `None` otherwise.
+///
+/// A subtest is set aside by its parent's quarantine only if it was known
+/// before the quarantine (`first_seen`): a new subtest's failure is news
+/// (round 14). A parent that failed only through quarantined subtests is
+/// set aside with them (Go fails the parent of a failing subtest).
 fn quarantined_only_failures(
     outcomes: &BTreeMap<String, Outcome>,
     quarantine: &BTreeMap<String, crate::quarantine::Entry>,
     exit_code: Option<i32>,
+    first_seen: &dyn Fn(&str) -> Option<u64>,
 ) -> Option<Vec<String>> {
     if quarantine.is_empty() || matches!(exit_code, None | Some(0 | 126 | 127)) {
         return None;
     }
+    let failing: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| o.is_failure())
+        .map(|(k, _)| key_display(k))
+        .collect();
     let mut names = Vec::new();
     for (key, o) in outcomes {
         if !o.is_failure() {
             continue;
         }
         let display = key_display(key);
-        if *o != Outcome::Failed || crate::quarantine::covers(quarantine, display).is_none() {
+        if *o != Outcome::Failed {
+            return None;
+        }
+        let set_aside = match quarantine.get(display) {
+            Some(_) => true,
+            None => match crate::quarantine::covers(quarantine, display) {
+                Some(parent) => first_seen(display).is_some_and(|t| t < parent.created_ms),
+                None => {
+                    let prefix = format!("{display}/");
+                    failing.iter().any(|f| f.starts_with(&prefix))
+                }
+            },
+        };
+        if !set_aside {
             return None;
         }
         names.push(display.to_owned());
     }
-    (!names.is_empty()).then_some(names)
+    // A run that verified nothing else passes nothing (round 14: a
+    // selection of only the quarantined test, failing, was "PASSED").
+    let verified_other = outcomes.iter().any(|(k, o)| {
+        *o == Outcome::Passed && crate::quarantine::covers(quarantine, key_display(k)).is_none()
+    });
+    (!names.is_empty() && verified_other).then_some(names)
 }
 
 /// The first crash-like line of the output that no quarantined failing
@@ -1980,7 +2030,8 @@ pub struct Summary {
 #[derive(Debug, Clone, Serialize)]
 pub struct QuarantinedTest {
     pub test: String,
-    /// `passed`, `failed`, `errored`, `skipped`, or `not run`.
+    /// `passed`, `failed`, `errored`, `skipped`, `not run`, or `not
+    /// reported` (no per-test results, or the run was cut short).
     pub result: String,
     pub reason: String,
     pub expires_ms: u64,
@@ -2406,13 +2457,19 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // ran here, or their suite (or one sharing tests with this run) did.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
     if row.status.is_terminal() {
+        // Without per-test results (opaque level, or a run cut short) a
+        // missing quarantined test is not known to have been left out
+        // (round 14: "not run" in a cancelled run).
+        let blind = row.level < Level::Recognized || row.status != Status::Finished;
         for (name, q) in &quarantine {
+            // A quarantined subtest is listed by its own result (round 14:
+            // "not run" for a subtest that ran and failed).
             let result = finals
                 .values()
-                .filter(|f| !f.4 && f.0.display() == *name)
+                .filter(|f| f.0.display() == *name)
                 .map(|f| f.1.as_str().to_owned())
                 .next();
-            if result.is_none() {
+            if result.is_none() && !(blind && row.level < Level::Recognized) {
                 let suites: Vec<String> = {
                     let mut stmt = store
                         .conn()
@@ -2426,7 +2483,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             }
             quarantined.push(QuarantinedTest {
                 test: name.clone(),
-                result: result.unwrap_or_else(|| "not run".to_owned()),
+                result: result
+                    .unwrap_or_else(|| if blind { "not reported" } else { "not run" }.to_owned()),
                 reason: q.reason.clone(),
                 expires_ms: q.expires_ms,
             });
@@ -2736,18 +2794,78 @@ mod quarantine_tests {
     fn only_quarantined_plain_failures_are_set_aside() {
         let o = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
         assert_eq!(
-            quarantined_only_failures(&o, &q(&["a"]), Some(1)),
+            quarantined_only_failures(&o, &q(&["a"]), Some(1), &|_| None),
             Some(vec!["a".to_owned()])
         );
         // Another failing test, an error, or no quarantine: the run fails.
         let two = outcomes(&[("a", Outcome::Failed), ("c", Outcome::Failed)]);
-        assert_eq!(quarantined_only_failures(&two, &q(&["a"]), Some(1)), None);
+        assert_eq!(
+            quarantined_only_failures(&two, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
         let err = outcomes(&[("a", Outcome::Errored)]);
-        assert_eq!(quarantined_only_failures(&err, &q(&["a"]), Some(1)), None);
-        assert_eq!(quarantined_only_failures(&o, &q(&[]), Some(1)), None);
+        assert_eq!(
+            quarantined_only_failures(&err, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&[]), Some(1), &|_| None),
+            None
+        );
         // A command that could not start, or was killed, is no test failure.
-        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), Some(127)), None);
-        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), None), None);
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), Some(127), &|_| None),
+            None
+        );
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), None, &|_| None),
+            None
+        );
+    }
+
+    /// Round 14: a parent's quarantine does not cover a subtest new since;
+    /// a parent failing only through its quarantined subtest is set aside.
+    #[test]
+    fn subtests_follow_their_quarantine_only_when_it_knew_them() {
+        // `q` quarantines at created_ms 0; first seen at 0 is not before.
+        let parent = outcomes(&[
+            ("TestQ", Outcome::Failed),
+            ("TestQ/new", Outcome::Failed),
+            ("TestO", Outcome::Passed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&parent, &q(&["TestQ"]), Some(1), &|_| Some(0)),
+            None
+        );
+        let mut known = q(&["TestQ"]);
+        known.get_mut("TestQ").unwrap().created_ms = 10;
+        assert_eq!(
+            quarantined_only_failures(&parent, &known, Some(1), &|_| Some(5)),
+            Some(vec!["TestQ".to_owned(), "TestQ/new".to_owned()])
+        );
+        let only = outcomes(&[("a", Outcome::Failed)]);
+        assert_eq!(
+            quarantined_only_failures(&only, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
+        let child = outcomes(&[
+            ("TestP", Outcome::Failed),
+            ("TestP/flaky", Outcome::Failed),
+            ("TestO", Outcome::Passed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&child, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            Some(vec!["TestP".to_owned(), "TestP/flaky".to_owned()])
+        );
+        let other = outcomes(&[
+            ("TestP", Outcome::Failed),
+            ("TestP/real", Outcome::Failed),
+            ("TestP/flaky", Outcome::Failed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&other, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            None
+        );
     }
 }
 
