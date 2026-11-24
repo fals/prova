@@ -241,14 +241,24 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
         return go_run_pattern(leaf);
     }
+    // A parameterized case (`divides(int, int, int)[2]`, `Adds(a: 1)`)
+    // selects its method: Surefire and VSTest filters name methods.
+    let method = |leaf: &str| -> String {
+        let cut = leaf.find(['(', '[']).unwrap_or(leaf.len());
+        leaf[..cut].trim_end().to_owned()
+    };
+    if command.contains("FullyQualifiedName") && !filter.contains("::") {
+        // VSTest names a case `Ns.Class.Method(args)`.
+        return method(filter);
+    }
     let Some((head, leaf)) = filter.rsplit_once("::") else {
         return filter.to_owned();
     };
     if command.contains("-Dtest=") {
         // Surefire: Class#method (package-qualified class is fine).
-        format!("{head}#{leaf}")
+        format!("{head}#{}", method(leaf))
     } else if command.contains("FullyQualifiedName") {
-        format!("{head}.{leaf}")
+        format!("{head}.{}", method(leaf))
     } else if command.contains(" -t ") {
         // vitest -t matches the full name, describe blocks joined by spaces
         // (round 11: prova's `calc > divides` matched nothing).
@@ -367,6 +377,36 @@ mod filter_tests {
         assert_eq!(f("go test -run=$PROVA_FILTER ./...", "TestB"), "^TestB$");
         // A pattern the user wrote is theirs.
         assert_eq!(f(go, "^TestEcho"), "^TestEcho");
+    }
+
+    /// Round 13 (Java, C#): a parameterized case named as prova shows it
+    /// (`divides(int, int, int)[2]`, `LengthMatches(s: "x/y", len: 3)`)
+    /// matched nothing: Surefire selects `Class#method`, VSTest filters
+    /// by method name. The case selects its method (all of its cases).
+    #[test]
+    fn a_parameterized_case_selects_its_method() {
+        use super::framework_filter as f;
+        assert_eq!(
+            f(
+                "mvn -q test -Dtest=\"$PROVA_FILTER\"",
+                "calc.CalcParamTest::divides(int, int, int)[2]"
+            ),
+            "calc.CalcParamTest#divides"
+        );
+        assert_eq!(
+            f(
+                "dotnet test --filter \"FullyQualifiedName~$PROVA_FILTER\"",
+                "Calc.TheoryTests.LengthMatches(s: \"x/y\", len: 3)"
+            ),
+            "Calc.TheoryTests.LengthMatches"
+        );
+        assert_eq!(
+            f(
+                "dotnet test --filter \"FullyQualifiedName~$PROVA_FILTER\"",
+                "Calc.TheoryTests::LengthMatches(s: \"x/y\", len: 3)"
+            ),
+            "Calc.TheoryTests.LengthMatches"
+        );
     }
 
     #[test]

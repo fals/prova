@@ -911,3 +911,18 @@ fn a_previous_runs_result_file_is_not_this_runs() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["counts"]["passed"], 1, "{v}");
 }
+
+/// Round 13 (Go, red team): subtests were never written to history (a
+/// pattern matched only non-subtests), so a failing subtest had no label
+/// and `prova history` did not know it. Medium: the store across runs.
+#[test]
+fn a_subtest_has_history() {
+    let d = workspace("subtest-history");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '=== RUN   TestA\\n=== RUN   TestA/two\\n    --- FAIL: TestA/two (0.00s)\\n--- FAIL: TestA (0.00s)\\nFAIL\\n'; exit 1";
+    prova(&d, &["run", "--until", "done", "--", "sh", "-c", script]);
+    let o = prova(&d, &["run", "--until", "done", "--", "sh", "-c", script]);
+    let out = stdout(&o);
+    assert!(out.contains("FAIL TestA/two [failed 1x before]"), "{out}");
+    let h = stdout(&prova(&d, &["history", "TestA/two"]));
+    assert!(h.contains("2 runs with a result"), "{h}");
+}
