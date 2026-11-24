@@ -140,7 +140,34 @@ fn looks_like_error(line: &str) -> bool {
     STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
 }
 
+/// A line without terminal colour sequences (`ESC [ ... m`): kept output
+/// is read as text (round 15: `[32m- Expected[39m`).
+fn plain(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\u{1b}') {
+        return line.into();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if ('@'..='~').contains(&d) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
 fn clip(line: &str) -> String {
+    let line = plain(line);
+    let line = line.as_ref();
     match line.char_indices().nth(LINE_CHARS) {
         Some((i, _)) => format!("{}…", &line[..i]),
         None => line.to_owned(),
@@ -735,5 +762,15 @@ mod tests {
         let b = bound_text(&t);
         assert!(b.len() < EXCERPT_BYTES + 64 && b.starts_with("[... "));
         assert!(b.ends_with("assert 16 == 4\n"));
+    }
+}
+
+#[cfg(test)]
+mod plain_tests {
+    /// Round 15: kept output showed `[32m- Expected[39m`.
+    #[test]
+    fn kept_lines_lose_their_colours() {
+        assert_eq!(super::clip("\u{1b}[32m- Expected\u{1b}[39m"), "- Expected");
+        assert_eq!(super::clip("plain"), "plain");
     }
 }

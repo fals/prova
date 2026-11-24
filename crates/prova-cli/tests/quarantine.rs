@@ -388,3 +388,34 @@ fn repeat_tallies_say_what_was_not_seen() {
         "{out}"
     );
 }
+
+/// Round 15: a pass that set a quarantined failure aside was named "last
+/// green", and every --select run listed the quarantined test "not run".
+#[test]
+fn a_set_aside_pass_is_no_last_green_and_selections_stay_quiet() {
+    let d = workspace("lastgreen");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let first = text(&run(&d, "make", "fail"));
+    let set_aside = first.split_whitespace().nth(1).unwrap().to_owned();
+    let out = text(&run(&d, "make", "fail"));
+    assert!(
+        out.contains("PASSED (quarantined failures set aside)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&format!("last green: run {set_aside}")),
+        "{set_aside}: {out}"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\nselect = {:?}\n",
+            full(),
+            format!("{BUSY} echo 'test calc::y ... ok'")
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make", "--select", "calc::y"]));
+    assert!(!out.contains("quarantined:"), "{out}");
+}

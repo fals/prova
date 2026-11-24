@@ -2612,7 +2612,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name)
                 .map(|f| f.1.as_str().to_owned())
                 .next();
-            if live && result.is_none() {
+            // A selection that did not include it says nothing of it
+            // (round 15: "not run" on every --select run).
+            if (live || selection.is_some()) && result.is_none() {
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
@@ -2856,6 +2858,9 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .filter(|r| {
             r.status == Status::Finished
                 && r.outcome == Some(Outcome::Passed)
+                // A pass that set a quarantined failure aside is no "last
+                // green" (round 15).
+                && r.exit_code == Some(0)
                 && !thin.contains(&r.id)
         })
         .take(CHECKED_PASSES)
