@@ -2117,11 +2117,54 @@ pub fn unverified_runs(
     let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
     let mut out = store.unverified(&ids)?;
     for r in runs {
-        if r.outcome == Some(Outcome::Passed) && !out.contains(&r.id) {
-            let s = summarize(store, &r.id, WaitReason::Done, 0)?;
-            if !s.flaky_passed.is_empty() {
-                out.insert(r.id.clone());
-            }
+        if r.status == Status::Finished
+            && r.outcome == Some(Outcome::Passed)
+            && !out.contains(&r.id)
+            && !flaky_passed_in(
+                store,
+                r,
+                &crate::quarantine::in_force_at(store, r.created_ms)?,
+            )?
+            .is_empty()
+        {
+            out.insert(r.id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Known flaky tests (as of the run) that passed in a finished run, apart
+/// from quarantined ones: such a pass proves little (round 7). Read from the
+/// store alone; it once took a full summary of the run, whose history took
+/// summaries of earlier runs in turn, exponential in the number of passes
+/// (round 14: `prova status` used a second of CPU, `wait` a core).
+fn flaky_passed_in(
+    store: &Store,
+    row: &RunRow,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+) -> Result<Vec<String>> {
+    let passed: std::collections::BTreeSet<String> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id = ?1 AND a.outcome = 'passed'
+                AND a.attempt = (SELECT MAX(b.attempt) FROM attempts b
+                                  WHERE b.run_id = a.run_id AND b.test_id = a.test_id)
+                AND NOT EXISTS (SELECT 1 FROM superseded s
+                                 WHERE s.run_id = a.run_id AND s.test_id = a.test_id)",
+        )?;
+        stmt.query_map(rusqlite::params![row.id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::new();
+    if passed.is_empty() {
+        return Ok(out);
+    }
+    for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
+        if passed.contains(&f.display)
+            && !out.contains(&f.display)
+            && crate::quarantine::covers(quarantine, &f.display).is_none()
+        {
+            out.push(f.display);
         }
     }
     Ok(out)
@@ -2275,24 +2318,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let n_failures = failing.len();
     // A pass of a known flaky test proves little: say so, or a green run
     // reads as a reliably green suite (round 7).
-    let mut flaky_passed = Vec::new();
-    if row.status == Status::Finished {
-        let passed: std::collections::BTreeSet<String> = finals
-            .values()
-            .filter(|(_, o, _, _, _)| *o == Outcome::Passed)
-            .map(|(k, _, _, _, _)| k.display())
-            .collect();
-        if !passed.is_empty() {
-            for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
-                if passed.contains(&f.display)
-                    && !flaky_passed.contains(&f.display)
-                    && crate::quarantine::covers(&quarantine, &f.display).is_none()
-                {
-                    flaky_passed.push(f.display);
-                }
-            }
-        }
-    }
+    let flaky_passed = if row.status == Status::Finished {
+        flaky_passed_in(store, &row, &quarantine)?
+    } else {
+        Vec::new()
+    };
     // Quarantined tests of this run, with their result: relevant when they
     // ran here, or their suite (or one sharing tests with this run) did.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
@@ -2495,19 +2525,30 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     let thin = store.unverified(&ids)?;
     // A pass that relied on a known flaky test is no "last green" either
     // (round 13: it named a run whose own output said "unverified").
+    // At most this many recent passes are checked for one: each check
+    // reads a test's flake history.
+    const CHECKED_PASSES: usize = 20;
     let mut last_passed = None;
+    let mut flaky_passes = std::collections::BTreeSet::new();
     for r in prev
         .iter()
-        .filter(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id))
+        .filter(|r| {
+            r.status == Status::Finished
+                && r.outcome == Some(Outcome::Passed)
+                && !thin.contains(&r.id)
+        })
+        .take(CHECKED_PASSES)
     {
-        if summarize(store, &r.id, WaitReason::Done, 0)?
-            .flaky_passed
-            .is_empty()
-        {
+        let q = crate::quarantine::in_force_at(store, r.created_ms)?;
+        if flaky_passed_in(store, r, &q)?.is_empty() {
             last_passed = Some(r);
             break;
         }
+        flaky_passes.insert(r.id.clone());
     }
+    // A pass that relied on a known flaky test is a pass with a warning,
+    // never "none of them passed" (round 14).
+    let thin: std::collections::BTreeSet<String> = thin.union(&flaky_passes).cloned().collect();
     let unverified_passes = prev
         .iter()
         .filter(|r| {

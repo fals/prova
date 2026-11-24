@@ -747,3 +747,32 @@ fn next_lines_are_honest_and_runnable() {
     assert!(out.contains("`prova run make --repeat 5`"), "{out}");
     assert!(!out.contains("--select"), "{out}");
 }
+
+/// Round 14: every pass of a suite with a flaky test passing relied on it,
+/// and checking each for "last green" summarized the earlier ones in turn,
+/// exponential in the number of passes (`prova status` used a second of CPU
+/// after 15 runs). The history then said "none of them passed".
+#[test]
+fn passes_with_a_flaky_test_are_cheap_to_check_and_named_as_passes() {
+    let d = workspace("flakychain");
+    suites(&d);
+    run(&d, "make", "fail");
+    for _ in 0..16 {
+        run(&d, "make", "pass");
+    }
+    run(&d, "make", "fail");
+    let started = std::time::Instant::now();
+    let status = text(&prova(&d, &["status", "last"]));
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !status.contains("none of them passed;")
+            && status.contains("none of them passed verified (16 passed with warnings"),
+        "{status}"
+    );
+    assert!(list.contains("passed?"), "{list}");
+}
