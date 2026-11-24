@@ -137,8 +137,14 @@ improvement loop does not get lucky by trying many ideas.
   "..."` sets the best back (recorded in the decision log), so later
   candidates are not compared against it.
 
-A foreground `exp run` waits at most 9 minutes; continue with
-`prova exp wait`. `caveat:` lines in the verdict flag a weak protocol or
+A foreground `exp run` (and `exp revalidate`) waits at most 9 minutes, or
+`--max-wait <duration>` when your tool calls are shorter; continue with
+`prova exp wait`. An oracle that cannot run (exit 126 or 127: command not found)
+fails the comparison with a reason saying so; it is never a REJECT, so install
+what it needs and run again. `prova exp status` leads with the current best,
+then the latest comparison; it exits 0 when a kept best stands after a later
+REJECT. The Holm family is every comparison on this baseline and metric,
+revalidations included. `caveat:` lines in the verdict flag a weak protocol or
 other experiments on the same baseline. Sandboxed arms have no network
 unless the protocol has `--allow-network`: install dependencies in `--setup`.
 

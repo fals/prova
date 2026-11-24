@@ -1012,3 +1012,101 @@ fn an_edited_verdict_shows_in_status() {
     let s = String::from_utf8_lossy(&prova(&d, &["exp", "status", "e"]).stdout).into_owned();
     assert!(s.contains("the record was changed"), "{s}");
 }
+
+/// Usability round: an oracle that cannot run (command not found) said the
+/// baseline "violates the specification". It is an infrastructure failure,
+/// for either arm, and never a REJECT.
+#[test]
+fn an_oracle_that_cannot_run_is_not_a_specification_violation() {
+    let d = spec_repo_with("oracle-missing", "prova_no_such_tool_xyz spec.txt");
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--json"]);
+    let r = json(&o);
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(!reason.contains("violates the specification"), "{reason}");
+    assert!(
+        reason.contains("could not run")
+            && reason.contains("exit 127")
+            && reason.contains("prova exp log e oracle-baseline"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_candidate_whose_oracle_cannot_run_is_not_rejected() {
+    let d = spec_repo_with(
+        "oracle-missing-cand",
+        "[ -f broken ] && exec prova_no_such_tool_xyz; test \"$(cat answer)\" = 42",
+    );
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("broken"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    assert_ne!(r["comparison"]["verdict"], "reject", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        !reason.contains("violates the specification") && reason.contains("oracle-candidate"),
+        "{reason}"
+    );
+}
+
+/// The decisive line of the oracle's output is in the reason itself.
+#[test]
+fn a_rejection_for_the_oracle_quotes_its_last_line() {
+    let d = spec_repo("oracle-last-line");
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("violates the specification: answer 41, spec says 42 (full log: prova exp log e oracle-candidate)"),
+        "{reason}"
+    );
+}
+
+/// `--max-wait` bounds the foreground wait of `exp run`.
+#[test]
+fn exp_run_accepts_max_wait_and_hands_over_the_wait() {
+    let d = repo("max-wait", "0.5");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e", "--max-wait", "1s"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(
+        o.status.code(),
+        Some(5),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("next: prova exp wait e --max-wait"), "{out}");
+    assert!(prova(&d, &["exp", "cancel", "e"]).status.success());
+}
+
+/// After a later REJECT the status leads with the best and exits 0.
+#[test]
+fn status_leads_with_the_best_after_a_later_reject() {
+    let d = repo("status-best", "0.3");
+    new_exp(&d, &["--min-effect", "20%"]);
+    std::fs::write(d.join("delay"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    assert_eq!(prova(&d, &["exp", "run", "e"]).status.code(), Some(0));
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e"]);
+    assert_eq!(o.status.code(), Some(1), "a run's own REJECT stays 1");
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    let best = out
+        .find("best: c1 (ACCEPT")
+        .unwrap_or_else(|| panic!("{out}"));
+    let latest = out.find("REJECT  c2").unwrap_or_else(|| panic!("{out}"));
+    assert!(best < latest, "{out}");
+    // Holm: what the family holds is said.
+    assert!(
+        out.contains("comparison(s) on this baseline and metric (revalidations count)"),
+        "{out}"
+    );
+}
