@@ -132,8 +132,6 @@ impl Observer for Ladder {
         }
         // Live and file results are matched by display name (best effort:
         // result files rarely carry the same file attribute).
-        let live_names: std::collections::BTreeSet<String> =
-            self.live.seen.values().map(|(d, _)| d.clone()).collect();
         let mut finals: std::collections::BTreeMap<String, prova_core::model::Outcome> =
             Default::default();
         for e in &report.events {
@@ -154,16 +152,64 @@ impl Observer for Ladder {
                 );
             }
         }
-        report.events.retain(|e| match e {
-            // nextest's JUnit names `calc::tests::adds` what its stream
-            // calls `tests::adds` (round 9: every test counted twice).
-            EventKind::TestFinished { test, .. } => {
-                let d = test.display();
-                !live_names
-                    .iter()
-                    .any(|l| *l == d || d.ends_with(&format!("::{l}")))
+        // Each live result covers one file result, of the same name or one
+        // that ends in it: nextest's JUnit says `calc::tests::adds` for its
+        // stream's `tests::adds` (round 9: every test counted twice), TRX
+        // `Nu.CalcTests.Same` for VSTest's console `Same`. One each: three
+        // classes' `Same` are three tests, and a live `Same` covers one of
+        // them (round 12 audit: 39 .NET tests counted 47, or merged into
+        // fewer). Same pass/fail first; otherwise the live result stands.
+        let mut live: Vec<(String, prova_core::model::Outcome, bool)> = self
+            .live
+            .seen
+            .values()
+            .map(|(d, o)| {
+                let base = d.strip_suffix(" (second result)").unwrap_or(d);
+                (base.to_owned(), *o, false)
+            })
+            .collect();
+        let covers = |l: &str, d: &str| {
+            l == d || d.ends_with(&format!("::{l}")) || d.ends_with(&format!(".{l}"))
+        };
+        // Matched in passes over all file results (exact outcome, then
+        // pass/fail, then any), not greedily: a passing `B.Same` must not
+        // take the live failing `Same` that `C.Same` is.
+        let files: Vec<(usize, String, prova_core::model::Outcome)> = report
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                EventKind::TestFinished { test, outcome, .. } => {
+                    Some((i, test.display(), *outcome))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut covered = vec![false; report.events.len()];
+        type Same = fn(prova_core::model::Outcome, prova_core::model::Outcome) -> bool;
+        let passes: [Same; 3] = [
+            |a, b| a == b,
+            |a, b| a.is_failure() == b.is_failure(),
+            |_, _| true,
+        ];
+        for same in passes {
+            for (i, d, o) in &files {
+                if covered[*i] {
+                    continue;
+                }
+                if let Some(l) = live
+                    .iter_mut()
+                    .find(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
+                {
+                    l.2 = true;
+                    covered[*i] = true;
+                }
             }
-            _ => true,
+        }
+        let mut i = 0;
+        report.events.retain(|_| {
+            i += 1;
+            !covered[i - 1]
         });
         // `go test` without -v or -json prints failures only (round 5).
         // (Not with -v: its `=== RUN` lines show it; round 9 noted it anyway.)
@@ -181,7 +227,11 @@ impl Observer for Ladder {
             });
         }
         // Say plainly when the output hid tests (e.g. `cargo test --quiet`).
-        let file_only = finals.keys().filter(|k| !live_names.contains(*k)).count() as u64;
+        let file_only = report
+            .events
+            .iter()
+            .filter(|e| matches!(e, EventKind::TestFinished { .. }))
+            .count() as u64;
         let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
         if self.live.summary_seen {
             report.events.push(EventKind::RunTotals {

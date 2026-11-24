@@ -121,8 +121,10 @@ fn busy_process_is_not_a_stall() {
 
 /// Cancels a run when dropped, so a failing assertion cannot leave an
 /// endless workload behind (it froze a CI runner).
+#[cfg(target_os = "linux")]
 struct CancelOnDrop<'a>(&'a Path, String);
 
+#[cfg(target_os = "linux")]
 impl Drop for CancelOnDrop<'_> {
     fn drop(&mut self) {
         prova(self.0, &["cancel", &self.1]);
@@ -843,4 +845,27 @@ fn a_slash_in_a_junit_name_is_not_a_subtest() {
         "{v}"
     );
     assert!(c["subtests"].is_null(), "{v}");
+}
+
+/// Round 12 count audit: VSTest's console names NUnit/MSTest tests by bare
+/// method, the TRX by class and method; each live result now covers one
+/// file result, so three classes' `Same` are three tests, not one (merged)
+/// or five (counted twice). Medium: a TRX found after the run.
+#[test]
+fn console_and_trx_results_are_each_test_once() {
+    let d = workspace("trx-merge");
+    let trx = r#"<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><TestDefinitions><UnitTest name="Same" id="1"><TestMethod className="Nu.A" name="Same"/></UnitTest><UnitTest name="Same" id="2"><TestMethod className="Nu.B" name="Same"/></UnitTest><UnitTest name="Same" id="3"><TestMethod className="Nu.C" name="Same"/></UnitTest><UnitTest name="Fails" id="4"><TestMethod className="Nu.A" name="Fails"/></UnitTest></TestDefinitions><Results><UnitTestResult testId="1" testName="Same" outcome="Passed"/><UnitTestResult testId="2" testName="Same" outcome="Passed"/><UnitTestResult testId="3" testName="Same" outcome="Failed"/><UnitTestResult testId="4" testName="Fails" outcome="Failed"/></Results></TestRun>"#;
+    std::fs::write(d.join("r.trx.src"), trx).unwrap();
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '  Passed Same [1 ms]\\n  Passed Same [1 ms]\\n  Failed Same [1 ms]\\n  Failed Fails [1 ms]\\n'; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1";
+    let o = prova(
+        &d,
+        &["run", "--json", "--until", "done", "--", "sh", "-c", script],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let c = &v["counts"];
+    assert_eq!(
+        (c["passed"].as_u64(), c["failed"].as_u64()),
+        (Some(2), Some(2)),
+        "{v}"
+    );
 }
