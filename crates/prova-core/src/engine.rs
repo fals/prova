@@ -951,46 +951,69 @@ fn observe_child(
         sup.flush()?;
     };
 
+    // The command's wall time is what the run lasted, however long the
+    // recording that follows takes (issue #91).
+    let exited_ms = now_ms();
     // Collect remaining output; leaked processes may hold the pipes open,
     // so never wait on EOF without a bound. The bound is on waiting for
     // output, not on recording it: every line that arrived before the
     // deadline is recorded however long that takes (round 12: with history,
     // recording 723 Go results took over 1 s and two thirds were dropped
     // from a run that still passed).
-    let drain = |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| {
-        let until = Instant::now() + DRAIN_AFTER_EXIT;
-        while *open > 0 {
-            let chunk = match rx.try_recv() {
-                Ok(c) => c,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-                Err(mpsc::TryRecvError::Empty) => {
-                    let Some(left) = until.checked_duration_since(Instant::now()) else {
-                        break;
-                    };
-                    match rx.recv_timeout(left) {
-                        Ok(c) => c,
-                        Err(_) => break,
+    //
+    // Recording can lag far behind the command (issue #91), so the drain
+    // flushes as it goes (a failure is visible as soon as it is recorded) and
+    // honours `prova cancel`, which the main loop no longer sees.
+    let drain =
+        |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| -> Result<bool> {
+            let until = Instant::now() + DRAIN_AFTER_EXIT;
+            let mut checked = Instant::now();
+            while *open > 0 {
+                if checked.elapsed() >= TICK {
+                    checked = Instant::now();
+                    sup.flush()?;
+                    if store.cancel_requested(run)? {
+                        return Ok(true);
                     }
                 }
-            };
-            match chunk {
-                // A leaked process still writing: what came after the
-                // deadline is not waited for.
-                Chunk::Line(_, _, a) if a.at > until => break,
-                // A read boundary mid-line sends a partial too: judged by
-                // when it arrived, like a line (round 12 CI: 388 of 400).
-                Chunk::Partial(_, _, a) if a.at > until => break,
-                Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                Chunk::Partial(i, p, _) => sup.partial(i, &p),
-                Chunk::Eof => *open -= 1,
+                let chunk = match rx.try_recv() {
+                    Ok(c) => c,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        let Some(left) = until.checked_duration_since(Instant::now()) else {
+                            break;
+                        };
+                        match rx.recv_timeout(left) {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        }
+                    }
+                };
+                match chunk {
+                    // A leaked process still writing: what came after the
+                    // deadline is not waited for.
+                    Chunk::Line(_, _, a) if a.at > until => break,
+                    // A read boundary mid-line sends a partial too: judged by
+                    // when it arrived, like a line (round 12 CI: 388 of 400).
+                    Chunk::Partial(_, _, a) if a.at > until => break,
+                    Chunk::Line(i, l, _) => sup.line(i, &l, observer),
+                    Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                    Chunk::Eof => *open -= 1,
+                }
             }
-        }
-    };
-    drain(sup, &mut open_streams, observer);
+            Ok(false)
+        };
+    let mut cancelled_late = drain(sup, &mut open_streams, observer)?;
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
-    if !leaked.is_empty() {
+    if !leaked.is_empty() && !cancelled_late {
         process::kill_group(pgid);
-        drain(sup, &mut open_streams, observer);
+        cancelled_late = drain(sup, &mut open_streams, observer)?;
+    }
+    if cancelled_late && terminating.is_none() {
+        // Cancelled while its output was still being recorded: what was not
+        // recorded yet is dropped, and the run says it was cancelled.
+        sup.terminating = true;
+        terminating = Some((Instant::now(), Status::Cancelled, "cancelled".into()));
     }
     // The test phase's size (ADR 0026 §2): what tests prova could not
     // isolate are held to. Only when the phase was sampled at least twice
@@ -1139,7 +1162,7 @@ fn observe_child(
     // that echoes `test x ... ok`, a stale JUnit file refreshed by touch).
     if status == Status::Finished && spec.expects_tests() {
         sup.flush()?;
-        let wall = now_ms().saturating_sub(started_ms);
+        let wall = exited_ms.saturating_sub(started_ms);
         let mut stmt = store.conn().prepare(
             "SELECT t.display, a.duration_ms,
                     -- the same code only: changed code may be faster
@@ -1464,7 +1487,7 @@ fn observe_child(
     store.finish_run(
         run,
         sup.seq + 1,
-        now_ms(),
+        exited_ms,
         status,
         Some(outcome),
         exit_code,
