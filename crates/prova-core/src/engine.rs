@@ -2294,7 +2294,14 @@ fn left_out_flaky(
         {
             continue;
         }
-        if f.suites.iter().any(|s| s == suite) || overlaps(store, run, &f.suites)? {
+        // Another suite sharing tests with this one is evidence only when
+        // the flaky test's neighbours (its file, or its module) ran here: a
+        // suite that runs everything shares tests with a narrow one that
+        // never meant to run it (round 15: `small` warned about a flaky
+        // test of `medium`, because `spec` runs both).
+        if f.suites.iter().any(|s| s == suite)
+            || (overlaps(store, run, &f.suites)? && neighbour_ran(store, run, &f.display)?)
+        {
             left.push(f.display);
         }
     }
@@ -2308,6 +2315,21 @@ fn left_out_flaky(
         left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
         if left.len() > 5 { ", ..." } else { "" }
     )))
+}
+
+/// Whether this run recorded a test of the same file (or, with no file, the
+/// same module path) as the test named `display`.
+fn neighbour_ran(store: &Store, run: &str, display: &str) -> Result<bool> {
+    Ok(store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
+                         WHERE a.run_id = ?1
+                           AND EXISTS (SELECT 1 FROM tests f WHERE f.display = ?2
+                                         AND ((f.file IS NOT NULL AND f.file = t.file)
+                                           OR (f.file IS NULL AND t.file IS NULL
+                                               AND f.path = t.path AND f.path <> '[]'))))",
+        rusqlite::params![run, display],
+        |r| r.get(0),
+    )?)
 }
 
 // ------------------------------------------------------------------ wait

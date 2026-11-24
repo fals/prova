@@ -578,3 +578,24 @@ fn a_refused_quarantine_says_why() {
         "{out}"
     );
 }
+
+/// Round 15: a narrow suite (unit tests) was warned that a flaky test of
+/// another module "did not run", because a suite that runs everything
+/// shares tests with both.
+#[test]
+fn a_narrow_suite_is_not_warned_about_another_modules_flaky_test() {
+    let d = workspace("narrow");
+    let all = format!(
+        "{BUSY} echo 'test other::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi"
+    );
+    let narrow = format!("{BUSY} echo 'test other::y ... ok'");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.all]\nrun = {all:?}\n\n[suite.narrow]\nrun = {narrow:?}\n"),
+    )
+    .unwrap();
+    run(&d, "all", "pass");
+    run(&d, "all", "fail");
+    let out = text(&run(&d, "narrow", "pass"));
+    assert!(!out.contains("did not run"), "{out}");
+}
