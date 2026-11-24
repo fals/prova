@@ -2544,6 +2544,17 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A failure before any test ran may be the environment's (a missing
+    // SDK), not the code's; history would count it against the code
+    // (round 14). Say how to keep it out.
+    if row.status == Status::Finished
+        && matches!(row.outcome, Some(Outcome::Failed | Outcome::Errored))
+        && counts.results() == 0
+    {
+        notes.push(format!(
+            "no test result was seen: if this failed for the environment (a missing tool or SDK), not the code, `prova forget {run} --reason \"...\"` keeps it out of history"
+        ));
+    }
     // A stalled selection: the selected test is the suspect (round 10).
     if !row.status.is_terminal()
         && stalled_ms.is_some()
@@ -2747,6 +2758,24 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             // them passed; on this exact code: passed").
             Status::Finished if r.outcome == Some(Outcome::Passed) && thin.contains(&r.id) => {
                 "passed?".to_owned()
+            }
+            // A failure with no test result says nothing of a test (round
+            // 14: a missing SDK read as "on this exact code: failed").
+            Status::Finished
+                if r.outcome != Some(Outcome::Passed)
+                    && !store
+                        .conn()
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM attempts WHERE run_id = ?1)",
+                            rusqlite::params![r.id],
+                            |q| q.get::<_, bool>(0),
+                        )
+                        .unwrap_or(true) =>
+            {
+                format!(
+                    "{} (no test seen)",
+                    r.outcome.map(|o| o.as_str()).unwrap_or_default()
+                )
             }
             Status::Finished => r.outcome.map(|o| o.as_str().to_owned()).unwrap_or_default(),
             s => s.as_str().to_owned(),

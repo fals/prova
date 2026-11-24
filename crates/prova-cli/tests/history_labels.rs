@@ -803,3 +803,28 @@ fn flips_count_code_versions_not_environments() {
         "{h}"
     );
 }
+
+/// Round 14: a run that failed before any test (no SDK installed) counted
+/// against the code in the next run's history, and nothing said how to
+/// take it out.
+#[test]
+fn a_failure_with_no_test_is_named_and_can_be_forgotten() {
+    let d = workspace("notest");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}if [ \"$(cat state)\" = env ]; then echo 'No .NET SDKs were found.'; exit 155; fi; {SCRIPT}"
+            )
+        ),
+    )
+    .unwrap();
+    let out = run(&d, "make", "env");
+    assert!(
+        out.contains("no test result was seen") && out.contains("prova forget"),
+        "{out}"
+    );
+    let out = run(&d, "make", "fail");
+    assert!(out.contains("failed (no test seen)"), "{out}");
+}
