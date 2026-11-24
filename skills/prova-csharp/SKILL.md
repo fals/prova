@@ -11,7 +11,12 @@ description: Gives the dotnet test flags and prova.toml settings that let prova 
 - Single test: `dotnet test --logger trx --filter FullyQualifiedName~{filter}`.
 - Plain `dotnet test` prints only failing tests (recognized live, with
   their error message); prova notes the hidden passes. Add `--logger trx`
-  (or `--logger "console;verbosity=normal"`) for every test.
+  and `--logger "console;verbosity=normal"` for every test, live: `prova
+  adopt` proposes both, so a hang names the running test. Through a wrapper
+  that runs `sh -c "$*"` (`./dev`) the `;` splits the command unless the
+  whole command is one quoted argument:
+  `./dev "dotnet test --logger trx --logger \"console;verbosity=normal\""`
+  (adopt writes that form when your earlier runs used the wrapper so).
 - A leaked process after `dotnet test` is usually the MSBuild build
   server; prova kills it. `DOTNET_CLI_USE_MSBUILD_SERVER=0` avoids it.
 - Build once, then test with `--no-build` in the fix loop to shorten runs.

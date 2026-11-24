@@ -18,6 +18,10 @@ pub struct Recipe {
     /// A file in the run directory the framework appends events to while it
     /// runs; prova reads it live, like output.
     pub stream: Option<&'static str>,
+    /// A result file in the run directory the framework writes at the end;
+    /// prova ingests it after the run (a missing one means the variable
+    /// did not reach the test process).
+    pub report: Option<&'static str>,
 }
 
 /// Verified recipes only: each was checked against the real framework.
@@ -34,6 +38,7 @@ pub const RECIPES: &[Recipe] = &[
         },
         files: &[],
         stream: None,
+        report: Some("pytest-junit.xml"),
     },
     Recipe {
         name: "pytest-reportlog",
@@ -50,6 +55,7 @@ pub const RECIPES: &[Recipe] = &[
         },
         files: &[],
         stream: Some("pytest-reportlog.jsonl"),
+        report: None,
     },
     Recipe {
         name: "vitest-stream",
@@ -73,6 +79,7 @@ pub const RECIPES: &[Recipe] = &[
             include_str!("vitest-reporter.mjs"),
         )],
         stream: Some("vitest.jsonl"),
+        report: None,
     },
     Recipe {
         name: "gotestsum-json",
@@ -86,6 +93,7 @@ pub const RECIPES: &[Recipe] = &[
         },
         files: &[],
         stream: Some("gotestsum.jsonl"),
+        report: None,
     },
     Recipe {
         name: "go-nocache",
@@ -93,6 +101,7 @@ pub const RECIPES: &[Recipe] = &[
         env: |_| vec![("GOFLAGS", "-count=1".to_owned(), true)],
         files: &[],
         stream: None,
+        report: None,
     },
 ];
 
@@ -110,6 +119,14 @@ pub fn files(names: &[String]) -> Vec<(&'static str, &'static str)> {
 /// Stream files the listed recipes make the framework write.
 pub fn streams(names: &[String]) -> Vec<&'static str> {
     chosen(names).filter_map(|r| r.stream).collect()
+}
+
+/// Result files the listed recipes make the framework write at the end:
+/// (recipe, file name).
+pub fn reports(names: &[String]) -> Vec<(&'static str, &'static str)> {
+    chosen(names)
+        .filter_map(|r| r.report.map(|f| (r.name, f)))
+        .collect()
 }
 
 pub fn names() -> String {

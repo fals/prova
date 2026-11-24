@@ -570,27 +570,47 @@ pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
     }
     // Its runs went through a container client: what the tests use is out
     // of sight, and no amount of sampling will change that (round 15).
-    let client: Option<String> = store
+    let client: Option<(String, Option<String>)> = store
         .conn()
         .query_row(
-            "SELECT json_extract(e.payload, '$.message')
+            "SELECT json_extract(e.payload, '$.message'), json_extract(r.spec, '$.size')
                FROM events e JOIN runs r ON r.id = e.run_id
               WHERE e.kind = 'run_note' AND r.status = 'finished'
                 AND json_extract(e.payload, '$.message') LIKE 'the tests ran through `%'
                 AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1)
                 AND e.run_id NOT IN (SELECT run_id FROM forgotten)
+              -- a run whose suite declared a size is preferred
+              ORDER BY json_extract(r.spec, '$.size') IS NULL, r.created_ms DESC
               LIMIT 1",
             params![test_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if let Some(note) = client {
+    if let Some((note, declared)) = client {
         let name = note.split('`').nth(1).unwrap_or("a container client");
+        // What cannot be observed can still be declared: report it as such
+        // (round 16: `size = "small"` on the suite still read "unknown").
+        let declared = declared.as_deref().and_then(|d| match d {
+            "small" => Some(Size::Small),
+            "medium" => Some(Size::Medium),
+            "large" => Some(Size::Large),
+            _ => None,
+        });
+        if let Some(size) = declared {
+            return Ok(Some(SizeView {
+                size: Some(size),
+                at_most: None,
+                label: format!(
+                    "{} (declared; out of sight in {name}, so not observed)",
+                    size.as_str()
+                ),
+            }));
+        }
         return Ok(Some(SizeView {
             size: None,
             at_most: None,
             label: format!(
-                "unknown (ran through {name}: out of sight, so its size cannot be observed; declare it with `size` in prova.toml)"
+                "unknown (ran through {name}: out of sight, so its size cannot be observed; declare it with `size = \"small\"` (or medium, large) under `[suite.<name>]` in prova.toml)"
             ),
         }));
     }

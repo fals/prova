@@ -174,6 +174,107 @@ pub fn container_of(cmdline: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
+/// Runs `client args` and returns its stdout, abandoning a client that
+/// takes longer than `secs`.
+fn client_output(client: &str, args: &[&str], secs: u64) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(client)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text);
+        text
+    });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = reader.join().ok()?;
+                return status.success().then_some(text);
+            }
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Milliseconds since the epoch of an RFC 3339 UTC time as docker prints it
+/// (`2026-11-24T10:00:00.123456789Z`).
+fn rfc3339_ms(t: &str) -> Option<u64> {
+    let (date, time) = t.split_once('T')?;
+    let time = time.trim_end_matches('Z');
+    let mut d = date.split('-').map(|n| n.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut h = hms.split(':').map(|n| n.parse::<u64>().ok());
+    let (hh, mm, ss) = (h.next()??, h.next()??, h.next()??);
+    let ms: u64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    // Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days)
+        .ok()
+        .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+}
+
+/// Running containers that look like the run's own, when its client was
+/// given no `--name` or `--cidfile`: created after the run started, with a
+/// bind mount of the run's working directory or a parent of it. Bounded: a
+/// client that hangs yields nothing. Ids, shortest form.
+pub fn containers_of_run(client: &str, cwd: &str, started_ms: u64) -> Vec<String> {
+    let Some(ids) = client_output(client, &["ps", "-q"], 3) else {
+        return Vec::new();
+    };
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["inspect"];
+    args.extend(ids);
+    let Some(json) = client_output(client, &args, 3) else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Array(all)) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let cwd = std::path::Path::new(cwd);
+    all.iter()
+        .filter(|c| {
+            let created = c["Created"].as_str().and_then(rfc3339_ms);
+            // A second of slack: the client records the run's start before
+            // the container exists, but clocks are read at different points.
+            created.is_some_and(|t| t + 1000 >= started_ms)
+                && c["Mounts"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| {
+                        m["Type"].as_str().is_none_or(|t| t == "bind")
+                            && m["Source"]
+                                .as_str()
+                                .is_some_and(|s| !s.is_empty() && cwd.starts_with(s))
+                    })
+                })
+        })
+        .filter_map(|c| c["Id"].as_str())
+        .map(|id| id.chars().take(12).collect())
+        .collect()
+}
+
 /// Kills a container by name or id with its client; true when it did.
 /// Bounded: a client that hangs is abandoned.
 pub fn kill_container(client: &str, target: &str) -> bool {
@@ -693,6 +794,15 @@ mod tests {
 
 #[cfg(test)]
 mod container_tests {
+    #[test]
+    fn docker_times_are_read_as_epoch_milliseconds() {
+        use super::rfc3339_ms as t;
+        assert_eq!(t("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(t("2000-03-01T00:00:01.5Z"), Some(951_868_801_500));
+        assert_eq!(t("2026-11-24T10:00:00.123456789Z"), Some(1_795_514_400_123));
+        assert_eq!(t("nonsense"), None);
+    }
+
     #[test]
     fn container_clients_are_recognized_by_what_they_do() {
         use super::container_client as c;

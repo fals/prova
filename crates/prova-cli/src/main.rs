@@ -1377,16 +1377,38 @@ fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
 }
 
 /// The wrapper this project's earlier runs put in front of the test command
-/// (`./dev`, `nix develop -c`), from the newest run that had one.
-fn earlier_wrapper(store: &Store) -> Option<String> {
-    store.recent_runs(30).ok()?.into_iter().find_map(|r| {
-        let argv: Vec<String> = r.spec["command"]["argv"]
-            .as_array()?
-            .iter()
-            .filter_map(|w| w.as_str().map(str::to_owned))
-            .collect();
-        prova_adapters::adopt::wrapper_of(&argv)
-    })
+/// (`./dev`, `./dev "dotnet test"`, `nix develop -c`): the most frequent
+/// over the recent runs, argv or a suite's shell command, the newest first
+/// among equals (round 16: the newest run alone lost it).
+fn earlier_wrapper(store: &Store) -> Option<prova_adapters::adopt::Wrapper> {
+    let mut seen: Vec<(prova_adapters::adopt::Wrapper, usize)> = Vec::new();
+    for r in store.recent_runs(300).ok()? {
+        let found = match (
+            r.spec["command"]["argv"].as_array(),
+            r.spec["command"]["shell"].as_str(),
+        ) {
+            (Some(argv), _) => {
+                let argv: Vec<String> = argv
+                    .iter()
+                    .filter_map(|w| w.as_str().map(str::to_owned))
+                    .collect();
+                prova_adapters::adopt::wrapper_form(&argv)
+            }
+            (None, Some(cmd)) => prova_adapters::adopt::wrapper_of_shell(cmd),
+            _ => None,
+        };
+        if let Some(w) = found {
+            match seen.iter_mut().find(|(x, _)| *x == w) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((w, 1)),
+            }
+        }
+    }
+    // `max_by_key` keeps the last of equals: the list is newest first.
+    seen.into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(w, _)| w)
 }
 
 /// What the framework named in a filter's syntax, for the framework the
@@ -1408,20 +1430,6 @@ fn filter_syntax_advice(command: &str) -> &'static str {
     } else {
         "use the framework's own filter syntax"
     }
-}
-
-/// The part of a filter a framework's "not found" line names, when the
-/// filter has spaces and the line quotes only a piece of it: a wrapper or
-/// shell split it into words (round 15: `./dev` re-splits `$*`).
-fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
-    if !filter.contains(' ') {
-        return None;
-    }
-    lines.iter().find_map(|l| {
-        let (_, frag) = l.split_once("not found:")?;
-        let frag = frag.trim();
-        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
-    })
 }
 
 /// Why a run that ran no test failed on its own: the command could not
@@ -1523,7 +1531,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             })
             .map(|l| render::clean(l.trim()));
         let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
-            let split = split_filter_fragment(&filter, &lines);
+            let split = engine::split_filter_fragment(&filter, &lines);
             (
                 false,
                 format!(
@@ -1588,7 +1596,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
     }
     let mut p = prova_adapters::adopt::propose(&root);
     if let Some(wrapper) = earlier_wrapper(&store) {
-        prova_adapters::adopt::apply_wrapper(&mut p, &wrapper);
+        prova_adapters::adopt::apply_wrapper_form(&mut p, &wrapper);
     }
     let toml = prova_adapters::adopt::to_toml(&p);
     if json {
@@ -2721,7 +2729,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
                 if d.out_of_sight > 0 {
                     println!(
-                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size` in prova.toml",
+                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size = \"small\"` (or medium, large) under `[suite.<name>]` in prova.toml",
                         d.out_of_sight
                     );
                 }

@@ -261,6 +261,11 @@ struct Supervisor<'a> {
     /// The client's command line, to find its container when the run is
     /// stopped (round 15).
     container_cmd: Option<String>,
+    /// The run's working directory and start (ms since the epoch): a
+    /// container started without a name is found by what it mounts and when
+    /// it was created (round 16).
+    run_cwd: String,
+    run_started_ms: u64,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -337,6 +342,10 @@ struct SizeTrack {
     /// `SIZE_GUARD` after the start line and before the finish line.
     pending: Option<(Instant, crate::resources::Seen)>,
 }
+
+/// The least idle time a run through a container client is called stalled
+/// after: its tests run out of sight of the process tree.
+const CONTAINER_STALL_AFTER: Duration = Duration::from_secs(60);
 
 /// How far from a test's start and finish lines a sample must be to count
 /// for that test (ADR 0025 §5: a missed resource is a lower bound, a
@@ -675,6 +684,43 @@ impl Supervisor<'_> {
                     self.emit(EventKind::RunWarning { message });
                 }
             }
+            _ if crate::resources::container_client_runs(&cmd) => {
+                let found = crate::resources::containers_of_run(
+                    client,
+                    &self.run_cwd,
+                    self.run_started_ms,
+                );
+                match found.as_slice() {
+                    [one] => {
+                        let ok = crate::resources::kill_container(client, one);
+                        let message = if ok {
+                            format!("stopped the container `{one}` with `{client} kill {one}` (it mounts the run's directory and was created after the run started; the `{client}` command had no --name or --cidfile)")
+                        } else {
+                            format!("could not stop the container `{one}`: run `{client} kill {one}`")
+                        };
+                        if ok {
+                            self.emit(EventKind::RunNote { message });
+                        } else {
+                            self.emit(EventKind::RunWarning { message });
+                        }
+                    }
+                    [] => self.emit(EventKind::RunWarning {
+                        message: format!(
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container mounts this directory); check `{client} ps` and stop it"
+                        ),
+                    }),
+                    many => self.emit(EventKind::RunWarning {
+                        message: format!(
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and {} running containers could be it; stop the right one: {}",
+                            many.len(),
+                            many.iter()
+                                .map(|id| format!("`{client} kill {id}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }),
+                }
+            }
             _ => self.emit(EventKind::RunWarning {
                 message: format!(
                     "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
@@ -863,6 +909,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
         container_cmd: Some(spec.command.display()),
+        run_cwd: row.cwd.clone(),
+        run_started_ms: started_ms,
         superseded: Default::default(),
         phase: None,
         whole: None,
@@ -1000,7 +1048,7 @@ fn observe_child(
     }
     drop(tx);
 
-    let stall_after = Duration::from_millis(spec.stall_after_ms);
+    let declared_stall = Duration::from_millis(spec.stall_after_ms);
     let kill_after = Duration::from_millis(spec.kill_after_ms);
     let start = Instant::now();
     let mut last_activity = Instant::now();
@@ -1070,8 +1118,24 @@ fn observe_child(
             }
         }
         let idle = now.duration_since(last_activity);
+        // Through a container client the host process tree is idle by
+        // design (round 16: a NuGet restore in docker was called a stall at
+        // 20 s): process inactivity alone is no stall before a minute.
+        let stall_after = if sup.container.is_some() {
+            declared_stall.max(CONTAINER_STALL_AFTER)
+        } else {
+            declared_stall
+        };
         if idle >= stall_after && !stalled {
             stalled = true;
+            if let Some(client) = sup.container {
+                sup.emit(EventKind::RunNote {
+                    message: format!(
+                        "the tests run in a container (`{client}`): prova sees only its output, not what runs inside, so a stall is called after at least {}",
+                        crate::ids::format_duration(CONTAINER_STALL_AFTER)
+                    ),
+                });
+            }
             sup.emit(EventKind::RunStalled {
                 idle_ms: idle.as_millis() as u64,
                 basis: StallBasis::ProcessTree,
@@ -1245,6 +1309,19 @@ fn observe_child(
         });
     }
     let mut warnings = report.warnings;
+    // Through a container client the test process is elsewhere: say what an
+    // injected report needs there (round 16: `./dev` neither forwarded
+    // PYTEST_ADDOPTS nor mounted the report's directory).
+    if let Some(client) = sup.container {
+        for w in warnings
+            .iter_mut()
+            .filter(|w| w.contains("report was never written"))
+        {
+            w.push_str(&format!(
+                "; the tests run through `{client}`: the variable must be forwarded into the container (`-e PYTEST_ADDOPTS`) and the report's directory must be mounted so the path exists inside it"
+            ));
+        }
+    }
     // Tests set aside by hand, as they were when this run was created (0027).
     let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
@@ -1527,27 +1604,15 @@ fn observe_child(
         {
             let lines: Vec<String> = sup.tail.iter().cloned().collect();
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let listed = list_suspects(store, &sup.suite, &suspects);
             let message = match class {
                 Some(c) => format!(
-                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {}{}",
+                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {listed}",
                     suspects.len(),
-                    names.join(", "),
-                    if suspects.len() > names.len() {
-                        ", ..."
-                    } else {
-                        ""
-                    }
                 ),
                 None => format!(
-                    "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {}{}",
+                    "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {listed}",
                     missing.len(),
-                    names.join(", "),
-                    if missing.len() > names.len() {
-                        ", ..."
-                    } else {
-                        ""
-                    }
                 ),
             };
             sup.emit(EventKind::RunNote { message });
@@ -1908,6 +1973,39 @@ fn missing_since_last_pass(
 /// Like `missing_since_last_pass`, from the last finished full run whatever
 /// its outcome: the suspects of a hang (round 8: a suite that never passed
 /// yet still names them).
+/// The suspects of a hung run as text, most likely first: tests that
+/// ended in an error in earlier runs of the suite (a hang is recorded as
+/// one) come before the rest, which keep their usual order. A list cut
+/// short says how many it left out (round 16: "..." hid the hung test).
+fn list_suspects(store: &Store, suite: &str, suspects: &[&String]) -> String {
+    const SHOWN: usize = 8;
+    let hurt: std::collections::BTreeSet<String> = store
+        .conn()
+        .prepare(
+            "SELECT DISTINCT t.display FROM attempts a
+               JOIN tests t ON t.id = a.test_id JOIN runs r ON r.id = a.run_id
+              WHERE r.suite = ?1 AND a.outcome = 'errored'",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![suite], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .unwrap_or_default();
+    let mut ordered: Vec<&String> = suspects.to_vec();
+    ordered.sort_by_key(|n| !hurt.contains(n.as_str())); // stable
+    let shown: Vec<&str> = ordered.iter().take(SHOWN).map(|s| s.as_str()).collect();
+    let mut text = shown.join(", ");
+    if ordered.len() > shown.len() {
+        text.push_str(&format!(
+            " (first {} of {}; {} more not listed)",
+            shown.len(),
+            ordered.len(),
+            ordered.len() - shown.len()
+        ));
+    }
+    text
+}
+
 fn missing_since_last_run(
     store: &Store,
     run: &str,
@@ -2694,6 +2792,20 @@ fn readable(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// The part of a filter a framework's "not found" line names, when the
+/// filter has spaces and the line quotes only a piece of it: a wrapper or
+/// shell split it into words (round 15: `./dev` re-splits `$*`).
+pub fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
+    if !filter.contains(' ') {
+        return None;
+    }
+    lines.iter().find_map(|l| {
+        let (_, frag) = l.split_once("not found:")?;
+        let frag = frag.trim();
+        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
+    })
+}
+
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
     if let Ok(crate::output::Kept::Excerpt(e)) = crate::output::run_excerpt(store, run) {
         return e.tail(n);
@@ -3134,21 +3246,31 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         {
             let lines = output_tail(store, run, 30);
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let listed = list_suspects(store, &row.suite, &suspects);
             notes.push(match class {
                 Some(c) => format!(
-                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {}{}",
+                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {listed}",
                     suspects.len(),
-                    names.join(", "),
-                    if suspects.len() > names.len() { ", ..." } else { "" }
                 ),
                 None => format!(
-                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
+                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {listed}",
                     missing.len(),
-                    names.join(", "),
-                    if missing.len() > names.len() { ", ..." } else { "" }
                 ),
             });
+        }
+    }
+    // A selection with spaces that a wrapper split into words (round 16:
+    // `./dev` re-splits `$*`; `prova adopt --verify` said so, `run` did not).
+    if let Some(sel) = &selection
+        && row.status.is_terminal()
+        && counts.results() == 0
+    {
+        let lines = output_tail(store, run, 30);
+        let refs: Vec<&String> = lines.iter().collect();
+        if let Some(frag) = split_filter_fragment(sel, &refs) {
+            notes.push(format!(
+                "the filter {sel:?} was split into words by a wrapper or the shell ({frag:?} is only a part of it): use a filter without spaces (pytest: `-k` with a substring)"
+            ));
         }
     }
     // A selection that ran nothing must not look like a pass.

@@ -27,7 +27,12 @@ project's test scripts, Makefile or CI config to adopt prova.
 
    Read the proposal. `run` is the project's own command. `select` is the
    framework command that runs only tests matching `{filter}`. prova passes
-   the filter as one shell word: never put `{filter}` inside quotes.
+   the filter as one shell word: never put `{filter}` inside quotes of your
+   own, with one exception: a wrapper that runs `sh -c "$*"` (`./dev`) takes
+   the whole command as one quoted argument, and then `{filter}` goes inside
+   that argument: `./dev "dotnet test --filter FullyQualifiedName~{filter}"`.
+   `prova adopt` keeps such a wrapper and its quoting from your earlier runs
+   (the one most runs used).
 
 3. Verify selection with one real test name taken from step 1 output:
 
