@@ -13,8 +13,10 @@ description: Gives the go test flags and prova.toml settings that let prova see 
   natively: per-test start, result, duration and the failure output.
 - Plain `go test ./...` (often in `make test`) prints only failures;
   `go test -v` prints every test and is recognized live too.
-- Single test: `select = "go test -json -count=1 -run {filter} ./..."`. `-run` is a
-  regular expression; anchor it (`^TestDiv$`) when names share prefixes.
+- Single test: `select = "go test -json -count=1 -run {filter} ./..."`.
+  `--select TestDiv` (or a subtest, `TestPod/case_1`, as prova prints it)
+  runs exactly that test: prova escapes and anchors each level for `-run`.
+  A pattern starting with `^` is passed as written (`--select '^TestDiv'`).
 - Subtests appear as `TestParent/sub`; select them with `-run 'TestParent/sub'`.
   They are counted apart: `tests: 3 passed ... (and 18 subtests, 0 failed)`.
   JSON and `-v` text give the same counts.
