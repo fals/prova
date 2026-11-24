@@ -2,6 +2,10 @@
 # Local mirror of .github/workflows/ci.yml. Run before merging.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# One temporary directory for the tests, emptied first: they leave their
+# workspaces behind (round 16: /tmp's inodes ran out). Outside the repository.
+rm -rf /tmp/prova-suite-ci && mkdir -p /tmp/prova-suite-ci
+export TMPDIR=/tmp/prova-suite-ci
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --no-fail-fast

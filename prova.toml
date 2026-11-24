@@ -3,14 +3,18 @@
 # small and medium run under cargo-nextest with its libtest JSON stream, so
 # prova sees prova's own tests at full fidelity (native level, per-test
 # durations). The format version is pinned; the stream is experimental.
+# Each suite's tests get one temporary directory, emptied before the run:
+# tests leave their workspaces behind, and tens of thousands of them once
+# filled /tmp's inodes (round 16). It is outside the repository on purpose:
+# tests rely on not being inside a git work tree.
 [suite.small]
-run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final"
-select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
+run = "rm -rf /tmp/prova-suite-small && mkdir -p /tmp/prova-suite-small && TMPDIR=/tmp/prova-suite-small NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final"
+select = "rm -rf /tmp/prova-suite-small && mkdir -p /tmp/prova-suite-small && TMPDIR=/tmp/prova-suite-small NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --lib --bins --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
 size = "small"
 
 [suite.medium]
-run = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final"
-select = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
+run = "rm -rf /tmp/prova-suite-medium && mkdir -p /tmp/prova-suite-medium && TMPDIR=/tmp/prova-suite-medium NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final"
+select = "rm -rf /tmp/prova-suite-medium && mkdir -p /tmp/prova-suite-medium && TMPDIR=/tmp/prova-suite-medium NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --tests --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}"
 size = "medium"
 stall_after = "2m"
 
