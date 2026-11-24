@@ -31,6 +31,9 @@ pub struct Lifecycle {
     /// The framework's own report contradicts a pass (ADR 0017).
     contradiction: bool,
     verdict: Option<Outcome>,
+    /// Names re-keyed under another test's (spec/run.qnt `superseded`):
+    /// they never start or finish again.
+    superseded: BTreeSet<String>,
 }
 
 /// The run's verdict (ADR 0017, `decide` in `spec/run.qnt`): a pass must be
@@ -79,6 +82,7 @@ impl Lifecycle {
             exit_code: None,
             contradiction: false,
             verdict: None,
+            superseded: BTreeSet::new(),
         }
     }
 
@@ -155,7 +159,10 @@ impl Lifecycle {
     /// (spec/run.qnt, ADR 0024).
     pub fn test_started(&mut self, test: &str) -> Result<(), LifecycleError> {
         self.reject_late()?;
-        if self.open.contains(test) || self.outcomes.get(test).is_some_and(|o| !o.is_failure()) {
+        if self.open.contains(test)
+            || self.superseded.contains(test)
+            || self.outcomes.get(test).is_some_and(|o| !o.is_failure())
+        {
             return Err(LifecycleError::DuplicateTest);
         }
         self.open.insert(test.to_owned());
@@ -167,7 +174,9 @@ impl Lifecycle {
     /// A retry's start may be implied too: after a failed attempt.
     pub fn test_finished(&mut self, test: &str, outcome: Outcome) -> Result<(), LifecycleError> {
         self.reject_late()?;
-        if !self.open.remove(test) && self.outcomes.get(test).is_some_and(|o| !o.is_failure()) {
+        if self.superseded.contains(test)
+            || (!self.open.remove(test) && self.outcomes.get(test).is_some_and(|o| !o.is_failure()))
+        {
             return Err(LifecycleError::DuplicateTest);
         }
         self.outcomes.insert(test.to_owned(), outcome);
@@ -183,6 +192,23 @@ impl Lifecycle {
             return Err(LifecycleError::DuplicateTest);
         }
         self.outcomes.insert(test.to_owned(), outcome);
+        Ok(())
+    }
+
+    /// A result recorded under a provisional name is re-keyed: its test is
+    /// `by`, whose own result is already recorded. The provisional entry
+    /// leaves the outcomes (spec/run.qnt `superseded`).
+    pub fn supersede(&mut self, test: &str, by: &str) -> Result<(), LifecycleError> {
+        self.reject_late()?;
+        if test == by
+            || self.open.contains(test)
+            || !self.outcomes.contains_key(test)
+            || !self.outcomes.contains_key(by)
+        {
+            return Err(LifecycleError::DuplicateTest);
+        }
+        self.outcomes.remove(test);
+        self.superseded.insert(test.to_owned());
         Ok(())
     }
 

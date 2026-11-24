@@ -612,3 +612,20 @@ fn a_slow_go_test_is_listed_once() {
         "{out}"
     );
 }
+
+/// Round 15: with `go test -v` text under gotestsum `--rerun-fails`, the
+/// provisional name's failure stayed in the verdict after the rerun passed:
+/// FAILED with exit 0.
+#[test]
+fn a_go_verbose_rerun_that_passes_is_flaky_not_failed() {
+    let d = workspace("gov-rerun");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestF' '    f_test.go:4: flake' \
+         '--- FAIL: TestF (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' \
+         '=== RUN   TestF' '--- PASS: TestF (0.00s)' 'PASS' 'ok  \texample.com/m\t0.01s'; exit 0",
+    );
+    assert_eq!(code, Some(0), "{s}");
+    assert_eq!(s["outcome"], "passed", "{s}");
+    assert_eq!(s["verified"], false, "{s}");
+}

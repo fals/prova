@@ -479,8 +479,12 @@ impl Supervisor<'_> {
         {
             *d = Some(started.elapsed().as_millis() as u64);
         }
-        if let EventKind::TestSuperseded { test, .. } = &kind {
+        if let EventKind::TestSuperseded { test, by } = &kind {
             self.superseded.insert(test.unique());
+            // One test, one result: the provisional entry leaves the
+            // verdict once its test's own result is recorded (spec/run.qnt
+            // `superseded`; round 15: a rerun's pass did not count).
+            let _ = self.lifecycle.supersede(&test.unique(), &by.unique());
         }
         // Guard every test event with the lifecycle (spec/run.qnt).
         let ok = match &kind {

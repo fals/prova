@@ -65,6 +65,7 @@ fn replay(path: &PathBuf) -> usize {
             "testStarted" => l.test_started(&t()),
             "testFinished" => l.test_finished(&t(), outcome(pick(s, "o"))),
             "testRepeated" => l.test_repeated(&t(), outcome(pick(s, "o"))),
+            "superseded" => l.supersede(&t(), pick(s, "b").as_str().expect("b")),
             "exited" => l.exited(Some(int(pick(s, "code")) as i32)),
             "contradicted" => l.contradict(),
             "end" => {
