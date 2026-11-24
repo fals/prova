@@ -173,6 +173,17 @@ impl Observer for Ladder {
                 ));
             }
         }
+        // The same for a result file written at the end (pytest-junit).
+        if let Some(dir) = &self.inject_dir {
+            for (recipe, file) in inject::reports(&self.inject) {
+                if !dir.join(file).exists() {
+                    report.warnings.push(format!(
+                        "the {recipe} report was never written to {}: the variable did not reach the test process, or the path is not visible where the tests ran (a wrapper or container?)",
+                        dir.join(file).display()
+                    ));
+                }
+            }
+        }
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
             report.events.extend(injected.events);

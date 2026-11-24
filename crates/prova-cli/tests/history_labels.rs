@@ -384,6 +384,40 @@ fn a_hung_run_without_live_tests_names_the_suspects() {
     );
 }
 
+/// Round 16: a list of suspects cut at five ended in "..." and hid the hung
+/// test. A list cut short says how many it left out.
+#[test]
+fn a_long_suspect_list_says_how_many_it_left_out() {
+    let d = workspace("suspects-many");
+    let cases: String = (1..=12)
+        .map(|i| format!("<testcase classname=\\\"s\\\" name=\\\"t{i:02}\\\"/>"))
+        .collect();
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; printf '<testsuite name=\\\"s\\\">{cases}</testsuite>' > build/test-results/junit.xml\"\n"
+        ),
+    )
+    .unwrap();
+    let first = text(&prova(&d, &["run", "j"]));
+    assert!(first.contains("PASSED"), "{first}");
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(
+        w.contains("12 of the last finished run") && w.contains("first 8 of 12; 4 more not listed"),
+        "{w}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
 /// Round 9: `#[ignore]` on a test that passed in the last passing run gave
 /// a clean pass; a skipped test did not run.
 #[test]

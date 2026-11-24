@@ -1186,8 +1186,9 @@ fn fake_docker(d: &Path) -> (String, PathBuf) {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {}; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
-            killed.display()
+            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {k}; exit 0;; ps) cat {d}/ps.out 2>/dev/null; exit 0;; inspect) cat {d}/inspect.json 2>/dev/null || echo '[]'; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
+            k = killed.display(),
+            d = d.display()
         ),
     )
     .unwrap();
@@ -1243,6 +1244,81 @@ fn cancel_stops_a_named_container_of_the_run() {
     assert!(s.to_string().contains("pv-x"), "{s}");
 }
 
+/// Round 16: a client with no --name or --cidfile (`./dev` wrappers) leaked
+/// its container. The one running container that mounts the run's
+/// directory and was created after the run started is the run's: killed.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_stops_the_one_container_that_mounts_the_run_directory() {
+    let d = workspace("cancel-container-mount");
+    let (path, killed) = fake_docker(&d);
+    std::fs::write(
+        d.join("ps.out"),
+        "aaa111bbb222\nold000old000\nother00other\n",
+    )
+    .unwrap();
+    let mount = |id: &str, created: &str, src: &str| {
+        format!(
+            r#"{{"Id":"{id}ffffffff","Created":"{created}","Mounts":[{{"Type":"bind","Source":"{src}"}}]}}"#
+        )
+    };
+    let cwd = d.canonicalize().unwrap();
+    std::fs::write(
+        d.join("inspect.json"),
+        format!(
+            "[{},{},{}]",
+            mount(
+                "aaa111bbb222",
+                "2999-01-01T00:00:00.5Z",
+                cwd.to_str().unwrap()
+            ),
+            mount(
+                "old000old000",
+                "2000-01-01T00:00:00Z",
+                cwd.to_str().unwrap()
+            ),
+            mount("other00other", "2999-01-01T00:00:00Z", "/elsewhere"),
+        ),
+    )
+    .unwrap();
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
+        "kill aaa111bbb222",
+        "{s}"
+    );
+}
+
+/// Several containers could be the run's: none is killed, the warning names
+/// the exact commands.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_names_the_candidates_when_several_containers_could_be_the_run() {
+    let d = workspace("cancel-container-many");
+    let (path, killed) = fake_docker(&d);
+    std::fs::write(d.join("ps.out"), "aaa111bbb222\nccc333ddd444\n").unwrap();
+    let cwd = d.canonicalize().unwrap();
+    let one = |id: &str| {
+        format!(
+            r#"{{"Id":"{id}ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}"#,
+            cwd.display()
+        )
+    };
+    std::fs::write(
+        d.join("inspect.json"),
+        format!("[{},{}]", one("aaa111bbb222"), one("ccc333ddd444")),
+    )
+    .unwrap();
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert!(!killed.exists(), "{s}");
+    let text = s.to_string();
+    assert!(
+        text.contains("`docker kill aaa111bbb222`") && text.contains("`docker kill ccc333ddd444`"),
+        "{text}"
+    );
+}
+
 /// Without a name or cidfile the container cannot be attributed: prova
 /// does not guess, it says what to check.
 #[cfg(target_os = "linux")]
@@ -1290,5 +1366,56 @@ fn a_cancelled_hang_is_not_a_slow_test() {
     assert!(
         out.contains("CANCELLED") && !out.contains("slow tests:"),
         "{out}"
+    );
+}
+
+/// Round 16: a NuGet restore inside docker was called a stall at 20 s: the
+/// host process tree is idle by design when the tests run in a container.
+/// Before a minute, process inactivity alone is no stall there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_run_is_not_stalled_by_an_idle_process_tree() {
+    let d = workspace("container-stall");
+    let (path, _killed) = fake_docker(&d);
+    let o = Command::new(PROVA)
+        .args([
+            "run",
+            "--detach",
+            "--json",
+            "--stall-after",
+            "1s",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            "pv-idle",
+            "img",
+            "t",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let id = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(&d, id.clone());
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "3s",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        w.status.code(),
+        Some(5),
+        "not stalled before a minute: {}",
+        stdout(&w)
     );
 }

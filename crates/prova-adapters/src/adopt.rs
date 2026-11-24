@@ -188,9 +188,9 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         out.push(Framework {
             language: "csharp",
             base: "dotnet test",
-            run: "dotnet test --logger trx",
-            select: "dotnet test --logger trx --filter FullyQualifiedName~{filter}",
-            why: ".NET; TRX results are ingested".into(),
+            run: "dotnet test --logger trx --logger \"console;verbosity=normal\"",
+            select: "dotnet test --logger trx --logger \"console;verbosity=normal\" --filter FullyQualifiedName~{filter}",
+            why: ".NET; TRX results are ingested, and the console logger prints each test as it finishes so a hang names the running test".into(),
         });
     }
     out
@@ -236,6 +236,34 @@ fn existing_command(root: &Path) -> Option<String> {
     None
 }
 
+/// The steps of `npm test` besides the test runner: the other commands of
+/// the `test` script (`tsc --noEmit && vitest run`) and its `pretest` and
+/// `posttest` scripts. A selected run starts the runner alone.
+fn npm_test_extra_steps(root: &Path, runner: &str) -> Vec<String> {
+    let pkg: serde_json::Value =
+        serde_json::from_str(&read(root, "package.json")).unwrap_or_default();
+    let scripts = &pkg["scripts"];
+    let mut steps = Vec::new();
+    let mut parts = |script: &str| {
+        for part in script.split("&&").flat_map(|x| x.split(';')) {
+            let part = part.trim();
+            if !part.is_empty() && !part.contains(runner) {
+                steps.push(part.to_owned());
+            }
+        }
+    };
+    if let Some(t) = scripts["pretest"].as_str() {
+        parts(t);
+    }
+    if let Some(t) = scripts["test"].as_str() {
+        parts(t);
+    }
+    if let Some(t) = scripts["posttest"].as_str() {
+        parts(t);
+    }
+    steps
+}
+
 pub fn propose(root: &Path) -> Proposal {
     let mut p = propose_with(root, nextest_version);
     p.reportlog = p.languages.iter().any(|l| l == "python") && pytest_reportlog_installed(root);
@@ -270,15 +298,44 @@ const RUNNERS: &[&str] = &[
     "nox",
 ];
 
+/// A wrapper in front of the test command, and how it takes it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Wrapper {
+    pub prefix: String,
+    /// The command goes as one quoted argument (`./dev "dotnet test"`, a
+    /// wrapper that runs `sh -c "$*"`), not as separate words.
+    pub quoted: bool,
+}
+
+fn is_runner(w: &str) -> bool {
+    RUNNERS.contains(&w.rsplit('/').next().unwrap_or(w))
+}
+
 /// The wrapper in front of a test command an earlier run used (`./dev`,
 /// `docker compose run web`, `nix develop -c`): everything before the first
 /// word that is a test runner. None for a command that starts with its
 /// runner, or with a shell, whose arguments are not a prefix.
 pub fn wrapper_of(argv: &[String]) -> Option<String> {
+    wrapper_form(argv).filter(|w| !w.quoted).map(|w| w.prefix)
+}
+
+/// Like `wrapper_of`, also for a wrapper given the whole command as one
+/// quoted argument (`./dev "dotnet test"`: round 16, adopt dropped `./dev`).
+pub fn wrapper_form(argv: &[String]) -> Option<Wrapper> {
     let name = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
-    let at = argv
-        .iter()
-        .position(|w| RUNNERS.contains(&name(w).as_str()))?;
+    if let [wrapper, whole] = argv
+        && whole.contains(' ')
+        && !wrapper.contains(['"', '\'', '=', ' '])
+        && !is_runner(wrapper)
+        && !matches!(name(wrapper).as_str(), "sh" | "bash" | "zsh" | "dash")
+        && whole.split_whitespace().next().is_some_and(is_runner)
+    {
+        return Some(Wrapper {
+            prefix: wrapper.clone(),
+            quoted: true,
+        });
+    }
+    let at = argv.iter().position(|w| is_runner(w))?;
     let prefix = &argv[..at];
     let shell = |w: &String| matches!(name(w).as_str(), "sh" | "bash" | "zsh" | "dash");
     if prefix.is_empty()
@@ -287,18 +344,74 @@ pub fn wrapper_of(argv: &[String]) -> Option<String> {
     {
         return None;
     }
-    Some(prefix.join(" "))
+    Some(Wrapper {
+        prefix: prefix.join(" "),
+        quoted: false,
+    })
+}
+
+/// The wrapper of a command line a suite runs with `sh -c` (a `prova.toml`
+/// `run`): its words are split at spaces, a trailing quoted argument kept
+/// whole.
+pub fn wrapper_of_shell(cmd: &str) -> Option<Wrapper> {
+    let (head, rest) = match cmd.find(['"', '\'']) {
+        Some(at) => (&cmd[..at], Some(&cmd[at..])),
+        None => (cmd, None),
+    };
+    if head.contains(['&', ';', '|', '`', '$', '\n', '=']) {
+        return None;
+    }
+    let mut argv: Vec<String> = head.split_whitespace().map(str::to_owned).collect();
+    if let Some(rest) = rest {
+        let quote = rest.chars().next()?;
+        let inner = rest.strip_prefix(quote)?.strip_suffix(quote)?;
+        if inner.contains(quote) {
+            return None;
+        }
+        argv.push(inner.to_owned());
+    }
+    wrapper_form(&argv)
 }
 
 /// Puts the project's wrapper in front of every suite's command and select
 /// (round 15: adopt proposed `python3 -m pytest` on the host when the
 /// project's own runs went through `./dev`).
 pub fn apply_wrapper(p: &mut Proposal, wrapper: &str) {
+    apply_wrapper_form(
+        p,
+        &Wrapper {
+            prefix: wrapper.to_owned(),
+            quoted: false,
+        },
+    );
+}
+
+/// `apply_wrapper` for either way a wrapper takes its command.
+pub fn apply_wrapper_form(p: &mut Proposal, w: &Wrapper) {
+    let wrapper = w.prefix.as_str();
+    let quote = |cmd: &str| {
+        // Inside double quotes: the quotes and backslashes of the command
+        // itself are escaped; `$` stays, so `{filter}` and variables expand
+        // as before. The wrapper's `sh -c "$*"` parses the quotes again.
+        let escaped = cmd
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('`', "\\`");
+        format!("{wrapper} \"{escaped}\"")
+    };
     let wrap = |cmd: &str| {
+        if cmd.starts_with(wrapper) {
+            return cmd.to_owned();
+        }
+        // A quoted `;` would split at the wrapper's `$*`: the console
+        // logger's `"console;verbosity=normal"` goes inside the quotes.
+        if w.quoted || cmd.contains("\"console;") {
+            return quote(cmd);
+        }
         // A compound command or one that starts with variable assignments
         // cannot take a prefix as is.
         let first = cmd.split_whitespace().next().unwrap_or("");
-        if cmd.starts_with(wrapper) || cmd.contains(';') || first.contains('=') {
+        if cmd.contains(';') || first.contains('=') {
             cmd.to_owned()
         } else {
             format!("{wrapper} {cmd}")
@@ -311,9 +424,15 @@ pub fn apply_wrapper(p: &mut Proposal, wrapper: &str) {
     p.existing = p.existing.as_deref().map(wrap);
     // Whether the host has pytest-reportlog says nothing about the wrapper.
     p.reportlog = false;
-    p.notes.push(format!(
-        "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none"
-    ));
+    p.notes.push(if w.quoted {
+        format!(
+            "commands run through `{wrapper}`, as your earlier runs did, with the whole command as one quoted argument; `{{filter}}` stays inside that argument"
+        )
+    } else {
+        format!(
+            "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none"
+        )
+    });
 }
 
 fn pytest_reportlog_installed(root: &Path) -> bool {
@@ -396,11 +515,40 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                     Some(cmd) => cmd.clone(),
                     None => f.run.into(),
                 };
+                // Steps of the project's test script besides the runner:
+                // `select` runs the runner alone, so they are skipped there.
+                let skipped = if existing.as_deref() == Some("npm test") {
+                    npm_test_extra_steps(root, f.base)
+                } else {
+                    Vec::new()
+                };
+                if !skipped.is_empty() {
+                    p.notes.push(format!(
+                        "select runs {} alone: {} from `npm test` {} not run for single tests (a failure there passes under --select)",
+                        f.base,
+                        skipped
+                            .iter()
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if skipped.len() == 1 { "does" } else { "do" },
+                    ));
+                }
                 p.suites.push(SuiteProposal {
                     name: "default".into(),
                     run,
                     select: Some(f.select.into()),
                     why: match &existing {
+                        Some(cmd) if f.language == "python" => format!(
+                            "runs `{cmd}` as the project does; passes are seen live only if its pytest runs verbose (-v) or with pytest-reportlog (inject = [\"pytest-reportlog\"]); selection runs `{}` verbosely",
+                            f.select.split(" -k").next().unwrap_or(f.select)
+                        ),
+                        Some(cmd) if !skipped.is_empty() => format!(
+                            "runs `{cmd}` as the project does; selection via {} (select runs {} alone: `{}` does not run for single tests)",
+                            f.why,
+                            f.base,
+                            skipped.join("`, `")
+                        ),
                         Some(cmd) => {
                             format!("runs `{cmd}` as the project does; selection via {}", f.why)
                         }
@@ -772,5 +920,117 @@ mod tests {
         ));
         let names: Vec<&str> = p.suites.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["default", "rust", "python", "ts"]);
+    }
+
+    fn argv(s: &[&str]) -> Vec<String> {
+        s.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    /// Round 16: `./dev "dotnet test"` (the whole command as one argument)
+    /// was no wrapper: adopt proposed the bare command.
+    #[test]
+    fn a_wrapper_given_the_whole_command_quoted_is_kept() {
+        let w = wrapper_form(&argv(&["./dev", "dotnet test"])).unwrap();
+        assert_eq!((w.prefix.as_str(), w.quoted), ("./dev", true));
+        let w = wrapper_form(&argv(&["./dev", "mvn -q test"])).unwrap();
+        assert!(w.quoted);
+        assert_eq!(wrapper_form(&argv(&["./dev", "echo hi there"])), None);
+        assert_eq!(wrapper_form(&argv(&["make", "test"])), None);
+        let w = wrapper_of_shell("./dev 'mvn -q test'").unwrap();
+        assert_eq!((w.prefix.as_str(), w.quoted), ("./dev", true));
+        let w = wrapper_of_shell("./dev make test").unwrap();
+        assert!(!w.quoted);
+        assert_eq!(wrapper_of_shell("cd x && make test"), None);
+        assert_eq!(wrapper_of_shell("FOO=1 cargo test"), None);
+    }
+
+    #[test]
+    fn a_quoted_wrapper_wraps_the_whole_command_and_keeps_the_console_logger_whole() {
+        let d = dir("csharp-wrap", &[("App.sln", "")]);
+        let mut p = propose(&d);
+        apply_wrapper_form(
+            &mut p,
+            &Wrapper {
+                prefix: "./dev".into(),
+                quoted: true,
+            },
+        );
+        let run = &p.suites[0].run;
+        assert!(
+            run.starts_with(
+                "./dev \"dotnet test --logger trx --logger \\\"console;verbosity=normal\\\"\""
+            ),
+            "{run}"
+        );
+        let sel = p.suites[0].select.as_deref().unwrap();
+        assert!(sel.ends_with("FullyQualifiedName~{filter}\""), "{sel}");
+        // An unquoted wrapper must not split the logger at its `;` either.
+        let mut p = propose(&d);
+        apply_wrapper(&mut p, "./dev");
+        assert!(
+            p.suites[0].run.starts_with("./dev \"dotnet test"),
+            "{:?}",
+            p.suites[0].run
+        );
+    }
+
+    /// Round 16: the console logger shows each test as it finishes, so a
+    /// hang names the running test.
+    #[test]
+    fn dotnet_is_proposed_with_the_console_logger() {
+        let d = dir("csharp-console", &[("App.sln", "")]);
+        let p = propose(&d);
+        assert!(p.suites[0].run.contains("console;verbosity=normal"));
+        assert!(p.suites[0].run.contains("--logger trx"));
+    }
+
+    /// Round 16 (coordinator): `tsc --noEmit && vitest run` as `npm test`;
+    /// `select` runs vitest alone.
+    #[test]
+    fn select_that_skips_steps_of_the_test_script_says_so() {
+        let d = dir(
+            "npm-steps",
+            &[(
+                "package.json",
+                r#"{"scripts":{"test":"tsc --noEmit && vitest run"},"devDependencies":{"vitest":"1"}}"#,
+            )],
+        );
+        let p = propose(&d);
+        let note = p.notes.join("\n");
+        assert!(
+            note.contains("select runs vitest alone") && note.contains("`tsc --noEmit`"),
+            "{note}"
+        );
+        let toml = to_toml(&p);
+        assert!(toml.contains("select runs vitest alone"), "{toml}");
+        // A plain script says nothing.
+        let d = dir(
+            "npm-plain",
+            &[(
+                "package.json",
+                r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"1"}}"#,
+            )],
+        );
+        assert!(!propose(&d).notes.join("\n").contains("alone"));
+    }
+
+    /// Round 16: the comment claimed `-v` lines for a command that is not
+    /// verbose.
+    #[test]
+    fn the_project_command_is_not_claimed_verbose() {
+        let d = dir(
+            "py-quiet",
+            &[
+                ("pytest.ini", "[pytest]\n"),
+                ("Makefile", "test:\n\tpytest -q\n\tflake8\n"),
+            ],
+        );
+        let p = propose(&d);
+        let why = &p.suites[0].why;
+        assert!(
+            why.contains("only if its pytest runs verbose")
+                && !why.contains("-v lines are recognized"),
+            "{why}"
+        );
     }
 }
