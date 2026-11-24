@@ -872,6 +872,19 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     sup.pgid = pgid;
     sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
+    // A parameterized case's selection that the framework can only take as
+    // its whole method: all its cases run (round 15: no word of it).
+    if let Some(sel) = spec.selection.as_deref() {
+        let filter = crate::config::framework_filter(&spec.command.display(), sel);
+        if (sel.ends_with(']') || sel.ends_with(')')) && sel.contains('(') && !filter.contains('(')
+        {
+            sup.emit(EventKind::RunNote {
+                message: format!(
+                    "the framework selects {filter:?}, not one of its cases: every case of it runs"
+                ),
+            });
+        }
+    }
     if !injected.is_empty() {
         // Short: the temporary paths are noise in every summary (round 9).
         let vars: Vec<String> = injected

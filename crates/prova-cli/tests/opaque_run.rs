@@ -1145,3 +1145,32 @@ fn skipped_subtests_are_counted_as_skipped() {
         "{out}"
     );
 }
+
+/// Round 15: selecting one case of a parameterized test ran all of them,
+/// with no word of it (Surefire selects methods).
+#[test]
+fn selecting_one_parameterized_case_says_every_case_runs() {
+    let d = workspace("param-select");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.j]\nrun = \"echo all\"\nselect = \"echo mvn -q test -Dtest={filter}; i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test calc::x ... ok'\"\n",
+    )
+    .unwrap();
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "j",
+            "--json",
+            "--select",
+            "calc.CalcTest::many(int, int)[2]",
+        ],
+    );
+    let v = json(&o);
+    assert!(
+        v["notes"]
+            .to_string()
+            .contains("not one of its cases: every case of it runs"),
+        "{v}"
+    );
+}
