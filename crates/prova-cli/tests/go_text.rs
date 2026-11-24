@@ -753,3 +753,16 @@ fn a_quarantined_go_failure_is_no_retry() {
     assert_eq!(s["outcome"], "passed", "{s}");
     assert!(!s.to_string().contains("passed on a retry"), "{s}");
 }
+
+/// Round 16: gotestsum prints a subpackage relative to the module
+/// (`calc.TestFlaky`), `go test` by its import path: one test, two names.
+#[test]
+fn gotestsum_subpackages_are_named_by_import_path() {
+    let d = workspace("gts-subpkg");
+    std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
+    let (_, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'PASS calc.TestAdd (0.00s)' 'FAIL calc.TestFlaky (0.00s)' 'FAIL calc' '' 'DONE 2 tests, 1 failure in 0.1s'; exit 1",
+    );
+    assert_eq!(failing(&s), vec!["example.com/m/calc::TestFlaky"], "{s}");
+}

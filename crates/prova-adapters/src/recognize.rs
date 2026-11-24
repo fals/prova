@@ -4898,11 +4898,25 @@ impl Recognizers {
         {
             return root.clone();
         }
-        self.go_full_pkgs
+        if let Some(full) = self
+            .go_full_pkgs
             .iter()
             .find(|f| f.as_str() == printed || f.ends_with(&format!("/{printed}")))
-            .cloned()
-            .unwrap_or_else(|| printed.to_owned())
+        {
+            return full.clone();
+        }
+        // gotestsum prints a package relative to the module (`calc` for
+        // `example.com/m/calc`): go.mod completes it, as `go test` prints
+        // it (round 16: two identities for one test).
+        if let Some(m) = &self.go_module
+            && !printed.starts_with(m.as_str())
+            && !printed.split('/').next().unwrap_or("").contains('.')
+            && !printed.contains(' ')
+            && !printed.is_empty()
+        {
+            return format!("{m}/{printed}");
+        }
+        printed.to_owned()
     }
 
     /// The name a Go test has until its package is known. The segment keeps
