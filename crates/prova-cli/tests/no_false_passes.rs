@@ -595,3 +595,22 @@ fn a_vitest_unhandled_error_is_named_by_its_origin_and_error() {
         "{s}"
     );
 }
+
+/// Round 16: older pytest-subtests prints `test_other [case 2] SUBFAIL`;
+/// the failure was attributed to no test ("no test failed; exit 1").
+#[test]
+fn an_older_pytest_subtests_failure_names_its_test() {
+    let d = workspace("subfail_old");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'tests/test_q.py::test_ok PASSED' 'tests/test_q.py::test_other [case 1] SUBPASS' 'tests/test_q.py::test_other [case 2] SUBFAIL' 'tests/test_q.py::test_other PASSED' '========= 3 passed, 1 subtests failed in 0.05s ========='; exit 1",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    let names = failure_names(&s);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("test_other") && n.contains("case 2")),
+        "{s}"
+    );
+}

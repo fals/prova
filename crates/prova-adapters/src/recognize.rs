@@ -2070,12 +2070,17 @@ impl Recognizers {
         if !line.contains(".py::") {
             return false;
         }
-        const STATUS: [(&str, Outcome); 10] = [
+        const STATUS: [(&str, Outcome); 13] = [
             // pytest-rerunfailures: a failed attempt that runs again.
             ("RERUN", Outcome::Failed),
             ("SUBPASSED", Outcome::Passed),
             ("SUBFAILED", Outcome::Failed),
             ("SUBSKIPPED", Outcome::Skipped),
+            // Older pytest-subtests: `test_x [case 2] SUBFAIL` (round 16:
+            // the failure was attributed to no test).
+            ("SUBPASS", Outcome::Passed),
+            ("SUBFAIL", Outcome::Failed),
+            ("SUBSKIP", Outcome::Skipped),
             ("PASSED", Outcome::Passed),
             ("FAILED", Outcome::Failed),
             ("SKIPPED", Outcome::Skipped),
@@ -2105,6 +2110,14 @@ impl Recognizers {
         let id = line[..i].trim();
         if id.contains(' ') && !id.contains('[') {
             return false; // not an id: prose that mentions a test file
+        }
+        // Older pytest-subtests prints the subtest's label before the word.
+        if matches!(word, "SUBPASS" | "SUBFAIL" | "SUBSKIP")
+            && let Some((parent, label)) = id.rsplit_once(" [")
+        {
+            let key = pytest_subtest(pytest_key(parent.trim()), &format!("[{label}"));
+            self.result(key, outcome, None, None, Level::Recognized, true, out);
+            return true;
         }
         let key = pytest_key(id);
         if word == "RERUN" {
