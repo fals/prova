@@ -253,6 +253,9 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The container client the tests run through, if any.
     container: Option<&'static str>,
+    /// The client's command line, to find its container when the run is
+    /// stopped (round 15).
+    container_cmd: Option<String>,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -641,6 +644,36 @@ impl Supervisor<'_> {
         });
     }
 
+    /// The run is being stopped: stopping a container client does not stop
+    /// its container. A container the run named (`--name`, `--cidfile`) is
+    /// killed; any other is not attributable, so the run says to check.
+    fn stop_container(&mut self) {
+        let Some(client) = self.container else {
+            return;
+        };
+        let cmd = self.container_cmd.clone().unwrap_or_default();
+        match crate::resources::container_of(&cmd) {
+            Some(target) if crate::resources::container_client_runs(&cmd) => {
+                let ok = crate::resources::kill_container(client, &target);
+                let message = if ok {
+                    format!("stopped the container `{target}` with `{client} kill {target}`: stopping the `{client}` client alone does not stop it")
+                } else {
+                    format!("could not stop the container `{target}` with `{client} kill {target}`: check `{client} ps` and stop it")
+                };
+                if ok {
+                    self.emit(EventKind::RunNote { message });
+                } else {
+                    self.emit(EventKind::RunWarning { message });
+                }
+            }
+            _ => self.emit(EventKind::RunWarning {
+                message: format!(
+                    "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
+                ),
+            }),
+        }
+    }
+
     /// A snapshot of the command's group, reused when under 50 ms old.
     fn usage_now(&mut self) -> crate::resources::Usage {
         if let Some((at, u)) = &self.last_usage
@@ -652,13 +685,19 @@ impl Supervisor<'_> {
         // A container client started before the tests printed anything is
         // how the command runs them: what they use is out of sight.
         if self.container.is_none() {
-            self.container = u.procs.iter().find_map(|(pid, (_, cmd))| {
+            let found = u.procs.iter().find_map(|(pid, (_, cmd))| {
                 let early = match (u.starts.get(pid), self.first_line_ms) {
                     (Some(start), Some(first)) => *start <= first,
                     _ => true,
                 };
-                crate::resources::container_client(cmd).filter(|_| early)
+                crate::resources::container_client(cmd)
+                    .filter(|_| early)
+                    .map(|c| (c, cmd.clone()))
             });
+            if let Some((client, cmd)) = found {
+                self.container = Some(client);
+                self.container_cmd = Some(cmd);
+            }
         }
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
@@ -812,6 +851,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // The command itself may be the client (`docker run ... go test`):
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
+        container_cmd: Some(spec.command.display()),
         superseded: Default::default(),
         phase: None,
         whole: None,
@@ -1001,6 +1041,7 @@ fn observe_child(
             if terminating.is_none() && store.cancel_requested(run)? {
                 process::terminate_group(pgid);
                 sup.terminating = true;
+                sup.stop_container();
                 terminating = Some((now, Status::Cancelled, "cancelled".into()));
             }
         }
@@ -1018,6 +1059,7 @@ fn observe_child(
         if terminating.is_none() && now.duration_since(start) >= kill_after {
             process::terminate_group(pgid);
             sup.terminating = true;
+            sup.stop_container();
             let reason = format!(
                 "killed: exceeded kill_after {}",
                 crate::ids::format_duration(kill_after)
@@ -1094,6 +1136,7 @@ fn observe_child(
         // Cancelled while its output was still being recorded: what was not
         // recorded yet is dropped, and the run says it was cancelled.
         sup.terminating = true;
+        sup.stop_container();
         terminating = Some((Instant::now(), Status::Cancelled, "cancelled".into()));
     }
     // The test phase's size (ADR 0026 §2): what tests prova could not

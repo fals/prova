@@ -1145,3 +1145,80 @@ fn skipped_subtests_are_counted_as_skipped() {
         "{out}"
     );
 }
+
+/// A fake `docker` on PATH: `run` prints a test line and hangs; `kill`
+/// records its arguments in `killed`.
+#[cfg(target_os = "linux")]
+fn fake_docker(d: &Path) -> (String, PathBuf) {
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let killed = d.join("killed");
+    let fake = bin.join("docker");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {}; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
+            killed.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (path, killed)
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_fake_docker(d: &Path, path: &str, args: &[&str]) -> serde_json::Value {
+    let mut a = vec!["run", "--detach", "--json", "--", "docker", "run", "--rm"];
+    a.extend_from_slice(args);
+    let o = Command::new(PROVA)
+        .args(a)
+        .current_dir(d)
+        .env("PROVA_HOME", home_of(d))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let id = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(d, id.clone());
+    assert!(prova(d, &["cancel", &id]).status.success());
+    json(&prova(
+        d,
+        &["wait", &id, "--until", "done", "--max-wait", "20s", "--json"],
+    ))
+}
+
+/// Round 15: cancelling a run through a container client left the
+/// container running. A named container is attributable to the run: prova
+/// kills it, and says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_stops_a_named_container_of_the_run() {
+    let d = workspace("cancel-container");
+    let (path, killed) = fake_docker(&d);
+    let s = cancel_fake_docker(&d, &path, &["--name", "pv-x", "img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
+        "kill pv-x",
+        "{s}"
+    );
+    assert!(s.to_string().contains("pv-x"), "{s}");
+}
+
+/// Without a name or cidfile the container cannot be attributed: prova
+/// does not guess, it says what to check.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_warns_when_the_container_cannot_be_attributed() {
+    let d = workspace("cancel-container-anon");
+    let (path, killed) = fake_docker(&d);
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(!killed.exists(), "{s}");
+    let text = s.to_string();
+    assert!(
+        text.contains("does not stop its container") && text.contains("docker ps"),
+        "{text}"
+    );
+}
