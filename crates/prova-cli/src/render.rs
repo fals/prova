@@ -852,7 +852,7 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) on this baseline and metric (revalidations count), Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment's family for this metric (revalidations count), Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
                     num("baseline_median"),
@@ -892,6 +892,21 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             {
                 format!(
                     "revalidated against the original baseline: report experiment {} and this verdict",
+                    r.experiment
+                )
+            }
+            // Beat something other than the best: the best is unchanged.
+            ("decided", Some("accept")) if c.baseline != r.best && c.candidate != r.best => {
+                format!(
+                    "accepted against {}, not against the best: the best is still {}; compare with it: prova exp run {} --against {}",
+                    c.baseline, r.best, r.experiment, r.best
+                )
+            }
+            ("decided", Some("accept"))
+                if r.protocol.oracle.is_none() && r.protocol.specs.is_empty() =>
+            {
+                format!(
+                    "keep it once its correctness is checked (tests, or an --oracle); try the next idea, or `prova exp revalidate {}`",
                     r.experiment
                 )
             }
