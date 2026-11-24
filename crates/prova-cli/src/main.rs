@@ -1150,13 +1150,20 @@ fn init() -> Result<u8> {
             targets.push((f, false));
         }
     }
+    let mut created = Vec::new();
     for (f, create) in targets {
+        let existed = root.join(f).exists();
         match upsert_section(&root, &root.join(f), create) {
+            // "updated" a file init had just created (round 14).
+            Ok(Section::Changed) if !existed => created.push(f),
             Ok(Section::Changed) => updated.push(f),
             Ok(Section::Unchanged) => {}
             Ok(Section::Skipped(why)) => eprintln!("skipped {f}: {why}"),
             Err(e) => failures.push(format!("{f}: {e}")),
         }
+    }
+    if !created.is_empty() {
+        println!("created {} with a prova section", created.join(", "));
     }
     if !updated.is_empty() {
         println!("updated the prova section in {}", updated.join(", "));

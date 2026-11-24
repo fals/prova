@@ -851,7 +851,13 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             })
             .collect();
         sup.emit(EventKind::RunNote {
-            message: format!("injected by prova.toml (opt-in): {}", vars.join("; ")),
+            // From prova.toml or `--inject` alike (round 14: the note
+            // named prova.toml for a recipe given on the command line).
+            message: format!(
+                "injected by opt-in recipe {}: {}",
+                spec.inject.join(", "),
+                vars.join("; ")
+            ),
         });
     }
     let result = observe_child(

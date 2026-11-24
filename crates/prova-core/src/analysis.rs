@@ -533,7 +533,12 @@ pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
         return Ok(Some(SizeView {
             size: None,
             at_most: None,
-            label: format!("small? (nothing more seen in {small} of {SMALL_AFTER} runs)"),
+            // "1 of 3 runs" next to a history of 12 runs read as a
+            // miscount (round 14): it is the evidence so far, of what is
+            // needed.
+            label: format!(
+                "small? (nothing more seen in {small} run(s) that could show it; {SMALL_AFTER} needed)"
+            ),
         }));
     }
     Ok(None)

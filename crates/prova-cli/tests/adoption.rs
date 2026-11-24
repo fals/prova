@@ -373,3 +373,18 @@ fn verify_accepts_the_parent_of_a_selected_subtest() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.starts_with("VERIFIED"), "{out}");
 }
+
+/// Round 14: `init` said it "updated" an AGENTS.md it had just created.
+#[test]
+fn init_says_created_for_a_new_agents_md() {
+    let d = workspace("created");
+    let o = prova(&d, &["init"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("created AGENTS.md with a prova section"),
+        "{out}"
+    );
+    let o = prova(&d, &["init"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(!out.contains("created AGENTS.md"), "{out}");
+}

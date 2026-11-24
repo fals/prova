@@ -73,7 +73,7 @@ fn pytest_junit_recipe_lifts_the_run_and_is_visible() {
     assert_eq!(s["failures"][0]["test"], "tests.test_m::test_c");
     let notes = s["notes"].to_string();
     assert!(
-        notes.contains("injected by prova.toml (opt-in): PYTEST_ADDOPTS=--junitxml="),
+        notes.contains("injected by opt-in recipe pytest-junit: PYTEST_ADDOPTS=--junitxml="),
         "{notes}"
     );
     assert!(

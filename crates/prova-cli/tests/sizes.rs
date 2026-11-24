@@ -96,7 +96,7 @@ fn sizes_follow_processes_and_sockets_not_time() {
     // One attributed run is not enough to call a test small (ADR 0025 §5).
     let h = text(&prova(&d, port, &["history", "m::computes"]));
     assert!(
-        h.contains("size: small? (nothing more seen in 1 of 3 runs)"),
+        h.contains("size: small? (nothing more seen in 1 run(s) that could show it; 3 needed)"),
         "{h}"
     );
 
