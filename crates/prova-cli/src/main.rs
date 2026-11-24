@@ -2042,7 +2042,8 @@ fn repeat_runs(
 /// Waits for `until` within `budget` (ADR 0019). Short waits for the first
 /// failure return as they are; a wait for the result or a stall shows
 /// progress on stderr for the person watching: every new failure, slow
-/// test and stall as it happens, and one line every 30 s.
+/// test and stall as it happens, and a live line on a terminal (one line
+/// every 30 s in a log).
 fn wait_until(
     store: &Store,
     id: &str,
@@ -2057,9 +2058,11 @@ fn wait_until(
     let mut beat = std::time::Instant::now();
     let mut cursor = after;
     let mut reported: std::collections::BTreeSet<String> = Default::default();
+    let mut live = render::Live::new();
     loop {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
+            live.clear();
             return Ok(engine::summarize(store, id, WaitReason::Running, cursor)?);
         }
         let s = engine::wait(
@@ -2071,17 +2074,29 @@ fn wait_until(
         )?;
         cursor = s.last_seq;
         match s.reason {
-            WaitReason::Done => return Ok(s),
+            WaitReason::Done => {
+                live.clear();
+                return Ok(s);
+            }
             // A stall ends any long wait: waiting out the budget on a hung
             // run helps nobody (round 6); the summary says to cancel.
             // (Not once a cancel was asked for: then the end is coming.)
-            WaitReason::Stall if !store.cancel_requested(id)? => return Ok(s),
+            WaitReason::Stall if !store.cancel_requested(id)? => {
+                live.clear();
+                return Ok(s);
+            }
             WaitReason::Failure | WaitReason::Slow | WaitReason::Stall => {
+                live.clear();
                 render::progress(&s, &mut reported)
             }
             WaitReason::Running => {}
         }
-        if beat.elapsed() >= Duration::from_secs(30) {
+        // A person at a terminal sees the run move; a log gets a line
+        // every 30 s.
+        if live.on() {
+            let last = engine::output_tail(store, id, 1);
+            live.show(&s, last.last().map(String::as_str));
+        } else if beat.elapsed() >= Duration::from_secs(30) {
             beat = std::time::Instant::now();
             render::heartbeat(&s);
         }
@@ -2102,6 +2117,8 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<(u8, bool)> {
     let mut cursor = 0;
     let mut cancel_sent = false;
     let mut reported: std::collections::BTreeSet<String> = Default::default();
+    let mut live = render::Live::new();
+    let mut beat = std::time::Instant::now();
     loop {
         if interrupted.load(std::sync::atomic::Ordering::SeqCst) && !cancel_sent {
             cancel_sent = true;
@@ -2119,6 +2136,7 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<(u8, bool)> {
         cursor = s.last_seq;
         match s.reason {
             WaitReason::Done => {
+                live.clear();
                 render::summary(&s, json);
                 return Ok((exit_code(&s), true));
             }
@@ -2126,13 +2144,27 @@ fn attached(store: &Store, id: &str, json: bool) -> Result<(u8, bool)> {
             // round 7: a hang blocked a bare `prova run -- cmd` forever).
             // The run goes on; the summary says to cancel it.
             WaitReason::Stall if !cancel_sent => {
+                live.clear();
                 render::summary(&s, json);
                 return Ok((exit_code(&s), false));
             }
             WaitReason::Failure | WaitReason::Stall | WaitReason::Slow if !json => {
+                live.clear();
                 render::progress(&s, &mut reported)
             }
             _ => {}
+        }
+        // Progress while it runs (round: a 50 s `prova run -- make test`
+        // that passed showed nothing until the end): a live line on a
+        // terminal, a line every 30 s in a log.
+        if !json {
+            if live.on() {
+                let last = engine::output_tail(store, id, 1);
+                live.show(&s, last.last().map(String::as_str));
+            } else if beat.elapsed() >= Duration::from_secs(30) {
+                beat = std::time::Instant::now();
+                render::heartbeat(&s);
+            }
         }
     }
 }
