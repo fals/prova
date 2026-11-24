@@ -3052,17 +3052,37 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // the selection leaking).
     if let Some(sel) = &selection {
         let leaf = sel.rsplit("::").next().unwrap_or(sel).to_lowercase();
-        let outside: Vec<&str> = failures
-            .iter()
-            .map(|f| f.test.as_str())
+        // A qualified selection (`pkg::TestAdd`) names one test and its
+        // subtests: a same-named test of another package that ran is
+        // outside it (round 16: `go test -run ^TestAdd$ ./...` ran both).
+        let qualified = sel.contains("::");
+        let selected = |t: &str| {
+            let tl = t.to_lowercase();
+            if qualified && tl.contains("::") {
+                let sl = sel.to_lowercase();
+                tl == sl || tl.starts_with(&format!("{sl}/")) || sl.starts_with(&format!("{tl}/"))
+            } else {
+                tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl))
+            }
+        };
+        let mut outside: Vec<String> = finals
+            .values()
+            .map(|f| f.0.display())
             .filter(|t| {
-                let tl = t.to_lowercase();
                 t.ends_with("::(file)")
                     || t.ends_with("::(package)")
                     || t.ends_with("::(suite)")
-                    || !(tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl)))
+                    || !selected(t)
+            })
+            .filter(|t| {
+                // Passes outside only matter for a qualified selection;
+                // failures always.
+                qualified || failures.iter().any(|f| f.test == *t)
             })
             .collect();
+        outside.sort();
+        outside.dedup();
+        let outside: Vec<&str> = outside.iter().map(String::as_str).collect();
         if !outside.is_empty() {
             notes.push(format!(
                 "outside the selection {sel:?}: {} (the framework loaded or ran more than the filter names)",

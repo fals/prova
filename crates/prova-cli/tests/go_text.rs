@@ -659,3 +659,29 @@ fn gotestsum_testname_root_package_tests_are_tests() {
         "{s}"
     );
 }
+
+/// Round 16: selecting `pkg/b::TestAdd` ran `go test -run ^TestAdd$ ./...`,
+/// so pkg/a's TestAdd ran (and failed) too, with no word that it was not
+/// what was selected.
+#[test]
+fn a_qualified_selection_names_same_named_tests_it_also_ran() {
+    let d = workspace("qual-sel");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.go]\nrun = \"true\"\nselect = {:?}\n",
+            format!(
+                "{WORK}: go test -run {{filter}} ./...; printf '%s\\n' '=== RUN   TestAdd' '    a_test.go:3: boom' '--- FAIL: TestAdd (0.00s)' 'FAIL' 'FAIL\texample.com/m/a\t0.01s' '=== RUN   TestAdd' '--- PASS: TestAdd (0.00s)' 'PASS' 'ok  \texample.com/m/b\t0.01s'; exit 1"
+            )
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "go", "--select", "example.com/m/b::TestAdd"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains(
+            "outside the selection \"example.com/m/b::TestAdd\": example.com/m/a::TestAdd"
+        ),
+        "{out}"
+    );
+}
