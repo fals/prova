@@ -658,3 +658,27 @@ fn a_quarantine_applies_under_gotestsum_and_says_what_make_skipped() {
     assert_eq!(o.status.code(), Some(0), "{t}");
     assert!(t.contains("any step after it did not run"), "{t}");
 }
+
+/// Round 16: under a quiet suite (`cargo test --quiet` via make) a refused
+/// quarantine said "no other test passed" next to "the framework counted 5".
+#[test]
+fn a_refusal_under_quiet_output_says_passes_were_only_counted() {
+    let d = workspace("quiet-q");
+    let quiet = format!(
+        "{BUSY} if [ \"$(cat state)\" = pass ]; then echo 'test result: ok. 5 passed; 0 failed; 0 ignored'; else echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 4 passed; 1 failed; 0 ignored'; exit 101; fi"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.q]\nrun = {quiet:?}\n"),
+    )
+    .unwrap();
+    run(&d, "q", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "q", "fail");
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(
+        t.contains("the framework counted 5 test(s), but its output names no passing test"),
+        "{t}"
+    );
+}

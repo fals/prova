@@ -1768,10 +1768,18 @@ fn observe_child(
                 new_subtests.join(", ")
             )
         } else if !verified_other {
-            format!(
-                "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
-                failing.join(", ")
-            )
+            // Quiet output counts passes without naming them (round 16:
+            // "no other test passed" next to "the framework counted 5").
+            match sup.framework_total {
+                Some(t) if t > failing.len() as u64 => format!(
+                    "only quarantined test(s) failed ({}); the framework counted {t} test(s), but its output names no passing test, so nothing else was verified: a suite with verbose or structured output (prova adopt) can set the failure aside",
+                    failing.join(", ")
+                ),
+                _ => format!(
+                    "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
+                    failing.join(", ")
+                ),
+            }
         } else {
             format!(
                 "only quarantined test(s) failed ({}), but the run cannot be set aside (exit {}, or the run did not end on its own)",
