@@ -3,7 +3,7 @@
 Format: one file per decision, `NNNN-title.md`, sections Status, Context, Decision, Consequences, Alternatives.
 Status values: Proposed, Accepted, Superseded by NNNN. An accepted ADR is never edited in substance; it is superseded.
 
-Records 0001 to 0026 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
+Records 0001 to 0027 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
 
 | # | Decision | Status | Deviates from README? |
 |---|---|---|---|
@@ -33,6 +33,6 @@ Records 0001 to 0026 are **Accepted**, each on the date in its row. Later amendm
 | [0024](0024-sandbox-retries-and-abba.md) | Sandboxed experiment arms (bubblewrap); retries decided by the last attempt; nextest early-exit detection; ABBA trials; amends 0002, 0007, 0017, 0023 | Accepted 2026-11-23 | no |
 | [0025](0025-sizes-by-resources.md) | Test sizes come from the resources a test used (processes, network), never from its duration; amends 0005, 0013 | Accepted 2026-11-23 | no |
 | [0026](0026-sizes-from-process-start-times-and-the-run.md) | Sizes from process start times and from the whole run; small says it is the absence of evidence; amends 0025 | Accepted 2026-11-24 | no |
-| [0027](0027-quarantine-and-slow-tests.md) | Quarantine for known-flaky tests (store, reason, expiry, always listed); a left-out flaky test is warned about; `prova slowest`; amends 0017, 0018 | Proposed 2026-11-24 | no |
+| [0027](0027-quarantine-and-slow-tests.md) | Quarantine for known-flaky tests (store, reason, expiry, always listed); a left-out flaky test is warned about; `prova slowest`; amends 0017, 0018 | Accepted 2026-11-24 | no |
 
 The deviations from the README were accepted with the records.

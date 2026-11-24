@@ -1,6 +1,6 @@
 # 0027: Quarantine for known-flaky tests, and slow tests made visible
 
-Status: Proposed (2026-11-24). Amends [0017](0017-no-false-passes.md) (what a pass may exclude) and [0018](0018-honest-history-and-live-nextest.md) (what the flaky label does to a verdict).
+Status: Accepted (2026-11-24). Modelled in `spec/run.qnt` (`withQuarantine`, invariant `quarantineHidesOnlyItsOwn`). Amends [0017](0017-no-false-passes.md) (what a pass may exclude) and [0018](0018-honest-history-and-live-nextest.md) (what the flaky label does to a verdict).
 
 ## Context
 
