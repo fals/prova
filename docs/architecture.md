@@ -183,6 +183,26 @@ A test's size is what it used, never how long it took
 Google, ch. 11): one process and no network is small; more processes or
 `localhost` is medium; another host is large.
 
+```mermaid
+flowchart TB
+    subgraph Sample["Supervisor: every 0.5 s, and at each test start and finish"]
+        T["Process tree<br/>group + descendants in other groups<br/>(/proc, ps)"]
+        K["Sockets of the tree<br/>/proc/pid/fd + /proc/net/*, lsof<br/>local or another host"]
+    end
+    T --> A{"Can prova tell<br/>which test used it?"}
+    K --> A
+    A -->|"a process names the test<br/>(nextest --exact): its subtree"| OWN["Own process"]
+    A -->|"only test running, first seen<br/>50 ms inside its start and finish lines"| SOLO["Solo window"]
+    A -->|"tests overlap, or too short<br/>to be sampled"| NONE["Not attributed"]
+    OWN --> TS["test_size event<br/>size + evidence"]
+    SOLO --> TS
+    NONE --> RS["run_size event<br/>the whole command: an upper bound"]
+    TS --> DB[("test_sizes table")]
+    RS --> DB
+    DB --> R["prova sizes · prova history<br/>small after 3 runs; medium and large at once;<br/>else 'medium or less' or unknown"]
+    TS -->|"suite declared smaller"| NOTE["run note naming the resource"]
+```
+
 - Each sample records the run's process tree and the sockets it holds
   (`/proc/<pid>/fd` against `/proc/net/{tcp,tcp6,udp,udp6,unix}` on Linux,
   `lsof` on macOS), each socket as local or another host.

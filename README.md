@@ -43,12 +43,9 @@ next: fix and rerun, or `prova cancel 3fa9c1d2`; `prova wait 3fa9c1d2 --after 14
   progress line; agents get compact output. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
 - **Memory.** Every attempt is stored with the exact code it ran on: new
   failure, failed before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
-- **A suite that stays cheap.** Agents write broad tests that start servers
-  and databases; every run then costs CPU and flakes on ports. prova
-  observes what each test uses (processes, sockets) and sizes it by
-  Google's definition, never by duration: `prova sizes` names what makes a
-  test medium or large ("started postgres"), so you know what to replace
-  with an in-process fake. ([why sizes matter](docs/getting-started.md#test-sizes-why-they-matter))
+- **A suite that stays cheap.** Every test is sized by what it uses
+  (processes, network), never by its duration, and `prova sizes` names what
+  to fix. ([why sizes matter](docs/getting-started.md#test-sizes-why-they-matter))
 - **Experiments, not anecdotes.** Any objective (time, steps, accuracy),
   read straight from `go test -bench`, criterion, pytest-benchmark, Vitest,
   JMH or BenchmarkDotNet. Pre-registered protocol, interleaved
@@ -108,6 +105,16 @@ prova exp new speed --hypothesis "sieve beats trial division" \
 # change the code, then
 prova exp candidate speed && prova exp run speed
 # ACCEPT  c1 vs baseline: BenchmarkCountPrimes.ns_per_op improved +94.9% (CI [+94.5%, +95.9%], p=0.0079)
+```
+
+What does each test cost?
+
+```console
+$ prova sizes
+212 tests by what they used (ADR 0025): small 171  medium 38  large 3  unknown 0
+  api::orders::lists_paid_orders: large (connected to 10.0.3.7:5432)
+  api::orders::creates_an_order: medium (started postgres; 2 local socket(s))
+  cli::exports_csv: medium (started sh)
 ```
 
 More in [Getting started](docs/getting-started.md).
