@@ -103,8 +103,13 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         " so far"
     };
     line.push_str(&format!(
-        "  level{so_far} {}  code {}",
+        "  level{so_far} {}{}  code {}",
         level_name(s.level),
+        if s.with_result_files {
+            " + result files"
+        } else {
+            ""
+        },
         s.code
     ));
     println!("{line}");
@@ -1089,6 +1094,7 @@ mod live_tests {
             status: Status::Running,
             outcome: None,
             level: Level::Opaque,
+            with_result_files: false,
             last_seq: 0,
             elapsed_ms: 12_000,
             counts: Counts {

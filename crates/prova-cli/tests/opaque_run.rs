@@ -868,6 +868,9 @@ fn console_and_trx_results_are_each_test_once() {
         (Some(2), Some(2)),
         "{v}"
     );
+    // Round 14: the level named only the console though the TRX counted.
+    assert_eq!(v["level"], "recognized", "{v}");
+    assert_eq!(v["with_result_files"], true, "{v}");
 }
 
 /// Round 13 (Java, C#): a result file the previous run wrote moments before

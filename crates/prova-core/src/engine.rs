@@ -1976,6 +1976,10 @@ pub struct Summary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
     pub level: Level,
+    /// Some results came from result files although the level is higher
+    /// (round 14: "recognized output" with counts read from TRX).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub with_result_files: bool,
     pub last_seq: u64,
     pub elapsed_ms: u64,
     pub counts: Counts,
@@ -2632,6 +2636,15 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         status: row.status,
         outcome: row.outcome,
         level: row.level,
+        with_result_files: row.level > Level::ResultFiles
+            && store
+                .conn()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM attempts WHERE run_id = ?1 AND source = ?2)",
+                    rusqlite::params![run, Level::ResultFiles.as_u8()],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false),
         last_seq,
         elapsed_ms: end.saturating_sub(row.started_ms.unwrap_or(row.created_ms)),
         counts,
