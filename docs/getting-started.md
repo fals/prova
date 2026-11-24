@@ -97,12 +97,7 @@ the command's latest output line, when prova cannot see individual tests);
 it is erased before the result. Agents and CI logs get compact output: no
 live line, one progress line every 30 s.
 
-Sizes follow what a test used, never its duration: one process and no
-network is small, more processes or `localhost` is medium, another host is
-large ([ADR 0025](adr/0025-sizes-by-resources.md)). prova can tell only for
-tests it sees alone or in their own process (nextest runs each test so);
-`prova sizes` says how many it could not see, and `prova history <test>`
-shows a test's size with the reason.
+Sizes are explained in [Test sizes](#test-sizes-why-they-matter) below.
 
 A run whose results were not real (a broken fixture, a stale report) can be
 taken out of every test's history: `prova forget <run> --reason "..."`.
@@ -125,6 +120,78 @@ in the suite command.
 
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 prova or infrastructure error, 5 still running.
+
+## Test sizes: why they matter
+
+Agents write tests faster than anyone reviews them, and the easy test to
+write is a broad one: start the server, the database, the queue, then
+check one function. Each such test costs seconds of CPU and real
+processes, fails when a port is taken or a container starts slowly, and
+the fix loop runs the suite dozens of times a day. CPU, CI minutes and the
+agent's own time are limited; a suite that grows this way gets slower and
+flakier with every change, and nobody notices until it is expensive to
+undo.
+
+Size is the measure that tells. It is what a test **uses**, never how long
+it takes ([Software Engineering at Google, ch. 11](https://abseil.io/resources/swe-book/html/ch11.html);
+[ADR 0025](adr/0025-sizes-by-resources.md)):
+
+| Size | Processes | Network | Also |
+|---|---|---|---|
+| small | one, the test's own | none | no disk, no sleep |
+| medium | several, one machine | `localhost` only | a local database, temp files |
+| large | any | other hosts | end-to-end |
+
+A fast test that starts a database is medium; a slow pure computation is
+small. Size is not scope: a "unit" test that talks to a local database is
+medium, an "integration" test of two in-process components is small. Small
+tests run in milliseconds, in parallel, with the same result every time:
+most of a suite should be small (Google's rough guide is 80/15/5).
+
+What prova does for you, on every run, with no configuration:
+
+- **Observes what each test used:** its processes and its sockets, local or
+  to another host. A test is held to what prova saw in its own process (one
+  process per test, as nextest runs them) or while it was the only test
+  running; prova never guesses, and never charges one test for another's
+  resources.
+- **Names what to fix.** `prova sizes` counts small, medium and large tests
+  and lists each medium or large one with the reason: `started postgres`,
+  `2 local socket(s)`, `connected to 10.0.3.7:5432`. Replace that dependency
+  with an in-process fake and the test becomes small; prova sees it on the
+  next runs. `prova history <test>` shows one test's size and why.
+- **Warns when the suite drifts:** fewer than 60% small tests among those
+  with an observed size gets a warning in `prova sizes`.
+- **Keeps a fast suite fast.** A suite declared `size = "small"` in
+  `prova.toml` gets a run note when one of its tests starts a process or
+  opens a socket, naming it, so a slow test does not slip into the inner
+  loop.
+- **Bounds time by size.** Until history exists, a small test is called
+  slow after 1 s (medium 30 s, large 5 min), a quiet run stalls after 30 s
+  (60 s, 5 min), and a test is killed at 60 s (300 s, 900 s). A hung test
+  costs seconds, not a CI timeout.
+
+What prova cannot see: what a test starts and stops between two samples
+(every 0.5 s); a test is called small only after 3 runs that saw nothing
+more, and a test it never saw alone or in its own process shows the run's
+size as an upper bound, or "unknown". Split small tests into their own
+suite and run that one in the fix loop:
+
+```toml
+[suite.small]
+run = "cargo test --lib"
+size = "small"
+
+[suite.medium]
+run = "cargo test --tests"
+size = "medium"
+```
+
+```
+prova run small --until first-failure   # the inner loop: seconds
+prova run medium --until done           # before a PR
+prova sizes                             # what to make smaller
+```
 
 ## Is the change better?
 
