@@ -1047,3 +1047,30 @@ fn a_stall_reports_the_idle_time_so_far() {
     assert!(s["stalled_ms"].as_u64().unwrap() >= 3000, "{s}");
     prova(&d, &["cancel", &run]);
 }
+
+/// Round 14: `run_finished` was stamped with the process's exit time,
+/// before the size and totals events recorded ahead of it.
+#[test]
+fn event_timestamps_never_go_back() {
+    let d = workspace("ts-order");
+    prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test m::a ... ok'; echo 'test result: ok. 1 passed; 0 failed'",
+        ],
+    );
+    let ev = stdout(&prova(&d, &["events", "last"]));
+    let ts: Vec<u64> = ev
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["ts_ms"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ev}");
+}
