@@ -251,6 +251,8 @@ struct Supervisor<'a> {
     line_at: Option<Arrived>,
     /// When the run's first output line arrived, in ms since boot.
     first_line_ms: Option<u64>,
+    /// The container client the tests run through, if any.
+    container: Option<&'static str>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
     /// From the first output line to the end: the phase of a run whose
@@ -514,6 +516,7 @@ impl Supervisor<'_> {
             // Nothing sampled inside it (its lines came at once, or it was
             // too short): no size can be claimed (ADR 0026).
             && t.seen.samples > 0
+            && self.container.is_none()
         {
             let size = t.seen.size();
             let evidence = t.seen.evidence();
@@ -633,6 +636,17 @@ impl Supervisor<'_> {
             return u.clone();
         }
         let u = crate::resources::sample(self.pgid);
+        // A container client started before the tests printed anything is
+        // how the command runs them: what they use is out of sight.
+        if self.container.is_none() {
+            self.container = u.procs.iter().find_map(|(pid, (_, cmd))| {
+                let early = match (u.starts.get(pid), self.first_line_ms) {
+                    (Some(start), Some(first)) => *start <= first,
+                    _ => true,
+                };
+                crate::resources::container_client(cmd).filter(|_| early)
+            });
+        }
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
         for (pid, (_, cmd)) in &u.procs {
@@ -782,6 +796,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         known_sockets: Default::default(),
         line_at: None,
         first_line_ms: None,
+        container: None,
         phase: None,
         whole: None,
         one_test_procs: BTreeMap::new(),
@@ -1068,7 +1083,13 @@ fn observe_child(
     // The test phase's size (ADR 0026 §2): what tests prova could not
     // isolate are held to. Only when the phase was sampled at least twice
     // (lines that all came at the end tell nothing about when tests ran).
-    if let Some(seen) = sup.phase_seen() {
+    if let Some(client) = sup.container {
+        sup.emit(EventKind::RunNote {
+            message: format!(
+                "the tests ran through `{client}`: their processes and sockets are out of prova's sight, so no size is recorded for them"
+            ),
+        });
+    } else if let Some(seen) = sup.phase_seen() {
         let size = seen.size();
         let evidence = seen.evidence();
         // A declared size is checked against the run as well (§5).

@@ -1090,3 +1090,42 @@ fn gotestsum_quiet_output_is_explained_once() {
         "{notes}"
     );
 }
+
+/// Round 14: tests run through `docker run` were called small ("no other
+/// process or socket seen") though prova could see only the client.
+/// Linux: sizes come from sampling /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn tests_run_through_a_container_client_get_no_size() {
+    let d = workspace("container");
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("docker");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ni=0; while [ $i -lt 400000 ]; do i=$((i+1)); done\necho 'test m::a ... ok'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = Command::new(PROVA)
+        .args([
+            "run", "--json", "--", "docker", "run", "--rm", "img", "cargo", "test",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let v = json(&o);
+    assert!(
+        v["notes"].to_string().contains("ran through `docker`"),
+        "{v}"
+    );
+    let ev = stdout(&prova(&d, &["events", "last"]));
+    assert!(
+        !ev.contains("\"run_size\"") && !ev.contains("\"test_size\""),
+        "{ev}"
+    );
+}
