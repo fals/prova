@@ -68,8 +68,11 @@ pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
     live.go_module = std::fs::read_to_string(root.join("go.mod"))
         .ok()
         .and_then(|m| {
-            m.lines()
-                .find_map(|l| l.trim().strip_prefix("module ").map(|p| p.trim().trim_matches('"').to_owned()))
+            m.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("module ")
+                    .map(|p| p.trim().trim_matches('"').to_owned())
+            })
         })
         .filter(|p| !p.is_empty());
     Box::new(Ladder {
