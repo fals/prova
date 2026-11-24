@@ -1220,8 +1220,9 @@ fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
 #[test]
 fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
     // Delays long against process start noise (macOS CI: a 20 ms arm
-    // measured 43 ms, then 92 ms, and the comparison was void).
-    let d = repo("notbest", "0.3");
+    // measured 43 ms, then 92 ms, and the comparison was void), with wide
+    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive).
+    let d = repo("notbest", "0.6");
     new_exp(&d, &[]);
     std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(
@@ -1233,7 +1234,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
         "fast"
     );
-    std::fs::write(d.join("delay"), "0.2").unwrap();
+    std::fs::write(d.join("delay"), "0.25").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "mid"])
             .status
@@ -1252,7 +1253,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         "{t}"
     );
     // A discard names its reference.
-    std::fs::write(d.join("delay"), "0.6").unwrap();
+    std::fs::write(d.join("delay"), "1.2").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
