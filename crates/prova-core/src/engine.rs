@@ -2174,9 +2174,12 @@ fn quarantined_only_failures(
         if *o != Outcome::Failed {
             return None;
         }
-        let set_aside = match quarantine.get(display) {
+        // Of the same file, when the quarantine names one (round 16: two
+        // crates' `tests::flaky`).
+        let own = crate::quarantine::covers_key(quarantine, key).filter(|e| e.test == display);
+        let set_aside = match own {
             Some(_) => true,
-            None => match crate::quarantine::covers(quarantine, display) {
+            None => match crate::quarantine::covers_key(quarantine, key) {
                 Some(parent) => first_seen(display).is_some_and(|t| t < parent.created_ms),
                 None => {
                     let prefix = format!("{display}/");
@@ -2192,7 +2195,7 @@ fn quarantined_only_failures(
     // A run that verified nothing else passes nothing (round 14: a
     // selection of only the quarantined test, failing, was "PASSED").
     let verified_other = outcomes.iter().any(|(k, o)| {
-        *o == Outcome::Passed && crate::quarantine::covers(quarantine, key_display(k)).is_none()
+        *o == Outcome::Passed && crate::quarantine::covers_key(quarantine, k).is_none()
     });
     (!names.is_empty() && verified_other).then_some(names)
 }
@@ -3623,6 +3626,7 @@ mod quarantine_tests {
                         created_ms: 0,
                         expires_ms: 1,
                         removed_ms: None,
+                        file: None,
                     },
                 )
             })

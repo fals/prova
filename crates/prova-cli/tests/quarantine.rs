@@ -701,3 +701,52 @@ fn history_counts_passes_that_set_a_quarantine_aside() {
     );
     assert!(!out.contains("none of them passed"), "{out}");
 }
+
+/// Round 16: two crates' `tests::flaky` shared one name; a quarantine of
+/// crate calc's set aside crate geo's real failure.
+#[test]
+fn a_quarantine_names_the_binary_when_a_name_is_shared() {
+    let d = workspace("crates");
+    let nx = |calc: &str, geo: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run'; exit {code}"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n",
+            nx("FAIL", "PASS", 100),
+            nx("PASS", "FAIL", 100)
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "a"]);
+    let o = prova(
+        &d,
+        &["quarantine", "add", "tests::flaky", "--reason", "clock"],
+    );
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(
+        t.contains("2 tests are named \"tests::flaky\", in: calc, geo"),
+        "{t}"
+    );
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky",
+            "--in",
+            "calc",
+            "--reason",
+            "clock",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "a"]);
+    assert_eq!(o.status.code(), Some(0), "calc's own: {}", text(&o));
+    let o = prova(&d, &["run", "b"]);
+    assert_eq!(o.status.code(), Some(1), "geo's failure: {}", text(&o));
+}

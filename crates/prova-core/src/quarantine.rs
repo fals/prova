@@ -21,6 +21,10 @@ pub struct Entry {
     pub expires_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_ms: Option<u64>,
+    /// The test's file (binary, module) when its name alone is shared by
+    /// tests of several: only that one is set aside.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl Entry {
@@ -33,7 +37,14 @@ impl Entry {
 
 /// Quarantines a test for `days` (1 to `MAX_DAYS`). A quarantine already in
 /// force for the test is replaced (renewed with the new reason).
-pub fn add(store: &Store, test: &str, reason: &str, days: u32, now_ms: u64) -> Result<Entry> {
+pub fn add(
+    store: &Store,
+    test: &str,
+    file: Option<&str>,
+    reason: &str,
+    days: u32,
+    now_ms: u64,
+) -> Result<Entry> {
     let days = days.clamp(1, MAX_DAYS);
     store.conn().execute(
         "UPDATE quarantine SET removed_ms = ?2 WHERE test = ?1 AND removed_ms IS NULL",
@@ -41,8 +52,8 @@ pub fn add(store: &Store, test: &str, reason: &str, days: u32, now_ms: u64) -> R
     )?;
     let expires = now_ms + u64::from(days) * DAY_MS;
     store.conn().execute(
-        "INSERT INTO quarantine (test, reason, created_ms, expires_ms) VALUES (?1, ?2, ?3, ?4)",
-        params![test, reason, now_ms as i64, expires as i64],
+        "INSERT INTO quarantine (test, reason, created_ms, expires_ms, file) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![test, reason, now_ms as i64, expires as i64, file],
     )?;
     Ok(Entry {
         test: test.to_owned(),
@@ -50,6 +61,7 @@ pub fn add(store: &Store, test: &str, reason: &str, days: u32, now_ms: u64) -> R
         created_ms: now_ms,
         expires_ms: expires,
         removed_ms: None,
+        file: file.map(str::to_owned),
     })
 }
 
@@ -65,7 +77,7 @@ pub fn remove(store: &Store, test: &str, now_ms: u64) -> Result<bool> {
 /// Every quarantine, newest first; removed ones only with `include_removed`.
 pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
     let mut stmt = store.conn().prepare(
-        "SELECT test, reason, created_ms, expires_ms, removed_ms FROM quarantine
+        "SELECT test, reason, created_ms, expires_ms, removed_ms, file FROM quarantine
           WHERE (?1 OR removed_ms IS NULL) ORDER BY created_ms DESC, id DESC",
     )?;
     let rows = stmt.query_map(params![include_removed], |r| {
@@ -75,6 +87,7 @@ pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
             created_ms: r.get::<_, i64>(2)? as u64,
             expires_ms: r.get::<_, i64>(3)? as u64,
             removed_ms: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+            file: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -113,6 +126,27 @@ pub fn covers<'a>(q: &'a BTreeMap<String, Entry>, display: &str) -> Option<&'a E
     })
 }
 
+/// The quarantine that sets aside the test with lifecycle key `unique`
+/// (`file<US>display`): as `covers`, and of the same file when the
+/// quarantine names one.
+pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'a Entry> {
+    let (file, display) = unique.rsplit_once('\u{1f}').unwrap_or(("", unique));
+    covers(q, display).filter(|e| match (&e.file, file) {
+        (Some(f), k) if !k.is_empty() => f == k,
+        _ => true,
+    })
+}
+
+/// The files (binaries, modules) that hold a test of this name.
+pub fn files_of(store: &Store, display: &str) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL ORDER BY file",
+    )?;
+    Ok(stmt
+        .query_map(params![display], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Quarantines in force for the run (when it was created), by test name.
 pub fn for_run(store: &Store, run: &str) -> Result<BTreeMap<String, Entry>> {
     let created = store.run(run)?.created_ms;
@@ -130,6 +164,7 @@ mod tests {
             created_ms: created,
             expires_ms: expires,
             removed_ms: removed,
+            file: None,
         }
     }
 

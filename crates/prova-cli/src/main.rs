@@ -72,6 +72,10 @@ Example:
         #[arg(long, value_name = "DAYS", default_value_t = prova_core::quarantine::DEFAULT_DAYS,
               value_parser = clap::value_parser!(u32).range(1..=prova_core::quarantine::MAX_DAYS as i64))]
         days: u32,
+        /// The test binary or module, when tests of several share the name
+        /// (e.g. two crates' `tests::flaky`).
+        #[arg(long = "in", value_name = "FILE")]
+        in_file: Option<String>,
     },
     /// List the quarantined tests.
     #[command(after_help = "\
@@ -2020,7 +2024,12 @@ fn main() -> ExitCode {
 fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
     use prova_core::quarantine as q;
     match action {
-        QuarantineCmd::Add { test, reason, days } => {
+        QuarantineCmd::Add {
+            test,
+            reason,
+            days,
+            in_file,
+        } => {
             let found = analysis::find_tests(store, &test, None)?;
             let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
             names.sort();
@@ -2059,7 +2068,31 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                     }
                 }
             };
-            let e = q::add(store, &name, &reason, days, now_ms())?;
+            // Tests of several binaries or modules sharing the name: only
+            // the one named with --in is set aside (round 16: a quarantine
+            // of crate calc's `tests::flaky` hid crate geo's failure).
+            let files = q::files_of(store, &name)?;
+            let file = match (in_file.as_deref(), files.as_slice()) {
+                (Some(f), _) if files.iter().any(|x| x == f) => Some(f.to_owned()),
+                (Some(f), _) => {
+                    return Err(UsageError(format!(
+                        "{name:?} is not known in {f:?}; it is in: {}",
+                        files.join(", ")
+                    ))
+                    .into());
+                }
+                (None, [one]) => Some(one.clone()),
+                (None, []) => None,
+                (None, many) => {
+                    return Err(UsageError(format!(
+                        "{} tests are named {name:?}, in: {}; say which with --in <one of them>",
+                        many.len(),
+                        many.join(", ")
+                    ))
+                    .into());
+                }
+            };
+            let e = q::add(store, &name, file.as_deref(), &reason, days, now_ms())?;
             println!(
                 "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
