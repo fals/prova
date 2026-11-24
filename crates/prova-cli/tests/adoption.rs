@@ -165,3 +165,57 @@ fn verify_ignores_tests_the_filter_skipped() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.starts_with("VERIFIED"), "{out}");
 }
+
+/// Every major harness finds prova (researched 2026-11-24): skills in
+/// `.agents/skills` and `.claude/skills` always (Claude Code and Cline read
+/// only the latter); the section in AGENTS.md, and in the instruction files
+/// that already exist and would otherwise hide it (CLAUDE.md for Claude
+/// Code, GEMINI.md, Zed's first-match files); a harness's own skills
+/// directory only where it is already set up (Kiro, Junie). Nothing is
+/// created that would shadow AGENTS.md.
+#[test]
+fn init_reaches_every_harness_without_shadowing_agents_md() {
+    let d = workspace("harnesses");
+    std::fs::write(d.join("CLAUDE.md"), "# Claude\n\nOwn rules.\n").unwrap();
+    std::fs::write(d.join(".cursorrules"), "be brief\n").unwrap();
+    std::fs::create_dir_all(d.join(".kiro")).unwrap();
+    assert!(prova(&d, &["init"]).status.success());
+    assert!(prova(&d, &["init"]).status.success());
+    for dir in [".agents/skills", ".claude/skills", ".kiro/skills"] {
+        assert!(d.join(dir).join("prova-test/SKILL.md").exists(), "{dir}");
+    }
+    assert!(!d.join(".junie").exists(), "no .junie/ without Junie");
+    for f in ["AGENTS.md", "CLAUDE.md", ".cursorrules"] {
+        let text = std::fs::read_to_string(d.join(f)).unwrap();
+        assert_eq!(
+            text.matches("<!-- prova:begin -->").count(),
+            1,
+            "{f}: {text}"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(d.join("CLAUDE.md"))
+            .unwrap()
+            .starts_with("# Claude\n\nOwn rules."),
+        "user content kept"
+    );
+    // Files that would hide AGENTS.md from a harness (Zed reads only the
+    // first it finds) are never created.
+    for f in ["GEMINI.md", ".github/copilot-instructions.md", ".rules"] {
+        assert!(!d.join(f).exists(), "{f} created");
+    }
+    let agents = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains(".agents/skills"),
+        "says where the skills are"
+    );
+
+    // A CLAUDE.md that imports AGENTS.md already gets prova through it.
+    let e = workspace("imports");
+    std::fs::write(e.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+    assert!(prova(&e, &["init"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(e.join("CLAUDE.md")).unwrap(),
+        "@AGENTS.md\n"
+    );
+}

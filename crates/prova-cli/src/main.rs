@@ -196,8 +196,8 @@ enum Cmd {
     },
     /// Install prova skills for agents and add a short section to AGENTS.md.
     Init {
-        /// Also install into .claude/skills (default: when .claude/ or CLAUDE.md exists).
-        #[arg(long)]
+        /// Kept for compatibility: skills now always go to .claude/skills too.
+        #[arg(long, hide = true)]
         claude: bool,
     },
     /// Detect the test setup and propose prova.toml; verify single-test selection.
@@ -657,7 +657,7 @@ fn write_skills(dir: &Path, names: &[String]) -> Result<usize> {
     Ok(n)
 }
 
-fn init(claude: bool) -> Result<u8> {
+fn init() -> Result<u8> {
     let cwd = std::env::current_dir()?;
     let root = config::find_root(&cwd);
     let proposal = prova_adapters::adopt::propose(&root);
@@ -668,38 +668,53 @@ fn init(claude: bool) -> Result<u8> {
             names.push(skill);
         }
     }
-    let n = write_skills(&root.join(".agents/skills"), &names)?;
+    // Where harnesses look (researched 2026-11-24): `.agents/skills` serves
+    // Codex, Copilot, Cursor, Gemini, Antigravity, OpenCode, Amp, Kimi Code,
+    // pi, Goose, Devin, Roo, Zed, Factory and Warp; Claude Code, Cline and
+    // Kimchi read only `.claude/skills`. Kiro and Junie read only their own
+    // directory: written where the project already uses them.
+    let mut dirs = vec![".agents/skills", ".claude/skills"];
+    for (own, skills) in [(".kiro", ".kiro/skills"), (".junie", ".junie/skills")] {
+        if root.join(own).is_dir() {
+            dirs.push(skills);
+        }
+    }
+    let mut files = 0;
+    for dir in &dirs {
+        files = write_skills(&root.join(dir), &names)?;
+    }
     println!(
-        "installed {} skills ({n} files) into .agents/skills: {}",
+        "installed {} skills ({files} files) into {}: {}",
         names.len(),
+        dirs.join(", "),
         names.join(", ")
     );
-    if claude || root.join(".claude").is_dir() || root.join("CLAUDE.md").exists() {
-        write_skills(&root.join(".claude/skills"), &names)?;
-        println!("also installed into .claude/skills");
+    // AGENTS.md, read by nearly every harness, always; and the section in
+    // instruction files that already exist and would otherwise keep a
+    // harness from reading it: CLAUDE.md (Claude Code then ignores
+    // AGENTS.md), GEMINI.md (Gemini CLI's default), and the files Zed reads
+    // first. None of those is created: a new one would hide AGENTS.md.
+    let mut updated = Vec::new();
+    if upsert_section(&root.join("AGENTS.md"), true)? {
+        updated.push("AGENTS.md");
     }
-    // AGENTS.md: replace our section between markers, or append it.
-    let agents = root.join("AGENTS.md");
-    let text = std::fs::read_to_string(&agents).unwrap_or_default();
-    let new = match (
-        text.find("<!-- prova:begin -->"),
-        text.find("<!-- prova:end -->"),
-    ) {
-        (Some(a), Some(b)) if b > a => {
-            let end = b + "<!-- prova:end -->".len();
-            format!(
-                "{}{}{}",
-                &text[..a],
-                skills::AGENTS_SECTION.trim_end(),
-                &text[end..]
-            )
+    for f in [
+        "CLAUDE.md",
+        ".claude/CLAUDE.md",
+        "GEMINI.md",
+        ".rules",
+        ".cursorrules",
+        ".windsurfrules",
+        ".clinerules",
+        ".github/copilot-instructions.md",
+    ] {
+        let path = root.join(f);
+        if path.is_file() && upsert_section(&path, false)? {
+            updated.push(f);
         }
-        _ if text.is_empty() => skills::AGENTS_SECTION.to_owned(),
-        _ => format!("{}\n\n{}", text.trim_end(), skills::AGENTS_SECTION),
-    };
-    if new != text {
-        std::fs::write(&agents, new)?;
-        println!("updated AGENTS.md (prova section)");
+    }
+    if !updated.is_empty() {
+        println!("updated the prova section in {}", updated.join(", "));
     }
     let gi = root.join(".gitignore");
     let ignore = std::fs::read_to_string(&gi).unwrap_or_default();
@@ -719,6 +734,36 @@ fn init(claude: bool) -> Result<u8> {
         println!("next: prova adopt   (proposes prova.toml for this project)");
     }
     Ok(exit::PASSED)
+}
+
+/// Puts the prova section into an instruction file: replaces it between
+/// its markers, or appends it. A file that imports AGENTS.md (`@AGENTS.md`)
+/// already has it. Returns whether the file changed.
+fn upsert_section(path: &Path, create: bool) -> Result<bool> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.is_empty() && !create {
+        return Ok(false);
+    }
+    if text.lines().any(|l| l.trim() == "@AGENTS.md") {
+        return Ok(false);
+    }
+    let section = skills::AGENTS_SECTION;
+    let new = match (
+        text.find("<!-- prova:begin -->"),
+        text.find("<!-- prova:end -->"),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            let end = b + "<!-- prova:end -->".len();
+            format!("{}{}{}", &text[..a], section.trim_end(), &text[end..])
+        }
+        _ if text.is_empty() => section.to_owned(),
+        _ => format!("{}\n\n{}", text.trim_end(), section),
+    };
+    if new == text {
+        return Ok(false);
+    }
+    std::fs::write(path, new)?;
+    Ok(true)
 }
 
 /// Whether a test prova names `calc.CalcTest::divides` is one a framework
@@ -1834,7 +1879,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             mcp::serve()?;
             Ok(exit::PASSED)
         }
-        Cmd::Init { claude } => init(claude),
+        Cmd::Init { .. } => init(),
         Cmd::Adopt {
             write,
             verify,
