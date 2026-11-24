@@ -441,6 +441,93 @@ fn all_known_flaky(s: &Summary) -> bool {
 }
 
 /// One stderr line while a long wait goes on (ADR 0019): the run is alive.
+/// One status line for a person watching a run in a terminal: elapsed
+/// time and counts, the test running now, or, when prova sees no tests
+/// (an opaque `make test`), the command's last line of output.
+pub fn live_line(s: &Summary, last_output: Option<&str>, width: usize) -> String {
+    let c = &s.counts;
+    let elapsed = format_duration(std::time::Duration::from_millis(s.elapsed_ms));
+    let seen = c.passed + c.failed + c.errored + c.skipped;
+    let mut line = if seen > 0 || !s.running.is_empty() {
+        let mut l = format!("{elapsed}  {} passed", c.passed);
+        if c.failed + c.errored > 0 {
+            l.push_str(&format!("  {} failed", c.failed + c.errored));
+        }
+        if c.skipped > 0 {
+            l.push_str(&format!("  {} skipped", c.skipped));
+        }
+        if let Some(t) = s.running.first() {
+            l.push_str(&format!("  running {}", clean(t)));
+        }
+        l
+    } else {
+        match last_output.map(str::trim).filter(|o| !o.is_empty()) {
+            Some(o) => format!("{elapsed}  {}", clean(o)),
+            None => format!("{elapsed}  running `{}`", clean(&s.command)),
+        }
+    };
+    if line.chars().count() > width {
+        line = line
+            .chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…";
+    }
+    line
+}
+
+/// The live status line: redrawn in place on a terminal, never written
+/// anywhere else (agents and CI read a log, where it would be noise).
+pub struct Live {
+    on: bool,
+    shown: bool,
+    width: usize,
+}
+
+impl Live {
+    pub fn new() -> Self {
+        use std::io::IsTerminal;
+        let on =
+            std::io::stderr().is_terminal() && std::env::var("TERM").map_or(true, |t| t != "dumb");
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(20, 240)
+            - 1;
+        Live {
+            on,
+            shown: false,
+            width,
+        }
+    }
+
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    pub fn show(&mut self, s: &Summary, last_output: Option<&str>) {
+        if self.on {
+            eprint!("\r\x1b[2K{}", live_line(s, last_output, self.width));
+            self.shown = true;
+        }
+    }
+
+    /// Erases the line before anything else is printed.
+    pub fn clear(&mut self) {
+        if self.shown {
+            eprint!("\r\x1b[2K");
+            self.shown = false;
+        }
+    }
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn heartbeat(s: &Summary) {
     let c = &s.counts;
     let mut line = format!(
@@ -803,4 +890,71 @@ pub fn protocol_line(p: &prova_core::experiment::Protocol) -> String {
         None => {}
     }
     s
+}
+
+#[cfg(test)]
+mod live_tests {
+    use prova_core::engine::{Counts, Summary, WaitReason};
+    use prova_core::model::{Level, Status};
+
+    fn summary(passed: u64, failed: u64, running: &[&str]) -> Summary {
+        Summary {
+            run: "r".into(),
+            suite: "s".into(),
+            command: "make test".into(),
+            reason: WaitReason::Running,
+            status: Status::Running,
+            outcome: None,
+            level: Level::Opaque,
+            last_seq: 0,
+            elapsed_ms: 12_000,
+            counts: Counts {
+                passed,
+                failed,
+                skipped: 0,
+                errored: 0,
+            },
+            running: running.iter().map(|s| (*s).to_owned()).collect(),
+            framework: None,
+            failures: vec![],
+            stalled_ms: None,
+            slow: vec![],
+            exit_code: None,
+            detail: None,
+            leaked: vec![],
+            notes: vec![],
+            warnings: vec![],
+            verified: None,
+            output_tail: vec![],
+            code: String::new(),
+            fingerprint: None,
+            store: String::new(),
+            flaky_passed: vec![],
+            history: None,
+        }
+    }
+
+    #[test]
+    fn the_live_line_shows_counts_and_the_running_test() {
+        let l = super::live_line(&summary(37, 1, &["calc::divides"]), None, 100);
+        assert_eq!(l, "12.0s  37 passed  1 failed  running calc::divides");
+    }
+
+    /// A 50 s `prova run -- make test` that passed showed nothing until the
+    /// end: with no tests seen, the command's own last line moves instead.
+    #[test]
+    fn an_opaque_run_shows_its_last_output() {
+        let s = summary(0, 0, &[]);
+        assert_eq!(
+            super::live_line(&s, Some("  CC  src/parser.o\u{1b}[0m"), 100),
+            "12.0s  CC  src/parser.o"
+        );
+        assert_eq!(
+            super::live_line(&s, None, 100),
+            "12.0s  running `make test`"
+        );
+        let long = super::live_line(&s, Some(&"x".repeat(300)), 40);
+        assert_eq!(long.chars().count(), 40);
+        assert!(long.ends_with('…'));
+    }
 }

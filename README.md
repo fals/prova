@@ -36,10 +36,16 @@ next: fix and rerun, or `prova cancel 3fa9c1d2`; `prova wait 3fa9c1d2 --after 14
 - **Zero config on any project.** `prova run -- <your test command>`. Detail
   rises automatically from exit code, to JUnit/TRX files, to live output, to
   native streams. ([fidelity ladder](docs/architecture.md#seeing-tests-the-fidelity-ladder))
-- **No long timeouts.** Runs detach; `prova wait` returns within seconds on the
-  first failure, a slow test (named) or a stall. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
+- **No long timeouts.** One command starts the run and waits:
+  `--until first-failure` returns within seconds on the first failure, a
+  slow test (named) or a stall; `--until done` gives the result, with the
+  `next:` command if it takes longer. A person at a terminal sees a live
+  progress line; agents get compact output. ([liveness](docs/architecture.md#liveness-slow-stalled-killed))
 - **Memory.** Every attempt is stored with the exact code it ran on: new
   failure, failed before, flaky, last green commit. ([history](docs/architecture.md#memory-history-and-flaky-tests))
+- **A suite that stays cheap.** Every test is sized by what it uses
+  (processes, network), never by its duration, and `prova sizes` names what
+  to fix. ([why sizes matter](docs/getting-started.md#test-sizes-why-they-matter))
 - **Experiments, not anecdotes.** Any objective (time, steps, accuracy),
   read straight from `go test -bench`, criterion, pytest-benchmark, Vitest,
   JMH or BenchmarkDotNet. Pre-registered protocol, interleaved
@@ -101,6 +107,16 @@ prova exp candidate speed && prova exp run speed
 # ACCEPT  c1 vs baseline: BenchmarkCountPrimes.ns_per_op improved +94.9% (CI [+94.5%, +95.9%], p=0.0079)
 ```
 
+What does each test cost?
+
+```console
+$ prova sizes
+212 tests by what they used (ADR 0025): small 171  medium 38  large 3  unknown 0
+  api::orders::lists_paid_orders: large (connected to 10.0.3.7:5432)
+  api::orders::creates_an_order: medium (started postgres; 2 local socket(s))
+  cli::exports_csv: medium (started sh)
+```
+
 More in [Getting started](docs/getting-started.md).
 
 ## For agents
@@ -146,6 +162,8 @@ calling a failure new or flaky. Performance claims need `prova exp`.
 |---|---|---|
 | First failure | when the suite ends | while it runs |
 | A hang | the harness timeout, minutes later | a stall event, seconds later |
+| While it runs | silence, or a wall of output | failures as they happen, a live line on a terminal |
+| Test size | "unit" or "integration", by name | small / medium / large by what each test used |
 | "Did I break this?" | guess | new / seen before / flaky / last green commit |
 | What ran, with what | lost in scrollback | recorded: command, code, environment, origin |
 | "It's faster now" | one run | protocol, trials, confidence interval, verdict |
