@@ -143,6 +143,12 @@ fn looks_like_error(line: &str) -> bool {
         "error TS",
         "\u{2716}",
         "make: ***",
+        "]: ***",
+        "not remade because of errors",
+        "fail-under",
+        "coverage threshold",
+        "Required test coverage",
+        "Coverage failure",
         "not met",
         "not reached",
         "Interrupted",
@@ -192,7 +198,7 @@ fn clip(line: &str) -> String {
 
 /// Lines that mean something broke, even in a passing run (stricter than
 /// `looks_like_error`, which also matches test names and log levels).
-fn looks_like_crash(line: &str) -> bool {
+pub fn looks_like_crash(line: &str) -> bool {
     let t = line.trim_start();
     const STARTS: &[&str] = &[
         "Traceback (most recent call last)",
@@ -245,6 +251,59 @@ pub struct Distiller {
     /// `____ test_x ____`, libtest's `---- x stdout ----`, Jest's `● a › b`,
     /// Go's `=== RUN   TestX`): an error line there is that test's.
     owner: Option<String>,
+    /// The runner's last summary line seen, and the non-blank lines after it
+    /// (a step that ran after the tests, ADR 0029 round 16).
+    summary_seen: bool,
+    after_summary: Vec<(u64, String)>,
+    after_overflow: bool,
+    /// The last `Test Suites:` / `Test Files` line: how many files failed.
+    files_line: Option<(u64, String)>,
+}
+
+/// A test runner's final summary of a run: pytest's `=== 1 failed, 2 passed
+/// in 0.1s ===`, libtest's `test result:`, Jest's and Vitest's counts,
+/// gotestsum's `DONE`, go's package results, Maven's `Tests run:` and
+/// `BUILD`, dotnet's `Failed!  -` and `Total tests:`, nextest's `Summary [`,
+/// unittest's `Ran N tests`.
+pub fn is_runner_summary(t: &str) -> bool {
+    let t = t.trim();
+    let lower = t.to_lowercase();
+    (t.starts_with('=')
+        && t.ends_with('=')
+        && lower.contains(" in ")
+        && [
+            "passed",
+            "failed",
+            "skipped",
+            "error",
+            "deselected",
+            "no tests ran",
+        ]
+        .iter()
+        .any(|w| lower.contains(w)))
+        || t.starts_with("test result:")
+        || t.starts_with("Tests:")
+        || t.starts_with("Test Suites:")
+        || t.starts_with("Test Files ")
+        || t.starts_with("Tests ")
+        || t.starts_with("DONE ")
+        || t.starts_with("ok  \t")
+        || t.starts_with("FAIL\t")
+        || t.starts_with("?   \t")
+        || t == "FAIL"
+        || t == "PASS"
+        || t.starts_with("[ERROR] Tests run:")
+        || t.starts_with("[INFO] Tests run:")
+        || t.starts_with("[INFO] BUILD ")
+        || t.starts_with("Failed!  -")
+        || t.starts_with("Passed!  -")
+        || t.starts_with("Total tests:")
+        || t.starts_with("Test Run ")
+        || t.starts_with("Summary [")
+        || (t.starts_with("Ran ") && t.contains(" test") && t.contains(" in "))
+        || t.starts_with("FAILED (")
+        || (t.starts_with("{\"type\":\"suite\"")
+            && (t.contains("\"event\":\"ok\"") || t.contains("\"event\":\"failed\"")))
 }
 
 /// The test a line opens a section for, if it is such a header.
@@ -264,12 +323,67 @@ fn section_owner(t: &str) -> Option<String> {
     if let Some(name) = t.strip_prefix("\u{25cf} ") {
         return Some(name.trim().to_owned());
     }
-    for p in ["=== RUN ", "=== CONT ", "=== NAME ", "--- FAIL: "] {
+    for p in [
+        "=== RUN ",
+        "=== CONT ",
+        "=== NAME ",
+        "--- FAIL: ",
+        "=== FAIL: ",
+    ] {
         if let Some(rest) = t.strip_prefix(p) {
-            return rest.split_whitespace().next().map(str::to_owned);
+            // gotestsum's `=== FAIL: pkg Test (0.00s)` names the package first.
+            let mut words = rest.split_whitespace();
+            let first = words.next()?;
+            return match (p, words.next()) {
+                ("=== FAIL: ", Some(test)) => Some(format!("{first}::{test}")),
+                _ => Some(first.to_owned()),
+            };
         }
     }
-    None
+    nextest_header(t)
+        .or_else(|| vitest_header(t))
+        .or_else(|| vstest_header(t))
+}
+
+/// nextest's `PASS [   0.004s] (1/5) calc tests::adds` (also `FAIL`, and
+/// `TRY 1 FAIL` for a retried test): the test's own output follows it.
+fn nextest_header(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("TRY ").map_or(t, |r| {
+        r.trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start()
+    });
+    let rest = ["PASS ", "FAIL ", "LEAK ", "SLOW ", "TIMEOUT ", "FLAKY "]
+        .iter()
+        .find_map(|p| rest.strip_prefix(p))?
+        .trim_start();
+    let (time, after) = rest.strip_prefix('[')?.split_once(']')?;
+    time.trim().ends_with('s').then_some(())?;
+    // `(1/5) calc tests::adds`: the binary, then the test.
+    let after = after.trim_start();
+    let after = after.strip_prefix('(')?.split_once(')')?.1;
+    after.split_whitespace().last().map(str::to_owned)
+}
+
+/// Vitest's `FAIL  src/a.test.ts > describe > test`: the block of a failed
+/// test, as the `file::describe > test` name the adapter gives it.
+fn vitest_header(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("FAIL ")?.trim_start();
+    let (file, test) = rest.split_once(" > ")?;
+    (!file.contains(char::is_whitespace) && file.contains('.') && !test.trim().is_empty())
+        .then(|| format!("{file}::{}", test.trim()))
+}
+
+/// VSTest's `  Failed Calc.CalcTests.FlakyClock [12 ms]` (also `Passed` and
+/// `Skipped`): the block of one test, with its `Error Message:` and `Stack
+/// Trace:` after a failed one.
+fn vstest_header(t: &str) -> Option<String> {
+    let rest = ["Failed ", "Passed ", "Skipped "]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))?;
+    let (name, time) = rest.trim().split_once(" [")?;
+    let time = time.strip_suffix(']')?;
+    let timed = time.ends_with("s") && time.starts_with(|c: char| c.is_ascii_digit() || c == '<');
+    (timed && !name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_owned())
 }
 
 /// A line that ends any test's section: a summary banner or a runner's
@@ -281,6 +395,17 @@ fn ends_section(t: &str) -> bool {
         || t == "failures:"
         || t.starts_with("Tests:")
         || t.starts_with("Test Suites:")
+        || t.starts_with("Test Files ")
+        || t.starts_with("Tests ")
+        || t.starts_with("Total tests:")
+        || t.starts_with("Failed!  ")
+        || t.starts_with("Passed!  ")
+        || t.starts_with("Test Run ")
+        || t.starts_with("DONE ")
+        || t.starts_with('\u{23af}')
+        // pytest-cov's `---------- coverage: ...` and any bare rule (unittest's
+        // `-----` between tests): a captured-output header has words in it.
+        || (t.starts_with("-------") && (t.contains("coverage:") || t.chars().all(|c| c == '-')))
         || t == "FAIL"
         || t == "PASS"
         || t.starts_with("FAIL\t")
@@ -329,6 +454,26 @@ impl Distiller {
                 self.owner = Some(o);
             } else if ends_section(&t) {
                 self.owner = None;
+            }
+            if is_runner_summary(&t) {
+                self.summary_seen = true;
+                self.after_summary.clear();
+                self.after_overflow = false;
+                if t.starts_with("Test Suites:") || t.starts_with("Test Files ") {
+                    self.files_line = Some((n, t.trim().to_owned()));
+                }
+            } else if self.summary_seen
+                && !t.trim().is_empty()
+                // a `go test -json` event with no text of its own
+                && !(line.starts_with('{')
+                    && line.contains("\"Action\"")
+                    && !line.contains("\"Output\""))
+            {
+                if self.after_summary.len() < ERROR_LINES {
+                    self.after_summary.push((n, t.trim().to_owned()));
+                } else {
+                    self.after_overflow = true;
+                }
             }
             if looks_like_error(&t) {
                 if self.error_lines.len() < ERROR_LINES {
@@ -399,6 +544,17 @@ impl Distiller {
                     .map(|(i, l)| (s.start + i as u64, l.clone()))
             })
             .collect()
+    }
+
+    /// The non-blank lines after the runner's last summary, and whether more
+    /// came than were kept.
+    pub fn after_summary(&self) -> (&[(u64, String)], bool) {
+        (&self.after_summary, self.after_overflow)
+    }
+
+    /// The last `Test Suites:` / `Test Files` line of the output.
+    pub fn files_line(&self) -> Option<&(u64, String)> {
+        self.files_line.as_ref()
     }
 
     /// Every line that looks like an error (a `go test -json` event's
@@ -674,6 +830,21 @@ pub fn test_output_summary(store: &Store, run: &str, test_id: &str) -> Option<St
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        // Go's framing lines say nothing (round 16: a parent's message was
+        // `=== RUN   TestMean / --- FAIL: TestMean (0.00s)`).
+        .filter(|l| {
+            ![
+                "=== RUN",
+                "=== PAUSE",
+                "=== CONT",
+                "=== NAME",
+                "--- FAIL",
+                "--- PASS",
+                "--- SKIP",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+        })
         .collect();
     let picked: Vec<&str> = match lines.iter().position(|l| l.starts_with("panic: ")) {
         Some(p) => {
@@ -910,6 +1081,117 @@ mod tests {
         let b = bound_text(&t);
         assert!(b.len() < EXCERPT_BYTES + 64 && b.starts_with("[... "));
         assert!(b.ends_with("assert 16 == 4\n"));
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    /// The owner of each error-looking line of `text`.
+    fn owners(text: &str) -> Vec<(String, Option<String>)> {
+        let mut d = Distiller::default();
+        for l in text.lines() {
+            d.push(l);
+        }
+        d.error_lines()
+            .0
+            .iter()
+            .map(|(_, l, o)| (l.trim().to_owned(), o.clone()))
+            .collect()
+    }
+
+    /// Round 16: headers as the real frameworks print them.
+    #[test]
+    fn real_framework_headers_open_a_tests_section() {
+        for (header, owner) in [
+            (
+                "  Failed Calc.CalcTests.FlakyClock [< 1 ms]",
+                "Calc.CalcTests.FlakyClock",
+            ),
+            (
+                "  Failed Calc.CalcTests.FlakyClock [12 ms]",
+                "Calc.CalcTests.FlakyClock",
+            ),
+            (
+                "  Passed Calc.CalcTests.Divides [1 s]",
+                "Calc.CalcTests.Divides",
+            ),
+            (
+                " FAIL  src/calc.test.ts > calc > flaky clock",
+                "src/calc.test.ts::calc > flaky clock",
+            ),
+            ("=== FAIL: . TestFlakyClock (0.00s)", ".::TestFlakyClock"),
+        ] {
+            assert_eq!(section_owner(header).as_deref(), Some(owner), "{header}");
+        }
+        for not_header in [
+            "Failed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5",
+            "Failed to execute goal x [ERROR] boom",
+            "FAIL\texample.com/calc\t0.012s",
+            "FAIL  src/lib.rs",
+            "Failed some test [not a time]",
+        ] {
+            assert_eq!(section_owner(not_header), None, "{not_header}");
+        }
+    }
+
+    #[test]
+    fn runner_summaries_end_the_tests_and_what_follows_is_kept() {
+        let mut d = Distiller::default();
+        for l in [
+            "=== 1 failed, 2 passed in 0.12s ===",
+            "ruff: Found 1 error.",
+            "",
+            "=== 1 failed, 2 passed in 0.12s ===",
+            "make: *** [Makefile:2: test] Error 2",
+        ] {
+            d.push(l);
+        }
+        let (after, over) = d.after_summary();
+        assert!(!over);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0].0, 5);
+    }
+
+    #[test]
+    fn nextest_and_coverage_headers_bound_a_tests_section() {
+        assert_eq!(
+            section_owner("TRY 1 FAIL [   0.003s] (\u{2500}\u{2500}\u{2500}) calc tests::retried")
+                .as_deref(),
+            Some("tests::retried")
+        );
+        assert_eq!(
+            section_owner("PASS [   0.004s] (1/5) calc tests::adds").as_deref(),
+            Some("tests::adds")
+        );
+        assert!(ends_section(
+            "---------- coverage: platform linux ----------"
+        ));
+        assert!(ends_section(
+            "----------------------------------------------------------------------"
+        ));
+        assert!(!ends_section(
+            "----------------------------- Captured stdout call -----------------------------"
+        ));
+    }
+
+    /// Strict: another test's header, or a runner's wrap-up, ends the
+    /// section of the one before; the error after it is not that test's.
+    #[test]
+    fn an_error_after_another_header_or_the_wrap_up_is_not_the_earlier_tests() {
+        let o = owners(
+            "  Failed Calc.A [1 ms]\n  Error Message:\n  Passed Calc.B [1 ms]\n  Error Message:\nFailed!  - Failed: 1, Passed: 1\nError: build broke",
+        );
+        let by = |i: usize| (o[i].0.as_str(), o[i].1.as_deref());
+        assert_eq!(by(0), ("Error Message:", Some("Calc.A")));
+        assert_eq!(by(1), ("Error Message:", Some("Calc.B")));
+        assert_eq!(by(2), ("Error: build broke", None));
+        let v = owners(
+            " FAIL  src/a.test.ts > a > x\nAssertionError: no\n⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯\n\nError: later",
+        );
+        assert_eq!(v[1].1.as_deref(), Some("src/a.test.ts::a > x"), "{v:?}");
+        assert_eq!(v[2].1, None, "{v:?}");
     }
 }
 

@@ -1,0 +1,6 @@
+--- FAIL: TestFlakyClock (0.00s)
+    calc_test.go:23: clock tick landed on a bad boundary
+FAIL
+FAIL	example.com/calc	0.012s
+?   	example.com/calc/cmd/conform	[no test files]
+FAIL

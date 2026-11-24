@@ -24,6 +24,13 @@ pub struct Recognizers {
     /// The Go module of the run's directory (go.mod), for packages printed
     /// as `.`.
     pub go_module: Option<String>,
+    /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
+    /// failures it listed, and how many runs `--rerun-fails` made. A
+    /// package green on its last run after failures means its failed tests
+    /// passed on a rerun (round 16: reported as failures, exit 0).
+    gts_pkg_last: BTreeMap<String, bool>,
+    gts_failed: Vec<TestKey>,
+    gts_runs: u64,
     /// The key each `seen` entry was reported under (unique key -> key):
     /// a result superseded later names the test it was stored as.
     pub seen_keys: BTreeMap<String, TestKey>,
@@ -151,6 +158,10 @@ pub struct Recognizers {
     pub unhandled_errors: u64,
     /// The `Unhandled Errors` block was seen (and recorded as an entry).
     pub unhandled_block: bool,
+    /// Lines of a Vitest unhandled-errors block being read: its error and
+    /// where it originated name the entry (round 16: one fixed name for
+    /// every unhandled error gave a new one an unrelated history).
+    unhandled_lines: Option<Vec<String>>,
     /// Jest files read: its totals are believed against what was recognized.
     pub jest_files: u64,
     jest: JestState,
@@ -561,6 +572,13 @@ impl Recognizers {
                 // `--rerun-fails` ends with `DONE 2 runs, 4 tests, ...`: the
                 // tests of every run, reruns again. The first DONE is the
                 // suite's count.
+                if counts.contains(" runs")
+                    && let Some(n) = counts
+                        .split(", ")
+                        .find_map(|p| p.strip_suffix(" runs")?.trim().parse::<u64>().ok())
+                {
+                    self.gts_runs = self.gts_runs.max(n);
+                }
                 if self.gts_done_seen && counts.contains(" runs") {
                     return;
                 }
@@ -736,7 +754,16 @@ impl Recognizers {
         }
         let body = match t.strip_prefix("test result: ") {
             Some(rest) => rest.split_once(". ").map(|(_, b)| b).unwrap_or(""),
-            None if t.contains(" in ")
+            // pytest's summary ends in its duration (`in 0.12s`): tsc's
+            // `Found 1 error in src/calc.ts:4` is no test summary (round 16).
+            None if t
+                .trim_matches('=')
+                .trim()
+                .rsplit_once(" in ")
+                .and_then(|(_, d)| d.split_whitespace().next())
+                .is_some_and(|d| {
+                    d.ends_with('s') && d.starts_with(|c: char| c.is_ascii_digit())
+                })
                 && [
                     " passed",
                     " failed",
@@ -927,16 +954,23 @@ impl Recognizers {
             return out;
         }
         self.totals(line);
+        if let Some(lines) = self.unhandled_lines.as_mut() {
+            let t = line.trim();
+            let ends = (t.contains('\u{23af}') && !t.contains("Unhandled"))
+                || t.starts_with("Test Files")
+                || t.starts_with("Tests ")
+                || lines.len() >= 60;
+            if ends {
+                self.flush_unhandled(&mut out);
+            } else {
+                lines.push(t.to_owned());
+                return out;
+            }
+        }
         if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
             self.unhandled_block = true;
-            self.finished(
-                TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
-                Outcome::Errored,
-                None,
-                Some("Vitest caught unhandled errors during the run (see its output)".to_owned()),
-                Level::Recognized,
-                &mut out,
-            );
+            self.unhandled_lines = Some(Vec::new());
+            return out;
         }
         if self.dotnet_message.is_some() {
             if self.dotnet_collect(line) {
@@ -1077,6 +1111,46 @@ impl Recognizers {
         out
     }
 
+    /// The entry for a Vitest unhandled-errors block: named by the file it
+    /// originated in (`src/x.test.ts::(unhandled error)`), else by Vitest's
+    /// own name; its message is the error itself.
+    fn flush_unhandled(&mut self, out: &mut Vec<EventKind>) {
+        let Some(lines) = self.unhandled_lines.take() else {
+            return;
+        };
+        let origin = lines.iter().find_map(|l| {
+            let rest = l.split_once("originated in \"")?.1;
+            rest.split_once('"').map(|(f, _)| f.to_owned())
+        });
+        let error = lines
+            .iter()
+            .map(|l| l.trim())
+            .find(|l| {
+                !l.is_empty()
+                    && !l.contains('\u{23af}')
+                    && !l.starts_with("Vitest caught")
+                    && !l.starts_with("This might cause")
+            })
+            .map(str::to_owned);
+        let key = match origin {
+            Some(f) => TestKey::new(vec![f], "(unhandled error)"),
+            None => TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
+        };
+        if !lines.is_empty() {
+            self.failure_output.push((key.clone(), lines.join("\n")));
+        }
+        self.finished(
+            key,
+            Outcome::Errored,
+            None,
+            Some(error.unwrap_or_else(|| {
+                "Vitest caught unhandled errors during the run (see its output)".to_owned()
+            })),
+            Level::Recognized,
+            out,
+        );
+    }
+
     fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
         self.holding = true;
         let r = f(self);
@@ -1094,6 +1168,18 @@ impl Recognizers {
     /// none of it). Names match `go test -v`'s (the package is relative).
     fn gotestsum(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_end();
+        // `pkgname`'s package status lines: `✓  pkg (2ms)`, `✖  pkg (1.5s)`.
+        for (mark, passed) in [('\u{2713}', true), ('\u{2716}', false)] {
+            if let Some(rest) = t.strip_prefix(mark)
+                && let Some(pkg) = rest.split_whitespace().next()
+                && rest.starts_with("  ")
+            {
+                let pkg = self.go_pkg(pkg);
+                self.gts_pkg_last.insert(pkg, passed);
+                self.gotestsum_seen = true;
+                return true;
+            }
+        }
         // A failing `testname` line is followed by what the test printed.
         if self.gts_inline && self.gts_pending.is_some() {
             if line.starts_with([' ', '\t']) {
@@ -1256,7 +1342,39 @@ impl Recognizers {
                     self.failure_fallback.push((key, m));
                 }
             } else {
+                if outcome.is_failure() {
+                    self.gts_failed.push(key.clone());
+                }
                 self.result(key, outcome, dur, msg, Level::Recognized, sub, out);
+            }
+        }
+    }
+
+    /// gotestsum reran its failures and the last run of their package was
+    /// green: each passed on a rerun (it exits non-zero if any still fails).
+    fn gotestsum_reruns_passed(&mut self, out: &mut Vec<EventKind>) {
+        if self.gts_runs < 2 {
+            return;
+        }
+        for key in std::mem::take(&mut self.gts_failed) {
+            let green = key
+                .path
+                .first()
+                .and_then(|p| self.gts_pkg_last.get(p))
+                .copied()
+                .unwrap_or(false);
+            if green {
+                let sub = key.name.contains('/');
+                self.go_result(
+                    key,
+                    Outcome::Passed,
+                    None,
+                    None,
+                    Level::Recognized,
+                    sub,
+                    true,
+                    out,
+                );
             }
         }
     }
@@ -1961,12 +2079,17 @@ impl Recognizers {
         if !line.contains(".py::") {
             return false;
         }
-        const STATUS: [(&str, Outcome); 10] = [
+        const STATUS: [(&str, Outcome); 13] = [
             // pytest-rerunfailures: a failed attempt that runs again.
             ("RERUN", Outcome::Failed),
             ("SUBPASSED", Outcome::Passed),
             ("SUBFAILED", Outcome::Failed),
             ("SUBSKIPPED", Outcome::Skipped),
+            // Older pytest-subtests: `test_x [case 2] SUBFAIL` (round 16:
+            // the failure was attributed to no test).
+            ("SUBPASS", Outcome::Passed),
+            ("SUBFAIL", Outcome::Failed),
+            ("SUBSKIP", Outcome::Skipped),
             ("PASSED", Outcome::Passed),
             ("FAILED", Outcome::Failed),
             ("SKIPPED", Outcome::Skipped),
@@ -1996,6 +2119,14 @@ impl Recognizers {
         let id = line[..i].trim();
         if id.contains(' ') && !id.contains('[') {
             return false; // not an id: prose that mentions a test file
+        }
+        // Older pytest-subtests prints the subtest's label before the word.
+        if matches!(word, "SUBPASS" | "SUBFAIL" | "SUBSKIP")
+            && let Some((parent, label)) = id.rsplit_once(" [")
+        {
+            let key = pytest_subtest(pytest_key(parent.trim()), &format!("[{label}"));
+            self.result(key, outcome, None, None, Level::Recognized, true, out);
+            return true;
         }
         let key = pytest_key(id);
         if word == "RERUN" {
@@ -2779,10 +2910,12 @@ impl Recognizers {
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
+        self.flush_unhandled(&mut gts);
         self.go_confirm_tentative(&mut gts);
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
+        self.gotestsum_reruns_passed(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
                 if !self.gts_pkg_with_failure.contains(&pkg)
@@ -4846,11 +4979,25 @@ impl Recognizers {
         {
             return root.clone();
         }
-        self.go_full_pkgs
+        if let Some(full) = self
+            .go_full_pkgs
             .iter()
             .find(|f| f.as_str() == printed || f.ends_with(&format!("/{printed}")))
-            .cloned()
-            .unwrap_or_else(|| printed.to_owned())
+        {
+            return full.clone();
+        }
+        // gotestsum prints a package relative to the module (`calc` for
+        // `example.com/m/calc`): go.mod completes it, as `go test` prints
+        // it (round 16: two identities for one test).
+        if let Some(m) = &self.go_module
+            && !printed.starts_with(m.as_str())
+            && !printed.split('/').next().unwrap_or("").contains('.')
+            && !printed.contains(' ')
+            && !printed.is_empty()
+        {
+            return format!("{m}/{printed}");
+        }
+        printed.to_owned()
     }
 
     /// The name a Go test has until its package is known. The segment keeps

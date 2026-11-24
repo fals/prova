@@ -384,6 +384,40 @@ fn a_hung_run_without_live_tests_names_the_suspects() {
     );
 }
 
+/// Round 16: a list of suspects cut at five ended in "..." and hid the hung
+/// test. A list cut short says how many it left out.
+#[test]
+fn a_long_suspect_list_says_how_many_it_left_out() {
+    let d = workspace("suspects-many");
+    let cases: String = (1..=12)
+        .map(|i| format!("<testcase classname=\\\"s\\\" name=\\\"t{i:02}\\\"/>"))
+        .collect();
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; printf '<testsuite name=\\\"s\\\">{cases}</testsuite>' > build/test-results/junit.xml\"\n"
+        ),
+    )
+    .unwrap();
+    let first = text(&prova(&d, &["run", "j"]));
+    assert!(first.contains("PASSED"), "{first}");
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(
+        w.contains("12 of the last finished run") && w.contains("first 8 of 12; 4 more not listed"),
+        "{w}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
 /// Round 9: `#[ignore]` on a test that passed in the last passing run gave
 /// a clean pass; a skipped test did not run.
 #[test]
@@ -861,4 +895,110 @@ fn a_thin_history_is_not_failing_now() {
     run(&d, "make", "fail");
     let out = run(&d, "make", "fail");
     assert!(!out.contains("failing now"), "{out}");
+}
+
+/// Round 16: quiet tests that all passed, then a failing lint step: "no
+/// test result was seen" with a hint to forget a real code failure.
+#[test]
+fn a_step_failing_after_quiet_tests_is_not_called_testless() {
+    let d = workspace("quietlint");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}echo '.......'; echo '7 passed in 0.10s'; echo \"*** Error compiling './broken.py'...\"; echo 'SyntaxError: invalid syntax'; exit 1"
+            )
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make"]));
+    assert!(
+        out.contains("FAILED") && !out.contains("prova forget"),
+        "{out}"
+    );
+    let out = text(&prova(&d, &["run", "make", "--repeat", "2"]));
+    assert!(!out.contains("(no test ran)"), "{out}");
+}
+
+/// Round 16: skipped tests were counted but never named.
+#[test]
+fn skipped_tests_are_named() {
+    let d = workspace("skipnames");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::later ... ignored'")
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make"]));
+    assert!(out.contains("skipped: calc::later"), "{out}");
+}
+
+/// Round 16: a selection's runner reports the tests it filtered out as
+/// skipped, read as disabled tests.
+#[test]
+fn a_selection_says_skipped_tests_may_be_unselected() {
+    let d = workspace("selskip");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = \"true\"\nselect = {:?}\n",
+            format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::b ... ignored'")
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make", "--select", "calc::a"]));
+    assert!(out.contains("1 skipped (or not selected)"), "{out}");
+}
+
+/// Round 16: a failing run in which a panic kept two tests from running
+/// did not say they were missing.
+#[test]
+fn a_failed_run_names_tests_that_did_not_run() {
+    let d = workspace("failmissing");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}if [ \"$(cat state)\" = pass ]; then echo 'test calc::a ... ok'; echo 'test calc::b ... ok'; echo 'test calc::c ... ok'; else echo 'test calc::a ... FAILED'; exit 101; fi"
+            )
+        ),
+    )
+    .unwrap();
+    run(&d, "make", "pass");
+    let out = run(&d, "make", "fail");
+    assert!(
+        out.contains("2 test(s) from the last passing run") && out.contains("calc::b"),
+        "{out}"
+    );
+}
+
+/// Round 16: `--select tests.test_q::test_flaky` became `-k test_flaky`,
+/// which ran only `test_flaky_slow`; the run passed.
+#[test]
+fn a_named_selection_must_run_the_test_it_names() {
+    let d = workspace("selnamed");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.py]\nrun = \"true\"\nselect = {:?}\n",
+            format!(
+                "{WORK_SH}: pytest -k {{filter}}; echo 'collected 4 items / 3 deselected / 1 selected'; echo 'tests/test_q.py::test_flaky_slow PASSED'; echo '1 passed, 3 deselected in 0.01s'"
+            )
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "py", "--select", "tests.test_q::test_flaky"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(
+            "that test did not run; the filter matched other tests (tests.test_q::test_flaky_slow)"
+        ),
+        "{out}"
+    );
 }

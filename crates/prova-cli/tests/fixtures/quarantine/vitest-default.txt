@@ -1,0 +1,40 @@
+npm notice run npx
+npm notice run 'vitest' run
+
+ RUN  v3.2.4 /w/ts
+
+ ❯ src/calc.test.ts (5 tests | 1 failed) 16ms
+   ✓ calc > adds 1ms
+   ✓ calc > divides 0ms
+   × calc > flaky clock 4ms
+     → clock tick landed on a bad boundary: expected true to be false // Object.is equality
+   ✓ calc > slow integration 10ms
+   ✓ calc > hangs when asked 0ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/calc.test.ts > calc > flaky clock
+AssertionError: clock tick landed on a bad boundary: expected true to be false // Object.is equality
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- false[39m
+[31m+ true[39m
+
+ ❯ src/calc.test.ts:15:64
+     13|   it("flaky clock", () => {
+     14|     const micros = Math.floor(performance.now() * 1000);
+     15|     expect(micros >= 0, "clock tick landed on a bad boundary").toBe(fa…
+       |                                                                ^
+     16|   });
+     17| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 4 passed (5)
+   Start at  20:41:15
+   Duration  280ms (transform 23ms, setup 0ms, collect 17ms, tests 16ms, environment 0ms, prepare 81ms)
+

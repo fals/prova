@@ -247,7 +247,7 @@ fn a_quarantine_sets_aside_only_what_its_test_explains() {
     let script = format!(
         "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
          pass) echo 'test calc::x ... ok' ;; \
-         own) echo 'test calc::x ... FAILED'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
+         own) echo 'test calc::x ... FAILED'; echo 'failures:'; echo '---- calc::x stdout ----'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
          summary) echo 'test calc::x ... FAILED'; echo 'error: test run failed'; echo 'error: test failed, to rerun pass `--lib`'; exit 100 ;; \
          race) echo 'test calc::x ... FAILED'; echo 'WARNING: DATA RACE'; exit 101 ;; \
          build) echo 'test calc::x ... FAILED'; echo 'error[E0425]: cannot find value `y` in this scope'; exit 101 ;; \
@@ -600,4 +600,211 @@ fn a_narrow_suite_is_not_warned_about_another_modules_flaky_test() {
     run(&d, "all", "fail");
     let out = text(&run(&d, "narrow", "pass"));
     assert!(!out.contains("did not run"), "{out}");
+}
+
+/// Round 16: under gotestsum's default output, its red package line for
+/// the quarantined test's package was "an error outside the quarantined
+/// test(s)", so a quarantine never applied; and a pass behind make's stop
+/// at the test step did not say later steps never ran.
+#[test]
+fn a_quarantine_applies_under_gotestsum_and_says_what_make_skipped() {
+    let d = workspace("gts-q");
+    let script = |flaky_fails: bool| {
+        let verdict = if flaky_fails { "fail" } else { "pass" };
+        let ev = |test: Option<&str>| match test {
+            Some(t) => format!(
+                r#"{{"Action":"{verdict}","Package":"example.com/calc","Test":"{t}","Elapsed":0}}"#
+            ),
+            None => format!(r#"{{"Action":"{verdict}","Package":"example.com/calc","Elapsed":0}}"#),
+        };
+        let pass_add =
+            r#"{"Action":"pass","Package":"example.com/calc","Test":"TestAdd","Elapsed":0}"#;
+        let json = format!(
+            "printf '%s\\n' '{pass_add}' '{}' '{}' >> \"$GOTESTSUM_JSONFILE\";",
+            ev(Some("TestFlaky")),
+            ev(None)
+        );
+        let text = if flaky_fails {
+            "printf '%s\\n' '\u{2716}  . (1.503s)' '' '=== Failed' '=== FAIL: . TestFlaky (0.00s)' '    calc_test.go:23: tick' '' 'DONE 2 tests, 1 failure in 0.1s' 'make: *** [Makefile:2: test] Error 1'; exit 2"
+        } else {
+            "printf '%s\\n' '\u{2713}  . (1.503s)' '' 'DONE 2 tests in 0.1s'"
+        };
+        format!("{BUSY} : make test; {json} {text}")
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.flake]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n\n[suite.ok]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n",
+            script(true),
+            script(false)
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("go.mod"), "module example.com/calc\n").unwrap();
+    prova(&d, &["run", "ok"]);
+    prova(&d, &["run", "flake"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/calc::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "flake"]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{t}");
+    assert!(t.contains("any step after it did not run"), "{t}");
+}
+
+/// Round 16: under a quiet suite (`cargo test --quiet` via make) a refused
+/// quarantine said "no other test passed" next to "the framework counted 5".
+#[test]
+fn a_refusal_under_quiet_output_says_passes_were_only_counted() {
+    let d = workspace("quiet-q");
+    let quiet = format!(
+        "{BUSY} if [ \"$(cat state)\" = pass ]; then echo 'test result: ok. 5 passed; 0 failed; 0 ignored'; else echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 4 passed; 1 failed; 0 ignored'; exit 101; fi"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.q]\nrun = {quiet:?}\n"),
+    )
+    .unwrap();
+    run(&d, "q", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "q", "fail");
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(
+        t.contains("the framework counted 5 test(s), but its output names no passing test"),
+        "{t}"
+    );
+}
+
+/// Round 16: history said "none of them passed" when earlier runs had
+/// passed with a quarantined failure set aside.
+#[test]
+fn history_counts_passes_that_set_a_quarantine_aside() {
+    let d = workspace("setaside-hist");
+    suites(&d);
+    run(&d, "make", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    run(&d, "make", "fail");
+    let out = text(&run(&d, "make", "fail"));
+    assert!(
+        out.contains(
+            "none passed with every test passing; 2 passed with quarantined failures set aside"
+        ) || out.contains("1 passed with quarantined failures set aside"),
+        "{out}"
+    );
+    assert!(!out.contains("none of them passed"), "{out}");
+}
+
+/// Round 16: two crates' `tests::flaky` shared one name; a quarantine of
+/// crate calc's set aside crate geo's real failure.
+#[test]
+fn a_quarantine_names_the_binary_when_a_name_is_shared() {
+    let d = workspace("crates");
+    let nx = |calc: &str, geo: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run'; exit {code}"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n",
+            nx("FAIL", "PASS", 100),
+            nx("PASS", "FAIL", 100)
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "a"]);
+    let o = prova(
+        &d,
+        &["quarantine", "add", "tests::flaky", "--reason", "clock"],
+    );
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(
+        t.contains("2 tests are named \"tests::flaky\", in: calc, geo"),
+        "{t}"
+    );
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky",
+            "--in",
+            "calc",
+            "--reason",
+            "clock",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "a"]);
+    assert_eq!(o.status.code(), Some(0), "calc's own: {}", text(&o));
+    let o = prova(&d, &["run", "b"]);
+    assert_eq!(o.status.code(), Some(1), "geo's failure: {}", text(&o));
+}
+
+/// Round 16: `quarantine add` accepted a file-level entry, which a
+/// quarantine can never set aside.
+#[test]
+fn a_file_level_entry_cannot_be_quarantined() {
+    let d = workspace("fileentry");
+    let script = format!(
+        "{BUSY} printf '%s\\n' 'ERROR tests/test_db.py - ModuleNotFoundError: No module named x' '1 error in 0.1s'; exit 2"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &script]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests/test_db.py::(file)",
+            "--reason",
+            "r",
+        ],
+    );
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(t.contains("is not a test but a file"), "{t}");
+}
+
+/// Round 16: `prova flaky` had no column names and did not show a
+/// quarantine.
+#[test]
+fn flaky_names_its_columns_and_quarantines() {
+    let d = workspace("flakycols");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&prova(&d, &["flaky"]));
+    assert!(
+        out.contains("same-code flips") && out.contains("calc::x  (quarantined)"),
+        "{out}"
+    );
+}
+
+/// Round 16: `--repeat --json` tallied a quarantined test's failures with
+/// nothing marking it quarantined.
+#[test]
+fn repeat_json_marks_quarantined_tests() {
+    let d = workspace("repeatjson");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let o = prova(&d, &["run", "make", "--repeat", "2", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let x = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["test"] == "calc::x")
+        .cloned()
+        .unwrap();
+    assert_eq!(x["quarantined"], true, "{v}");
 }

@@ -1,0 +1,15 @@
+  Determining projects to restore...
+  Restored /w/Calc.Tests.csproj (in 9.91 sec).
+  Calc.Tests -> /w/bin/Debug/net9.0/Calc.Tests.dll
+Test run for /w/bin/Debug/net9.0/Calc.Tests.dll (.NETCoreApp,Version=v9.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.09]     Calc.CalcTests.FlakyClock [FAIL]
+  Failed Calc.CalcTests.FlakyClock [< 1 ms]
+  Error Message:
+   clock tick landed on a bad boundary
+  Stack Trace:
+     at Calc.CalcTests.FlakyClock() in /w/CalcTests.cs:line 17
+   at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+
+Failed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5, Duration: 19 ms - Calc.Tests.dll (net9.0)

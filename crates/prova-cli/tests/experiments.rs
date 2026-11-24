@@ -1220,8 +1220,9 @@ fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
 #[test]
 fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
     // Delays long against process start noise (macOS CI: a 20 ms arm
-    // measured 43 ms, then 92 ms, and the comparison was void).
-    let d = repo("notbest", "0.3");
+    // measured 43 ms, then 92 ms, and the comparison was void), with wide
+    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive).
+    let d = repo("notbest", "0.6");
     new_exp(&d, &[]);
     std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(
@@ -1233,7 +1234,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
         "fast"
     );
-    std::fs::write(d.join("delay"), "0.2").unwrap();
+    std::fs::write(d.join("delay"), "0.25").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "mid"])
             .status
@@ -1252,7 +1253,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         "{t}"
     );
     // A discard names its reference.
-    std::fs::write(d.join("delay"), "0.6").unwrap();
+    std::fs::write(d.join("delay"), "1.2").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
@@ -1305,4 +1306,47 @@ fn unmeasured_experiments_do_not_count_as_other_experiments() {
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     let caveats = r["comparison"]["result"]["caveats"].to_string();
     assert!(!caveats.contains("other experiment"), "{r}");
+}
+
+/// Round 16: the oracle's build ran out of disk quota in the candidate's
+/// checkout; the correct candidate was REJECTed as violating the spec.
+#[test]
+fn an_oracle_out_of_room_is_not_a_specification_violation() {
+    let d = spec_repo_with(
+        "oracle-quota",
+        "[ -f broken ] && { echo 'error: failed to write target/deps/x.rmeta: Disk quota exceeded (os error 122)'; exit 101; }; test \"$(cat answer)\" = 42",
+    );
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("broken"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    assert_ne!(r["comparison"]["verdict"], "reject", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("ran out of room") && reason.contains("Disk quota"),
+        "{reason}"
+    );
+}
+
+/// Round 16: a 527288x "improvement" (the candidate special-cased the
+/// benchmark's input) ended its long reason with the warning, and `next:`
+/// said keep it.
+#[test]
+fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
+    let d = spec_repo_with("huge", "test \"$(cat answer)\" = 42");
+    std::fs::write(d.join("steps"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e"]);
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(t.contains("ACCEPT"), "{t}");
+    assert!(
+        t.lines()
+            .any(|l| l.starts_with("warning: a change this large is rarely real")),
+        "{t}"
+    );
+    assert!(
+        t.contains("next: read the candidate's diff before trusting this"),
+        "{t}"
+    );
 }

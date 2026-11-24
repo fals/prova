@@ -659,3 +659,127 @@ fn gotestsum_testname_root_package_tests_are_tests() {
         "{s}"
     );
 }
+
+/// Round 16: selecting `pkg/b::TestAdd` ran `go test -run ^TestAdd$ ./...`,
+/// so pkg/a's TestAdd ran (and failed) too, with no word that it was not
+/// what was selected.
+#[test]
+fn a_qualified_selection_names_same_named_tests_it_also_ran() {
+    let d = workspace("qual-sel");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.go]\nrun = \"true\"\nselect = {:?}\n",
+            format!(
+                "{WORK}: go test -run {{filter}} ./...; printf '%s\\n' '=== RUN   TestAdd' '    a_test.go:3: boom' '--- FAIL: TestAdd (0.00s)' 'FAIL' 'FAIL\texample.com/m/a\t0.01s' '=== RUN   TestAdd' '--- PASS: TestAdd (0.00s)' 'PASS' 'ok  \texample.com/m/b\t0.01s'; exit 1"
+            )
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "go", "--select", "example.com/m/b::TestAdd"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains(
+            "outside the selection \"example.com/m/b::TestAdd\": example.com/m/a::TestAdd"
+        ),
+        "{out}"
+    );
+}
+
+/// Round 16: the parent of failing subtests showed Go's framing lines as
+/// its message (`go test -json`, as gotestsum's stream gives it).
+#[test]
+fn a_parent_of_failing_subtests_has_no_framing_message() {
+    let d = workspace("parent-msg");
+    let ev = |a: &str, t: &str, out: Option<&str>| {
+        let mut v = serde_json::json!({"Action": a, "Package": "example.com/m", "Test": t});
+        if let Some(o) = out {
+            v["Output"] = format!("{o}\n").into();
+        }
+        format!("'{v}'")
+    };
+    let lines = [
+        ev("run", "TestMean", None),
+        ev("output", "TestMean", Some("=== RUN   TestMean")),
+        ev("run", "TestMean/one", None),
+        ev("output", "TestMean/one", Some("=== RUN   TestMean/one")),
+        ev(
+            "output",
+            "TestMean/one",
+            Some("    m_test.go:9: got 2 want 1"),
+        ),
+        ev(
+            "output",
+            "TestMean/one",
+            Some("    --- FAIL: TestMean/one (0.00s)"),
+        ),
+        ev("fail", "TestMean/one", None),
+        ev("output", "TestMean", Some("--- FAIL: TestMean (0.00s)")),
+        ev("fail", "TestMean", None),
+    ];
+    let (_, s) = run_sh(&d, &format!("printf '%s\\n' {}; exit 1", lines.join(" ")));
+    let parent = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["test"] == "example.com/m::TestMean")
+        .cloned()
+        .unwrap_or_default();
+    let msg = parent["message"].as_str().unwrap_or("");
+    assert!(!msg.contains("=== RUN") && !msg.contains("--- FAIL"), "{s}");
+}
+
+/// Round 16: a quarantined `go test -v` failure made the pass "unverified":
+/// "1 test(s) failed, then passed on a retry: TestFlaky", with no retry.
+#[test]
+fn a_quarantined_go_failure_is_no_retry() {
+    let d = workspace("q-noretry");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &script]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "passed", "{s}");
+    assert!(!s.to_string().contains("passed on a retry"), "{s}");
+}
+
+/// Round 16: gotestsum prints a subpackage relative to the module
+/// (`calc.TestFlaky`), `go test` by its import path: one test, two names.
+#[test]
+fn gotestsum_subpackages_are_named_by_import_path() {
+    let d = workspace("gts-subpkg");
+    std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
+    let (_, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'PASS calc.TestAdd (0.00s)' 'FAIL calc.TestFlaky (0.00s)' 'FAIL calc' '' 'DONE 2 tests, 1 failure in 0.1s'; exit 1",
+    );
+    assert_eq!(failing(&s), vec!["example.com/m/calc::TestFlaky"], "{s}");
+}
+
+/// Round 16: gotestsum `--format pkgname --rerun-fails` whose rerun passed
+/// (real capture: the failures are listed, the package's last line is
+/// green, exit 0) was reported as a failure.
+#[test]
+fn a_gotestsum_pkgname_rerun_that_passed_is_flaky() {
+    let d = workspace("gts-pkg-rerun");
+    std::fs::write(d.join("go.mod"), "module example.com/calc\n").unwrap();
+    let capture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/quarantine/gotestsum-pkgname-rerun.txt"
+    );
+    let (code, s) = run_sh(&d, &format!("cat {capture}; exit 0"));
+    assert_eq!(code, Some(0), "{s}");
+    assert_eq!(s["outcome"], "passed", "{s}");
+    assert!(s.to_string().contains("passed on a retry"), "{s}");
+}

@@ -1,0 +1,31 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+────────────
+ Nextest run ID c4ec0289-cce9-493d-9b35-a5128851e4c9 with nextest profile: default
+    Starting 5 tests across 1 binary
+        PASS [   0.004s] (1/5) calc tests::adds
+        PASS [   0.004s] (2/5) calc tests::hangs_when_asked
+        PASS [   0.005s] (3/5) calc tests::divides
+        FAIL [   0.004s] (4/5) calc tests::flaky_clock
+  stdout ───
+
+    running 1 test
+    test tests::flaky_clock ... FAILED
+
+    failures:
+
+    failures:
+        tests::flaky_clock
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::flaky_clock' (2983108) panicked at src/lib.rs:29:9:
+    clock tick landed on a bad boundary
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.015s] (5/5) calc tests::slow_integration
+────────────
+     Summary [   0.015s] 5 tests run: 4 passed, 1 failed, 0 skipped
+        FAIL [   0.004s] (4/5) calc tests::flaky_clock
+error: test run failed

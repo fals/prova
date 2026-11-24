@@ -1,0 +1,12 @@
+∅  cmd/conform
+✖  . (12ms)
+
+=== Skipped
+=== SKIP: . TestHang (0.00s)
+    calc_test.go:33: set HANG=1 to hang
+
+=== Failed
+=== FAIL: . TestFlakyClock (0.00s)
+    calc_test.go:23: clock tick landed on a bad boundary
+
+DONE 5 tests, 1 skipped, 1 failure in 0.012s

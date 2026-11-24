@@ -72,6 +72,10 @@ Example:
         #[arg(long, value_name = "DAYS", default_value_t = prova_core::quarantine::DEFAULT_DAYS,
               value_parser = clap::value_parser!(u32).range(1..=prova_core::quarantine::MAX_DAYS as i64))]
         days: u32,
+        /// The test binary or module, when tests of several share the name
+        /// (e.g. two crates' `tests::flaky`).
+        #[arg(long = "in", value_name = "FILE")]
+        in_file: Option<String>,
     },
     /// List the quarantined tests.
     #[command(after_help = "\
@@ -1377,16 +1381,38 @@ fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
 }
 
 /// The wrapper this project's earlier runs put in front of the test command
-/// (`./dev`, `nix develop -c`), from the newest run that had one.
-fn earlier_wrapper(store: &Store) -> Option<String> {
-    store.recent_runs(30).ok()?.into_iter().find_map(|r| {
-        let argv: Vec<String> = r.spec["command"]["argv"]
-            .as_array()?
-            .iter()
-            .filter_map(|w| w.as_str().map(str::to_owned))
-            .collect();
-        prova_adapters::adopt::wrapper_of(&argv)
-    })
+/// (`./dev`, `./dev "dotnet test"`, `nix develop -c`): the most frequent
+/// over the recent runs, argv or a suite's shell command, the newest first
+/// among equals (round 16: the newest run alone lost it).
+fn earlier_wrapper(store: &Store) -> Option<prova_adapters::adopt::Wrapper> {
+    let mut seen: Vec<(prova_adapters::adopt::Wrapper, usize)> = Vec::new();
+    for r in store.recent_runs(300).ok()? {
+        let found = match (
+            r.spec["command"]["argv"].as_array(),
+            r.spec["command"]["shell"].as_str(),
+        ) {
+            (Some(argv), _) => {
+                let argv: Vec<String> = argv
+                    .iter()
+                    .filter_map(|w| w.as_str().map(str::to_owned))
+                    .collect();
+                prova_adapters::adopt::wrapper_form(&argv)
+            }
+            (None, Some(cmd)) => prova_adapters::adopt::wrapper_of_shell(cmd),
+            _ => None,
+        };
+        if let Some(w) = found {
+            match seen.iter_mut().find(|(x, _)| *x == w) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((w, 1)),
+            }
+        }
+    }
+    // `max_by_key` keeps the last of equals: the list is newest first.
+    seen.into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(w, _)| w)
 }
 
 /// What the framework named in a filter's syntax, for the framework the
@@ -1408,20 +1434,6 @@ fn filter_syntax_advice(command: &str) -> &'static str {
     } else {
         "use the framework's own filter syntax"
     }
-}
-
-/// The part of a filter a framework's "not found" line names, when the
-/// filter has spaces and the line quotes only a piece of it: a wrapper or
-/// shell split it into words (round 15: `./dev` re-splits `$*`).
-fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
-    if !filter.contains(' ') {
-        return None;
-    }
-    lines.iter().find_map(|l| {
-        let (_, frag) = l.split_once("not found:")?;
-        let frag = frag.trim();
-        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
-    })
 }
 
 /// Why a run that ran no test failed on its own: the command could not
@@ -1523,7 +1535,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             })
             .map(|l| render::clean(l.trim()));
         let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
-            let split = split_filter_fragment(&filter, &lines);
+            let split = engine::split_filter_fragment(&filter, &lines);
             (
                 false,
                 format!(
@@ -1588,7 +1600,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
     }
     let mut p = prova_adapters::adopt::propose(&root);
     if let Some(wrapper) = earlier_wrapper(&store) {
-        prova_adapters::adopt::apply_wrapper(&mut p, &wrapper);
+        prova_adapters::adopt::apply_wrapper_form(&mut p, &wrapper);
     }
     let toml = prova_adapters::adopt::to_toml(&p);
     if json {
@@ -2012,7 +2024,12 @@ fn main() -> ExitCode {
 fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
     use prova_core::quarantine as q;
     match action {
-        QuarantineCmd::Add { test, reason, days } => {
+        QuarantineCmd::Add {
+            test,
+            reason,
+            days,
+            in_file,
+        } => {
             let found = analysis::find_tests(store, &test, None)?;
             let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
             names.sort();
@@ -2051,7 +2068,48 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                     }
                 }
             };
-            let e = q::add(store, &name, &reason, days, now_ms())?;
+            // Tests of several binaries or modules sharing the name: only
+            // the one named with --in is set aside (round 16: a quarantine
+            // of crate calc's `tests::flaky` hid crate geo's failure).
+            // A file-level entry is an error, never a plain failure: a
+            // quarantine could never set it aside (round 16).
+            if [
+                "(file)",
+                "(package)",
+                "(suite)",
+                "(unhandled error)",
+                "(unhandled errors)",
+            ]
+            .iter()
+            .any(|p| name.ends_with(p))
+            {
+                return Err(UsageError(format!(
+                    "{name:?} is not a test but a file, package or suite that failed to load or run: a quarantine sets aside test failures only; fix what keeps it from loading"
+                ))
+                .into());
+            }
+            let files = q::files_of(store, &name)?;
+            let file = match (in_file.as_deref(), files.as_slice()) {
+                (Some(f), _) if files.iter().any(|x| x == f) => Some(f.to_owned()),
+                (Some(f), _) => {
+                    return Err(UsageError(format!(
+                        "{name:?} is not known in {f:?}; it is in: {}",
+                        files.join(", ")
+                    ))
+                    .into());
+                }
+                (None, [one]) => Some(one.clone()),
+                (None, []) => None,
+                (None, many) => {
+                    return Err(UsageError(format!(
+                        "{} tests are named {name:?}, in: {}; say which with --in <one of them>",
+                        many.len(),
+                        many.join(", ")
+                    ))
+                    .into());
+                }
+            };
+            let e = q::add(store, &name, file.as_deref(), &reason, days, now_ms())?;
             println!(
                 "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
@@ -2694,9 +2752,17 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else if list.is_empty() {
                 println!("no flaky tests in recorded history");
             } else {
+                // Columns named, and a quarantine shown (round 16).
+                let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
+                println!("fail%   retry-passes  same-code flips  test");
                 for s in &list {
+                    let q = if prova_core::quarantine::covers(&quarantined, &s.display).is_some() {
+                        "  (quarantined)"
+                    } else {
+                        ""
+                    };
                     println!(
-                        "{:5.1}% fail  {:2} retry-passes  flipped on {:2} code version(s)  {}",
+                        "{:5.1}%  {:12}  {:15}  {}{q}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
@@ -2721,7 +2787,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
                 if d.out_of_sight > 0 {
                     println!(
-                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size` in prova.toml",
+                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size = \"small\"` (or medium, large) under `[suite.<name>]` in prova.toml",
                         d.out_of_sight
                     );
                 }
@@ -2848,6 +2914,8 @@ fn repeat_runs(
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     let mut quarantined = std::collections::BTreeSet::new();
     let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
+    let mut unverified_why: Option<String> = None;
+    let mut failed_why: Option<String> = None;
     // Runs in which each test had a result.
     let mut seen_in: std::collections::BTreeMap<String, u32> = Default::default();
     for i in 1..=n {
@@ -2879,6 +2947,7 @@ fn repeat_runs(
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
             failed_otherwise += 1;
+            failed_why = failed_why.or_else(|| s.detail.clone());
         }
         if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
             quiet += 1;
@@ -2889,6 +2958,13 @@ fn repeat_runs(
         if s.outcome == Some(Outcome::Passed)
             && (!s.warnings.is_empty() || s.verified == Some(false))
         {
+            // The reason itself, not a generic one (round 16: "e.g. cached
+            // results" for a known flaky test's pass).
+            unverified_why.get_or_insert_with(|| {
+                s.warnings.first().cloned().unwrap_or_else(|| {
+                    format!("known flaky test(s) passed: {}", s.flaky_passed.join(", "))
+                })
+            });
             unverified.push(id.clone());
         }
         // A result re-keyed under another name (a Go test once its package
@@ -2933,7 +3009,7 @@ fn repeat_runs(
                 .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
-            } else if ran == 0 {
+            } else if ran == 0 && !counted {
                 " (no test ran)".to_owned()
             } else if let (Some(Outcome::Failed | Outcome::Errored), Some(d)) =
                 (s.outcome, &s.detail)
@@ -2964,7 +3040,16 @@ fn repeat_runs(
     if json {
         let tests: Vec<_> = tally
             .iter()
-            .map(|(t, (p, f))| serde_json::json!({ "test": t, "passed": p, "failed": f }))
+            .map(|(t, (p, f))| {
+                serde_json::json!({
+                    "test": t,
+                    "passed": p,
+                    "failed": f,
+                    // (round 16: a quarantined test's failures looked like
+                    // any other's in --json)
+                    "quarantined": quarantined.contains(t),
+                })
+            })
             .collect();
         println!(
             "{}",
@@ -3010,14 +3095,16 @@ fn repeat_runs(
         }
         if !unverified.is_empty() {
             println!(
-                "  {} of {done} pass(es) verified little (warnings; e.g. cached results): {}",
+                "  {} of {done} pass(es) verified little: {} (e.g. {})",
                 unverified.len(),
-                unverified.join(", ")
+                unverified.join(", "),
+                render::clean(unverified_why.as_deref().unwrap_or("see each run's status"))
             );
         }
         if failed_otherwise > 0 {
             println!(
-                "  {failed_otherwise} of {done} run(s) failed with no failing test (see each run's status)"
+                "  {failed_otherwise} of {done} run(s) failed with no failing test shown: {}",
+                render::clean(failed_why.as_deref().unwrap_or("see each run's status"))
             );
         }
         if tally.is_empty() {

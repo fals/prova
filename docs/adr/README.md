@@ -36,5 +36,6 @@ Records 0001 to 0027 are **Accepted**, each on the date in its row. Later amendm
 | [0027](0027-quarantine-and-slow-tests.md) | Quarantine for known-flaky tests (store, reason, expiry, always listed); a left-out flaky test is warned about; `prova slowest`; amends 0017, 0018 | Accepted 2026-11-24 | no |
 | [0028](0028-quarantine-sets-aside-only-what-it-explains.md) | A quarantine sets aside only what its tests explain (counts, crash lines, subtests, something else verified); marked everywhere; stall after 30 s with no size, running tests' time so far; amends 0004, 0027 | Accepted 2026-11-24 | no |
 | [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) | A quarantine accounts for every error line (sections, summaries, kills); `-count` repeats are not retries; 20 s stall and slow defaults; containers stopped or warned about on cancel; amends 0004, 0024, 0028 | Accepted 2026-11-24 | no |
+| [0030](0030-nothing-after-the-summary-and-named-selections.md) | A quarantine sets nothing aside after the tests' summary (real-output corpus); quarantines name a file when a name is shared; a fully named selection must run its test; container stalls and cancels; amends 0027, 0029 | Accepted 2026-11-24 | no |
 
 The deviations from the README were accepted with the records.

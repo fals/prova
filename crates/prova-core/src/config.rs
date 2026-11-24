@@ -189,6 +189,21 @@ pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(20);
 pub const DEFAULT_SLOW: Duration = Duration::from_secs(20);
 pub const DEFAULT_KILL_AFTER: Duration = Duration::from_secs(3600);
 
+/// Whether an injection recipe can act on `command`: the recipes that
+/// configure one tool need that tool (or a wrapper that may run it: make,
+/// npm, a script) in the command.
+fn recipe_applies(recipe: &str, command: &str) -> bool {
+    let runs = |tool: &str| command.contains(tool);
+    let indirect = ["make", "npm", "yarn", "pnpm", "./", "sh ", "bash "]
+        .iter()
+        .any(|w| command.contains(w));
+    match recipe {
+        "gotestsum-json" => runs("gotestsum") || (indirect && !runs("go test")),
+        "vitest-stream" => runs("PROVA_VITEST_REPORTER"),
+        _ => true,
+    }
+}
+
 /// Workspace root: nearest ancestor with `prova.toml`, else with `.git`,
 /// else `start` itself.
 pub fn find_root(start: &Path) -> PathBuf {
@@ -368,6 +383,12 @@ impl Config {
             }
         };
         let default_stall = s.size.map(Size::stall_after).unwrap_or(DEFAULT_STALL_AFTER);
+        let inject = s
+            .inject
+            .iter()
+            .filter(|r| selection.is_none() || recipe_applies(r, &command))
+            .cloned()
+            .collect();
         Ok(RunSpec {
             command: CommandSpec::Shell(command),
             size: s.size,
@@ -376,7 +397,10 @@ impl Config {
             kill_after_ms: dur(name, "kill_after", &s.kill_after, DEFAULT_KILL_AFTER)?,
             results: s.results.clone(),
             adapter: s.adapter.clone(),
-            inject: s.inject.clone(),
+            // A recipe for a tool the select command does not run is not
+            // injected there (round 16: gotestsum's stream for a plain `go
+            // test -json` select made every selected pass "unverified").
+            inject,
             keep_output: false,
             expect_tests: s.expect_tests,
         })
@@ -531,6 +555,16 @@ mod tests {
             Err(ConfigError::BadSelection(_))
         ));
         assert_eq!(spec.stall_after_ms, 20_000);
+        // Round 16: a recipe for a tool the select command does not run.
+        assert!(super::recipe_applies("gotestsum-json", "make test"));
+        assert!(!super::recipe_applies(
+            "gotestsum-json",
+            "go test -json -count=1 -run \"$PROVA_FILTER\" ./..."
+        ));
+        assert!(super::recipe_applies(
+            "gotestsum-json",
+            "gotestsum -- -run x ./..."
+        ));
         assert!(matches!(
             c.run_spec("nope", None),
             Err(ConfigError::UnknownSuite(..))

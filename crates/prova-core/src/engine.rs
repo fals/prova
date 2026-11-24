@@ -261,6 +261,11 @@ struct Supervisor<'a> {
     /// The client's command line, to find its container when the run is
     /// stopped (round 15).
     container_cmd: Option<String>,
+    /// The run's working directory and start (ms since the epoch): a
+    /// container started without a name is found by what it mounts and when
+    /// it was created (round 16).
+    run_cwd: String,
+    run_started_ms: u64,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -337,6 +342,10 @@ struct SizeTrack {
     /// `SIZE_GUARD` after the start line and before the finish line.
     pending: Option<(Instant, crate::resources::Seen)>,
 }
+
+/// The least idle time a run through a container client is called stalled
+/// after: its tests run out of sight of the process tree.
+const CONTAINER_STALL_AFTER: Duration = Duration::from_secs(60);
 
 /// How far from a test's start and finish lines a sample must be to count
 /// for that test (ADR 0025 §5: a missed resource is a lower bound, a
@@ -675,6 +684,43 @@ impl Supervisor<'_> {
                     self.emit(EventKind::RunWarning { message });
                 }
             }
+            _ if crate::resources::container_client_runs(&cmd) => {
+                let found = crate::resources::containers_of_run(
+                    client,
+                    &self.run_cwd,
+                    self.run_started_ms,
+                );
+                match found.as_slice() {
+                    [one] => {
+                        let ok = crate::resources::kill_container(client, one);
+                        let message = if ok {
+                            format!("stopped the container `{one}` with `{client} kill {one}` (it mounts the run's directory and was created after the run started; the `{client}` command had no --name or --cidfile)")
+                        } else {
+                            format!("could not stop the container `{one}`: run `{client} kill {one}`")
+                        };
+                        if ok {
+                            self.emit(EventKind::RunNote { message });
+                        } else {
+                            self.emit(EventKind::RunWarning { message });
+                        }
+                    }
+                    [] => self.emit(EventKind::RunWarning {
+                        message: format!(
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container mounts this directory); check `{client} ps` and stop it"
+                        ),
+                    }),
+                    many => self.emit(EventKind::RunWarning {
+                        message: format!(
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and {} running containers could be it; stop the right one: {}",
+                            many.len(),
+                            many.iter()
+                                .map(|id| format!("`{client} kill {id}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }),
+                }
+            }
             _ => self.emit(EventKind::RunWarning {
                 message: format!(
                     "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
@@ -863,6 +909,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
         container_cmd: Some(spec.command.display()),
+        run_cwd: row.cwd.clone(),
+        run_started_ms: started_ms,
         superseded: Default::default(),
         phase: None,
         whole: None,
@@ -1000,7 +1048,7 @@ fn observe_child(
     }
     drop(tx);
 
-    let stall_after = Duration::from_millis(spec.stall_after_ms);
+    let declared_stall = Duration::from_millis(spec.stall_after_ms);
     let kill_after = Duration::from_millis(spec.kill_after_ms);
     let start = Instant::now();
     let mut last_activity = Instant::now();
@@ -1070,8 +1118,24 @@ fn observe_child(
             }
         }
         let idle = now.duration_since(last_activity);
+        // Through a container client the host process tree is idle by
+        // design (round 16: a NuGet restore in docker was called a stall at
+        // 20 s): process inactivity alone is no stall before a minute.
+        let stall_after = if sup.container.is_some() {
+            declared_stall.max(CONTAINER_STALL_AFTER)
+        } else {
+            declared_stall
+        };
         if idle >= stall_after && !stalled {
             stalled = true;
+            if let Some(client) = sup.container {
+                sup.emit(EventKind::RunNote {
+                    message: format!(
+                        "the tests run in a container (`{client}`): prova sees only its output, not what runs inside, so a stall is called after at least {}",
+                        crate::ids::format_duration(CONTAINER_STALL_AFTER)
+                    ),
+                });
+            }
             sup.emit(EventKind::RunStalled {
                 idle_ms: idle.as_millis() as u64,
                 basis: StallBasis::ProcessTree,
@@ -1245,6 +1309,19 @@ fn observe_child(
         });
     }
     let mut warnings = report.warnings;
+    // Through a container client the test process is elsewhere: say what an
+    // injected report needs there (round 16: `./dev` neither forwarded
+    // PYTEST_ADDOPTS nor mounted the report's directory).
+    if let Some(client) = sup.container {
+        for w in warnings
+            .iter_mut()
+            .filter(|w| w.contains("report was never written"))
+        {
+            w.push_str(&format!(
+                "; the tests run through `{client}`: the variable must be forwarded into the container (`-e PYTEST_ADDOPTS`) and the report's directory must be mounted so the path exists inside it"
+            ));
+        }
+    }
     // Tests set aside by hand, as they were when this run was created (0027).
     let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
@@ -1265,6 +1342,30 @@ fn observe_child(
             contradictions.push(format!(
                 "selection {sel:?} matched no test: nothing was verified"
             ));
+        } else if let Some(sel) = &spec.selection
+            && sel.contains("::")
+            && sup.level > Level::Opaque
+        {
+            // A test named in full must itself run: a framework filter by
+            // substring or by bare name can match only others (round 16:
+            // `-k test_flaky` ran `test_flaky_slow`, `-run ^TestParse$`
+            // ran another package's TestParse, and the run passed).
+            let ran_names: Vec<String> = sup
+                .lifecycle
+                .outcomes()
+                .keys()
+                .filter(|k| !sup.superseded.contains(*k))
+                .map(|k| key_display(k).to_owned())
+                .collect();
+            if !ran_names.iter().any(|d| names_the_selection(d, sel)) {
+                let mut others = ran_names.clone();
+                others.sort();
+                others.truncate(5);
+                contradictions.push(format!(
+                    "selection {sel:?}: that test did not run; the filter matched other tests ({}): nothing selected was verified",
+                    others.join(", ")
+                ));
+            }
         }
         if spec.selection.is_none() {
             sup.flush()?; // this run's results must be in the store to compare
@@ -1527,27 +1628,15 @@ fn observe_child(
         {
             let lines: Vec<String> = sup.tail.iter().cloned().collect();
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let listed = list_suspects(store, &sup.suite, &suspects);
             let message = match class {
                 Some(c) => format!(
-                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {}{}",
+                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {listed}",
                     suspects.len(),
-                    names.join(", "),
-                    if suspects.len() > names.len() {
-                        ", ..."
-                    } else {
-                        ""
-                    }
                 ),
                 None => format!(
-                    "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {}{}",
+                    "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {listed}",
                     missing.len(),
-                    names.join(", "),
-                    if missing.len() > names.len() {
-                        ", ..."
-                    } else {
-                        ""
-                    }
                 ),
             };
             sup.emit(EventKind::RunNote { message });
@@ -1605,6 +1694,14 @@ fn observe_child(
             contradictions.push(why);
         }
     }
+    // Maven prints `BUILD FAILURE` whenever a test failed. With the quarantined
+    // failures set aside it says nothing more: the goal's own error lines
+    // (`Failed to execute goal ...`) are what `unaccounted_error` checks.
+    if set_aside.is_some() {
+        contradictions.retain(|c| {
+            !(c.starts_with("the build says it failed: \"") && c.ends_with("BUILD FAILURE\""))
+        });
+    }
     if let Some(code @ (126 | 127)) = exit_code {
         reason = Some(format!(
             "the command could not start (exit {code}: {}); no test ran",
@@ -1650,6 +1747,17 @@ fn observe_child(
             quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
     {
         outcome = Outcome::Passed;
+        // make stopped at the failing test step: the steps after it never
+        // ran, so the pass verified nothing of them (round 16: a vet step
+        // after the tests was never seen).
+        if let Some((_, line, _)) = sup.distiller.error_lines().0.iter().find(|(_, l, _)| {
+            l.trim_start().starts_with("make: ***") || l.trim_start().starts_with("make[")
+        }) {
+            warnings.push(format!(
+                "the command stopped at the failing test step ({}): any step after it did not run",
+                line.trim()
+            ));
+        }
         sup.emit(EventKind::RunNote {
             message: format!(
                 "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
@@ -1665,12 +1773,33 @@ fn observe_child(
         outcome = Outcome::Errored;
     }
     if outcome == Outcome::Passed {
-        // A quarantined test's own crash is set aside with it (round 14).
+        sup.flush()?;
+        let rerun_all: Vec<String> = {
+            let mut stmt = store.conn().prepare(
+                // A retry: a failed attempt, then a pass of the same test.
+                // A result re-keyed under another name is no attempt (round
+                // 16: a quarantined Go failure read as "passed on a retry").
+                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                  WHERE a.run_id = ?1
+                    AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+                  GROUP BY a.test_id
+                 HAVING SUM(a.outcome IN ('failed','errored')) > 0
+                    AND SUM(a.outcome = 'passed') > 0",
+            )?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        // A quarantined test's own crash is set aside with it (round 14),
+        // and a retried test's panic on its first try is its own (round 16:
+        // a nextest retry that passed was "an error outside any failing
+        // test").
+        let mut own_crashes: Vec<String> = set_aside.clone().unwrap_or_default();
+        own_crashes.extend(rerun_all.iter().cloned());
         if let Some((line, text)) = unexplained_crash(
             store,
             run,
             &sup.distiller,
-            set_aside.as_deref().unwrap_or_default(),
+            &own_crashes,
             &report.test_outputs,
         )? {
             warnings.push(format!(
@@ -1680,16 +1809,7 @@ fn observe_child(
         }
         // A test that passed only on a retry is flaky: the run passes (its
         // last attempt decides, ADR 0024) but the pass is not a green one.
-        sup.flush()?;
-        let rerun: Vec<String> = {
-            let mut stmt = store.conn().prepare(
-                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-                  WHERE a.run_id = ?1 GROUP BY a.test_id
-                 HAVING SUM(a.outcome IN ('failed','errored')) > 0",
-            )?;
-            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
+        let rerun = rerun_all;
         let rerun: Vec<String> = rerun
             .into_iter()
             .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
@@ -1757,10 +1877,18 @@ fn observe_child(
                 new_subtests.join(", ")
             )
         } else if !verified_other {
-            format!(
-                "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
-                failing.join(", ")
-            )
+            // Quiet output counts passes without naming them (round 16:
+            // "no other test passed" next to "the framework counted 5").
+            match sup.framework_total {
+                Some(t) if t > failing.len() as u64 => format!(
+                    "only quarantined test(s) failed ({}); the framework counted {t} test(s), but its output names no passing test, so nothing else was verified: a suite with verbose or structured output (prova adopt) can set the failure aside",
+                    failing.join(", ")
+                ),
+                _ => format!(
+                    "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
+                    failing.join(", ")
+                ),
+            }
         } else {
             format!(
                 "only quarantined test(s) failed ({}), but the run cannot be set aside (exit {}, or the run did not end on its own)",
@@ -1768,6 +1896,17 @@ fn observe_child(
                 exit_code.map_or("none".to_owned(), |c| c.to_string())
             )
         });
+    }
+    // A failed run's missing tests are news too: a panic or a crash that
+    // stopped the rest is visible only this way (round 16: two tests a
+    // panic kept from running vanished without a word).
+    if outcome != Outcome::Passed {
+        for w in warnings
+            .iter()
+            .filter(|w| w.contains("from the last passing run") && w.contains("did not run"))
+        {
+            sup.emit(EventKind::RunNote { message: w.clone() });
+        }
     }
     let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
@@ -1897,6 +2036,39 @@ fn missing_since_last_pass(
 /// Like `missing_since_last_pass`, from the last finished full run whatever
 /// its outcome: the suspects of a hang (round 8: a suite that never passed
 /// yet still names them).
+/// The suspects of a hung run as text, most likely first: tests that
+/// ended in an error in earlier runs of the suite (a hang is recorded as
+/// one) come before the rest, which keep their usual order. A list cut
+/// short says how many it left out (round 16: "..." hid the hung test).
+fn list_suspects(store: &Store, suite: &str, suspects: &[&String]) -> String {
+    const SHOWN: usize = 8;
+    let hurt: std::collections::BTreeSet<String> = store
+        .conn()
+        .prepare(
+            "SELECT DISTINCT t.display FROM attempts a
+               JOIN tests t ON t.id = a.test_id JOIN runs r ON r.id = a.run_id
+              WHERE r.suite = ?1 AND a.outcome = 'errored'",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![suite], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .unwrap_or_default();
+    let mut ordered: Vec<&String> = suspects.to_vec();
+    ordered.sort_by_key(|n| !hurt.contains(n.as_str())); // stable
+    let shown: Vec<&str> = ordered.iter().take(SHOWN).map(|s| s.as_str()).collect();
+    let mut text = shown.join(", ");
+    if ordered.len() > shown.len() {
+        text.push_str(&format!(
+            " (first {} of {}; {} more not listed)",
+            shown.len(),
+            ordered.len(),
+            ordered.len() - shown.len()
+        ));
+    }
+    text
+}
+
 fn missing_since_last_run(
     store: &Store,
     run: &str,
@@ -2016,9 +2188,12 @@ fn quarantined_only_failures(
         if *o != Outcome::Failed {
             return None;
         }
-        let set_aside = match quarantine.get(display) {
+        // Of the same file, when the quarantine names one (round 16: two
+        // crates' `tests::flaky`).
+        let own = crate::quarantine::covers_key(quarantine, key).filter(|e| e.test == display);
+        let set_aside = match own {
             Some(_) => true,
-            None => match crate::quarantine::covers(quarantine, display) {
+            None => match crate::quarantine::covers_key(quarantine, key) {
                 Some(parent) => first_seen(display).is_some_and(|t| t < parent.created_ms),
                 None => {
                     let prefix = format!("{display}/");
@@ -2034,9 +2209,23 @@ fn quarantined_only_failures(
     // A run that verified nothing else passes nothing (round 14: a
     // selection of only the quarantined test, failing, was "PASSED").
     let verified_other = outcomes.iter().any(|(k, o)| {
-        *o == Outcome::Passed && crate::quarantine::covers(quarantine, key_display(k)).is_none()
+        *o == Outcome::Passed && crate::quarantine::covers_key(quarantine, k).is_none()
     });
     (!names.is_empty() && verified_other).then_some(names)
+}
+
+/// Whether a test's display name is the selected test, one of its
+/// subtests, or one of its parameterized cases.
+fn names_the_selection(display: &str, sel: &str) -> bool {
+    display == sel
+        || [
+            sel.to_owned() + "/",
+            sel.to_owned() + "[",
+            sel.to_owned() + "(",
+        ]
+        .iter()
+        .any(|p| display.starts_with(p.as_str()))
+        || sel.starts_with(&format!("{display}/"))
 }
 
 /// Whether `name` occurs in `line` as a whole name, not inside a longer one
@@ -2093,6 +2282,17 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
     {
         return true;
     }
+    // gotestsum's package summary, `✖  pkg (1.5s)`: red because a test of
+    // it failed (round 16: every quarantined pass under gotestsum failed on
+    // it). A package's own failure is an errored `(package)` entry.
+    if let Some(rest) = t.strip_prefix('\u{2716}') {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        return match words.as_slice() {
+            [_pkg] => true,
+            [_pkg, time] => time.starts_with('(') && time.ends_with("s)"),
+            _ => false,
+        };
+    }
     // go: `FAIL\tpkg\t0.01s` (a package's result, not a build failure).
     if (t.starts_with("FAIL\t") || t.starts_with("FAIL "))
         && !t.contains('[')
@@ -2126,6 +2326,8 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
             || r.starts_with("-> [Help")
             || r.starts_with("[Help ")
             || r.starts_with("To see the full stack trace")
+            || (r.starts_with("See ") && r.ends_with(" for the individual test results."))
+            || r.starts_with("See dump files (if any exist)")
             || r.starts_with("Re-run Maven")
             || r.starts_with("For more information")
             || r.starts_with("Please refer to")
@@ -2140,7 +2342,29 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
         && let Some((target, _)) = rest.split_once(']')
     {
         let target = target.rsplit(':').next().unwrap_or(target).trim();
-        return !target.is_empty() && command.split_whitespace().any(|w| w == target);
+        return !target.is_empty() && make_names_target(command, target);
+    }
+    false
+}
+
+/// Whether `command` runs `make` with `target` among its goals: a word
+/// after a `make` word, up to the end of that command (`;`, `&&`, `|`).
+/// A word of a script that merely spells the target (a `case` pattern
+/// `lint)`) is not the suite running it.
+fn make_names_target(command: &str, target: &str) -> bool {
+    let mut in_make = false;
+    for word in command.split_whitespace() {
+        let w = word.trim_matches(['"', '\'', '(', ')']);
+        let ends = w.ends_with([';', '&', '|']) || matches!(w, "&&" | "||" | "|");
+        let w = w.trim_matches([';', '&', '|']);
+        if in_make && !w.starts_with('-') && w == target {
+            return true;
+        }
+        if w == "make" || w.ends_with("/make") {
+            in_make = true;
+        } else if ends {
+            in_make = false;
+        }
     }
     false
 }
@@ -2179,17 +2403,73 @@ fn unaccounted_error(
         }
     }
     let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
+    // The runner's last summary is the end of the tests: another step that
+    // printed after it (a linter, a smoke check, a coverage gate) failed or
+    // passed in words prova cannot tell from the quarantined failure.
+    let (after, after_overflow) = distiller.after_summary();
+    if let Some((n, line)) = after
+        .iter()
+        .find(|(_, l)| !wrapper_line(l, command, &names))
+    {
+        return Ok(Some(format!(
+            "the command printed more after the tests' summary (line {n}: {}): another step ran, and its result cannot be told apart from the quarantined failure",
+            line.chars().take(160).collect::<String>()
+        )));
+    }
+    if after_overflow {
+        return Ok(Some(
+            "the command printed too much after the tests' summary to account for it: another step ran, and its result cannot be told apart from the quarantined failure".into(),
+        ));
+    }
+    // A summary of failed files above the files that hold the quarantined
+    // failures: another file failed (Jest `Test Suites:`, Vitest `Test Files`).
+    if let Some((n, line)) = distiller.files_line()
+        && let Some(failed) = failed_count(line)
+    {
+        let mut files: Vec<&str> = quarantined
+            .iter()
+            .map(|q| q.split_once("::").map_or(q.as_str(), |(f, _)| f))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        if failed > files.len() as u64 {
+            return Ok(Some(format!(
+                "the framework counts {failed} failed file(s) (line {n}: {}), more than the file(s) of the quarantined test(s): another file failed",
+                line.chars().take(160).collect::<String>()
+            )));
+        }
+    }
+    let mut reruns = 0;
     Ok(lines.iter().find_map(|(n, line, owner)| {
         let t = line.trim();
+        // A coverage gate is never a test's: it ran after them, whichever
+        // section pytest's output put it in.
+        let gate = [
+            "Required test coverage",
+            "fail-under",
+            "coverage threshold",
+            "not met",
+        ]
+        .iter()
+        .any(|g| t.contains(g));
         // In a quarantined test's own section (its own section header
         // names it as a whole name too).
         let in_own_section = owner
             .as_deref()
             .is_some_and(|o| names.iter().any(|q| names_word(o, q)));
-        let accounted = in_own_section
-            || names.iter().any(|q| names_word(t, q))
-            || own.iter().any(|o| o.contains(t))
-            || summary_of_failures(t, command);
+        // A crash is accounted for only by being the test's own, never by
+        // naming it: another process crashed on a test of that name.
+        let own_line = own.iter().any(|o| o.contains(t));
+        let by_name = names.iter().any(|q| names_word(t, q)) && !crash_like(t);
+        // cargo prints this once per failing target: a second one is another
+        // target's.
+        let rerun_again = t.starts_with("error: test failed, to rerun pass") && {
+            reruns += 1;
+            reruns > 1
+        };
+        let accounted = !gate
+            && !rerun_again
+            && (in_own_section || by_name || own_line || summary_of_failures(t, command));
         (!accounted).then(|| {
             format!(
                 "the output shows an error outside the quarantined test(s) (line {n}): {}",
@@ -2197,6 +2477,77 @@ fn unaccounted_error(
             )
         })
     }))
+}
+
+/// A line that says a process crashed, whatever it names.
+fn crash_like(t: &str) -> bool {
+    let lower = t.to_lowercase();
+    crate::output::looks_like_crash(t)
+        || [
+            "exited with code",
+            "oomkilled",
+            "killed",
+            "aborted",
+            "terminated",
+            "segmentation fault",
+            "core dumped",
+            "panicked",
+            "fatal",
+            "exception",
+            "traceback",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
+/// The number before `failed` in a summary of counts (`2 failed, 1 passed`,
+/// `1 failed | 2 passed (3)`).
+fn failed_count(line: &str) -> Option<u64> {
+    line.split([',', '|'])
+        .find(|part| part.contains(" failed"))?
+        .split_whitespace()
+        .rev()
+        .skip_while(|w| *w != "failed")
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A line after the runner's summary that belongs to the test command's own
+/// wrap-up: the runner's summary of failures, make's line for the suite's
+/// target, a runner's timing lines, npm's report of its test script, a line
+/// of the quarantined test's own (without a crash).
+fn wrapper_line(t: &str, command: &str, names: &[String]) -> bool {
+    let t = t.trim();
+    let info = t.strip_prefix("[INFO]").map(str::trim);
+    summary_of_failures(t, command)
+        || (t.starts_with("make")
+            && (t.contains("Entering directory") || t.contains("Leaving directory")))
+        || t.starts_with("Start at ")
+        || t.starts_with("Duration ")
+        || t.starts_with("Snapshots:")
+        || t.starts_with("Time:")
+        || t == "Ran all test suites."
+        || t.starts_with("Total time:")
+        || t.starts_with("Results File:")
+        || t.starts_with("Passed:")
+        || t.starts_with("Failed:")
+        || t.starts_with("Skipped:")
+        || t.starts_with("Test Run ")
+        || t.starts_with("npm ERR!")
+        || t.starts_with("npm error")
+        || t.starts_with("npm notice")
+        || t.starts_with("Lifecycle script `test` failed")
+        || t.starts_with("Lifecycle script \"test\" failed")
+        || (t.starts_with('`') && t.ends_with('`'))
+        || info.is_some_and(|i| {
+            i.is_empty()
+                || i.starts_with("---")
+                || i.starts_with("Total time:")
+                || i.starts_with("Finished at:")
+                || i.starts_with("BUILD ")
+        })
+        || (names.iter().any(|q| names_word(t, q)) && !crash_like(t))
 }
 
 /// The first crash-like line of the output that no quarantined failing
@@ -2245,8 +2596,8 @@ fn unexplained_crash(
 fn runner_failure_summary(line: &str) -> bool {
     line == "error: test run failed"
         || line.starts_with("error: test failed, to rerun pass")
-        || (line.starts_with("error: ")
-            && (line.ends_with(" target failed:") || line.ends_with(" targets failed:")))
+        // One target failed; `error: 2 targets failed:` is another's too.
+        || line == "error: 1 target failed:"
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite
@@ -2433,6 +2784,13 @@ pub struct Summary {
     /// How long each test of `running` has been running, in order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub running_for_ms: Vec<u64>,
+    /// Tests skipped in a full run, by name (at most 10): a count alone
+    /// hides which (round 16).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_tests: Vec<String>,
+    /// The run's selection (`--select`), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
     /// The framework's own count (tests, failed), when it printed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<(u64, u64)>,
@@ -2667,6 +3025,20 @@ fn readable(lines: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The part of a filter a framework's "not found" line names, when the
+/// filter has spaces and the line quotes only a piece of it: a wrapper or
+/// shell split it into words (round 15: `./dev` re-splits `$*`).
+pub fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
+    if !filter.contains(' ') {
+        return None;
+    }
+    lines.iter().find_map(|l| {
+        let (_, frag) = l.split_once("not found:")?;
+        let frag = frag.trim();
+        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
+    })
 }
 
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
@@ -2999,14 +3371,20 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
               WHERE a.run_id = ?1 AND a.duration_ms >= ?2
                 AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+                -- A test the cancel cut off took as long as the cancel let it
+                -- (round 16: a hung test listed as slow).
+                AND NOT (a.outcome = 'errored' AND ?3)
               GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
         )?;
-        stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
-            Ok(SlowestTest {
-                test: r.get(0)?,
-                duration_ms: r.get::<_, i64>(1)? as u64,
-            })
-        })?
+        stmt.query_map(
+            rusqlite::params![run, SLOWEST_MIN_MS, row.status != Status::Finished],
+            |r| {
+                Ok(SlowestTest {
+                    test: r.get(0)?,
+                    duration_ms: r.get::<_, i64>(1)? as u64,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<_>>()?
     } else {
         Vec::new()
@@ -3027,17 +3405,37 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // the selection leaking).
     if let Some(sel) = &selection {
         let leaf = sel.rsplit("::").next().unwrap_or(sel).to_lowercase();
-        let outside: Vec<&str> = failures
-            .iter()
-            .map(|f| f.test.as_str())
+        // A qualified selection (`pkg::TestAdd`) names one test and its
+        // subtests: a same-named test of another package that ran is
+        // outside it (round 16: `go test -run ^TestAdd$ ./...` ran both).
+        let qualified = sel.contains("::");
+        let selected = |t: &str| {
+            let tl = t.to_lowercase();
+            if qualified && tl.contains("::") {
+                let sl = sel.to_lowercase();
+                tl == sl || tl.starts_with(&format!("{sl}/")) || sl.starts_with(&format!("{tl}/"))
+            } else {
+                tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl))
+            }
+        };
+        let mut outside: Vec<String> = finals
+            .values()
+            .map(|f| f.0.display())
             .filter(|t| {
-                let tl = t.to_lowercase();
                 t.ends_with("::(file)")
                     || t.ends_with("::(package)")
                     || t.ends_with("::(suite)")
-                    || !(tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl)))
+                    || !selected(t)
+            })
+            .filter(|t| {
+                // Passes outside only matter for a qualified selection;
+                // failures always.
+                qualified || failures.iter().any(|f| f.test == *t)
             })
             .collect();
+        outside.sort();
+        outside.dedup();
+        let outside: Vec<&str> = outside.iter().map(String::as_str).collect();
         if !outside.is_empty() {
             notes.push(format!(
                 "outside the selection {sel:?}: {} (the framework loaded or ran more than the filter names)",
@@ -3051,6 +3449,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     if row.status == Status::Finished
         && matches!(row.outcome, Some(Outcome::Failed | Outcome::Errored))
         && counts.results() == 0
+        // Quiet output: the framework counted tests, so tests ran and the
+        // failure came after them (round 16: a lint step's failure got a
+        // `forget` hint).
+        && framework.is_none_or(|(t, _)| t == 0)
     {
         notes.push(format!(
             "no test result was seen: if this failed for the environment (a missing tool or SDK), not the code, `prova forget {run} --reason \"...\"` keeps it out of history"
@@ -3085,21 +3487,31 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         {
             let lines = output_tail(store, run, 30);
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let listed = list_suspects(store, &row.suite, &suspects);
             notes.push(match class {
                 Some(c) => format!(
-                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {}{}",
+                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {listed}",
                     suspects.len(),
-                    names.join(", "),
-                    if suspects.len() > names.len() { ", ..." } else { "" }
                 ),
                 None => format!(
-                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
+                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {listed}",
                     missing.len(),
-                    names.join(", "),
-                    if missing.len() > names.len() { ", ..." } else { "" }
                 ),
             });
+        }
+    }
+    // A selection with spaces that a wrapper split into words (round 16:
+    // `./dev` re-splits `$*`; `prova adopt --verify` said so, `run` did not).
+    if let Some(sel) = &selection
+        && row.status.is_terminal()
+        && counts.results() == 0
+    {
+        let lines = output_tail(store, run, 30);
+        let refs: Vec<&String> = lines.iter().collect();
+        if let Some(frag) = split_filter_fragment(sel, &refs) {
+            notes.push(format!(
+                "the filter {sel:?} was split into words by a wrapper or the shell ({frag:?} is only a part of it): use a filter without spaces (pytest: `-k` with a substring)"
+            ));
         }
     }
     // A selection that ran nothing must not look like a pass.
@@ -3148,6 +3560,19 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         // How long each has been running: a test running for 30 s that
         // usually takes milliseconds is the hang, before any budget says so
         // (round 14).
+        selection: selection.clone(),
+        skipped_tests: if selection.is_none() {
+            let mut v: Vec<String> = finals
+                .values()
+                .filter(|f| f.1 == Outcome::Skipped && !f.4)
+                .map(|f| f.0.display())
+                .collect();
+            v.sort();
+            v.truncate(10);
+            v
+        } else {
+            Vec::new()
+        },
         running_for_ms: if row.status.is_terminal() {
             Vec::new()
         } else {
@@ -3310,6 +3735,17 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             "code": last.code,
         },
         "unverified_passes": unverified_passes,
+        // Passes that set a quarantined failure aside: no "last green", but
+        // passes all the same (round 16: "none of them passed").
+        "set_aside_passes": prev
+            .iter()
+            .filter(|r| {
+                r.status == Status::Finished
+                    && r.outcome == Some(Outcome::Passed)
+                    && r.exit_code.is_some_and(|c| c != 0)
+            })
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
@@ -3340,6 +3776,74 @@ mod quarantine_tests {
     use super::*;
     use crate::quarantine::Entry;
 
+    /// Round 16: make's line for a target is the runner's own only when the
+    /// suite's command runs that target, not when a script spells the word.
+    #[test]
+    fn make_failing_a_target_the_command_runs_is_a_summary_and_no_other_is() {
+        let line = "make: *** [Makefile:2: test] Error 2";
+        let lint = "make: *** [Makefile:5: lint] Error 1";
+        let script = "sh -c : make test; case $s in lint) echo x ;; esac";
+        assert!(summary_of_failures(line, script));
+        assert!(!summary_of_failures(lint, script));
+        assert!(summary_of_failures(lint, "make test lint"));
+        assert!(summary_of_failures(line, "make -C sub test && echo done"));
+        assert!(!summary_of_failures(lint, "make test && lint"));
+        assert!(!summary_of_failures(lint, "make test; lint"));
+    }
+
+    /// Round 16: wrap-up lines after a runner's summary, and counts.
+    #[test]
+    fn only_the_commands_own_wrap_up_may_follow_the_summary() {
+        let names = vec!["tests::flaky".to_owned()];
+        for t in [
+            "error: test run failed",
+            "error: 1 target failed:",
+            "`--lib`",
+            "make[1]: Leaving directory '/w'",
+            "Start at  20:41:15",
+            "npm error Lifecycle script `test` failed",
+            "FAIL [   0.004s] (4/5) calc tests::flaky",
+        ] {
+            assert!(wrapper_line(t, "make test", &names), "{t}");
+        }
+        for t in [
+            "smoke: GET /health returned 503",
+            "Found 1 error.",
+            "error: 2 targets failed:",
+            "Segmentation fault (core dumped) ./bin/tests::flaky",
+            "make[1]: *** [Makefile:6: lint] Error 1",
+        ] {
+            assert!(!wrapper_line(t, "make test", &names), "{t}");
+        }
+        assert_eq!(
+            failed_count("Test Suites: 2 failed, 1 passed, 3 total"),
+            Some(2)
+        );
+        assert_eq!(failed_count("Test Files  1 failed | 2 passed (3)"), Some(1));
+        assert_eq!(failed_count("Test Suites: 3 passed, 3 total"), None);
+    }
+
+    /// Round 16: Maven's wrap-up of a failed test step, as captured from
+    /// `mvn test`; a line that merely starts the same way is not one.
+    #[test]
+    fn maven_wrap_up_lines_of_a_failed_test_step_are_the_runners_summary() {
+        for t in [
+            "[ERROR] See /w/target/surefire-reports for the individual test results.",
+            "[ERROR] See dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.",
+            "[ERROR] Failures: ",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0",
+        ] {
+            assert!(summary_of_failures(t, "mvn test"), "{t}");
+        }
+        for t in [
+            "[ERROR] See you at /w/src/Other.java:[3,5] ';' expected",
+            "[ERROR] COMPILATION ERROR :",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 0",
+        ] {
+            assert!(!summary_of_failures(t, "mvn test"), "{t}");
+        }
+    }
+
     fn q(names: &[&str]) -> BTreeMap<String, Entry> {
         names
             .iter()
@@ -3352,6 +3856,7 @@ mod quarantine_tests {
                         created_ms: 0,
                         expires_ms: 1,
                         removed_ms: None,
+                        file: None,
                     },
                 )
             })

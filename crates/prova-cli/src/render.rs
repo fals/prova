@@ -157,10 +157,17 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {errored}, {} skipped{}{counted}",
+            "tests: {} passed, {} failed, {errored}, {} skipped{}{}{counted}",
             c.passed,
             c.failed,
             c.skipped,
+            // A selection's runner reports the tests it filtered out as
+            // skipped (round 16: read as disabled tests).
+            if s.selection.is_some() && c.skipped > 0 {
+                " (or not selected)"
+            } else {
+                ""
+            },
             if c.subtests > 0 {
                 format!(
                     " (and {} subtests, {} failed{})",
@@ -199,6 +206,19 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         println!(
             "stalled: no activity for {}",
             format_duration(std::time::Duration::from_millis(ms))
+        );
+    }
+    if !s.skipped_tests.is_empty() {
+        let names: Vec<String> = s.skipped_tests.iter().map(|t| clean(t)).collect();
+        let more = (s.counts.skipped as usize).saturating_sub(names.len());
+        println!(
+            "skipped: {}{}",
+            names.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
         );
     }
     if !s.running.is_empty() && s.reason != WaitReason::Failure {
@@ -486,6 +506,14 @@ fn history_line(h: &serde_json::Value) -> String {
                 o["run"].as_str().unwrap_or("?")
             ),
             None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+                0 if h["set_aside_passes"].as_array().is_some_and(|a| !a.is_empty()) => {
+                    let a = h["set_aside_passes"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    format!(
+                        "none passed with every test passing; {} passed with quarantined failures set aside (last: run {})",
+                        a.len(),
+                        a[0].as_str().unwrap_or("?")
+                    )
+                }
                 0 => "none of them passed".into(),
                 // (round 12: "none of them passed; on this exact code: passed?")
                 u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
@@ -797,14 +825,24 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
 
 pub fn exp_progress(r: &prova_core::experiment::Report) {
     if let Some(c) = &r.comparison {
+        // Extended past its target, the count is out of the maximum (round
+        // 16: "7/5 baseline").
+        let target = if c.baseline_trials.max(c.candidate_trials) > c.target_trials {
+            c.max_trials
+        } else {
+            c.target_trials
+        };
         eprintln!(
-            "{} vs {}: {}/{} baseline, {}/{} candidate trials",
+            "{} vs {}: {}/{target} baseline, {}/{target} candidate trials{}",
             c.candidate,
             c.baseline,
             c.baseline_trials,
-            c.target_trials,
             c.candidate_trials,
-            c.target_trials
+            if target != c.target_trials {
+                " (extended)"
+            } else {
+                ""
+            }
         );
     }
 }
@@ -858,7 +896,16 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
         );
         if let Some(res) = &c.result {
             if let Some(reason) = res["reason"].as_str() {
-                println!("reason: {}", clean(reason));
+                // A warning gets its own line, not the end of a long reason
+                // (round 16: a 527288x "improvement" from special-casing the
+                // benchmark's input was kept as the best).
+                match reason.split_once("; warning: ") {
+                    Some((r, w)) => {
+                        println!("reason: {}", clean(r));
+                        println!("warning: {}", clean(w));
+                    }
+                    None => println!("reason: {}", clean(reason)),
+                }
             }
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
@@ -921,6 +968,18 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
                 format!(
                     "accepted against {}, not against the best: the best is still {}; compare with it: prova exp run {} --against {}",
                     c.baseline, r.best, r.experiment, r.best
+                )
+            }
+            ("decided", Some("accept"))
+                if c.result.as_ref().is_some_and(|res| {
+                    res["reason"]
+                        .as_str()
+                        .is_some_and(|x| x.contains("a change this large is rarely real"))
+                }) =>
+            {
+                format!(
+                    "read the candidate's diff before trusting this: a change this large usually means the code special-cases the benchmark or the workload changed; if so, put the best back: prova exp best {} <label> --reason \"...\"",
+                    r.experiment
                 )
             }
             ("decided", Some("accept"))
@@ -1140,6 +1199,8 @@ mod live_tests {
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
+            skipped_tests: vec![],
+            selection: None,
             framework: None,
             failures: vec![],
             stalled_ms: None,

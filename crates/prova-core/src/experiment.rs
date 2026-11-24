@@ -472,7 +472,9 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "no practical effect, neither better nor worse beyond ±{0}: CI {ci} inside ±{0}",
+                // (round 16: "CI [...], positive = better inside ±5%" read
+                // as one garbled phrase)
+                "no practical effect, neither better nor worse beyond ±{0}: the CI lies inside ±{0} (CI {ci})",
                 pct(min_effect).trim_start_matches('+')
             ),
         )
@@ -2345,6 +2347,26 @@ fn satisfies_spec(
         return Ok(Err(SpecFail::Infra(format!(
             "the oracle could not run (exit {code}: {what}; see `prova exp log <experiment> {arm_log}`): install what it needs"
         ))));
+    }
+    // The machine ran out of space or quota while the oracle built or ran:
+    // nothing was checked (round 16: `Disk quota exceeded` while compiling
+    // dependencies was "candidate violates the specification").
+    {
+        let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
+        const NO_ROOM: &[&str] = &[
+            "Disk quota exceeded",
+            "No space left on device",
+            "os error 28",
+            "os error 122",
+            "Cannot allocate memory",
+            "out of memory",
+        ];
+        if let Some(l) = text.lines().find(|l| NO_ROOM.iter().any(|p| l.contains(p))) {
+            return Ok(Err(SpecFail::Infra(format!(
+                "the oracle could not run: the machine ran out of room ({}; see `prova exp log <experiment> {arm_log}`): free space and run again",
+                l.trim().chars().take(200).collect::<String>()
+            ))));
+        }
     }
     // The checkouts' tracked files are read-only: an oracle that writes
     // one (go generate) fails for that, not for the spec (round 10).

@@ -1,0 +1,25 @@
+PASS src/b.test.ts
+PASS src/c.test.ts
+FAIL src/a.test.ts
+  calc
+    ✓ adds (2 ms)
+    ✕ flaky clock (3 ms)
+
+  ● calc › flaky clock
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      13 |   it("flaky clock", () => {
+    > 14 |     expect(true).toBe(false);
+         |                  ^
+
+      at Object.<anonymous> (src/a.test.ts:14:18)
+
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       1 failed, 1 passed, 2 total
+Snapshots:   0 total
+Time:        0.5 s
+Ran all test suites.
