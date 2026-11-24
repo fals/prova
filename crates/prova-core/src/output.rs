@@ -674,6 +674,21 @@ pub fn test_output_summary(store: &Store, run: &str, test_id: &str) -> Option<St
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        // Go's framing lines say nothing (round 16: a parent's message was
+        // `=== RUN   TestMean / --- FAIL: TestMean (0.00s)`).
+        .filter(|l| {
+            ![
+                "=== RUN",
+                "=== PAUSE",
+                "=== CONT",
+                "=== NAME",
+                "--- FAIL",
+                "--- PASS",
+                "--- SKIP",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+        })
         .collect();
     let picked: Vec<&str> = match lines.iter().position(|l| l.starts_with("panic: ")) {
         Some(p) => {

@@ -685,3 +685,46 @@ fn a_qualified_selection_names_same_named_tests_it_also_ran() {
         "{out}"
     );
 }
+
+/// Round 16: the parent of failing subtests showed Go's framing lines as
+/// its message (`go test -json`, as gotestsum's stream gives it).
+#[test]
+fn a_parent_of_failing_subtests_has_no_framing_message() {
+    let d = workspace("parent-msg");
+    let ev = |a: &str, t: &str, out: Option<&str>| {
+        let mut v = serde_json::json!({"Action": a, "Package": "example.com/m", "Test": t});
+        if let Some(o) = out {
+            v["Output"] = format!("{o}\n").into();
+        }
+        format!("'{v}'")
+    };
+    let lines = [
+        ev("run", "TestMean", None),
+        ev("output", "TestMean", Some("=== RUN   TestMean")),
+        ev("run", "TestMean/one", None),
+        ev("output", "TestMean/one", Some("=== RUN   TestMean/one")),
+        ev(
+            "output",
+            "TestMean/one",
+            Some("    m_test.go:9: got 2 want 1"),
+        ),
+        ev(
+            "output",
+            "TestMean/one",
+            Some("    --- FAIL: TestMean/one (0.00s)"),
+        ),
+        ev("fail", "TestMean/one", None),
+        ev("output", "TestMean", Some("--- FAIL: TestMean (0.00s)")),
+        ev("fail", "TestMean", None),
+    ];
+    let (_, s) = run_sh(&d, &format!("printf '%s\\n' {}; exit 1", lines.join(" ")));
+    let parent = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["test"] == "example.com/m::TestMean")
+        .cloned()
+        .unwrap_or_default();
+    let msg = parent["message"].as_str().unwrap_or("");
+    assert!(!msg.contains("=== RUN") && !msg.contains("--- FAIL"), "{s}");
+}
