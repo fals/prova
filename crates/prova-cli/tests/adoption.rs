@@ -219,3 +219,142 @@ fn init_reaches_every_harness_without_shadowing_agents_md() {
         "@AGENTS.md\n"
     );
 }
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Marker damage must never lose user text: the file stays byte-identical,
+/// init says which file and what is wrong, and repeating changes nothing.
+/// (Medium: needs the real binary and files; a unit test cannot see exit codes.)
+#[test]
+fn init_leaves_broken_markers_untouched_and_names_them() {
+    let cases = [
+        (
+            "stray-begin",
+            "# top\n<!-- prova:begin -->\nold stuff\n## My important section\nuser text\n",
+            "begin without end",
+        ),
+        (
+            "reversed",
+            "# top\n<!-- prova:end -->\nmid\n<!-- prova:begin -->\ntail\n",
+            "end before begin",
+        ),
+        (
+            "duplicate",
+            "<!-- prova:begin -->\na\n<!-- prova:end -->\nuser\n<!-- prova:begin -->\nb\n<!-- prova:end -->\n",
+            "duplicate",
+        ),
+    ];
+    for (name, content, problem) in cases {
+        let d = workspace(&format!("markers-{name}"));
+        std::fs::write(d.join("AGENTS.md"), content).unwrap();
+        for _ in 0..2 {
+            let o = prova(&d, &["init"]);
+            assert_eq!(o.status.code(), Some(4), "{name}: {}", stderr(&o));
+            let err = stderr(&o);
+            assert!(
+                err.contains("AGENTS.md") && err.contains(problem),
+                "{name}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(d.join("AGENTS.md")).unwrap(),
+                content,
+                "{name}: file must be untouched"
+            );
+        }
+    }
+}
+
+#[test]
+fn init_without_markers_appends_once_and_keeps_user_text() {
+    let d = workspace("no-markers");
+    std::fs::write(d.join("AGENTS.md"), "# top\nuser text").unwrap();
+    assert!(prova(&d, &["init"]).status.success());
+    let first = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
+    assert!(first.starts_with("# top\nuser text\n"));
+    assert!(prova(&d, &["init"]).status.success());
+    assert_eq!(std::fs::read_to_string(d.join("AGENTS.md")).unwrap(), first);
+}
+
+/// One bad target must not stop the others, and is named.
+#[test]
+fn init_reports_each_failing_file_and_does_the_rest() {
+    let d = workspace("partial");
+    std::fs::create_dir_all(d.join("AGENTS.md")).unwrap(); // a directory
+    std::fs::write(d.join("CLAUDE.md"), "# claude\n").unwrap();
+    let o = prova(&d, &["init"]);
+    assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
+    assert!(stderr(&o).contains("AGENTS.md"), "{}", stderr(&o));
+    let claude = std::fs::read_to_string(d.join("CLAUDE.md")).unwrap();
+    assert!(
+        claude.contains("<!-- prova:begin -->"),
+        "CLAUDE.md still done"
+    );
+    assert!(d.join(".agents/skills/prova-test/SKILL.md").exists());
+    assert!(d.join(".gitignore").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_never_writes_through_a_symlink_leaving_the_repo() {
+    let d = workspace("symlink");
+    let outside = workspace("symlink-outside");
+    let target = outside.join("shared.md");
+    std::fs::write(&target, "# shared, not ours\n").unwrap();
+    std::os::unix::fs::symlink(&target, d.join("AGENTS.md")).unwrap();
+    std::fs::write(d.join("CLAUDE.md"), "# claude\n").unwrap();
+    let o = prova(&d, &["init"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "# shared, not ours\n"
+    );
+    let err = stderr(&o);
+    assert!(
+        err.contains("AGENTS.md") && err.contains("outside"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_to_string(d.join("CLAUDE.md"))
+            .unwrap()
+            .contains("prova:begin")
+    );
+    // A symlink that stays inside the repository is followed.
+    let d2 = workspace("symlink-inside");
+    std::fs::write(d2.join("real.md"), "# inside\n").unwrap();
+    std::os::unix::fs::symlink(d2.join("real.md"), d2.join("AGENTS.md")).unwrap();
+    assert!(prova(&d2, &["init"]).status.success());
+    assert!(
+        std::fs::read_to_string(d2.join("real.md"))
+            .unwrap()
+            .contains("prova:begin")
+    );
+}
+
+#[test]
+fn init_keeps_crlf_line_endings() {
+    let d = workspace("crlf");
+    std::fs::write(d.join("AGENTS.md"), "# top\r\nlast user line\r\n").unwrap();
+    assert!(prova(&d, &["init"]).status.success());
+    let first = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
+    assert!(
+        first.starts_with("# top\r\nlast user line\r\n"),
+        "{first:?}"
+    );
+    assert!(
+        !first.replace("\r\n", "").contains('\n'),
+        "all CRLF: {first:?}"
+    );
+    assert!(first.contains("<!-- prova:begin -->\r\n"));
+    assert!(prova(&d, &["init"]).status.success());
+    assert_eq!(std::fs::read_to_string(d.join("AGENTS.md")).unwrap(), first);
+}
+
+#[test]
+fn init_section_names_the_prova_home() {
+    let d = workspace("home-text");
+    assert!(prova(&d, &["init"]).status.success());
+    let agents = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("`PROVA_HOME`"), "{agents}");
+}
