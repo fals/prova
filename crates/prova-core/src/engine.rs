@@ -795,7 +795,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         default_slow: spec
             .size
             .map(crate::config::Size::slow_budget)
-            .unwrap_or(Duration::from_secs(60)),
+            .unwrap_or(crate::config::DEFAULT_SLOW),
         running: BTreeMap::new(),
         terminating: false,
         partial: Default::default(),

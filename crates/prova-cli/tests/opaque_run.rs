@@ -1018,7 +1018,7 @@ fn a_wait_says_how_long_each_running_test_has_run() {
     let j = json(&prova(&d, &["status", &run, "--json"]));
     assert!(j["running_for_ms"][0].as_u64().unwrap() >= 1000, "{j}");
     prova(&d, &["cancel", &run]);
-    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 30);
+    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 20);
 }
 
 /// Round 14: a stalled run said "no activity for 5.1s" half a minute after

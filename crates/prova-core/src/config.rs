@@ -73,7 +73,7 @@ impl Size {
     /// Default idle budget before a stall is reported for a whole run.
     pub fn stall_after(self) -> Duration {
         match self {
-            Size::Small => Duration::from_secs(30),
+            Size::Small => Duration::from_secs(20),
             Size::Medium => Duration::from_secs(60),
             Size::Large => Duration::from_secs(300),
         }
@@ -181,9 +181,12 @@ impl RunSpec {
 }
 
 /// A quiet run of a suite with no declared size stalls after this long, as
-/// a small one does: `--until first-failure` (30 s) then catches a hang
-/// on its second wait at the latest (round 14: 60 s, two waits or more).
-pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30);
+/// a small one does: inside the first `--until first-failure` wait (30 s),
+/// so a hang is named on the first call (rounds 14 and 15).
+pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(20);
+/// A test with no history in a suite with no declared size is called slow
+/// after this long, inside the first 30 s wait (round 15: 60 s).
+pub const DEFAULT_SLOW: Duration = Duration::from_secs(20);
 pub const DEFAULT_KILL_AFTER: Duration = Duration::from_secs(3600);
 
 /// Workspace root: nearest ancestor with `prova.toml`, else with `.git`,
@@ -493,7 +496,7 @@ mod tests {
             c.run_spec("small", Some("-x")),
             Err(ConfigError::BadSelection(_))
         ));
-        assert_eq!(spec.stall_after_ms, 30_000);
+        assert_eq!(spec.stall_after_ms, 20_000);
         assert!(matches!(
             c.run_spec("nope", None),
             Err(ConfigError::UnknownSuite(..))

@@ -188,8 +188,8 @@ What prova does for you, on every run, with no configuration:
   opens a socket, naming it, so a slow test does not slip into the inner
   loop.
 - **Bounds time by size.** Until history exists, a small test is called
-  slow after 1 s (medium 30 s, large 5 min), a quiet run stalls after 30 s
-  (60 s, 5 min; 30 s with no size declared), and a test is killed at 60 s
+  slow after 1 s (medium 30 s, large 5 min; 20 s with no size declared), a
+  quiet run stalls after 20 s (60 s, 5 min; 20 s with no size declared), and a test is killed at 60 s
   (300 s, 900 s). A hung test costs seconds, not a CI timeout. Tests run
   through a container client (`docker run`, `kubectl exec`) are out of
   sight: prova records no size for them.

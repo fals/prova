@@ -120,7 +120,7 @@ enum Cmd {
     #[command(after_help = "\
 Examples:
   prova run -- make test                     any command; history starts now
-  prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s)
+  prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s budget)
   prova run unit --until done                the result (waits up to 9m, then prints `next:`)
   prova run unit --select calc::divides      rerun one test (the suite's `select` template)
   prova run unit --repeat 10                 is it flaky? each test's pass/fail tally
@@ -148,8 +148,8 @@ Examples:
         #[arg(long, value_name = "N", conflicts_with = "detach")]
         repeat: Option<u32>,
         /// Report a stall after this long without activity (e.g. 30s).
-        /// Default: the suite's `stall_after`, else by size (small 30s,
-        /// medium 60s, large 5m), else 60s.
+        /// Default: the suite's `stall_after`, else by size (small 20s,
+        /// medium 60s, large 5m), else 20s.
         #[arg(long, value_name = "DURATION")]
         stall_after: Option<String>,
         /// Kill the run after this long in total (e.g. 30m).

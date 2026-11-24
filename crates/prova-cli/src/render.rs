@@ -15,6 +15,18 @@ fn level_name(l: Level) -> &'static str {
     }
 }
 
+/// Where a slow budget came from; "3x its usual time" is not what applied
+/// when its usual time is so short that the 1 s minimum did (round 15:
+/// "3x its usual time" for a test whose p50 is 0 ms).
+fn budget_why(t: &prova_core::engine::SlowTest) -> &'static str {
+    match t.budget_from {
+        prova_core::model::BudgetFrom::History if t.budget_ms <= 1000 => {
+            "the 1 s minimum; it usually takes far less"
+        }
+        b => b.describe(),
+    }
+}
+
 fn headline(s: &Summary) -> String {
     match s.reason {
         WaitReason::Running => "RUNNING".into(),
@@ -208,7 +220,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
             clean(&t.test),
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
             format_duration(std::time::Duration::from_millis(t.budget_ms)),
-            t.budget_from.describe()
+            budget_why(t)
         );
     }
     for w in &s.warnings {
@@ -698,7 +710,7 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
                         "SLOW {} (over its {} budget: {})",
                         clean(&t.test),
                         format_duration(std::time::Duration::from_millis(t.budget_ms)),
-                        t.budget_from.describe()
+                        budget_why(t)
                     );
                 }
             }
@@ -1168,5 +1180,26 @@ mod live_tests {
         let long = super::live_line(&s, Some(&"x".repeat(300)), 40);
         assert_eq!(long.chars().count(), 40);
         assert!(long.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Round 15: "3x its usual time" for a test whose usual time is 0 ms.
+    #[test]
+    fn the_minimum_budget_is_named_as_such() {
+        let t = |ms| prova_core::engine::SlowTest {
+            test: "t".into(),
+            elapsed_ms: 2000,
+            budget_ms: ms,
+            budget_from: prova_core::model::BudgetFrom::History,
+        };
+        assert_eq!(
+            budget_why(&t(1000)),
+            "the 1 s minimum; it usually takes far less"
+        );
+        assert_eq!(budget_why(&t(4500)), "3x its usual time");
     }
 }

@@ -70,7 +70,8 @@ Contents: [Failure history](#failure-history) ·
 - `running now:` names the tests still running, with how long each has
   run (`TestHang (for 28.4s)`): one running far longer than it usually
   takes is the likely hang, before any budget says so. A suite with no
-  declared size stalls after 30 s of no activity.
+  declared size stalls after 20 s of no activity, and a test with no history
+  is slow after 20 s: a hang is named within the first 30 s wait.
 
 ## Unverified passes
 
