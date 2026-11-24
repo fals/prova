@@ -728,3 +728,22 @@ fn a_parent_run_for_its_selected_subtest_is_not_evidence() {
     assert!(!out.contains("FLAKY"), "{out}");
     assert!(out.contains("FAIL TestX [failed 1x before]"), "{out}");
 }
+
+/// Round 13: `next: done` under an unverified pass, and a `next:` that
+/// suggested `--select` to a suite without a `select` template (it failed
+/// with a usage error).
+#[test]
+fn next_lines_are_honest_and_runnable() {
+    let d = workspace("next-lines");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let out = run(&d, "make", "pass");
+    assert!(
+        out.contains("next: done, but this pass is unverified"),
+        "{out}"
+    );
+    let out = run(&d, "make", "fail");
+    assert!(out.contains("`prova run make --repeat 5`"), "{out}");
+    assert!(!out.contains("--select"), "{out}");
+}

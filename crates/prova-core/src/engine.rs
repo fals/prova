@@ -1671,6 +1671,9 @@ pub struct Summary {
     /// Known flaky tests (ADR 0018) that passed in this run: luck, not proof.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flaky_passed: Vec<String>,
+    /// The suite has a `select` template, so `--select` works with it.
+    #[serde(skip)]
+    pub can_select: bool,
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
@@ -2050,7 +2053,14 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             "selection {sel:?}: no per-test results seen, so prova cannot tell whether any test matched"
         ));
     }
+    // A `next:` that suggests --select must not fail with a usage error
+    // (round 13: `make` has no `select`).
+    let can_select = crate::config::load(store.root())
+        .ok()
+        .and_then(|c| c.suite.get(&row.suite).map(|s| s.select.is_some()))
+        .unwrap_or(false);
     Ok(Summary {
+        can_select,
         run: row.id.clone(),
         suite: row.suite.clone(),
         command,
@@ -2114,9 +2124,21 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     // passes were named).
     let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
     let thin = store.unverified(&ids)?;
-    let last_passed = prev
+    // A pass that relied on a known flaky test is no "last green" either
+    // (round 13: it named a run whose own output said "unverified").
+    let mut last_passed = None;
+    for r in prev
         .iter()
-        .find(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id));
+        .filter(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id))
+    {
+        if summarize(store, &r.id, WaitReason::Done, 0)?
+            .flaky_passed
+            .is_empty()
+        {
+            last_passed = Some(r);
+            break;
+        }
+    }
     let unverified_passes = prev
         .iter()
         .filter(|r| {

@@ -425,6 +425,13 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             "prova cancel {}  (or `prova wait {} --after {}` if it is expected)",
             s.run, s.run, s.last_seq
         ),
+        WaitReason::Done
+            if s.outcome == Some(Outcome::Passed)
+                && (!s.warnings.is_empty() || !s.flaky_passed.is_empty()) =>
+        {
+            // Not "done": the pass is unverified (round 13).
+            "done, but this pass is unverified: act on the warnings above".into()
+        }
         WaitReason::Done if s.outcome == Some(Outcome::Passed) => "done".into(),
         WaitReason::Done if all_known_flaky(s) => {
             // The test's own name, not a placeholder (round 10).
@@ -435,12 +442,11 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
                 .unwrap_or_default();
             let confirm = if s.suite.starts_with("cmd:") {
                 format!("`prova history {t}`")
+            } else if s.can_select {
+                format!("`prova run {} --select '{t}' --repeat 5`", s.suite)
             } else {
-                // Not every suite can select (round 11: `make` cannot).
-                format!(
-                    "`prova run {} --select '{t}' --repeat 5` (or `--repeat 5` alone if the suite cannot select)",
-                    s.suite
-                )
+                // `make` cannot select (round 13: the suggestion failed).
+                format!("`prova run {} --repeat 5`", s.suite)
             };
             format!(
                 "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
@@ -971,6 +977,7 @@ mod live_tests {
 
     fn summary(passed: u64, failed: u64, running: &[&str]) -> Summary {
         Summary {
+            can_select: false,
             run: "r".into(),
             suite: "s".into(),
             command: "make test".into(),

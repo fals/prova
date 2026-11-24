@@ -612,7 +612,7 @@ impl Recognizers {
         {
             self.cache_noted = true;
             out.push(EventKind::RunNote {
-                message: "go replayed cached test results: these tests did not run again; add -count=1 to the suite command".into(),
+                message: "go replayed cached test results: these tests did not run again; add -count=1 to the go test command, or, when it is not yours to edit (make test), `inject = [\"go-nocache\"]` to the suite in prova.toml".into(),
             });
         }
         if line.starts_with('{') {
