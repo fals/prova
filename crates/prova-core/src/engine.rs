@@ -2577,7 +2577,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         failures.push(Failure {
             test: key.display(),
             outcome: *outcome,
-            message: message.clone(),
+            message: message
+                .clone()
+                .or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
                 c.suite_passed_on_same_code = suite_passed_on_same_code;
                 c

@@ -155,6 +155,25 @@ pub struct Recognizers {
     go_recovered: u64,
     /// Packages in which a test failed.
     go_failed_pkgs: BTreeSet<String>,
+    /// `go test -json` packages whose own result event was read: a test run
+    /// again after it is a retry, not an iteration of `-count`.
+    go_pkg_done: BTreeSet<String>,
+    /// Go text: tests started and not finished in the current package. A
+    /// package result line printed while one runs is held: a test can print
+    /// anything, `ok  \tfake\t0.1s` included.
+    go_open: BTreeSet<String>,
+    go_tentative: Option<(String, BTreeSet<String>)>,
+    /// The test whose `--- FAIL` line was the last thing printed: a panic
+    /// right after it is that test's.
+    go_after_fail: Option<String>,
+    go_panic_block: bool,
+    /// `go test -json`: per test, how many subtests were skipped and how
+    /// many were not.
+    go_subs: BTreeMap<String, (u32, u32)>,
+    /// Passing tests whose every subtest was skipped: nothing ran in them.
+    go_all_skipped: Vec<String>,
+    /// gotestsum printed a `DONE` line already.
+    gts_done_seen: bool,
     /// Output since the last package line, for a package failure's message.
     go_segment_text: Vec<String>,
     /// `running tests:` of a Go test timeout is being read; the tests named.
@@ -478,6 +497,13 @@ impl Recognizers {
             if let Some(n) = total {
                 self.summary_seen = true;
                 self.gotestsum_seen = true;
+                // `--rerun-fails` ends with `DONE 2 runs, 4 tests, ...`: the
+                // tests of every run, reruns again. The first DONE is the
+                // suite's count.
+                if self.gts_done_seen && counts.contains(" runs") {
+                    return;
+                }
+                self.gts_done_seen = true;
                 self.reported_total += n;
                 // A build error is listed among the failures too: the larger
                 // of the two, so errors alone count and nothing counts twice.
@@ -841,9 +867,15 @@ impl Recognizers {
                 self.flush_vitest(&mut out);
             }
         }
+        self.go_settle_tentative(line, &mut out);
         if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
-            self.go_package_lines += 1;
-            self.go_package(line, &mut out);
+            if self.go_open.is_empty() {
+                self.go_package_lines += 1;
+                self.go_package(line, &mut out);
+            } else {
+                // A test is running: this may be its own output.
+                self.go_tentative = Some((line.to_owned(), self.go_open.clone()));
+            }
         } else if !line.starts_with('{') && !line.starts_with("?   \t") {
             self.go_segment_line(line);
         }
@@ -972,7 +1004,7 @@ impl Recognizers {
             self.gts_pkg_failed.push(pkg.to_owned());
             return false;
         }
-        let (stripped, _rerun) = strip_rerun(t);
+        let (stripped, rerun) = strip_rerun(t);
         let mut w = stripped.split_whitespace();
         let (Some(word), Some(name)) = (w.next(), w.next()) else {
             return false;
@@ -1015,7 +1047,7 @@ impl Recognizers {
                     self.gts_pending = Some((key, outcome, dur, Vec::new()));
                 } else {
                     let sub = test.contains('/');
-                    self.go_result(key, outcome, dur, None, Level::Recognized, sub, out);
+                    self.go_result(key, outcome, dur, None, Level::Recognized, sub, rerun, out);
                 }
                 true
             }
@@ -1056,7 +1088,7 @@ impl Recognizers {
             if self.gts_inline {
                 // A `testname` result line: an execution of the test.
                 self.gts_inline = false;
-                self.go_result(key, outcome, dur, msg, Level::Recognized, sub, out);
+                self.go_result(key, outcome, dur, msg, Level::Recognized, sub, false, out);
             } else if self.seen.contains_key(&key.unique()) {
                 // The summary block repeats a result already reported: it
                 // carries the output, not another execution.
@@ -1126,6 +1158,25 @@ impl Recognizers {
                 } else {
                     None
                 };
+                // A test that passed with every subtest skipped ran nothing.
+                if let Some(&(skipped, other)) = self.go_subs.get(&format!("{pkg}\0{t}"))
+                    && outcome == Outcome::Passed
+                    && skipped > 0
+                    && other == 0
+                {
+                    let name = format!("{pkg}::{t}");
+                    if !self.go_all_skipped.contains(&name) {
+                        self.go_all_skipped.push(name);
+                    }
+                }
+                if let Some((parent, _)) = t.rsplit_once('/') {
+                    let e = self.go_subs.entry(format!("{pkg}\0{parent}")).or_default();
+                    if outcome == Outcome::Skipped {
+                        e.0 += 1;
+                    } else {
+                        e.1 += 1;
+                    }
+                }
                 // Go test names cannot contain '/': one that does is a
                 // subtest (`t.Run`).
                 // A repeated execution (`-count=N`, gotestsum's reruns) is
@@ -1137,10 +1188,15 @@ impl Recognizers {
                     msg,
                     Level::Native,
                     t.contains('/'),
+                    self.go_pkg_done.contains(pkg),
                     out,
                 );
             }
+            ("pass" | "skip", None) => {
+                self.go_pkg_done.insert(pkg.to_owned());
+            }
             ("fail", None) => {
+                self.go_pkg_done.insert(pkg.to_owned());
                 // Package failed without any failing test: build error or crash.
                 let prefix = format!("{pkg}\0");
                 let any_failed = self.go_failed_pkgs.contains(pkg)
@@ -1149,7 +1205,8 @@ impl Recognizers {
                         .values()
                         .any(|(d, o)| d.starts_with(&format!("{pkg}::")) && o.is_failure());
                 let lines = self.go_output.remove(&prefix).unwrap_or_default();
-                if !any_failed {
+                let crashed = lines.iter().any(|l| go_crash_line(l));
+                if !any_failed || crashed {
                     self.finished(
                         key("(package)"),
                         Outcome::Errored,
@@ -1465,6 +1522,7 @@ impl Recognizers {
             self.go_run_lines += 1;
             let name = name.trim().to_owned();
             self.go_current = Some(name.clone());
+            self.go_open.insert(name.clone());
             let key = self.go_key(&name);
             self.started(key, out);
             return true;
@@ -1485,6 +1543,13 @@ impl Recognizers {
                     ),
                     None => (rest.trim(), None),
                 };
+                self.go_open.remove(name);
+                // Without `-v` a failure's message follows its line; with
+                // it, only a panic does.
+                if outcome == Outcome::Failed && !line.starts_with(char::is_whitespace) {
+                    self.go_current = Some(name.to_owned());
+                    self.go_after_fail = Some(name.to_owned());
+                }
                 let lines = self
                     .go_output
                     .remove(&format!("v\0{name}"))
@@ -2363,6 +2428,9 @@ impl Recognizers {
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
+        self.go_confirm_tentative(&mut gts);
+        self.go_flush_tails();
+        self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
@@ -4266,6 +4334,15 @@ fn strip_rerun(t: &str) -> (String, bool) {
     (t.to_owned(), false)
 }
 
+/// A line of a Go package's own output (not a test's) that says the test
+/// binary crashed: a panic outside the tests, a fatal runtime error, a kill.
+fn go_crash_line(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace)
+        && (line.starts_with("panic: ")
+            || line.starts_with("fatal error: ")
+            || line.starts_with("signal: killed"))
+}
+
 impl Recognizers {
     /// Every `go test` package that ran said `[no tests to run]` (a `-run`
     /// typo): `ok` packages with tests, or failures, say it was not so.
@@ -4282,6 +4359,17 @@ impl Recognizers {
     /// The full import path of a package printed short (gotestsum trims the
     /// module path), when a `ok`/`FAIL` line of the run gave it.
     fn go_pkg(&self, printed: &str) -> String {
+        // gotestsum prints the module's root package as `.`: the one the
+        // other packages are under.
+        if printed == "."
+            && let Some(root) = self.go_full_pkgs.iter().min_by_key(|p| p.len())
+            && self
+                .go_full_pkgs
+                .iter()
+                .all(|p| p == root || p.starts_with(&format!("{root}/")))
+        {
+            return root.clone();
+        }
         self.go_full_pkgs
             .iter()
             .find(|f| f.as_str() == printed || f.ends_with(&format!("/{printed}")))
@@ -4300,9 +4388,11 @@ impl Recognizers {
     }
 
     /// One execution of a Go test whose key is final. The first is its
-    /// result; a later one is another attempt (`-count=N`, gotestsum's
-    /// `--rerun-fails`): the last decides, and a failure is kept in the
-    /// history whatever came after it. Equal passes change nothing.
+    /// result. A later one inside the same package run is an iteration
+    /// (`-count=N`): a failure sticks, a pass after it changes nothing. A
+    /// later one after the package's own result is a retry (gotestsum's
+    /// `--rerun-fails`, `retry`): the last decides, and a failure is kept in
+    /// the history whatever came after it. Equal passes change nothing.
     #[allow(clippy::too_many_arguments)]
     fn go_result(
         &mut self,
@@ -4312,6 +4402,7 @@ impl Recognizers {
         message: Option<String>,
         level: Level,
         subtest: bool,
+        retry: bool,
         out: &mut Vec<EventKind>,
     ) {
         let d = key.unique();
@@ -4331,6 +4422,10 @@ impl Recognizers {
             return;
         }
         if before.is_failure() && !outcome.is_failure() {
+            if !retry {
+                // A later iteration passing does not undo the failure.
+                return;
+            }
             self.go_recovered += 1;
         }
         if outcome.is_failure()
@@ -4385,6 +4480,7 @@ impl Recognizers {
             message,
             Level::Recognized,
             sub,
+            false,
             out,
         );
     }
@@ -4412,10 +4508,15 @@ impl Recognizers {
         if run.execs.iter().any(|e| e.outcome.is_failure()) {
             self.go_failed_pkgs.insert(pkg.to_owned());
         }
-        // A stream (gotestsum's JSON) may have reported them already.
-        if !self.seen.contains_key(&qd) {
-            for e in run.execs {
+        // A stream (gotestsum's JSON) may have reported them already. The
+        // executions of a package that already had its result (gotestsum
+        // reruns the failed tests: a second `go test` of the package) are
+        // retries.
+        let retry = self.go_pkg_done.contains(pkg);
+        if !self.seen.contains_key(&qd) || retry {
+            for (i, e) in run.execs.into_iter().enumerate() {
                 let (q, level) = (q.clone(), Level::Recognized);
+                // Within one run: the first execution of a retry is one.
                 self.go_result(
                     q,
                     e.outcome,
@@ -4423,6 +4524,7 @@ impl Recognizers {
                     e.message,
                     level,
                     e.subtest,
+                    retry && i == 0,
                     out,
                 );
             }
@@ -4482,6 +4584,11 @@ impl Recognizers {
                 }
             }
         }
+        self.go_flush_tails();
+        self.go_open.clear();
+        self.go_after_fail = None;
+        self.go_panic_block = false;
+        let crashed = text.iter().any(|l| go_crash_line(l));
         let pending = std::mem::take(&mut self.go_pending);
         let failed_here = pending
             .iter()
@@ -4490,6 +4597,7 @@ impl Recognizers {
         for run in pending {
             self.go_requalify(run, &pkg, out);
         }
+        self.go_pkg_done.insert(pkg.clone());
         self.go_segment += 1;
         if status.trim() == "ok" {
             if tail.contains("[no tests to run]") {
@@ -4500,7 +4608,9 @@ impl Recognizers {
             return;
         }
         self.go_fail_pkgs += 1;
-        let mut explained = failed_here;
+        // A panic or a kill outside any test is the package's own failure,
+        // whatever a test did (round 15: a quarantined failure hid it).
+        let mut explained = failed_here && !crashed;
         for name in hung {
             explained = true;
             let message = timed_out(&name);
@@ -4529,10 +4639,111 @@ impl Recognizers {
         }
     }
 
+    /// The package line held while a test ran: more of that test's output
+    /// (its own result line, `=== NAME`) says it was a forgery of the test's
+    /// stdout; the next test, package or build line says it was real.
+    fn go_settle_tentative(&mut self, line: &str, out: &mut Vec<EventKind>) {
+        let Some((_, open)) = &self.go_tentative else {
+            return;
+        };
+        let t = line.trim_start();
+        let continues = [
+            "--- PASS: ",
+            "--- FAIL: ",
+            "--- SKIP: ",
+            "=== NAME",
+            "=== CONT",
+        ]
+        .iter()
+        .any(|p| {
+            t.strip_prefix(p).is_some_and(|rest| {
+                let name = rest.trim();
+                let name = name.rsplit_once(" (").map_or(name, |(n, _)| n).trim();
+                open.contains(name)
+            })
+        });
+        if continues {
+            self.go_tentative = None;
+        } else if t.starts_with("=== RUN")
+            || line.starts_with("ok  \t")
+            || line.starts_with("FAIL\t")
+            || line.starts_with("?   \t")
+            || line.starts_with("# ")
+        {
+            self.go_confirm_tentative(out);
+        }
+    }
+
+    fn go_confirm_tentative(&mut self, out: &mut Vec<EventKind>) {
+        if let Some((line, _)) = self.go_tentative.take() {
+            self.go_package_lines += 1;
+            self.go_package(&line, out);
+        }
+    }
+
+    /// What a failed test printed after its `--- FAIL` line (`go test`
+    /// without `-v`, a panic) is its output.
+    fn go_flush_tails(&mut self) {
+        let keys: Vec<String> = self
+            .go_output
+            .keys()
+            .filter(|k| k.starts_with("v\0"))
+            .cloned()
+            .collect();
+        for k in keys {
+            let name = &k[2..];
+            let key = self.go_key(name);
+            let failed = self
+                .go_pending
+                .iter()
+                .any(|r| r.key == key && r.execs.iter().any(|e| e.outcome.is_failure()));
+            let lines = self.go_output.remove(&k).unwrap_or_default();
+            if failed && !lines.is_empty() {
+                self.failure_output.push((key, lines.join("\n")));
+            }
+        }
+    }
+
+    /// Tests that passed because every subtest skipped: nothing ran.
+    fn go_note_all_skipped(&mut self, out: &mut Vec<EventKind>) {
+        let names = std::mem::take(&mut self.go_all_skipped);
+        if names.is_empty() {
+            return;
+        }
+        let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
+        out.push(EventKind::RunNote {
+            message: format!(
+                "{} test(s) passed with every subtest skipped, so nothing ran in them: {}{}",
+                names.len(),
+                shown.join(", "),
+                if names.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+
     /// Lines between packages: what a package failure explains itself with,
     /// and the tests a timeout panic names under `running tests:`.
     fn go_segment_line(&mut self, line: &str) {
         let t = line.trim();
+        // A panic right after a test's `--- FAIL` line, and what follows it
+        // until the package line, is that test's output, not the package's.
+        if self.go_panic_block || (line.starts_with("panic: ") && self.go_after_fail.is_some()) {
+            self.go_panic_block = true;
+            if let Some(owner) = self.go_after_fail.clone() {
+                let lines = self.go_output.entry(format!("v\0{owner}")).or_default();
+                if lines.len() < 200 {
+                    lines.push(line.trim_end().to_owned());
+                }
+            }
+            return;
+        }
+        if !t.is_empty() && !line.starts_with(char::is_whitespace) {
+            self.go_after_fail = None;
+        }
         if t == "running tests:" {
             self.go_reading_hung = true;
             return;
@@ -4649,8 +4860,10 @@ mod go_tests {
         );
     }
 
+    /// `go test -count=3`: iterations are not retries. A failure in any of
+    /// them is the test's failure, whatever the later ones did.
     #[test]
-    fn go_count_repeats_are_attempts_of_one_test() {
+    fn go_count_iterations_keep_the_failure() {
         let (_, ev) = feed_all(concat!(
             "=== RUN   TestRace\n--- PASS: TestRace (0.00s)\n",
             "=== RUN   TestRace\n    race_test.go:9: lost update\n--- FAIL: TestRace (0.00s)\n",
@@ -4660,9 +4873,173 @@ mod go_tests {
         let s = settled(&ev);
         assert_eq!(
             one(&s, "example.com/m/r::TestRace"),
-            vec![Outcome::Passed, Outcome::Failed, Outcome::Passed]
+            vec![Outcome::Passed, Outcome::Failed]
         );
         assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
+    }
+
+    #[test]
+    fn go_count_fail_then_pass_is_a_failure_text() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestF\n    f_test.go:5: boom\n--- FAIL: TestF (0.00s)\n",
+            "=== RUN   TestF\n--- PASS: TestF (0.00s)\n",
+            "FAIL\nFAIL\texample.com/f\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/f::TestF"), vec![Outcome::Failed]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(r.failed_reported(), 0, "no stale totals");
+    }
+
+    /// gotestsum `--rerun-fails` with `-v` text: the rerun is another
+    /// `go test` of the package, after its own result line: a retry.
+    #[test]
+    fn go_text_rerun_after_the_package_line_is_a_retry() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestFlaky\n    f_test.go:4: first\n--- FAIL: TestFlaky (0.00s)\nFAIL\nFAIL\texample.com/q\t0.01s\n",
+            "=== RUN   TestFlaky\n--- PASS: TestFlaky (0.00s)\nPASS\nok  \texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/q::TestFlaky"),
+            vec![Outcome::Failed, Outcome::Passed]
+        );
+        assert_eq!(r.failed_reported(), 0);
+    }
+
+    #[test]
+    fn go_count_fail_then_pass_is_a_failure_json() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Elapsed":0}"#,
+            "\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed]);
+        assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    /// A panic outside any test fails the package even when a test of it
+    /// failed too (round 15: a quarantined failure hid it).
+    #[test]
+    fn go_json_panic_in_package_output_is_a_package_error() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"q","Test":"TestQ"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"q","Test":"TestQ","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"run","Package":"q","Test":"TestQueue"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"q","Test":"TestQueue","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"output","Package":"q","Output":"panic: send on closed channel\n"}"#,
+            "\n",
+            r#"{"Action":"output","Package":"q","Output":"goroutine 12 [running]:\n"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"q"}"#,
+            "\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "q::(package)"), vec![Outcome::Errored]);
+        assert_eq!(one(&s, "q::TestQ"), vec![Outcome::Failed]);
+    }
+
+    #[test]
+    fn go_text_panic_outside_a_test_is_a_package_error() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestQ\n    q_test.go:5: no\n--- FAIL: TestQ (0.00s)\n",
+            "=== RUN   TestQueue\n--- PASS: TestQueue (0.00s)\n",
+            "panic: send on closed channel\n\ngoroutine 12 [running]:\n",
+            "FAIL\texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/q::(package)"), vec![Outcome::Errored]);
+        assert_eq!(one(&s, "example.com/q::TestQ"), vec![Outcome::Failed]);
+    }
+
+    /// A test's own panic follows its `--- FAIL` line: it explains the
+    /// test, it is not another failure.
+    #[test]
+    fn go_text_panic_in_a_test_is_the_tests_output() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestP\n--- FAIL: TestP (0.00s)\npanic: boom [recovered]\n\ngoroutine 7 [running]:\n",
+            "\tq_test.go:4 +0x25\nFAIL\texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(s.len(), 1, "{s:?}");
+        let (_, text) = r
+            .failure_output
+            .iter()
+            .find(|(k, _)| k.name == "TestP")
+            .expect("the panic is kept as the test's output");
+        assert!(text.starts_with("panic: boom"), "{text}");
+        assert_eq!(r.failure_output[0].0.path, vec!["example.com/q".to_owned()]);
+    }
+
+    /// Without `-v` the message follows the `--- FAIL` line.
+    #[test]
+    fn go_text_message_after_the_fail_line_is_kept() {
+        let (r, _) = feed_all(
+            "--- FAIL: TestX (0.00s)\n    x_test.go:9: boom\nFAIL\nFAIL\texample.com/x\t0.01s\n",
+        );
+        let (k, text) = &r.failure_output[0];
+        assert_eq!(
+            (k.display().as_str(), text.as_str()),
+            ("example.com/x::TestX", "    x_test.go:9: boom")
+        );
+    }
+
+    /// Round 15: a test printing a package line is not a package line.
+    #[test]
+    fn a_package_line_printed_by_a_running_test_is_its_output() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestA\n    a_test.go:3: no\n--- FAIL: TestA (0.00s)\n",
+            "=== RUN   TestSub\nok  \texample.com/fake\t0.010s\n--- PASS: TestSub (0.00s)\n",
+            "FAIL\nFAIL\texample.com/real\t0.02s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/real::TestA"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "example.com/real::TestSub"), vec![Outcome::Passed]);
+        assert_eq!(s.len(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn go_json_parent_with_every_subtest_skipped_is_noted() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"p","Test":"TestS"}"#,
+            "\n",
+            r#"{"Action":"run","Package":"p","Test":"TestS/a"}"#,
+            "\n",
+            r#"{"Action":"skip","Package":"p","Test":"TestS/a","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Test":"TestS","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Elapsed":0}"#,
+            "\n",
+        ));
+        assert!(
+            ev.iter().any(|e| matches!(e, EventKind::RunNote { message } if message.contains("every subtest skipped") && message.contains("p::TestS"))),
+            "{ev:?}"
+        );
+    }
+
+    /// gotestsum `--rerun-fails` ends with `DONE 2 runs, 4 tests`: the first
+    /// DONE is the suite's count.
+    #[test]
+    fn gotestsum_rerun_totals_are_the_first_done() {
+        let (r, _) = feed_all(concat!(
+            "DONE 3 tests, 1 failure in 0.002s\n\n",
+            "PASS example.com/m/a.TestFlaky (re-run 1)\n",
+            "DONE 2 runs, 4 tests, 1 failure in 0.106s\n",
+        ));
+        assert_eq!(r.total(), 3);
     }
 
     #[test]
@@ -4700,6 +5077,8 @@ mod go_tests {
             r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
             "\n",
             r#"{"Action":"fail","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Elapsed":0}"#,
             "\n",
             r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
             "\n",

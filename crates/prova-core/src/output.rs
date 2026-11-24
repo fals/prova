@@ -539,6 +539,39 @@ pub fn run_full(store: &Store, run: &str) -> Result<Option<String>> {
         .map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
+/// What a failing test printed, in a line or two, for a failure the
+/// framework gave no message for (Go prints a test's message after its
+/// `--- FAIL` line, or a panic after it): a panic and the test's own frame,
+/// else the first lines.
+pub fn test_output_summary(store: &Store, run: &str, test_id: &str) -> Option<String> {
+    let blob: Vec<u8> = store
+        .conn()
+        .query_row(
+            "SELECT output FROM test_output WHERE run_id = ?1 AND test_id = ?2 AND output IS NOT NULL",
+            params![run, test_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let text = String::from_utf8_lossy(&decompress(&blob)?).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let picked: Vec<&str> = match lines.iter().position(|l| l.starts_with("panic: ")) {
+        Some(p) => {
+            let mut v = vec![lines[p]];
+            v.extend(lines[p..].iter().find(|l| l.contains("_test.go:")));
+            v
+        }
+        None => lines.iter().take(3).copied().collect(),
+    };
+    let msg: String = picked.join("\n").chars().take(400).collect();
+    (!msg.is_empty()).then_some(msg)
+}
+
 /// Failing tests' own output in a run: (display name, text).
 pub fn test_outputs(store: &Store, run: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = store.conn().prepare(
