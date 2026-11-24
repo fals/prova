@@ -63,6 +63,7 @@ Example:
   prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"")]
     Add {
         /// The test's full name, or a substring that matches one test.
+        #[arg(add = ArgValueCompleter::new(complete_tests))]
         test: String,
         /// Why it is set aside (shown in every run that touches it).
         #[arg(long)]
@@ -91,6 +92,7 @@ Example:
   prova quarantine remove calc::flaky_clock")]
     Remove {
         /// The quarantined test's name, or a substring that matches one.
+        #[arg(add = ArgValueCompleter::new(complete_quarantined))]
         test: String,
     },
 }
@@ -128,7 +130,7 @@ Examples:
         #[arg(add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
         /// Run only tests matching this filter (uses the suite's `select`).
-        #[arg(long, value_name = "TEST")]
+        #[arg(long, value_name = "TEST", add = ArgValueCompleter::new(complete_tests))]
         select: Option<String>,
         /// Return the run id immediately; follow with `prova wait`.
         #[arg(long, conflicts_with = "until")]
@@ -265,7 +267,7 @@ Examples:
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
         /// One failing test's own output (substring of its name).
-        #[arg(long, value_name = "TEST")]
+        #[arg(long, value_name = "TEST", add = ArgValueCompleter::new(complete_tests))]
         test: Option<String>,
         /// JSON instead of text.
         #[arg(long)]
@@ -279,6 +281,7 @@ Examples:
   prova history \"\"                      every test prova knows")]
     History {
         /// Substring of the test's full name.
+        #[arg(add = ArgValueCompleter::new(complete_tests))]
         test: String,
         /// Only runs of this suite.
         #[arg(long, add = ArgValueCompleter::new(complete_suites))]
@@ -350,7 +353,9 @@ Examples:
   prova quarantine remove calc::flaky_clock
 
 A quarantined test still runs and keeps its history. If it is the only thing
-that fails, the run passes; every summary lists it. A quarantine expires.")]
+that fails, the run passes; every summary lists it. A quarantine expires.
+It is kept in this machine's prova store (PROVA_HOME), not in the repository:
+CI and teammates do not see it; each quarantines in its own store.")]
     Quarantine {
         #[command(subcommand)]
         action: QuarantineCmd,
@@ -809,6 +814,41 @@ fn complete_runs(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     out
 }
 
+/// Test names prova has seen, by prefix (round 14: typos and ambiguous
+/// names happen exactly where test names are typed).
+fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Some(store) = existing_store() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = store.conn().prepare(
+        "SELECT DISTINCT display FROM tests WHERE substr(display, 1, length(?1)) = ?1
+          ORDER BY display LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([prefix.as_ref()], |r| r.get::<_, String>(0))
+        .map(|rows| {
+            rows.filter_map(Result::ok)
+                .map(CompletionCandidate::new)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn complete_quarantined(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Some(store) = existing_store() else {
+        return Vec::new();
+    };
+    prova_core::quarantine::list(&store, false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.test.starts_with(prefix.as_ref()))
+        .map(|e| CompletionCandidate::new(e.test).help(Some(e.reason.into())))
+        .collect()
+}
+
 fn complete_experiments(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let prefix = current.to_string_lossy();
     let Some(store) = existing_store() else {
@@ -1148,13 +1188,20 @@ fn init() -> Result<u8> {
             targets.push((f, false));
         }
     }
+    let mut created = Vec::new();
     for (f, create) in targets {
+        let existed = root.join(f).exists();
         match upsert_section(&root, &root.join(f), create) {
+            // "updated" a file init had just created (round 14).
+            Ok(Section::Changed) if !existed => created.push(f),
             Ok(Section::Changed) => updated.push(f),
             Ok(Section::Unchanged) => {}
             Ok(Section::Skipped(why)) => eprintln!("skipped {f}: {why}"),
             Err(e) => failures.push(format!("{f}: {e}")),
         }
+    }
+    if !created.is_empty() {
+        println!("created {} with a prova section", created.join(", "));
     }
     if !updated.is_empty() {
         println!("updated the prova section in {}", updated.join(", "));
@@ -1844,8 +1891,21 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
             names.sort();
             names.dedup();
-            let name = if names.contains(&test) {
+            // A bare name that is also a qualified test's tail is the same
+            // test seen two ways (round 14: gotestsum text, then go json):
+            // say which, rather than set aside the stale one.
+            let qualified: Vec<&String> = names
+                .iter()
+                .filter(|n| **n != test && n.ends_with(&format!("::{test}")))
+                .collect();
+            let name = if names.contains(&test) && qualified.is_empty() {
                 test.clone()
+            } else if names.contains(&test) {
+                return Err(UsageError(format!(
+                    "{test:?} is also known qualified, as {}; quarantine the name your suite reports now (see `prova status last`)",
+                    qualified.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ))
+                .into());
             } else {
                 match names.as_slice() {
                     [one] => one.clone(),
@@ -1867,7 +1927,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             let e = q::add(store, &name, &reason, days, now_ms())?;
             println!(
-                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it",
+                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
                 render::clean(&e.reason),
                 render::expires_in(e.expires_ms)
@@ -2499,7 +2559,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else {
                 for s in &list {
                     println!(
-                        "{:5.1}% fail  {:2} retry-passes  {:2} same-code flips  {}",
+                        "{:5.1}% fail  {:2} retry-passes  flipped on {:2} code version(s)  {}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
@@ -2643,6 +2703,7 @@ fn repeat_runs(
     // never "every test passed" (round 13: five runs whose selection matched
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
+    let mut quarantined = std::collections::BTreeSet::new();
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2680,8 +2741,18 @@ fn repeat_runs(
                 }
             }
         }
+        for q in &s.quarantined {
+            quarantined.insert(q.test.clone());
+        }
         if !json {
             let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            // A pass that set a quarantined failure aside says so (round 14).
+            let set_aside: Vec<&str> = s
+                .quarantined
+                .iter()
+                .filter(|q| q.result == "failed" || q.result == "errored")
+                .map(|q| q.test.as_str())
+                .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
             } else if ran == 0 {
@@ -2690,6 +2761,8 @@ fn repeat_runs(
                 (s.outcome, &s.detail)
             {
                 format!(" ({})", render::clean(d))
+            } else if !set_aside.is_empty() {
+                format!(" (quarantined, set aside: {})", set_aside.join(", "))
             } else {
                 String::new()
             };
@@ -2722,10 +2795,20 @@ fn repeat_runs(
     } else {
         println!("{done} run(s) of the same code:");
         for (t, (p, f)) in &mixed {
-            println!("  FLAKY {}: failed {f} of {}", render::clean(t), p + f);
+            let q = if quarantined.contains(*t) {
+                " (quarantined)"
+            } else {
+                ""
+            };
+            println!("  FLAKY {}{q}: failed {f} of {}", render::clean(t), p + f);
         }
         for t in &always {
-            println!("  FAIL {}: failed every time", render::clean(t));
+            let q = if quarantined.contains(*t) {
+                " (quarantined)"
+            } else {
+                ""
+            };
+            println!("  FAIL {}{q}: failed every time", render::clean(t));
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
         if no_tests > 0 {

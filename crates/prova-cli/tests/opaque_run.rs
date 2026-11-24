@@ -868,6 +868,9 @@ fn console_and_trx_results_are_each_test_once() {
         (Some(2), Some(2)),
         "{v}"
     );
+    // Round 14: the level named only the console though the TRX counted.
+    assert_eq!(v["level"], "recognized", "{v}");
+    assert_eq!(v["with_result_files"], true, "{v}");
 }
 
 /// Round 13 (Java, C#): a result file the previous run wrote moments before
@@ -999,5 +1002,146 @@ fn a_cancelled_run_has_no_test_outcome_in_the_list() {
     assert!(
         line.contains("cancelled") && !line.contains("errored"),
         "{list}"
+    );
+}
+
+/// Round 14: a wait that ended on its budget named the hung test without
+/// saying how long it had been running; the stall default for a suite of
+/// no declared size (60 s) outlasted two 30 s waits.
+#[test]
+fn a_wait_says_how_long_each_running_test_has_run() {
+    let d = workspace("runningfor");
+    let run = detach(&d, &[], "printf '=== RUN   TestHang\\n'; sleep 20");
+    let o = prova(&d, &["wait", &run, "--max-wait", "2s"]);
+    let out = stdout(&o);
+    assert!(out.contains("running now: TestHang (for "), "{out}");
+    let j = json(&prova(&d, &["status", &run, "--json"]));
+    assert!(j["running_for_ms"][0].as_u64().unwrap() >= 1000, "{j}");
+    prova(&d, &["cancel", &run]);
+    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 30);
+}
+
+/// Round 14: a stalled run said "no activity for 5.1s" half a minute after
+/// the stall, the idle time at the moment it was declared.
+#[test]
+fn a_stall_reports_the_idle_time_so_far() {
+    let d = workspace("idle-now");
+    let run = detach(&d, &["--stall-after", "1s"], "sleep 20");
+    let w = json(&prova(
+        &d,
+        &[
+            "wait",
+            &run,
+            "--until",
+            "stall",
+            "--max-wait",
+            "10s",
+            "--json",
+        ],
+    ));
+    assert_eq!(w["reason"], "stall", "{w}");
+    let seq = w["last_seq"].as_u64().unwrap().to_string();
+    // Nothing else happens: this wait ends on its budget.
+    prova(&d, &["wait", &run, "--after", &seq, "--max-wait", "2s"]);
+    let s = json(&prova(&d, &["status", &run, "--json"]));
+    assert!(s["stalled_ms"].as_u64().unwrap() >= 3000, "{s}");
+    prova(&d, &["cancel", &run]);
+}
+
+/// Round 14: `run_finished` was stamped with the process's exit time,
+/// before the size and totals events recorded ahead of it.
+#[test]
+fn event_timestamps_never_go_back() {
+    let d = workspace("ts-order");
+    prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test m::a ... ok'; echo 'test result: ok. 1 passed; 0 failed'",
+        ],
+    );
+    let ev = stdout(&prova(&d, &["events", "last"]));
+    let ts: Vec<u64> = ev
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["ts_ms"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ev}");
+}
+
+/// Round 14: gotestsum's default output gave two notes saying the same
+/// thing (its own, and the generic quiet-output one).
+#[test]
+fn gotestsum_quiet_output_is_explained_once() {
+    let d = workspace("gts-once");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\n' '✓  example.com/m (1ms)' '✖  example.com/m/b (2ms)' '' '=== Failed' '=== FAIL: example.com/m/b TestB (0.00s)' '    b_test.go:9: boom' '' 'DONE 5 tests, 1 failure in 0.1s'; exit 1";
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", script]);
+    let v = json(&o);
+    let notes = v["notes"].to_string();
+    assert_eq!(
+        notes.matches("passing tests are not recorded").count(),
+        1,
+        "{notes}"
+    );
+}
+
+/// Round 14: tests run through `docker run` were called small ("no other
+/// process or socket seen") though prova could see only the client.
+/// Linux: sizes come from sampling /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn tests_run_through_a_container_client_get_no_size() {
+    let d = workspace("container");
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("docker");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ni=0; while [ $i -lt 2000 ]; do i=$((i+1)); done\necho 'test m::a ... ok'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = Command::new(PROVA)
+        .args([
+            "run", "--json", "--", "docker", "run", "--rm", "img", "cargo", "test",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let v = json(&o);
+    assert!(
+        v["notes"].to_string().contains("ran through `docker`"),
+        "{v}"
+    );
+    // Its CPU is spent in the container: no "used no CPU" warning.
+    assert_eq!(v["verified"], true, "{v}");
+    let ev = stdout(&prova(&d, &["events", "last"]));
+    assert!(
+        !ev.contains("\"run_size\"") && !ev.contains("\"test_size\""),
+        "{ev}"
+    );
+}
+
+/// Round 14: a skipped Go subtest was counted as a subtest like one that
+/// ran.
+#[test]
+fn skipped_subtests_are_counted_as_skipped() {
+    let d = workspace("go-subtest-skip");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\n' '=== RUN   TestP' '=== RUN   TestP/a' '=== RUN   TestP/b' '    p_test.go:9: not here' '--- PASS: TestP (0.00s)' '    --- PASS: TestP/a (0.00s)' '    --- SKIP: TestP/b (0.00s)' 'PASS' 'ok  \texample.com/m\t0.01s'";
+    let o = prova(&d, &["run", "--", "sh", "-c", script]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("(and 2 subtests, 0 failed, 1 skipped)"),
+        "{out}"
     );
 }

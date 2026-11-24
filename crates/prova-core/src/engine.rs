@@ -220,6 +220,8 @@ struct Supervisor<'a> {
     cpu_start: Option<u64>,
     /// The framework's own test count, when it printed one.
     framework_total: Option<u64>,
+    /// The framework's own count of failures, when it printed one.
+    framework_failed: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
     partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
@@ -249,6 +251,8 @@ struct Supervisor<'a> {
     line_at: Option<Arrived>,
     /// When the run's first output line arrived, in ms since boot.
     first_line_ms: Option<u64>,
+    /// The container client the tests run through, if any.
+    container: Option<&'static str>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
     /// From the first output line to the end: the phase of a run whose
@@ -330,8 +334,9 @@ const SIZE_GUARD: Duration = Duration::from_millis(50);
 
 impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
-        if let EventKind::RunTotals { tests, .. } = &kind {
+        if let EventKind::RunTotals { tests, failed } = &kind {
             self.framework_total = Some(*tests);
+            self.framework_failed = Some(*failed);
         }
         // The run's test phase starts at its first test event (ADR 0026).
         if matches!(
@@ -482,11 +487,18 @@ impl Supervisor<'_> {
                 ..
             } => {
                 self.running.remove(&test.unique());
-                let _ = attempt;
-                let ok = self
+                // A test executed again after a pass and failing (Go's
+                // `-count=N`) is a later attempt: the failure is recorded.
+                let mut ok = self
                     .lifecycle
                     .test_finished(&test.unique(), *outcome)
                     .is_ok();
+                if !ok && *attempt > 1 {
+                    ok = self
+                        .lifecycle
+                        .test_repeated(&test.unique(), *outcome)
+                        .is_ok();
+                }
                 if ok && outcome.is_failure() {
                     self.any_test_failed = true;
                 }
@@ -511,6 +523,7 @@ impl Supervisor<'_> {
             // Nothing sampled inside it (its lines came at once, or it was
             // too short): no size can be claimed (ADR 0026).
             && t.seen.samples > 0
+            && self.container.is_none()
         {
             let size = t.seen.size();
             let evidence = t.seen.evidence();
@@ -630,6 +643,17 @@ impl Supervisor<'_> {
             return u.clone();
         }
         let u = crate::resources::sample(self.pgid);
+        // A container client started before the tests printed anything is
+        // how the command runs them: what they use is out of sight.
+        if self.container.is_none() {
+            self.container = u.procs.iter().find_map(|(pid, (_, cmd))| {
+                let early = match (u.starts.get(pid), self.first_line_ms) {
+                    (Some(start), Some(first)) => *start <= first,
+                    _ => true,
+                };
+                crate::resources::container_client(cmd).filter(|_| early)
+            });
+        }
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
         for (pid, (_, cmd)) in &u.procs {
@@ -770,6 +794,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         terminating: false,
         partial: Default::default(),
         framework_total: None,
+        framework_failed: None,
         cpu_start: None,
         pgid: 0,
         sizes: BTreeMap::new(),
@@ -778,6 +803,9 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         known_sockets: Default::default(),
         line_at: None,
         first_line_ms: None,
+        // The command itself may be the client (`docker run ... go test`):
+        // known before any sample, however short the run (round 14 CI).
+        container: crate::resources::container_client(&spec.command.display()),
         phase: None,
         whole: None,
         one_test_procs: BTreeMap::new(),
@@ -847,7 +875,13 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
             })
             .collect();
         sup.emit(EventKind::RunNote {
-            message: format!("injected by prova.toml (opt-in): {}", vars.join("; ")),
+            // From prova.toml or `--inject` alike (round 14: the note
+            // named prova.toml for a recipe given on the command line).
+            message: format!(
+                "injected by opt-in recipe {}: {}",
+                spec.inject.join(", "),
+                vars.join("; ")
+            ),
         });
     }
     let result = observe_child(
@@ -1058,7 +1092,13 @@ fn observe_child(
     // The test phase's size (ADR 0026 §2): what tests prova could not
     // isolate are held to. Only when the phase was sampled at least twice
     // (lines that all came at the end tell nothing about when tests ran).
-    if let Some(seen) = sup.phase_seen() {
+    if let Some(client) = sup.container {
+        sup.emit(EventKind::RunNote {
+            message: format!(
+                "the tests ran through `{client}`: their processes and sockets are out of prova's sight, so no size is recorded for them"
+            ),
+        });
+    } else if let Some(seen) = sup.phase_seen() {
         let size = seen.size();
         let evidence = seen.evidence();
         // A declared size is checked against the run as well (§5).
@@ -1320,7 +1360,10 @@ fn observe_child(
         // Passing tests from a command that used no CPU at all: printed, not run
         // (round 10: `echo "--- PASS: TestDiv"` passed in a Java project). Any
         // real test framework uses at least a clock tick.
+        // Not through a container client: the tests' CPU is spent in the
+        // container, out of sight (round 14).
         if status == Status::Finished
+            && sup.container.is_none()
             && sup.cpu_start.is_some()
             && process::children_ticks() == sup.cpu_start
         {
@@ -1436,6 +1479,45 @@ fn observe_child(
             sup.emit(EventKind::RunNote { message });
         }
     }
+    // Only quarantined tests failed, as far as the tests go: the run may
+    // pass without them only if they explain everything that went wrong
+    // (round 14: a build failure, a panic or a data race elsewhere hid
+    // behind a quarantined failure).
+    let first_seen = |d: &str| -> Option<u64> {
+        store
+            .conn()
+            .query_row(
+                "SELECT MIN(first_seen_ms) FROM tests WHERE display = ?1",
+                rusqlite::params![d],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    };
+    let set_aside = quarantined_only_failures(
+        sup.lifecycle.outcomes(),
+        &quarantine,
+        exit_code,
+        &first_seen,
+    );
+    if let Some(names) = &set_aside {
+        if let Some(n) = sup.framework_failed
+            && n > names.len() as u64
+        {
+            contradictions.push(format!(
+                "the framework counted {n} failure(s), more than the quarantined test(s) that failed ({}): something else failed too",
+                names.len()
+            ));
+        } else if let Some((line, text)) =
+            unexplained_crash(store, run, &sup.distiller, names, &report.test_outputs)?
+        {
+            contradictions.push(format!(
+                "the output shows an error outside the quarantined test(s) (line {line}): {}",
+                text.trim().chars().take(160).collect::<String>()
+            ));
+        }
+    }
     if let Some(code @ (126 | 127)) = exit_code {
         reason = Some(format!(
             "the command could not start (exit {code}: {}); no test ran",
@@ -1464,8 +1546,12 @@ fn observe_child(
         && closed.is_empty()
         && contradictions.is_empty()
         && sup.level >= Level::Recognized
-        && let Some(names) =
-            quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code)
+        && let Some(names) = quarantined_only_failures(
+            sup.lifecycle.outcomes(),
+            &quarantine,
+            exit_code,
+            &first_seen,
+        )
     {
         outcome = Outcome::Passed;
         sup.emit(EventKind::RunNote {
@@ -1476,7 +1562,14 @@ fn observe_child(
         });
     }
     if outcome == Outcome::Passed {
-        if let Some((line, text)) = sup.distiller.first_crash() {
+        // A quarantined test's own crash is set aside with it (round 14).
+        if let Some((line, text)) = unexplained_crash(
+            store,
+            run,
+            &sup.distiller,
+            set_aside.as_deref().unwrap_or_default(),
+            &report.test_outputs,
+        )? {
             warnings.push(format!(
                 "the output shows an error outside any failing test (line {line}): {}",
                 text.trim().chars().take(160).collect::<String>()
@@ -1651,7 +1744,9 @@ fn missing_since(
     let Some(prev) = prev else { return Ok(None) };
     let mut stmt = store.conn().prepare(
         "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.run_id = ?1 AND a.outcome <> 'skipped' GROUP BY a.test_id ORDER BY t.display",
+         WHERE a.run_id = ?1 AND a.outcome <> 'skipped'
+           AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+         GROUP BY a.test_id ORDER BY t.display",
     )?;
     let earlier: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![prev], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1659,12 +1754,35 @@ fn missing_since(
     if earlier.is_empty() {
         return Ok(None);
     }
+    // What this run has, by name: a test recorded bare before and qualified
+    // now (or the reverse) did run.
+    let mut now: Vec<String> = Vec::new();
+    for id in current {
+        let d: Option<String> = store
+            .conn()
+            .query_row("SELECT display FROM tests WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        now.extend(d);
+    }
     let missing = earlier
         .iter()
-        .filter(|(id, _)| !current.contains(id))
+        .filter(|(id, d)| !current.contains(id) && !now.iter().any(|n| same_test_name(n, d)))
         .map(|(_, d)| d.clone())
         .collect();
     Ok(Some((prev, missing, earlier.len())))
+}
+
+/// A name recorded bare (`TestX`, from text output that named no package)
+/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
+/// test: the same name, or one is the other behind a `::` or `/`.
+fn same_test_name(a: &str, b: &str) -> bool {
+    let tail = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
+    };
+    a == b || tail(a, b) || tail(b, a)
 }
 
 /// The display name of a lifecycle key (`file<US>name`).
@@ -1676,26 +1794,101 @@ fn key_display(key: &str) -> &str {
 /// quarantined and plainly `failed` (not errored), and the command's exit
 /// code is a test failure's (not 126/127 or a signal): the quarantined
 /// failures are then the run's only problem (ADR 0027 §4). `None` otherwise.
+///
+/// A subtest is set aside by its parent's quarantine only if it was known
+/// before the quarantine (`first_seen`): a new subtest's failure is news
+/// (round 14). A parent that failed only through quarantined subtests is
+/// set aside with them (Go fails the parent of a failing subtest).
 fn quarantined_only_failures(
     outcomes: &BTreeMap<String, Outcome>,
     quarantine: &BTreeMap<String, crate::quarantine::Entry>,
     exit_code: Option<i32>,
+    first_seen: &dyn Fn(&str) -> Option<u64>,
 ) -> Option<Vec<String>> {
     if quarantine.is_empty() || matches!(exit_code, None | Some(0 | 126 | 127)) {
         return None;
     }
+    let failing: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| o.is_failure())
+        .map(|(k, _)| key_display(k))
+        .collect();
     let mut names = Vec::new();
     for (key, o) in outcomes {
         if !o.is_failure() {
             continue;
         }
         let display = key_display(key);
-        if *o != Outcome::Failed || crate::quarantine::covers(quarantine, display).is_none() {
+        if *o != Outcome::Failed {
+            return None;
+        }
+        let set_aside = match quarantine.get(display) {
+            Some(_) => true,
+            None => match crate::quarantine::covers(quarantine, display) {
+                Some(parent) => first_seen(display).is_some_and(|t| t < parent.created_ms),
+                None => {
+                    let prefix = format!("{display}/");
+                    failing.iter().any(|f| f.starts_with(&prefix))
+                }
+            },
+        };
+        if !set_aside {
             return None;
         }
         names.push(display.to_owned());
     }
-    (!names.is_empty()).then_some(names)
+    // A run that verified nothing else passes nothing (round 14: a
+    // selection of only the quarantined test, failing, was "PASSED").
+    let verified_other = outcomes.iter().any(|(k, o)| {
+        *o == Outcome::Passed && crate::quarantine::covers(quarantine, key_display(k)).is_none()
+    });
+    (!names.is_empty() && verified_other).then_some(names)
+}
+
+/// The first crash-like line of the output that no quarantined failing
+/// test accounts for: it names one of them, or it is part of one's own
+/// output or failure message. With no quarantined failure, the first crash.
+fn unexplained_crash(
+    store: &Store,
+    run: &str,
+    distiller: &crate::output::Distiller,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+) -> Result<Option<(u64, String)>> {
+    let crashes = distiller.crashes();
+    if quarantined.is_empty() || crashes.is_empty() {
+        return Ok(crashes.into_iter().next());
+    }
+    let mut own: Vec<String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o.clone())
+        .collect();
+    let mut stmt = store.conn().prepare(
+        "SELECT a.message FROM attempts a JOIN tests t ON t.id = a.test_id
+          WHERE a.run_id = ?1 AND t.display = ?2 AND a.message IS NOT NULL",
+    )?;
+    for name in quarantined {
+        for m in stmt.query_map(rusqlite::params![run, name], |r| r.get::<_, String>(0))? {
+            own.push(m?);
+        }
+    }
+    // A name as frameworks print it: the whole display, or without the
+    // binary or file part before the first `::`.
+    let names: Vec<&str> = quarantined
+        .iter()
+        .flat_map(|n| {
+            [
+                n.as_str(),
+                n.split_once("::").map_or(n.as_str(), |(_, r)| r),
+            ]
+        })
+        .filter(|n| n.len() >= 4)
+        .collect();
+    Ok(crashes.into_iter().find(|(_, line)| {
+        let t = line.trim();
+        !names.iter().any(|n| t.contains(n)) && !own.iter().any(|o| o.contains(t))
+    }))
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite
@@ -1738,7 +1931,10 @@ fn left_out_flaky(
     }
     let mut left: Vec<String> = Vec::new();
     for f in crate::analysis::flaky(store, None, 50)? {
+        // A name recorded bare (`TestX`, text output before Go results were
+        // qualified by package) is the test `pkg::TestX` this run has.
         if ran.contains(&f.display)
+            || ran.iter().any(|r| same_test_name(r, &f.display))
             || left.contains(&f.display)
             || crate::quarantine::covers(quarantine, &f.display).is_some()
         {
@@ -1818,6 +2014,9 @@ pub struct Counts {
     /// Of them, failed or errored.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub subtests_failed: u64,
+    /// Of them, skipped (round 14: a skipped subtest read as one that ran).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests_skipped: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -1841,12 +2040,19 @@ pub struct Summary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
     pub level: Level,
+    /// Some results came from result files although the level is higher
+    /// (round 14: "recognized output" with counts read from TRX).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub with_result_files: bool,
     pub last_seq: u64,
     pub elapsed_ms: u64,
     pub counts: Counts,
     /// Tests running now (started, not finished), oldest first; at most 10.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub running: Vec<String>,
+    /// How long each test of `running` has been running, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub running_for_ms: Vec<u64>,
     /// The framework's own count (tests, failed), when it printed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<(u64, u64)>,
@@ -1901,7 +2107,8 @@ pub struct Summary {
 #[derive(Debug, Clone, Serialize)]
 pub struct QuarantinedTest {
     pub test: String,
-    /// `passed`, `failed`, `errored`, `skipped`, or `not run`.
+    /// `passed`, `failed`, `errored`, `skipped`, `not run`, or `not
+    /// reported` (no per-test results, or the run was cut short).
     pub result: String,
     pub reason: String,
     pub expires_ms: u64,
@@ -2117,11 +2324,54 @@ pub fn unverified_runs(
     let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
     let mut out = store.unverified(&ids)?;
     for r in runs {
-        if r.outcome == Some(Outcome::Passed) && !out.contains(&r.id) {
-            let s = summarize(store, &r.id, WaitReason::Done, 0)?;
-            if !s.flaky_passed.is_empty() {
-                out.insert(r.id.clone());
-            }
+        if r.status == Status::Finished
+            && r.outcome == Some(Outcome::Passed)
+            && !out.contains(&r.id)
+            && !flaky_passed_in(
+                store,
+                r,
+                &crate::quarantine::in_force_at(store, r.created_ms)?,
+            )?
+            .is_empty()
+        {
+            out.insert(r.id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Known flaky tests (as of the run) that passed in a finished run, apart
+/// from quarantined ones: such a pass proves little (round 7). Read from the
+/// store alone; it once took a full summary of the run, whose history took
+/// summaries of earlier runs in turn, exponential in the number of passes
+/// (round 14: `prova status` used a second of CPU, `wait` a core).
+fn flaky_passed_in(
+    store: &Store,
+    row: &RunRow,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+) -> Result<Vec<String>> {
+    let passed: std::collections::BTreeSet<String> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id = ?1 AND a.outcome = 'passed'
+                AND a.attempt = (SELECT MAX(b.attempt) FROM attempts b
+                                  WHERE b.run_id = a.run_id AND b.test_id = a.test_id)
+                AND NOT EXISTS (SELECT 1 FROM superseded s
+                                 WHERE s.run_id = a.run_id AND s.test_id = a.test_id)",
+        )?;
+        stmt.query_map(rusqlite::params![row.id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::new();
+    if passed.is_empty() {
+        return Ok(out);
+    }
+    for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
+        if passed.contains(&f.display)
+            && !out.contains(&f.display)
+            && crate::quarantine::covers(quarantine, &f.display).is_none()
+        {
+            out.push(f.display);
         }
     }
     Ok(out)
@@ -2200,7 +2450,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     entry.budget_from = *budget_from;
                 }
             }
-            EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
+            // Idle for as long as the stall said plus the time since, while
+            // nothing else happened (round 14: "no activity for 5.1s" half
+            // a minute later).
+            EventKind::RunStalled { idle_ms, .. } => {
+                stalled_ms = Some(if row.status.is_terminal() {
+                    *idle_ms
+                } else {
+                    idle_ms + now_ms().saturating_sub(e.ts_ms)
+                })
+            }
             EventKind::TestStarted { test } => {
                 stalled_ms = None;
                 started_at.entry(test.unique()).or_insert(e.ts_ms);
@@ -2224,6 +2483,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         if f.4 {
             counts.subtests += 1;
             counts.subtests_failed += u64::from(f.1.is_failure());
+            counts.subtests_skipped += u64::from(f.1 == Outcome::Skipped);
             if f.1.is_failure() {
                 failing.push(f);
             }
@@ -2275,35 +2535,35 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let n_failures = failing.len();
     // A pass of a known flaky test proves little: say so, or a green run
     // reads as a reliably green suite (round 7).
-    let mut flaky_passed = Vec::new();
-    if row.status == Status::Finished {
-        let passed: std::collections::BTreeSet<String> = finals
-            .values()
-            .filter(|(_, o, _, _, _)| *o == Outcome::Passed)
-            .map(|(k, _, _, _, _)| k.display())
-            .collect();
-        if !passed.is_empty() {
-            for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
-                if passed.contains(&f.display)
-                    && !flaky_passed.contains(&f.display)
-                    && crate::quarantine::covers(&quarantine, &f.display).is_none()
-                {
-                    flaky_passed.push(f.display);
-                }
-            }
-        }
-    }
+    let flaky_passed = if row.status == Status::Finished {
+        flaky_passed_in(store, &row, &quarantine)?
+    } else {
+        Vec::new()
+    };
     // Quarantined tests of this run, with their result: relevant when they
     // ran here, or their suite (or one sharing tests with this run) did.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
-    if row.status.is_terminal() {
+    // While the run goes on, the quarantined tests with a result so far:
+    // a "1 failed" that does not end a first-failure wait is explained
+    // (round 14).
+    let live = !row.status.is_terminal();
+    {
+        // Without per-test results (opaque level, or a run cut short) a
+        // missing quarantined test is not known to have been left out
+        // (round 14: "not run" in a cancelled run).
+        let blind = row.level < Level::Recognized || row.status != Status::Finished;
         for (name, q) in &quarantine {
+            // A quarantined subtest is listed by its own result (round 14:
+            // "not run" for a subtest that ran and failed).
             let result = finals
                 .values()
-                .filter(|f| !f.4 && f.0.display() == *name)
+                .filter(|f| f.0.display() == *name)
                 .map(|f| f.1.as_str().to_owned())
                 .next();
-            if result.is_none() {
+            if live && result.is_none() {
+                continue;
+            }
+            if result.is_none() && !(blind && row.level < Level::Recognized) {
                 let suites: Vec<String> = {
                     let mut stmt = store
                         .conn()
@@ -2317,13 +2577,17 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             }
             quarantined.push(QuarantinedTest {
                 test: name.clone(),
-                result: result.unwrap_or_else(|| "not run".to_owned()),
+                result: result
+                    .unwrap_or_else(|| if blind { "not reported" } else { "not run" }.to_owned()),
                 reason: q.reason.clone(),
                 expires_ms: q.expires_ms,
             });
         }
         // A quarantine that ran out is no longer set aside: say so.
-        for q in crate::quarantine::expired_at(store, row.created_ms)? {
+        for q in crate::quarantine::expired_at(store, row.created_ms)?
+            .into_iter()
+            .filter(|_| !live)
+        {
             if finals.values().any(|f| !f.4 && f.0.display() == q.test) {
                 notes.push(format!(
                     "quarantine of {} expired ({}); it counts again: fix it, or `prova quarantine add` it again with a reason",
@@ -2358,6 +2622,17 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A failure before any test ran may be the environment's (a missing
+    // SDK), not the code's; history would count it against the code
+    // (round 14). Say how to keep it out.
+    if row.status == Status::Finished
+        && matches!(row.outcome, Some(Outcome::Failed | Outcome::Errored))
+        && counts.results() == 0
+    {
+        notes.push(format!(
+            "no test result was seen: if this failed for the environment (a missing tool or SDK), not the code, `prova forget {run} --reason \"...\"` keeps it out of history"
+        ));
+    }
     // A stalled selection: the selected test is the suspect (round 10).
     if !row.status.is_terminal()
         && stalled_ms.is_some()
@@ -2435,9 +2710,31 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         status: row.status,
         outcome: row.outcome,
         level: row.level,
+        with_result_files: row.level > Level::ResultFiles
+            && store
+                .conn()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM attempts WHERE run_id = ?1 AND source = ?2)",
+                    rusqlite::params![run, Level::ResultFiles.as_u8()],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false),
         last_seq,
         elapsed_ms: end.saturating_sub(row.started_ms.unwrap_or(row.created_ms)),
         counts,
+        // How long each has been running: a test running for 30 s that
+        // usually takes milliseconds is the hang, before any budget says so
+        // (round 14).
+        running_for_ms: if row.status.is_terminal() {
+            Vec::new()
+        } else {
+            let now = now_ms();
+            running
+                .iter()
+                .take(10)
+                .map(|(u, _)| started_at.get(u).map_or(0, |t| now.saturating_sub(*t)))
+                .collect()
+        },
         running: if row.status.is_terminal() {
             Vec::new()
         } else {
@@ -2495,19 +2792,30 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     let thin = store.unverified(&ids)?;
     // A pass that relied on a known flaky test is no "last green" either
     // (round 13: it named a run whose own output said "unverified").
+    // At most this many recent passes are checked for one: each check
+    // reads a test's flake history.
+    const CHECKED_PASSES: usize = 20;
     let mut last_passed = None;
+    let mut flaky_passes = std::collections::BTreeSet::new();
     for r in prev
         .iter()
-        .filter(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id))
+        .filter(|r| {
+            r.status == Status::Finished
+                && r.outcome == Some(Outcome::Passed)
+                && !thin.contains(&r.id)
+        })
+        .take(CHECKED_PASSES)
     {
-        if summarize(store, &r.id, WaitReason::Done, 0)?
-            .flaky_passed
-            .is_empty()
-        {
+        let q = crate::quarantine::in_force_at(store, r.created_ms)?;
+        if flaky_passed_in(store, r, &q)?.is_empty() {
             last_passed = Some(r);
             break;
         }
+        flaky_passes.insert(r.id.clone());
     }
+    // A pass that relied on a known flaky test is a pass with a warning,
+    // never "none of them passed" (round 14).
+    let thin: std::collections::BTreeSet<String> = thin.union(&flaky_passes).cloned().collect();
     let unverified_passes = prev
         .iter()
         .filter(|r| {
@@ -2537,6 +2845,24 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             // them passed; on this exact code: passed").
             Status::Finished if r.outcome == Some(Outcome::Passed) && thin.contains(&r.id) => {
                 "passed?".to_owned()
+            }
+            // A failure with no test result says nothing of a test (round
+            // 14: a missing SDK read as "on this exact code: failed").
+            Status::Finished
+                if r.outcome != Some(Outcome::Passed)
+                    && !store
+                        .conn()
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM attempts WHERE run_id = ?1)",
+                            rusqlite::params![r.id],
+                            |q| q.get::<_, bool>(0),
+                        )
+                        .unwrap_or(true) =>
+            {
+                format!(
+                    "{} (no test seen)",
+                    r.outcome.map(|o| o.as_str()).unwrap_or_default()
+                )
             }
             Status::Finished => r.outcome.map(|o| o.as_str().to_owned()).unwrap_or_default(),
             s => s.as_str().to_owned(),
@@ -2616,18 +2942,78 @@ mod quarantine_tests {
     fn only_quarantined_plain_failures_are_set_aside() {
         let o = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
         assert_eq!(
-            quarantined_only_failures(&o, &q(&["a"]), Some(1)),
+            quarantined_only_failures(&o, &q(&["a"]), Some(1), &|_| None),
             Some(vec!["a".to_owned()])
         );
         // Another failing test, an error, or no quarantine: the run fails.
         let two = outcomes(&[("a", Outcome::Failed), ("c", Outcome::Failed)]);
-        assert_eq!(quarantined_only_failures(&two, &q(&["a"]), Some(1)), None);
+        assert_eq!(
+            quarantined_only_failures(&two, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
         let err = outcomes(&[("a", Outcome::Errored)]);
-        assert_eq!(quarantined_only_failures(&err, &q(&["a"]), Some(1)), None);
-        assert_eq!(quarantined_only_failures(&o, &q(&[]), Some(1)), None);
+        assert_eq!(
+            quarantined_only_failures(&err, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&[]), Some(1), &|_| None),
+            None
+        );
         // A command that could not start, or was killed, is no test failure.
-        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), Some(127)), None);
-        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), None), None);
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), Some(127), &|_| None),
+            None
+        );
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), None, &|_| None),
+            None
+        );
+    }
+
+    /// Round 14: a parent's quarantine does not cover a subtest new since;
+    /// a parent failing only through its quarantined subtest is set aside.
+    #[test]
+    fn subtests_follow_their_quarantine_only_when_it_knew_them() {
+        // `q` quarantines at created_ms 0; first seen at 0 is not before.
+        let parent = outcomes(&[
+            ("TestQ", Outcome::Failed),
+            ("TestQ/new", Outcome::Failed),
+            ("TestO", Outcome::Passed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&parent, &q(&["TestQ"]), Some(1), &|_| Some(0)),
+            None
+        );
+        let mut known = q(&["TestQ"]);
+        known.get_mut("TestQ").unwrap().created_ms = 10;
+        assert_eq!(
+            quarantined_only_failures(&parent, &known, Some(1), &|_| Some(5)),
+            Some(vec!["TestQ".to_owned(), "TestQ/new".to_owned()])
+        );
+        let only = outcomes(&[("a", Outcome::Failed)]);
+        assert_eq!(
+            quarantined_only_failures(&only, &q(&["a"]), Some(1), &|_| None),
+            None
+        );
+        let child = outcomes(&[
+            ("TestP", Outcome::Failed),
+            ("TestP/flaky", Outcome::Failed),
+            ("TestO", Outcome::Passed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&child, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            Some(vec!["TestP".to_owned(), "TestP/flaky".to_owned()])
+        );
+        let other = outcomes(&[
+            ("TestP", Outcome::Failed),
+            ("TestP/real", Outcome::Failed),
+            ("TestP/flaky", Outcome::Failed),
+        ]);
+        assert_eq!(
+            quarantined_only_failures(&other, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            None
+        );
     }
 }
 

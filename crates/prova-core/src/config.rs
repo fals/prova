@@ -180,7 +180,10 @@ impl RunSpec {
     }
 }
 
-pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(60);
+/// A quiet run of a suite with no declared size stalls after this long, as
+/// a small one does: `--until first-failure` (30 s) then catches a hang
+/// on its second wait at the latest (round 14: 60 s, two waits or more).
+pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30);
 pub const DEFAULT_KILL_AFTER: Duration = Duration::from_secs(3600);
 
 /// Workspace root: nearest ancestor with `prova.toml`, else with `.git`,
@@ -251,6 +254,13 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         // VSTest names a case `Ns.Class.Method(args)`.
         return method(filter);
     }
+    // Vitest and Jest `-t` match the full name, describe blocks joined by
+    // spaces: the name prova shows (`calc > divides`, with or without its
+    // file) selects with spaces (round 14: it matched nothing).
+    if command.contains(" -t ") || command.contains("--testNamePattern") {
+        let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
+        return leaf.replace(" > ", " ");
+    }
     let Some((head, leaf)) = filter.rsplit_once("::") else {
         return filter.to_owned();
     };
@@ -259,10 +269,6 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         format!("{head}#{}", method(leaf))
     } else if command.contains("FullyQualifiedName") {
         format!("{head}.{}", method(leaf))
-    } else if command.contains(" -t ") {
-        // vitest -t matches the full name, describe blocks joined by spaces
-        // (round 11: prova's `calc > divides` matched nothing).
-        leaf.replace(" > ", " ")
     } else if command.contains(" -k ") {
         // pytest -k: the test's own name.
         leaf.to_owned()
@@ -406,6 +412,28 @@ mod filter_tests {
                 "Calc.TheoryTests::LengthMatches(s: \"x/y\", len: 3)"
             ),
             "Calc.TheoryTests.LengthMatches"
+        );
+    }
+
+    /// Round 14: Vitest and Jest show `calc > divides`; their `-t` joins the
+    /// describe blocks with a space, whether or not the file is named.
+    #[test]
+    fn a_vitest_or_jest_name_selects_with_spaces() {
+        use super::framework_filter as f;
+        let vitest = "npx vitest run --reporter=default -t \"$PROVA_FILTER\"";
+        assert_eq!(f(vitest, "calc > divides"), "calc divides");
+        assert_eq!(
+            f(vitest, "src/calc.test.ts::calc > divides"),
+            "calc divides"
+        );
+        assert_eq!(f(vitest, "plain"), "plain");
+        assert_eq!(
+            f("npx jest --ci -t \"$PROVA_FILTER\"", "a > b > c"),
+            "a b c"
+        );
+        assert_eq!(
+            f("jest --testNamePattern \"$PROVA_FILTER\"", "a > b"),
+            "a b"
         );
     }
 

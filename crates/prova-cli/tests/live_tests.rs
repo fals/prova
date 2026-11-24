@@ -198,7 +198,8 @@ fn home_of(dir: &Path) -> PathBuf {
 }
 
 /// Round 12 count audit: verbose output with a collection error was told
-/// to "run with verbose output". Medium: the CLI's notes.
+/// to "run with verbose output". Medium: the CLI's notes. (Round 14 names
+/// a collection error; the second error here is the one left unnamed.)
 #[test]
 fn a_gap_in_verbose_output_is_not_blamed_on_quiet_output() {
     let d = workspace("gap-verbose");
@@ -210,7 +211,7 @@ fn a_gap_in_verbose_output_is_not_blamed_on_quiet_output() {
             "--",
             "sh",
             "-c",
-            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'tests/test_a.py::test_one PASSED  [100%]'; echo 'ERROR tests/test_b.py'; echo '===== 1 passed, 1 error in 0.01s ====='; exit 1",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'tests/test_a.py::test_one PASSED  [100%]'; echo 'ERROR tests/test_b.py'; echo '===== 1 passed, 2 errors in 0.01s ====='; exit 1",
         ],
     ));
     let notes = s["notes"].to_string();

@@ -1106,7 +1106,9 @@ fn status_leads_with_the_best_after_a_later_reject() {
     assert!(best < latest, "{out}");
     // Holm: what the family holds is said.
     assert!(
-        out.contains("comparison(s) on this baseline and metric (revalidations count)"),
+        out.contains(
+            "comparison(s) in this experiment's family for this metric (revalidations count)"
+        ),
         "{out}"
     );
 }
@@ -1179,5 +1181,81 @@ fn exp_metrics_next_line_names_the_hypothesis() {
     assert!(
         out.contains("next: prova exp new <name> --hypothesis"),
         "{out}"
+    );
+}
+
+/// Round 14: a verdict with no correctness gate says so, and its `next:`
+/// does not send the agent off to keep unchecked code.
+#[test]
+fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
+    let d = repo("nogate", "0.3");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e"]);
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        t.contains(
+            "caveat: no oracle or spec in the protocol: correctness was not checked, only speed"
+        ),
+        "{t}"
+    );
+    assert!(
+        t.contains("next: keep it once its correctness is checked (tests, or an --oracle)"),
+        "{t}"
+    );
+    let r = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    let cav = r["comparison"]["result"]["caveats"].to_string();
+    assert!(cav.contains("no oracle or spec"), "{cav}");
+}
+
+/// Round 14: an ACCEPT against something other than the best says, in the
+/// `next:` line, that the best is unchanged; the Holm family and the
+/// discard log name what they count and compare.
+#[test]
+fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
+    let d = repo("notbest", "0.3");
+    new_exp(&d, &[]);
+    std::fs::write(d.join("delay"), "0.02").unwrap();
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "fast"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
+        "fast"
+    );
+    std::fs::write(d.join("delay"), "0.1").unwrap();
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "mid"])
+            .status
+            .success()
+    );
+    let o = prova(&d, &["exp", "run", "e", "--against", "baseline"]);
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(t.contains("ACCEPT"), "{t}");
+    assert!(
+        t.contains("accepted against baseline, not against the best: the best is still fast"),
+        "{t}"
+    );
+    assert!(!t.contains("on this baseline and metric"), "{t}");
+    assert!(
+        t.contains("in this experiment's family for this metric"),
+        "{t}"
+    );
+    // A discard names its reference.
+    std::fs::write(d.join("delay"), "0.5").unwrap();
+    assert!(
+        prova(&d, &["exp", "candidate", "e", "--label", "slow"])
+            .status
+            .success()
+    );
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let last = r["decisions"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["decision"], "discard", "{r}");
+    assert!(
+        last["reason"].as_str().unwrap().contains("vs fast"),
+        "{last}"
     );
 }

@@ -237,3 +237,109 @@ fn slow_tests_are_named_in_the_summary_and_listed_by_slowest() {
     assert_eq!(j.as_array().unwrap().len(), 1);
     assert_eq!(j[0]["test"], "TestSlow");
 }
+
+/// Round 14: a quarantined failure passed a run whose output also showed a
+/// build failure, a data race or more failures than the quarantined test's;
+/// and the quarantined test's own panic made a quarantined pass unverified.
+#[test]
+fn a_quarantine_sets_aside_only_what_its_test_explains() {
+    let d = workspace("explains");
+    let script = format!(
+        "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
+         pass) echo 'test calc::x ... ok' ;; \
+         own) echo 'test calc::x ... FAILED'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
+         race) echo 'test calc::x ... FAILED'; echo 'WARNING: DATA RACE'; exit 101 ;; \
+         build) echo 'test calc::x ... FAILED'; echo 'error[E0425]: cannot find value `y` in this scope'; exit 101 ;; \
+         more) echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 1 passed; 3 failed; 0 ignored'; exit 101 ;; \
+         esac"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.make]\nrun = {script:?}\n"),
+    )
+    .unwrap();
+    run(&d, "make", "pass");
+    run(&d, "make", "own");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "make", "own");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(!out.contains("unverified"), "its own panic: {out}");
+    for (state, why) in [
+        ("race", "WARNING: DATA RACE"),
+        ("build", "error[E0425]"),
+        ("more", "counted 3 failure(s)"),
+    ] {
+        let o = run(&d, "make", state);
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{state}: {out}");
+        assert!(
+            out.contains("FAILED") && out.contains(why),
+            "{state}: {out}"
+        );
+    }
+}
+
+/// Round 14: a bare name seen once (gotestsum's text) and the same test
+/// qualified (its json stream) were two tests; `add` set aside the stale
+/// bare one, and the real failure still failed the run.
+#[test]
+fn a_bare_name_with_a_qualified_twin_is_ambiguous() {
+    let d = workspace("twin");
+    flaky_history(&d);
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n\n[suite.bare]\nrun = {:?}\n",
+            full(),
+            format!("{BUSY} echo 'test x ... FAILED'; exit 1")
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "bare"]);
+    let o = prova(&d, &["quarantine", "add", "x", "--reason", "r"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{out}");
+    assert!(out.contains("also known qualified, as calc::x"), "{out}");
+    let o = prova(&d, &["quarantine", "add", "calc::x", "--reason", "r"]);
+    let out = text(&o);
+    assert!(out.contains("this machine's prova store"), "{out}");
+}
+
+/// Round 14: a pass that set a quarantined failure aside looked like any
+/// pass in the run list and in `--repeat`; a run of only the quarantined
+/// test, failing, passed.
+#[test]
+fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
+    let d = workspace("marked");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let o = prova(&d, &["run", "make", "--repeat", "2"]);
+    let out = text(&o);
+    assert!(
+        out.contains("(quarantined, set aside: calc::x)")
+            && out.contains("FAIL calc::x (quarantined): failed every time"),
+        "{out}"
+    );
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        list.contains("passed*") && list.contains("passed*: passed with quarantined tests failing"),
+        "{list}"
+    );
+    let last = text(&prova(&d, &["status", "last"]));
+    assert!(
+        last.contains("PASSED (quarantined failures set aside)"),
+        "{last}"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.only]\nrun = {:?}\n",
+            format!("{BUSY} echo 'test calc::x ... FAILED'; exit 101")
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "only"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+}

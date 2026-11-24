@@ -284,7 +284,11 @@ impl Observer for Ladder {
             .seen
             .values()
             .any(|(_, o)| *o == prova_core::model::Outcome::Passed);
+        // One note per cause (round 14: gotestsum's note and the generic
+        // quiet-output note said the same thing twice).
+        let mut quiet_explained = false;
         if self.live.gotestsum_seen && !self.live.gotestsum_stream && hid_passes {
+            quiet_explained = true;
             report.events.push(EventKind::RunNote {
                 message: "gotestsum's default output prints only failures: passing tests are not recorded, so flaky detection is blind; add `inject = [\"gotestsum-json\"]` to the suite in prova.toml (prova reads gotestsum's own event stream) or run it with `--format testname`".into(),
             });
@@ -297,6 +301,7 @@ impl Observer for Ladder {
                 .any(|(_, o)| *o == prova_core::model::Outcome::Passed)
             && finals.is_empty()
         {
+            quiet_explained = true;
             report.events.push(EventKind::RunNote {
                 message: "`go test` without -v or -json prints only failures: passing tests are not recorded, so flaky detection is blind; run `go test -json` (prova adopt proposes it; if prova.toml has such a suite, run that suite)".into(),
             });
@@ -336,6 +341,14 @@ impl Observer for Ladder {
                 "the framework reported {failed_reported} failed test(s) but prova recorded {failed_seen}: its summary is believed over its exit code"
             ));
         }
+        // A test file that fails to load fails no test: its framework counts
+        // it as a failed file (Jest `Test Suites:`, Vitest `Test Files`).
+        if self.live.suites_failed > 0 && failed_seen == 0 {
+            report.contradictions.push(format!(
+                "the framework reported {} failed test file(s) but no failing test: a file that failed to load (an import error?)",
+                self.live.suites_failed
+            ));
+        }
         // The build itself says it failed or crashed, whatever the exit code
         // (round 10: `mvn -fn`, a forked JVM that died, a crashed class).
         // nextest counts a test that exited 0 early as passed; its captured
@@ -366,7 +379,12 @@ impl Observer for Ladder {
                 .contradictions
                 .push(format!("the build says it failed: {line:?}"));
         }
-        if seen == 0 && self.expect_tests {
+        if seen == 0 && self.expect_tests && self.live.go_no_tests_only() {
+            // A `-run` that matches nothing: `ok pkg [no tests to run]`.
+            report.contradictions.push(
+                "the framework says no test ran: go test reported `[no tests to run]` in every package (a -run filter that matches nothing?)".into(),
+            );
+        } else if seen == 0 && self.expect_tests {
             match &self.live.no_tests_line {
                 // One package without test files is normal when others
                 // printed `ok` (round 10: a `cmd/` dir failed a green run).
@@ -406,6 +424,14 @@ impl Observer for Ladder {
         let passes_seen = outcomes
             .values()
             .any(|o| *o == prova_core::model::Outcome::Passed);
+        if self.live.total() > seen && self.live.prints_every_test() {
+            // The format shows each test as it runs: a count above what was
+            // shown means results are missing, not hidden by quiet output.
+            report.warnings.push(format!(
+                "the framework counted {} tests but its output showed only {seen}: the pass rests on the exit code for the rest",
+                self.live.total()
+            ));
+        }
         if self.live.total() > seen && passes_seen {
             report.events.push(EventKind::RunNote {
                 message: format!(
@@ -414,7 +440,7 @@ impl Observer for Ladder {
                     self.live.total()
                 ),
             });
-        } else if self.live.total() > seen {
+        } else if self.live.total() > seen && !quiet_explained {
             report.events.push(EventKind::RunNote {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \
@@ -467,7 +493,9 @@ mod tests {
             streams: Vec::new(),
             expect_tests: true,
         };
-        let live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        // A pytest pass is held one line (a teardown error may follow).
+        let mut live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        live.extend(ladder.on_line("", 0));
         assert!(matches!(
             live.last(),
             Some(EventKind::TestFinished {

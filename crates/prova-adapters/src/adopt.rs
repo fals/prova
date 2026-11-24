@@ -391,6 +391,15 @@ pub fn to_toml(p: &Proposal) -> String {
             s.push_str("# pytest-reportlog is installed: every test is read live (native)\ninject = [\"pytest-reportlog\"]\n");
             continue;
         }
+        // gotestsum is already what the project runs: its own event stream
+        // needs nothing installed, so it is proposed on, like the Vitest
+        // reporter (round 14: left commented, the suite saw only failures).
+        if p.gotestsum && p.existing.as_deref() == Some(suite.run.as_str()) {
+            s.push_str(
+                "# gotestsum prints only failures by default; its event stream gives every test, live, with packages\ninject = [\"gotestsum-json\"]\n# also opt-in: \"go-nocache\" (stop go replaying cached passes via GOFLAGS)\n",
+            );
+            continue;
+        }
         // The project's own command hides detail; offer the opt-in recipe.
         if p.existing.as_deref() == Some(suite.run.as_str()) {
             for (lang, recipe, what) in [
@@ -414,11 +423,6 @@ pub fn to_toml(p: &Proposal) -> String {
                     s.push_str(&format!("# inject = [\"{recipe}\"]  # opt-in: {what}\n"));
                 }
             }
-        }
-        if p.gotestsum && p.existing.as_deref() == Some(suite.run.as_str()) {
-            s.push_str(
-                "# gotestsum prints only failures by default: inject = [\"gotestsum-json\"]\n#   reads its own event stream (every test, live, with packages)\n",
-            );
         }
         if suite.run.contains("vitest") {
             s.push_str(
@@ -484,7 +488,7 @@ mod tests {
         ));
         assert!(p.gotestsum);
         assert!(
-            to_toml(&p).contains("inject = [\"gotestsum-json\"]"),
+            to_toml(&p).contains("\ninject = [\"gotestsum-json\"]\n"),
             "{}",
             to_toml(&p)
         );

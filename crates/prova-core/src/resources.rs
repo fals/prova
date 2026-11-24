@@ -105,6 +105,26 @@ pub fn names_test(cmdline: &str, test: &str) -> bool {
         })
 }
 
+/// The container client a command runs its tests through (`docker run`,
+/// `podman exec`, `kubectl exec`, ...): the tests' own processes and
+/// sockets are then out of sight (round 14: sizes claimed "small" for
+/// tests run by `docker run`).
+pub fn container_client(cmdline: &str) -> Option<&'static str> {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    // The executable, or the script an interpreter runs (`sh docker ...`).
+    let (at, client) = words.iter().take(2).enumerate().find_map(|(i, w)| {
+        let exe = w.rsplit('/').next()?;
+        ["docker", "podman", "nerdctl", "kubectl"]
+            .into_iter()
+            .find(|c| exe == *c)
+            .map(|c| (i, c))
+    })?;
+    words[at + 1..]
+        .iter()
+        .any(|w| matches!(*w, "run" | "exec" | "compose" | "debug"))
+        .then_some(client)
+}
+
 /// Whether a process is a test runner's process for a single test
 /// (libtest's `--exact <name>`, as nextest starts each test).
 pub fn runs_one_test(cmdline: &str) -> bool {
@@ -589,5 +609,21 @@ mod tests {
         assert_eq!(a.size(), Size::Medium);
         assert!(a.processes.contains("sh") && a.local_sockets == 1 && a.remote.is_empty());
         assert_eq!(seen_in_subtree(&now, 30).size(), Size::Large);
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    #[test]
+    fn container_clients_are_recognized_by_what_they_do() {
+        use super::container_client as c;
+        assert_eq!(
+            c("/usr/bin/docker run --rm -v /w:/w img dotnet test"),
+            Some("docker")
+        );
+        assert_eq!(c("kubectl exec pod -- go test ./..."), Some("kubectl"));
+        assert_eq!(c("/bin/sh /w/bin/docker run img"), Some("docker"));
+        assert_eq!(c("docker ps"), None);
+        assert_eq!(c("dockerd --host x"), None);
     }
 }

@@ -57,7 +57,10 @@ module runLifecycle {
         and out.keys().exists(t => out.get(t) == Failed or out.get(t) == Errored)
         and out.keys().forall(t =>
           (out.get(t) != Failed and out.get(t) != Errored)
-          or (q.contains(t) and out.get(t) == Failed)))
+          or (q.contains(t) and out.get(t) == Failed))
+        // Something else was verified: a run of only quarantined tests
+        // that failed passes nothing (round 14).
+        and out.keys().exists(t => out.get(t) == Passed and not(q.contains(t))))
       Pass
     else v
 
@@ -118,6 +121,22 @@ module runLifecycle {
     open' = open.exclude(Set(t)),
     outcomes' = outcomes.put(t, o),
     status' = status,
+    inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
+  }
+
+  // A test that already has a result is executed again and fails (Go's
+  // `-count=N` repeats executions, it does not retry them). The failure is
+  // recorded: it must never hide behind an earlier pass. A repeated pass
+  // changes nothing and is not an event.
+  action testRepeated(t: str, o: Outcome): bool = all {
+    status == Running,
+    not(open.contains(t)),
+    outcomes.keys().contains(t),
+    isFailure(o),
+    log' = log.append(TestFinished({ test: t, outcome: o })),
+    outcomes' = outcomes.put(t, o),
+    open' = open, status' = status,
     inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
     exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
@@ -189,6 +208,7 @@ module runLifecycle {
       start,
       testStarted(t),
       testFinished(t, o),
+      testRepeated(t, o),
       end(s),
       cancelCreated,
       late(t, o),
@@ -262,6 +282,9 @@ module runLifecycle {
         outcomes.keys().forall(t =>
           (outcomes.get(t) != Failed and outcomes.get(t) != Errored)
           or (QUARANTINED.contains(t) and outcomes.get(t) == Failed)),
+        // A pass the quarantine granted verified some other test.
+        verdict != Pass implies
+          outcomes.keys().exists(t => outcomes.get(t) == Passed and not(QUARANTINED.contains(t))),
       }
 
   // A command that could not start is not a test failure.
@@ -322,6 +345,20 @@ module runLifecycle {
       .then(exited(0)).then(end(Finished))
       .then(all { assert(verdict == Pass), assert(safety), late("a", Passed) })
 
+  // Go -count=3: pass, fail, pass of one test. The failure is recorded after
+  // the pass, and the last execution is what the test ends as.
+  run repeatedFailureTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(testRepeated("a", Failed))
+      .then(all { assert(outcomes.get("a") == Failed), exited(1) })
+      .then(end(Finished))
+      .then(all { assert(verdict == Fail), assert(safety), late("a", Passed) })
+
+  // A repeated pass is not an event.
+  run repeatedPassIsNotAnEventTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(testRepeated("a", Passed)).fail()
+
   // A passed test does not start again.
   run noRestartAfterPassTest =
     init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
@@ -347,6 +384,15 @@ module runLifecycle {
       .then(all {
         assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
         late("a", Passed),
+      })
+
+  // Round 14: only the quarantined test ran, and failed: no pass.
+  run onlyQuarantinedFailingIsNoPassTest =
+    init.then(start).then(testStarted("b")).then(testFinished("b", Failed))
+      .then(exited(1)).then(end(Finished))
+      .then(all {
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
+        late("b", Failed),
       })
 
   run cleanPassTest =

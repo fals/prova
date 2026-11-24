@@ -174,6 +174,18 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// A test that already has a result is executed again and fails (Go's
+    /// `-count=N`): the failure is recorded, never hidden behind an earlier
+    /// pass (spec/run.qnt `testRepeated`). Anything else is refused.
+    pub fn test_repeated(&mut self, test: &str, outcome: Outcome) -> Result<(), LifecycleError> {
+        self.reject_late()?;
+        if self.open.contains(test) || !self.outcomes.contains_key(test) || !outcome.is_failure() {
+            return Err(LifecycleError::DuplicateTest);
+        }
+        self.outcomes.insert(test.to_owned(), outcome);
+        Ok(())
+    }
+
     /// Ends the run; open tests become errored.
     pub fn end(&mut self, status: Status) -> Result<Vec<String>, LifecycleError> {
         if !status.is_terminal() {
@@ -203,6 +215,25 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go's `-count=3`: pass, fail, pass of one test. The failure after the
+    /// pass is recorded; a repeated pass is not an event.
+    #[test]
+    fn a_failure_after_a_pass_is_recorded_as_a_repeat() {
+        let mut l = Lifecycle::new();
+        l.start().unwrap();
+        l.test_started("a").unwrap();
+        l.test_finished("a", Outcome::Passed).unwrap();
+        assert!(l.test_repeated("a", Outcome::Passed).is_err());
+        l.test_repeated("a", Outcome::Failed).unwrap();
+        assert_eq!(l.outcomes()["a"], Outcome::Failed);
+        // A test never seen cannot be a repeat.
+        assert!(l.test_repeated("b", Outcome::Failed).is_err());
+        l.test_finished("a", Outcome::Passed).unwrap(); // the third execution
+        l.exited(Some(1)).unwrap();
+        l.end(Status::Finished).unwrap();
+        assert_eq!(l.verdict(), Some(Outcome::Failed));
+    }
 
     #[test]
     fn a_pass_must_be_earned() {

@@ -263,7 +263,14 @@ fn stats_with(
             .or_default()
             .insert(r.outcome.is_failure());
     }
-    let flips = by_code.values().filter(|s| s.len() == 2).count();
+    // Code versions, not (code, environment) pairs: one code that flipped
+    // in two environments is one (round 14: "2 code version(s)" for one).
+    let flips = by_code
+        .iter()
+        .filter(|(_, s)| s.len() == 2)
+        .map(|((code, _), _)| *code)
+        .collect::<BTreeSet<_>>()
+        .len();
     // Same code, opposite results, different environments: name the
     // variables that differ between a pass and a failure.
     let mut env_dependent: BTreeSet<String> = BTreeSet::new();
@@ -353,6 +360,7 @@ pub fn find_tests(
     let mut stmt = store.conn().prepare(
         "SELECT id, display, suite FROM tests
          WHERE instr(display, ?1) > 0 AND (?2 IS NULL OR suite = ?2)
+           AND id NOT IN (SELECT test_id FROM superseded)
          ORDER BY (display = ?1) DESC, length(display) ASC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![query, suite], |r| {
@@ -526,7 +534,12 @@ pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
         return Ok(Some(SizeView {
             size: None,
             at_most: None,
-            label: format!("small? (nothing more seen in {small} of {SMALL_AFTER} runs)"),
+            // "1 of 3 runs" next to a history of 12 runs read as a
+            // miscount (round 14): it is the evidence so far, of what is
+            // needed.
+            label: format!(
+                "small? (nothing more seen in {small} run(s) that could show it; {SMALL_AFTER} needed)"
+            ),
         }));
     }
     Ok(None)

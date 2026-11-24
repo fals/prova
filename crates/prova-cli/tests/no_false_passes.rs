@@ -107,6 +107,13 @@ const CASES: &[(&str, &str, &str, i32, &str)] = &[
         "could not start",
     ),
     (
+        "jest_failed_suite_exit0",
+        "printf '%s\\n' 'Test Suites: 1 failed, 1 passed, 2 total' 'Tests:       3 passed, 3 total'; exit 0",
+        "failed",
+        1,
+        "failed test file",
+    ),
+    (
         "build_error",
         "echo 'error[E0308]: mismatched types'; echo 'error: could not compile'; exit 101",
         "failed",
@@ -377,4 +384,168 @@ fn a_nextest_pass_whose_harness_never_reported_fails_cleanly() {
         h.contains("0 runs with a result"),
         "no evidence in history: {h}"
     );
+}
+
+fn failure_names(s: &serde_json::Value) -> Vec<String> {
+    s["failures"]
+        .as_array()
+        .map(|f| {
+            f.iter()
+                .map(|t| t["test"].as_str().unwrap_or("").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Round 14: a pass on a retry within one run is flaky, whatever prints it:
+/// the run follows the command's exit, with a warning and no verification.
+#[test]
+fn text_retries_that_pass_are_flaky() {
+    for (name, script) in [
+        (
+            "nextest_retry",
+            "printf '%s\\n' '        PASS [   0.004s] calc tests::adds' '  TRY 1 FAIL [   0.004s] calc tests::retry_me' '  RETRY 2/2 [         ] calc tests::retry_me' '  TRY 2 PASS [   0.003s] calc tests::retry_me' '     Summary [   0.020s] 2 tests run: 2 passed (1 flaky), 0 skipped' '   FLAKY 2/2 [   0.003s] calc tests::retry_me'; exit 0",
+        ),
+        (
+            "pytest_rerun",
+            "printf '%s\\n' 'tests/test_a.py::test_ok PASSED [ 50%]' 'tests/test_a.py::test_flaky RERUN [100%]' 'tests/test_a.py::test_flaky PASSED [100%]' '==== 2 passed, 1 rerun in 0.10s ===='; exit 0",
+        ),
+    ] {
+        let d = workspace(name);
+        let (code, s) = run_sh(&d, script);
+        assert_eq!(
+            (s["outcome"].as_str(), code),
+            (Some("passed"), Some(0)),
+            "{name}: {s}"
+        );
+        assert_eq!(s["verified"], false, "{name}: {s}");
+        assert!(
+            s["warnings"].to_string().contains("passed on a retry"),
+            "{name}: {s}"
+        );
+        assert_eq!(s["counts"]["failed"], 0, "{name}: {s}");
+    }
+}
+
+/// Round 14: a pytest teardown error on a passed test is that one test
+/// erroring; and a collection error is named.
+#[test]
+fn pytest_errors_outside_the_call_are_named() {
+    let d = workspace("pytest_teardown");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'tests/test_b.py::test_ok PASSED [ 50%]' 'tests/test_b.py::test_ok ERROR [ 50%]' 'tests/test_b.py::test_next PASSED [100%]' '==== 2 passed, 1 error in 0.10s ===='; exit 1",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["tests.test_b::test_ok"], "{s}");
+    assert_eq!(s["counts"]["errored"], 1, "{s}");
+    assert_eq!(s["counts"]["passed"], 1, "{s}");
+
+    let d = workspace("pytest_collect");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' '==== short test summary info ====' 'ERROR tests/test_e.py - ImportError: no module x' '!!!! Interrupted: 1 error during collection !!!!'; exit 2",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["tests/test_e.py::(file)"], "{s}");
+}
+
+/// Round 14: Jest's verbose reporter names its tests and failures.
+#[test]
+fn jest_verbose_output_is_recognized() {
+    let d = workspace("jest_verbose");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'PASS src/a.test.ts' '  calc' '    \u{2713} adds (2 ms)' '    \u{2713} subtracts' ' FAIL  src/x.test.ts' '  calc' '    \u{2715} flaky clock (3 ms)' '    \u{2713} divides' '' '  \u{25cf} calc \u{203a} flaky clock' '' '    expect(received).toBe(expected)' 'Test Suites: 1 failed, 1 passed, 2 total' 'Tests:       1 failed, 3 passed, 4 total'; exit 1",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(
+        failure_names(&s),
+        vec!["src/x.test.ts::calc > flaky clock"],
+        "{s}"
+    );
+    assert_eq!(s["counts"]["passed"], 3, "{s}");
+}
+
+/// Round 14: a Jest file that fails to load is one errored entry.
+#[test]
+fn jest_file_that_fails_to_load_is_an_entry() {
+    let d = workspace("jest_file");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'PASS src/a.test.ts' 'FAIL src/b.test.ts' '  \u{25cf} Test suite failed to run' '' \"    Cannot find module './missing'\" '' 'Test Suites: 1 failed, 1 passed, 2 total' 'Tests:       3 passed, 3 total'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["src/b.test.ts::(file)"], "{s}");
+}
+
+/// Round 14: a JUnit header that counts an error no test case shows (Gradle
+/// `ignoreFailures`, exit 0) is a failed run.
+#[test]
+fn a_junit_header_error_without_a_case_fails() {
+    let d = workspace("junit_header");
+    let junit = "<testsuite name=\"com.acme.CalcTest\" tests=\"3\" errors=\"1\" failures=\"0\"><testcase classname=\"com.acme.CalcTest\" name=\"adds\" time=\"0.1\"/><testcase classname=\"com.acme.CalcTest\" name=\"subs\" time=\"0.1\"/><system-err>ExceptionInInitializerError</system-err></testsuite>";
+    std::fs::write(d.join("j.xml"), junit).unwrap();
+    let (code, s) = run_sh(
+        &d,
+        "mkdir -p build/test-results/test; cp j.xml build/test-results/test/TEST-com.acme.CalcTest.xml",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["com.acme.CalcTest::(suite)"], "{s}");
+}
+
+/// Round 14: Maven's console summary names a failing class the (partial)
+/// JUnit files do not.
+#[test]
+fn surefire_console_failures_are_recorded() {
+    let d = workspace("surefire_console");
+    let junit = "<testsuite name=\"CalcTest\" tests=\"1\"><testcase classname=\"com.acme.CalcTest\" name=\"adds\" time=\"0.1\"/></testsuite>";
+    std::fs::write(d.join("j.xml"), junit).unwrap();
+    let (code, s) = run_sh(
+        &d,
+        "mkdir -p target/surefire-reports; cp j.xml target/surefire-reports/TEST-com.acme.CalcTest.xml; printf '%s\\n' '[ERROR] Failures: ' '[ERROR]   OtherTest.fooWorks:12 expected:<2> but was:<3>' '[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["OtherTest::fooWorks"], "{s}");
+}
+
+/// Round 14: Vitest's `FAIL file [ file ]` (exit 0 from the wrapper) is a
+/// failing entry named by its file.
+#[test]
+fn a_vitest_file_that_failed_to_load_fails_the_run() {
+    let d = workspace("vitest_file");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' ' \u{2713} src/a.test.ts (3 tests) 5ms' ' FAIL  src/b.test.ts [ src/b.test.ts ]' 'Error: Cannot find module ./missing' ' Test Files  1 failed | 1 passed (2)' '      Tests  3 passed (3)'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("failed"), Some(1)),
+        "{s}"
+    );
+    assert_eq!(failure_names(&s), vec!["src/b.test.ts::(file)"], "{s}");
 }

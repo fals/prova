@@ -27,6 +27,10 @@ fn headline(s: &Summary) -> String {
             {
                 "PASSED (unverified: see warnings)".into()
             }
+            // "PASSED ... exit 100" read as a contradiction (round 14).
+            (Status::Finished, Some(Outcome::Passed)) if s.exit_code.is_some_and(|c| c != 0) => {
+                "PASSED (quarantined failures set aside)".into()
+            }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
             (Status::Finished, Some(Outcome::Errored)) => "ERRORED".into(),
             (Status::Finished, _) => "FAILED".into(),
@@ -99,8 +103,13 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         " so far"
     };
     line.push_str(&format!(
-        "  level{so_far} {}  code {}",
+        "  level{so_far} {}{}  code {}",
         level_name(s.level),
+        if s.with_result_files {
+            " + result files"
+        } else {
+            ""
+        },
         s.code
     ));
     println!("{line}");
@@ -139,8 +148,14 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
             c.skipped,
             if c.subtests > 0 {
                 format!(
-                    " (and {} subtests, {} failed)",
-                    c.subtests, c.subtests_failed
+                    " (and {} subtests, {} failed{})",
+                    c.subtests,
+                    c.subtests_failed,
+                    if c.subtests_skipped > 0 {
+                        format!(", {} skipped", c.subtests_skipped)
+                    } else {
+                        String::new()
+                    }
                 )
             } else {
                 String::new()
@@ -172,7 +187,19 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         );
     }
     if !s.running.is_empty() && s.reason != WaitReason::Failure {
-        let names: Vec<String> = s.running.iter().map(|t| clean(t)).collect();
+        let names: Vec<String> = s
+            .running
+            .iter()
+            .enumerate()
+            .map(|(i, t)| match s.running_for_ms.get(i) {
+                Some(ms) if *ms >= 1000 => format!(
+                    "{} (for {})",
+                    clean(t),
+                    format_duration(std::time::Duration::from_millis(*ms))
+                ),
+                _ => clean(t),
+            })
+            .collect();
         println!("running now: {}", names.join(", "));
     }
     for t in &s.slow {
@@ -697,10 +724,14 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
         );
         return;
     }
+    let mut marks = std::collections::BTreeSet::new();
     for r in rows {
         // A thin pass is not a plain "passed" in the list either (round 9).
         let outcome = match r.outcome {
             Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
+            // Passed although the command failed: only quarantined tests
+            // failed, set aside (round 14: listed as a plain "passed").
+            Some(Outcome::Passed) if r.exit_code.is_some_and(|c| c != 0) => "passed*",
             // A cancelled or killed run has no test outcome of its own:
             // "cancelled errored" read as a test error (round 13).
             _ if matches!(r.status, prova_core::model::Status::Cancelled) => "-",
@@ -724,6 +755,9 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
             .as_str()
             .map(|x| format!("  --select {}", clean(x)))
             .unwrap_or_default();
+        if outcome.ends_with(['?', '*']) {
+            marks.insert(outcome);
+        }
         println!(
             "{}  {:9}  {:7}  {:>7}  {}{sel}",
             r.id,
@@ -731,6 +765,17 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
             outcome,
             dur,
             r.suite
+        );
+    }
+    // The marks are explained where they appear (round 14).
+    for m in marks {
+        println!(
+            "{m}: {}",
+            if m == "passed?" {
+                "passed with warnings, verified little (`prova status <run>` says why)"
+            } else {
+                "passed with quarantined tests failing, set aside (`prova status <run>`)"
+            }
         );
     }
 }
@@ -813,7 +858,7 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) on this baseline and metric (revalidations count), Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment's family for this metric (revalidations count), Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
                     num("baseline_median"),
@@ -853,6 +898,21 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             {
                 format!(
                     "revalidated against the original baseline: report experiment {} and this verdict",
+                    r.experiment
+                )
+            }
+            // Beat something other than the best: the best is unchanged.
+            ("decided", Some("accept")) if c.baseline != r.best && c.candidate != r.best => {
+                format!(
+                    "accepted against {}, not against the best: the best is still {}; compare with it: prova exp run {} --against {}",
+                    c.baseline, r.best, r.experiment, r.best
+                )
+            }
+            ("decided", Some("accept"))
+                if r.protocol.oracle.is_none() && r.protocol.specs.is_empty() =>
+            {
+                format!(
+                    "keep it once its correctness is checked (tests, or an --oracle); try the next idea, or `prova exp revalidate {}`",
                     r.experiment
                 )
             }
@@ -1055,6 +1115,7 @@ mod live_tests {
             status: Status::Running,
             outcome: None,
             level: Level::Opaque,
+            with_result_files: false,
             last_seq: 0,
             elapsed_ms: 12_000,
             counts: Counts {
@@ -1063,6 +1124,7 @@ mod live_tests {
                 ..Counts::default()
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
+            running_for_ms: vec![],
             framework: None,
             failures: vec![],
             stalled_ms: None,

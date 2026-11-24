@@ -747,3 +747,84 @@ fn next_lines_are_honest_and_runnable() {
     assert!(out.contains("`prova run make --repeat 5`"), "{out}");
     assert!(!out.contains("--select"), "{out}");
 }
+
+/// Round 14: every pass of a suite with a flaky test passing relied on it,
+/// and checking each for "last green" summarized the earlier ones in turn,
+/// exponential in the number of passes (`prova status` used a second of CPU
+/// after 15 runs). The history then said "none of them passed".
+#[test]
+fn passes_with_a_flaky_test_are_cheap_to_check_and_named_as_passes() {
+    let d = workspace("flakychain");
+    suites(&d);
+    run(&d, "make", "fail");
+    for _ in 0..16 {
+        run(&d, "make", "pass");
+    }
+    run(&d, "make", "fail");
+    let started = std::time::Instant::now();
+    let status = text(&prova(&d, &["status", "last"]));
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !status.contains("none of them passed;")
+            && status.contains("none of them passed verified (16 passed with warnings"),
+        "{status}"
+    );
+    assert!(list.contains("passed?"), "{list}");
+}
+
+/// Round 14: a test that flipped on one code in two environments was
+/// "both passed and failed on 2 code version(s)".
+#[test]
+fn flips_count_code_versions_not_environments() {
+    let d = workspace("flipenv");
+    suites(&d);
+    let with_env = |state: &str| {
+        std::fs::write(d.join("state"), state).unwrap();
+        Command::new(PROVA)
+            .args(["run", "make"])
+            .current_dir(&d)
+            .env("PROVA_HOME", format!("{}.home", d.display()))
+            .env("BADENV", "1")
+            .output()
+            .unwrap()
+    };
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    with_env("pass");
+    with_env("fail");
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("both passed and failed on 1 code version(s)"),
+        "{h}"
+    );
+}
+
+/// Round 14: a run that failed before any test (no SDK installed) counted
+/// against the code in the next run's history, and nothing said how to
+/// take it out.
+#[test]
+fn a_failure_with_no_test_is_named_and_can_be_forgotten() {
+    let d = workspace("notest");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}if [ \"$(cat state)\" = env ]; then echo 'No .NET SDKs were found.'; exit 155; fi; {SCRIPT}"
+            )
+        ),
+    )
+    .unwrap();
+    let out = run(&d, "make", "env");
+    assert!(
+        out.contains("no test result was seen") && out.contains("prova forget"),
+        "{out}"
+    );
+    let out = run(&d, "make", "fail");
+    assert!(out.contains("failed (no test seen)"), "{out}");
+}

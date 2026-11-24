@@ -469,11 +469,14 @@ impl Store {
         fingerprint: Option<&str>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        // `now_ms` is when the process ended (the run's end); the event is
+        // recorded now, after the events of its wrap-up (round 14: it was
+        // stamped before the run_size and run_totals it follows).
         insert_event(
             &tx,
             run,
             seq,
-            now_ms,
+            crate::ids::now_ms().max(now_ms),
             &EventKind::RunFinished {
                 status,
                 exit_code,
