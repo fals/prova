@@ -21,6 +21,9 @@ pub struct Recognizers {
     /// Final outcome of every test reported so far:
     /// unique key -> (display name, outcome).
     pub seen: BTreeMap<String, (String, Outcome)>,
+    /// The key each `seen` entry was reported under (unique key -> key):
+    /// a result superseded later names the test it was stored as.
+    pub seen_keys: BTreeMap<String, TestKey>,
     /// Vitest: current test file header, and a failure held for its message.
     vitest_file: Option<String>,
     vitest_pending: Option<EventKind>,
@@ -303,6 +306,7 @@ impl Recognizers {
         let message = (outcome == Outcome::Failed)
             .then(|| v["stdout"].as_str().unwrap_or("").to_owned())
             .filter(|m| !m.is_empty());
+        self.seen_keys.insert(key.unique(), key.clone());
         self.seen.insert(key.unique(), (key.display(), outcome));
         out.push(EventKind::TestFinished {
             test: key,
@@ -329,6 +333,7 @@ impl Recognizers {
         level: Level,
         out: &mut Vec<EventKind>,
     ) {
+        self.seen_keys.insert(key.unique(), key.clone());
         self.seen.insert(key.unique(), (key.display(), outcome));
         lift(&mut self.level, level);
         out.push(EventKind::TestFinished {
@@ -432,6 +437,7 @@ impl Recognizers {
         {
             self.failure_fallback.push((key.clone(), m.clone()));
         }
+        self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         lift(&mut self.level, level);
         out.push(EventKind::TestFinished {
@@ -4335,6 +4341,7 @@ impl Recognizers {
         let n = self.go_attempts.entry(d.clone()).or_insert(1);
         *n += 1;
         let attempt = *n;
+        self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         out.push(EventKind::TestFinished {
             test: key,

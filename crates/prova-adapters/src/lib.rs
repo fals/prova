@@ -179,15 +179,19 @@ impl Observer for Ladder {
             .seen
             .iter()
             .map(|(unique, (d, _))| {
-                let file = unique
-                    .split_once('\u{1f}')
-                    .map(|(f, _)| f)
-                    .filter(|f| !f.is_empty());
-                prova_core::model::TestKey {
-                    file: file.map(str::to_owned),
-                    path: Vec::new(),
-                    name: d.clone(),
-                }
+                // The key it was stored under (round 15: rebuilt from the
+                // display, a `Class::method` key named no stored test).
+                self.live.seen_keys.get(unique).cloned().unwrap_or_else(|| {
+                    let file = unique
+                        .split_once('\u{1f}')
+                        .map(|(f, _)| f)
+                        .filter(|f| !f.is_empty());
+                    prova_core::model::TestKey {
+                        file: file.map(str::to_owned),
+                        path: Vec::new(),
+                        name: d.clone(),
+                    }
+                })
             })
             .collect();
         // A bare live name the file qualifies (VSTest's console `Divide`,
@@ -195,11 +199,26 @@ impl Observer for Ladder {
         // identity. Keeping the bare one made two classes' `Divide` swap
         // histories with the console's order, and a deterministic failure
         // read as flaky (round 13).
+        // A file name that qualifies the live one with a package (Surefire's
+        // console `CalcTest::flaky`, its report `calc.CalcTest::flaky`) is
+        // the identity too, whatever the live name holds (round 15: failures
+        // and passes of one Java test were two tests). A parameterized
+        // case's arguments and index are left out of the console name.
+        let base = |d: &str| -> String {
+            match d.find('(') {
+                Some(i) if d.ends_with(']') || d.ends_with(')') => d[..i].to_owned(),
+                _ => d.to_owned(),
+            }
+        };
         let qualifies =
-            |l: &str, d: &str| d != l && !l.contains("::") && d.ends_with(&format!(".{l}"));
+            |l: &str, d: &str| d != l && (base(d) == l || base(d).ends_with(&format!(".{l}")));
         let mut superseded: Vec<(usize, usize)> = Vec::new();
         let covers = |l: &str, d: &str| {
-            l == d || d.ends_with(&format!("::{l}")) || d.ends_with(&format!(".{l}"))
+            let b = base(d);
+            l == d
+                || d.ends_with(&format!("::{l}"))
+                || d.ends_with(&format!(".{l}"))
+                || (b != d && (b == l || b.ends_with(&format!(".{l}"))))
         };
         // Matched in passes over all file results (exact outcome, then
         // pass/fail, then any), not greedily: a passing `B.Same` must not
