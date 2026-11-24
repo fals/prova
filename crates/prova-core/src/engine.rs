@@ -1684,12 +1684,27 @@ fn observe_child(
         outcome = Outcome::Errored;
     }
     if outcome == Outcome::Passed {
-        // A quarantined test's own crash is set aside with it (round 14).
+        sup.flush()?;
+        let rerun_all: Vec<String> = {
+            let mut stmt = store.conn().prepare(
+                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                  WHERE a.run_id = ?1 GROUP BY a.test_id
+                 HAVING SUM(a.outcome IN ('failed','errored')) > 0",
+            )?;
+            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        // A quarantined test's own crash is set aside with it (round 14),
+        // and a retried test's panic on its first try is its own (round 16:
+        // a nextest retry that passed was "an error outside any failing
+        // test").
+        let mut own_crashes: Vec<String> = set_aside.clone().unwrap_or_default();
+        own_crashes.extend(rerun_all.iter().cloned());
         if let Some((line, text)) = unexplained_crash(
             store,
             run,
             &sup.distiller,
-            set_aside.as_deref().unwrap_or_default(),
+            &own_crashes,
             &report.test_outputs,
         )? {
             warnings.push(format!(
@@ -1699,16 +1714,7 @@ fn observe_child(
         }
         // A test that passed only on a retry is flaky: the run passes (its
         // last attempt decides, ADR 0024) but the pass is not a green one.
-        sup.flush()?;
-        let rerun: Vec<String> = {
-            let mut stmt = store.conn().prepare(
-                "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-                  WHERE a.run_id = ?1 GROUP BY a.test_id
-                 HAVING SUM(a.outcome IN ('failed','errored')) > 0",
-            )?;
-            stmt.query_map(rusqlite::params![run], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
+        let rerun = rerun_all;
         let rerun: Vec<String> = rerun
             .into_iter()
             .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
@@ -2233,17 +2239,73 @@ fn unaccounted_error(
         }
     }
     let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
+    // The runner's last summary is the end of the tests: another step that
+    // printed after it (a linter, a smoke check, a coverage gate) failed or
+    // passed in words prova cannot tell from the quarantined failure.
+    let (after, after_overflow) = distiller.after_summary();
+    if let Some((n, line)) = after
+        .iter()
+        .find(|(_, l)| !wrapper_line(l, command, &names))
+    {
+        return Ok(Some(format!(
+            "the command printed more after the tests' summary (line {n}: {}): another step ran, and its result cannot be told apart from the quarantined failure",
+            line.chars().take(160).collect::<String>()
+        )));
+    }
+    if after_overflow {
+        return Ok(Some(
+            "the command printed too much after the tests' summary to account for it: another step ran, and its result cannot be told apart from the quarantined failure".into(),
+        ));
+    }
+    // A summary of failed files above the files that hold the quarantined
+    // failures: another file failed (Jest `Test Suites:`, Vitest `Test Files`).
+    if let Some((n, line)) = distiller.files_line()
+        && let Some(failed) = failed_count(line)
+    {
+        let mut files: Vec<&str> = quarantined
+            .iter()
+            .map(|q| q.split_once("::").map_or(q.as_str(), |(f, _)| f))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        if failed > files.len() as u64 {
+            return Ok(Some(format!(
+                "the framework counts {failed} failed file(s) (line {n}: {}), more than the file(s) of the quarantined test(s): another file failed",
+                line.chars().take(160).collect::<String>()
+            )));
+        }
+    }
+    let mut reruns = 0;
     Ok(lines.iter().find_map(|(n, line, owner)| {
         let t = line.trim();
+        // A coverage gate is never a test's: it ran after them, whichever
+        // section pytest's output put it in.
+        let gate = [
+            "Required test coverage",
+            "fail-under",
+            "coverage threshold",
+            "not met",
+        ]
+        .iter()
+        .any(|g| t.contains(g));
         // In a quarantined test's own section (its own section header
         // names it as a whole name too).
         let in_own_section = owner
             .as_deref()
             .is_some_and(|o| names.iter().any(|q| names_word(o, q)));
-        let accounted = in_own_section
-            || names.iter().any(|q| names_word(t, q))
-            || own.iter().any(|o| o.contains(t))
-            || summary_of_failures(t, command);
+        // A crash is accounted for only by being the test's own, never by
+        // naming it: another process crashed on a test of that name.
+        let own_line = own.iter().any(|o| o.contains(t));
+        let by_name = names.iter().any(|q| names_word(t, q)) && !crash_like(t);
+        // cargo prints this once per failing target: a second one is another
+        // target's.
+        let rerun_again = t.starts_with("error: test failed, to rerun pass") && {
+            reruns += 1;
+            reruns > 1
+        };
+        let accounted = !gate
+            && !rerun_again
+            && (in_own_section || by_name || own_line || summary_of_failures(t, command));
         (!accounted).then(|| {
             format!(
                 "the output shows an error outside the quarantined test(s) (line {n}): {}",
@@ -2251,6 +2313,77 @@ fn unaccounted_error(
             )
         })
     }))
+}
+
+/// A line that says a process crashed, whatever it names.
+fn crash_like(t: &str) -> bool {
+    let lower = t.to_lowercase();
+    crate::output::looks_like_crash(t)
+        || [
+            "exited with code",
+            "oomkilled",
+            "killed",
+            "aborted",
+            "terminated",
+            "segmentation fault",
+            "core dumped",
+            "panicked",
+            "fatal",
+            "exception",
+            "traceback",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
+/// The number before `failed` in a summary of counts (`2 failed, 1 passed`,
+/// `1 failed | 2 passed (3)`).
+fn failed_count(line: &str) -> Option<u64> {
+    line.split([',', '|'])
+        .find(|part| part.contains(" failed"))?
+        .split_whitespace()
+        .rev()
+        .skip_while(|w| *w != "failed")
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A line after the runner's summary that belongs to the test command's own
+/// wrap-up: the runner's summary of failures, make's line for the suite's
+/// target, a runner's timing lines, npm's report of its test script, a line
+/// of the quarantined test's own (without a crash).
+fn wrapper_line(t: &str, command: &str, names: &[String]) -> bool {
+    let t = t.trim();
+    let info = t.strip_prefix("[INFO]").map(str::trim);
+    summary_of_failures(t, command)
+        || (t.starts_with("make")
+            && (t.contains("Entering directory") || t.contains("Leaving directory")))
+        || t.starts_with("Start at ")
+        || t.starts_with("Duration ")
+        || t.starts_with("Snapshots:")
+        || t.starts_with("Time:")
+        || t == "Ran all test suites."
+        || t.starts_with("Total time:")
+        || t.starts_with("Results File:")
+        || t.starts_with("Passed:")
+        || t.starts_with("Failed:")
+        || t.starts_with("Skipped:")
+        || t.starts_with("Test Run ")
+        || t.starts_with("npm ERR!")
+        || t.starts_with("npm error")
+        || t.starts_with("npm notice")
+        || t.starts_with("Lifecycle script `test` failed")
+        || t.starts_with("Lifecycle script \"test\" failed")
+        || (t.starts_with('`') && t.ends_with('`'))
+        || info.is_some_and(|i| {
+            i.is_empty()
+                || i.starts_with("---")
+                || i.starts_with("Total time:")
+                || i.starts_with("Finished at:")
+                || i.starts_with("BUILD ")
+        })
+        || (names.iter().any(|q| names_word(t, q)) && !crash_like(t))
 }
 
 /// The first crash-like line of the output that no quarantined failing
@@ -2299,8 +2432,8 @@ fn unexplained_crash(
 fn runner_failure_summary(line: &str) -> bool {
     line == "error: test run failed"
         || line.starts_with("error: test failed, to rerun pass")
-        || (line.starts_with("error: ")
-            && (line.ends_with(" target failed:") || line.ends_with(" targets failed:")))
+        // One target failed; `error: 2 targets failed:` is another's too.
+        || line == "error: 1 target failed:"
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite
@@ -3407,6 +3540,38 @@ mod quarantine_tests {
         assert!(summary_of_failures(line, "make -C sub test && echo done"));
         assert!(!summary_of_failures(lint, "make test && lint"));
         assert!(!summary_of_failures(lint, "make test; lint"));
+    }
+
+    /// Round 16: wrap-up lines after a runner's summary, and counts.
+    #[test]
+    fn only_the_commands_own_wrap_up_may_follow_the_summary() {
+        let names = vec!["tests::flaky".to_owned()];
+        for t in [
+            "error: test run failed",
+            "error: 1 target failed:",
+            "`--lib`",
+            "make[1]: Leaving directory '/w'",
+            "Start at  20:41:15",
+            "npm error Lifecycle script `test` failed",
+            "FAIL [   0.004s] (4/5) calc tests::flaky",
+        ] {
+            assert!(wrapper_line(t, "make test", &names), "{t}");
+        }
+        for t in [
+            "smoke: GET /health returned 503",
+            "Found 1 error.",
+            "error: 2 targets failed:",
+            "Segmentation fault (core dumped) ./bin/tests::flaky",
+            "make[1]: *** [Makefile:6: lint] Error 1",
+        ] {
+            assert!(!wrapper_line(t, "make test", &names), "{t}");
+        }
+        assert_eq!(
+            failed_count("Test Suites: 2 failed, 1 passed, 3 total"),
+            Some(2)
+        );
+        assert_eq!(failed_count("Test Files  1 failed | 2 passed (3)"), Some(1));
+        assert_eq!(failed_count("Test Suites: 3 passed, 3 total"), None);
     }
 
     /// Round 16: Maven's wrap-up of a failed test step, as captured from

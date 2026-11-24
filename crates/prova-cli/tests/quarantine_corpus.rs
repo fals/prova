@@ -145,6 +145,7 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str), expect:
         assert!(
             !is_guard
                 || t.contains("outside the quarantined test")
+                || t.contains("printed more after the tests' summary")
                 || matches!(expect, Expect::NoOtherPass),
             "{name} plus {extra:?} must say why: {t}"
         );
@@ -211,4 +212,165 @@ cases! {
     corpus_dotnet_test_normal: "dotnet-test-normal", None, DOTNET, Expect::Passes;
     corpus_mvn_quiet_with_junit: "mvn-q", JUNIT, MVN, Expect::Passes;
     corpus_mvn_test: "mvn", JUNIT, MVN, Expect::Passes;
+}
+
+/// A capture with its output edited: the flaky test is learned from the
+/// unedited output and quarantined; the edited run must fail, with `why`.
+fn probe(name: &str, edit: &dyn Fn(&str) -> String, why: &str) {
+    let dir = fixture_dir();
+    let raw = std::fs::read_to_string(dir.join(format!("{name}.txt"))).unwrap();
+    let code: i32 = std::fs::read_to_string(dir.join(format!("{name}.code")))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let d = workspace(&format!("probe-{name}-{}", why.len()));
+    std::fs::write(d.join("base.txt"), &raw).unwrap();
+    std::fs::write(d.join("edited.txt"), edit(&raw)).unwrap();
+    let script = |f: &str| format!("{BUSY} cat {f}; exit {code}");
+    let learn = prova(
+        &d,
+        &["run", "--json", "--", "sh", "-c", &script("base.txt")],
+    );
+    let json: serde_json::Value = serde_json::from_slice(&learn.stdout).unwrap();
+    let flaky = json["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["test"].as_str())
+        .find(|t| t.to_lowercase().contains("flaky"))
+        .unwrap_or_else(|| panic!("{name}: {}", text(&learn)));
+    prova(&d, &["quarantine", "add", flaky, "--reason", "clock"]);
+    let o = prova(&d, &["run", "--", "sh", "-c", &script("base.txt")]);
+    assert_eq!(o.status.code(), Some(0), "{name} base: {}", text(&o));
+    let o = prova(&d, &["run", "--", "sh", "-c", &script("edited.txt")]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{name} edited ({why}): {t}");
+    assert!(!passed(&t), "{name} edited ({why}): {t}");
+    assert!(t.contains(why), "{name} edited must say {why:?}: {t}");
+}
+
+const AFTER: &str = "the command printed more after the tests' summary";
+const OUTSIDE: &str = "outside the quarantined test";
+
+fn append(extra: &'static str) -> impl Fn(&str) -> String {
+    move |raw| format!("{raw}{extra}")
+}
+
+fn insert_before(marker: &'static str, extra: &'static str) -> impl Fn(&str) -> String {
+    move |raw| raw.replacen(marker, &format!("{extra}{marker}"), 1)
+}
+
+/// Round 16 probes: a step that ran after the tests, with no error word in
+/// its output, passed behind a quarantined failure.
+#[test]
+fn probe_steps_after_the_tests_summary_are_refused() {
+    for (name, extra) in [
+        (
+            "pytest-v",
+            "app/core.py:3:8: F401 [*] `os` imported but unused\nFound 1 error.\n",
+        ),
+        (
+            "pytest-v",
+            "./app/core.py:3:1: F401 'os' imported but unused\n",
+        ),
+        (
+            "go-test-v",
+            "calc/calc.go:9:2: fmt.Printf format %d has arg s of wrong type string\n",
+        ),
+        (
+            "pytest-v",
+            "In scripts/deploy.sh line 4:\nrm -rf $DIR/\n^-- SC2115 (warning): Use \"${var:?}\"\n",
+        ),
+        ("pytest-v", "smoke: GET /health returned 503\n"),
+        (
+            "pytest-v",
+            "Coverage failure: total of 85 is less than fail-under=90\n",
+        ),
+        (
+            "pytest-v",
+            "Jest: \"global\" coverage threshold for lines (90%) not met: 85%\n",
+        ),
+    ] {
+        probe(name, &append(extra), AFTER);
+    }
+}
+
+#[test]
+fn probe_a_coverage_gate_inside_the_failures_section_is_refused() {
+    probe(
+        "pytest-v",
+        &insert_before(
+            "=========================== short test summary info",
+            "---------- coverage: platform linux, python 3.12.1 ----------\nTOTAL 10 5 50%\nFAIL Required test coverage of 90% not reached. Total coverage: 50.00%\n",
+        ),
+        OUTSIDE,
+    );
+}
+
+#[test]
+fn probe_a_crash_naming_the_test_from_another_process_is_refused() {
+    for extra in [
+        "./scripts/check.sh: line 4: 31337 Segmentation fault (core dumped) ./bin/test_flaky_clock --integration\n",
+        "Error: test_flaky_clock fixture service exited with code 137 (OOMKilled)\n",
+    ] {
+        probe(
+            "pytest-v",
+            &insert_before("=================================== FAILURES", extra),
+            OUTSIDE,
+        );
+    }
+}
+
+#[test]
+fn probe_sub_make_failures_are_error_lines() {
+    for extra in [
+        "make[1]: *** [Makefile:6: lint] Error 1\n",
+        "make[1]: Target 'all' not remade because of errors.\n",
+    ] {
+        probe(
+            "pytest-v",
+            &insert_before("=================================== FAILURES", extra),
+            OUTSIDE,
+        );
+    }
+}
+
+#[test]
+fn probe_two_failed_cargo_targets_are_refused() {
+    probe(
+        "cargo-test",
+        &|raw| {
+            raw.replace(
+                "error: 1 target failed:\n    `--lib`\n",
+                "error: 2 targets failed:\n    `-p calc --lib`\n    `-p calc --test smoke`\n",
+            )
+        },
+        "error: 2 targets failed:",
+    );
+}
+
+#[test]
+fn probe_a_second_failed_file_is_refused() {
+    probe(
+        "jest-suites",
+        &|raw| raw.replace("Test Suites: 1 failed", "Test Suites: 2 failed"),
+        "failed file",
+    );
+}
+
+/// Round 16: nextest's retry that passed: the panic of the first try is
+/// the retried test's own, not an error outside any test.
+#[test]
+fn a_nextest_retry_that_passed_is_not_an_error_outside_a_test() {
+    let dir = fixture_dir();
+    let d = workspace("nextest-retry");
+    let script = format!(
+        "{BUSY} cat {}; exit 0",
+        dir.join("cargo-nextest-retry.txt").display()
+    );
+    let o = prova(&d, &["run", "--", "sh", "-c", &script]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{t}");
+    assert!(!t.contains("outside any failing test"), "{t}");
 }

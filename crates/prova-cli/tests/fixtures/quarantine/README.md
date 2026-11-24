@@ -30,3 +30,5 @@ Result files written by the same runs: `dotnet-test-normal.trx` (the TRX of
 `dotnet-test-normal`; the quiet `dotnet-test` writes none, the test gives it
 the same one) and `mvn.junit.xml` (surefire's `TEST-calc.CalcTest.xml`).
 Python, .NET and Maven ran in the `prova-fixture-*` images.
+
+Also: `cargo-nextest-retry` is `cargo nextest run --retries 1 -E 'test(retried)'` with a test that panics on its first try and passes on the second (exit 0). `jest-suites` is hand-made in Jest's format (no Jest here): one failed file of three.

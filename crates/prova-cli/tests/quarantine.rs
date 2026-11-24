@@ -247,7 +247,7 @@ fn a_quarantine_sets_aside_only_what_its_test_explains() {
     let script = format!(
         "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
          pass) echo 'test calc::x ... ok' ;; \
-         own) echo 'test calc::x ... FAILED'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
+         own) echo 'test calc::x ... FAILED'; echo 'failures:'; echo '---- calc::x stdout ----'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
          summary) echo 'test calc::x ... FAILED'; echo 'error: test run failed'; echo 'error: test failed, to rerun pass `--lib`'; exit 100 ;; \
          race) echo 'test calc::x ... FAILED'; echo 'WARNING: DATA RACE'; exit 101 ;; \
          build) echo 'test calc::x ... FAILED'; echo 'error[E0425]: cannot find value `y` in this scope'; exit 101 ;; \
