@@ -475,3 +475,61 @@ fn a_quarantine_accounts_for_every_error_line() {
         assert_eq!(o.status.code(), Some(1), "{state}: {}", text(&o));
     }
 }
+
+/// Round 15: in `go test -json`, a panic in the package's own output after
+/// the tests passed behind a quarantined failure.
+#[test]
+fn a_package_panic_in_go_json_is_not_a_quarantined_tests() {
+    let d = workspace("gojson-panic");
+    let ev = |a: &str, t: Option<&str>, out: Option<&str>| {
+        let mut v = serde_json::json!({"Action": a, "Package": "example.com/q"});
+        if let Some(t) = t {
+            v["Test"] = t.into();
+        }
+        if let Some(o) = out {
+            v["Output"] = format!("{o}\n").into();
+        }
+        format!("'{}'", v)
+    };
+    let lines = |panic: bool| {
+        let mut l = vec![
+            ev("run", Some("TestQueue"), None),
+            ev("pass", Some("TestQueue"), None),
+            ev("run", Some("TestQ"), None),
+            ev("output", Some("TestQ"), Some("=== RUN   TestQ")),
+            ev("output", Some("TestQ"), Some("    q_test.go:3: flake")),
+            ev("fail", Some("TestQ"), None),
+        ];
+        if panic {
+            l.push(ev("output", None, Some("panic: send on closed channel")));
+            l.push(ev("output", None, Some("goroutine 12 [running]:")));
+        }
+        l.push(ev("output", None, Some("FAIL\texample.com/q\t0.01s")));
+        l.push(ev("fail", None, None));
+        format!("{BUSY} printf '%s\\n' {}; exit 1", l.join(" "))
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.plain]\nrun = {:?}\n\n[suite.panic]\nrun = {:?}\n",
+            lines(false),
+            lines(true)
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "plain"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/q::TestQ",
+            "--reason",
+            "flake",
+        ],
+    );
+    let o = prova(&d, &["run", "plain"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "panic"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+}

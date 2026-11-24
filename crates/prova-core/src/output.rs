@@ -255,7 +255,9 @@ fn section_owner(t: &str) -> Option<String> {
         return (!name.is_empty()).then(|| name.to_owned());
     }
     if let Some(rest) = t.strip_prefix("---- ")
-        && let Some(name) = rest.strip_suffix(" stdout ----").or(rest.strip_suffix(" stderr ----"))
+        && let Some(name) = rest
+            .strip_suffix(" stdout ----")
+            .or(rest.strip_suffix(" stderr ----"))
     {
         return Some(name.to_owned());
     }
@@ -312,14 +314,22 @@ impl Distiller {
         }
         {
             let t = text_of(&line);
-            if let Some(o) = section_owner(&t) {
+            if line.starts_with('{') && line.contains("\"Output\"") {
+                // `go test -json`: the event says whose output it is; a
+                // package's own output is no test's (round 15: a panic
+                // after the tests was the last test's).
+                self.owner = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("Test").and_then(|t| t.as_str()).map(str::to_owned));
+            } else if let Some(o) = section_owner(&t) {
                 self.owner = Some(o);
             } else if ends_section(&t) {
                 self.owner = None;
             }
             if looks_like_error(&t) {
                 if self.error_lines.len() < ERROR_LINES {
-                    self.error_lines.push((n, t.into_owned(), self.owner.clone()));
+                    self.error_lines
+                        .push((n, t.into_owned(), self.owner.clone()));
                 } else {
                     self.error_overflow = true;
                 }
