@@ -1533,13 +1533,22 @@ fn observe_child(
                 "the framework counted {n} failure(s), more than the quarantined test(s) that failed ({}): something else failed too",
                 names.len()
             ));
-        } else if let Some((line, text)) =
-            unexplained_crash(store, run, &sup.distiller, names, &report.test_outputs)?
-        {
+        } else if exit_code.is_some_and(|c| c > 128) {
+            // Killed by a signal (exit 128 + n): cut short, whatever the
+            // tests said (round 15: exit 137 after a full summary passed).
             contradictions.push(format!(
-                "the output shows an error outside the quarantined test(s) (line {line}): {}",
-                text.trim().chars().take(160).collect::<String>()
+                "the command was killed (exit {}): a quarantine sets aside test failures, not a killed run",
+                exit_code.unwrap_or(0)
             ));
+        } else if let Some(why) = unaccounted_error(
+            store,
+            run,
+            &sup.distiller,
+            names,
+            &report.test_outputs,
+            &spec.command.display(),
+        )? {
+            contradictions.push(why);
         }
     }
     if let Some(code @ (126 | 127)) = exit_code {
@@ -1884,6 +1893,166 @@ fn quarantined_only_failures(
     (!names.is_empty() && verified_other).then_some(names)
 }
 
+/// Whether `name` occurs in `line` as a whole name, not inside a longer one
+/// (round 15: `test_q` covered a crash of `test_queue`).
+fn names_word(line: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(name).any(|(i, _)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + name.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// The ways a framework prints a test's name: the whole display, without
+/// its file or binary part, its last part, and Jest's `›` for ` > `.
+fn printed_names(display: &str) -> Vec<String> {
+    let mut out = vec![display.to_owned()];
+    if let Some((_, rest)) = display.split_once("::") {
+        out.push(rest.to_owned());
+    }
+    let last = display
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(display)
+        .rsplit(" > ")
+        .next()
+        .unwrap_or(display);
+    out.push(last.to_owned());
+    let more: Vec<String> = out
+        .iter()
+        .filter(|n| n.contains(" > "))
+        .map(|n| n.replace(" > ", " \u{203a} "))
+        .collect();
+    out.extend(more);
+    out.retain(|n| n.len() >= 3);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A test runner's own summary of failing tests that says nothing more
+/// than the failures seen: counts of failures with no error, the bare
+/// `FAIL` lines, a package's result, Maven's and make's wrap-up of a
+/// failed test step.
+fn summary_of_failures(t: &str, command: &str) -> bool {
+    let lower = t.to_lowercase();
+    let no_errors =
+        !lower.contains("error") || lower.contains("errors: 0") || lower.contains(" 0 error");
+    if runner_failure_summary(t)
+        || matches!(
+            t,
+            "FAIL" | "FAILED" | "failures:" | "=== Failed" | "BUILD FAILURE"
+        )
+    {
+        return true;
+    }
+    // go: `FAIL\tpkg\t0.01s` (a package's result, not a build failure).
+    if (t.starts_with("FAIL\t") || t.starts_with("FAIL "))
+        && !t.contains('[')
+        && t.split_whitespace().count() <= 3
+    {
+        return true;
+    }
+    // Counts: pytest's `=== 1 failed, 2 passed in 0.1s ===`, libtest's
+    // `test result: FAILED. ...`, Jest's and Vitest's `Tests:`/`Test
+    // Suites:`/`Test Files`, gotestsum's `DONE`, Maven's `Tests run:`,
+    // dotnet's `Failed!  - Failed:`.
+    let counts = (t.starts_with('=')
+        && (lower.contains(" failed") || lower.contains("short test summary")))
+        || t.starts_with("test result: FAILED.")
+        || t.starts_with("Tests:")
+        || t.starts_with("Tests ")
+        || t.starts_with("Test Suites:")
+        || t.starts_with("Test Files")
+        || t.starts_with("DONE ")
+        || t.starts_with("[ERROR] Tests run:")
+        || t.starts_with("Failed!  - Failed:")
+        || t == "Test Run Failed.";
+    if counts {
+        return no_errors;
+    }
+    // Maven's wrap-up of a failed test step.
+    if let Some(rest) = t.strip_prefix("[ERROR]") {
+        let r = rest.trim();
+        return r.is_empty()
+            || r == "Failures:"
+            || r.starts_with("-> [Help")
+            || r.starts_with("[Help ")
+            || r.starts_with("To see the full stack trace")
+            || r.starts_with("Re-run Maven")
+            || r.starts_with("For more information")
+            || r.starts_with("Please refer to")
+            || (r.starts_with("Failed to execute goal")
+                && (r.contains("surefire") || r.contains("failsafe"))
+                && r.contains("There are test failures"));
+    }
+    // make's line for the target the suite runs (`make test`).
+    if let Some(rest) = t
+        .strip_prefix("make: *** [")
+        .or_else(|| t.split_once("]: *** [").map(|(_, r)| r))
+        && let Some((target, _)) = rest.split_once(']')
+    {
+        let target = target.rsplit(':').next().unwrap_or(target).trim();
+        return !target.is_empty() && command.split_whitespace().any(|w| w == target);
+    }
+    false
+}
+
+/// The first error-looking line of the output that the quarantined
+/// failing tests do not account for, as the reason a quarantine cannot
+/// set the run aside (ADR 0029): it names one of them (as a whole name),
+/// is part of one's own output or failure message, or is the runner's
+/// summary of failures. Too many error lines to check is a reason too.
+fn unaccounted_error(
+    store: &Store,
+    run: &str,
+    distiller: &crate::output::Distiller,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+    command: &str,
+) -> Result<Option<String>> {
+    let (lines, overflow) = distiller.error_lines();
+    if overflow {
+        return Ok(Some(
+            "the output has more error lines than prova can account for: a quarantine sets aside only failures it can explain".into(),
+        ));
+    }
+    let mut own: Vec<String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o.clone())
+        .collect();
+    let mut stmt = store.conn().prepare(
+        "SELECT a.message FROM attempts a JOIN tests t ON t.id = a.test_id
+          WHERE a.run_id = ?1 AND t.display = ?2 AND a.message IS NOT NULL",
+    )?;
+    for name in quarantined {
+        for m in stmt.query_map(rusqlite::params![run, name], |r| r.get::<_, String>(0))? {
+            own.push(m?);
+        }
+    }
+    let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
+    Ok(lines.iter().find_map(|(n, line, owner)| {
+        let t = line.trim();
+        // In a quarantined test's own section (its own section header
+        // names it as a whole name too).
+        let in_own_section = owner
+            .as_deref()
+            .is_some_and(|o| names.iter().any(|q| names_word(o, q)));
+        let accounted = in_own_section
+            || names.iter().any(|q| names_word(t, q))
+            || own.iter().any(|o| o.contains(t))
+            || summary_of_failures(t, command);
+        (!accounted).then(|| {
+            format!(
+                "the output shows an error outside the quarantined test(s) (line {n}): {}",
+                t.chars().take(160).collect::<String>()
+            )
+        })
+    }))
+}
+
 /// The first crash-like line of the output that no quarantined failing
 /// test accounts for: it names one of them, or it is part of one's own
 /// output or failure message. With no quarantined failure, the first crash.
@@ -1914,19 +2083,10 @@ fn unexplained_crash(
     }
     // A name as frameworks print it: the whole display, or without the
     // binary or file part before the first `::`.
-    let names: Vec<&str> = quarantined
-        .iter()
-        .flat_map(|n| {
-            [
-                n.as_str(),
-                n.split_once("::").map_or(n.as_str(), |(_, r)| r),
-            ]
-        })
-        .filter(|n| n.len() >= 4)
-        .collect();
+    let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
     Ok(crashes.into_iter().find(|(_, line)| {
         let t = line.trim();
-        !names.iter().any(|n| t.contains(n))
+        !names.iter().any(|n| names_word(t, n))
             && !own.iter().any(|o| o.contains(t))
             && !runner_failure_summary(t)
     }))

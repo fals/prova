@@ -419,3 +419,59 @@ fn a_set_aside_pass_is_no_last_green_and_selections_stay_quiet() {
     let out = text(&prova(&d, &["run", "make", "--select", "calc::y"]));
     assert!(!out.contains("quarantined:"), "{out}");
 }
+
+/// Round 15: the guard matched a short list of crash lines; a coverage
+/// gate, a type checker, another make target, a killed run, an interrupted
+/// session or a crash of `test_queue` (next to quarantined `test_q`)
+/// passed behind a quarantined failure. Every error line must now be
+/// accounted for (ADR 0029).
+#[test]
+fn a_quarantine_accounts_for_every_error_line() {
+    let d = workspace("accounts");
+    let pytest = "printf '%s\\n' 'collected 3 items' \
+        'tests/test_a.py::test_q FAILED      [ 33%]' \
+        'tests/test_a.py::test_queue PASSED  [ 66%]' \
+        'tests/test_a.py::test_other PASSED  [100%]' \
+        '=================================== FAILURES ===================================' \
+        '___________________________________ test_q ____________________________________' \
+        '    def test_q():' \
+        '>       assert 2 == 1' \
+        'E       assert 2 == 1' \
+        'tests/test_a.py:3: AssertionError' \
+        '=========================== short test summary info ============================' \
+        'FAILED tests/test_a.py::test_q - assert 2 == 1' \
+        '========================= 1 failed, 2 passed in 0.12s =========================='";
+    let script = format!(
+        "{BUSY} : make test; {pytest}; case \"$(cat state)\" in \
+         plain) echo 'make: *** [Makefile:2: test] Error 1'; exit 2 ;; \
+         coverage) echo 'FAIL Required test coverage of 90% not reached. Total coverage: 50.00%'; exit 1 ;; \
+         tsc) echo \"src/app.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.\"; exit 1 ;; \
+         lint) echo 'make: *** [Makefile:5: lint] Error 1'; exit 2 ;; \
+         killed) exit 137 ;; \
+         segv) echo 'tests/test_a.py::test_queue Segmentation fault (core dumped)'; exit 1 ;; \
+         interrupted) echo '!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!'; exit 2 ;; \
+         esac"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.make]\nrun = {script:?}\n"),
+    )
+    .unwrap();
+    run(&d, "make", "plain");
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests.test_a::test_q",
+            "--reason",
+            "flake",
+        ],
+    );
+    let o = run(&d, "make", "plain");
+    assert_eq!(o.status.code(), Some(0), "plain: {}", text(&o));
+    for state in ["coverage", "tsc", "lint", "killed", "segv", "interrupted"] {
+        let o = run(&d, "make", state);
+        assert_eq!(o.status.code(), Some(1), "{state}: {}", text(&o));
+    }
+}
