@@ -22,7 +22,15 @@ needs attention.
    continue (`next: prova wait <run> --until done`): run exactly that, once
    per tool call. Never wrap prova in shell loops, pipes, `sleep` or output
    parsing: every intent has a command, and `--json` gives one object when
-   you need fields. If your tool calls are shorter than 9 minutes, pass
+   you need fields.
+
+   Read prova's output whole: never pipe it through `grep`, `head`, `tail`,
+   `cut` or similar. It is already short (a passing run is about six
+   lines), failures come first, and it ends with warnings, notes and the
+   `next:` command; filtering drops exactly those, so an unverified pass or
+   the command to continue goes unseen. Need one thing? Ask prova for it:
+   `prova status <run>`, `prova output <run> --tail N`,
+   `prova history <test>`. If your tool calls are shorter than 9 minutes, pass
    `--max-wait`. While it waits, prova prints each new failure and a line
    every 30 s on stderr, for the person watching; the result is on stdout.
    Use `--detach` only to do other work meanwhile; then
