@@ -279,3 +279,29 @@ fn a_quarantine_sets_aside_only_what_its_test_explains() {
         );
     }
 }
+
+/// Round 14: a bare name seen once (gotestsum's text) and the same test
+/// qualified (its json stream) were two tests; `add` set aside the stale
+/// bare one, and the real failure still failed the run.
+#[test]
+fn a_bare_name_with_a_qualified_twin_is_ambiguous() {
+    let d = workspace("twin");
+    flaky_history(&d);
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n\n[suite.bare]\nrun = {:?}\n",
+            full(),
+            format!("{BUSY} echo 'test x ... FAILED'; exit 1")
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "bare"]);
+    let o = prova(&d, &["quarantine", "add", "x", "--reason", "r"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{out}");
+    assert!(out.contains("also known qualified, as calc::x"), "{out}");
+    let o = prova(&d, &["quarantine", "add", "calc::x", "--reason", "r"]);
+    let out = text(&o);
+    assert!(out.contains("this machine's prova store"), "{out}");
+}

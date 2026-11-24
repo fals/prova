@@ -350,7 +350,9 @@ Examples:
   prova quarantine remove calc::flaky_clock
 
 A quarantined test still runs and keeps its history. If it is the only thing
-that fails, the run passes; every summary lists it. A quarantine expires.")]
+that fails, the run passes; every summary lists it. A quarantine expires.
+It is kept in this machine's prova store (PROVA_HOME), not in the repository:
+CI and teammates do not see it; each quarantines in its own store.")]
     Quarantine {
         #[command(subcommand)]
         action: QuarantineCmd,
@@ -1844,8 +1846,21 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
             names.sort();
             names.dedup();
-            let name = if names.contains(&test) {
+            // A bare name that is also a qualified test's tail is the same
+            // test seen two ways (round 14: gotestsum text, then go json):
+            // say which, rather than set aside the stale one.
+            let qualified: Vec<&String> = names
+                .iter()
+                .filter(|n| **n != test && n.ends_with(&format!("::{test}")))
+                .collect();
+            let name = if names.contains(&test) && qualified.is_empty() {
                 test.clone()
+            } else if names.contains(&test) {
+                return Err(UsageError(format!(
+                    "{test:?} is also known qualified, as {}; quarantine the name your suite reports now (see `prova status last`)",
+                    qualified.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ))
+                .into());
             } else {
                 match names.as_slice() {
                     [one] => one.clone(),
@@ -1867,7 +1882,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             let e = q::add(store, &name, &reason, days, now_ms())?;
             println!(
-                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it",
+                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
                 render::clean(&e.reason),
                 render::expires_in(e.expires_ms)
