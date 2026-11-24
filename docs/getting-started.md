@@ -57,7 +57,9 @@ cargo install --git https://github.com/fals/prova --tag v0.1.1 prova-cli
 
 ### Platform notes
 
-On macOS, prova watches test processes through `ps` instead of `/proc`.
+On macOS, prova watches test processes through `ps` instead of `/proc`,
+and a test's sockets through `lsof` (installed with macOS; without it, sizes
+see processes only).
 Two checks need counters macOS does not give: a pass whose command used
 no CPU at all is not flagged there, and experiments run without a
 sandbox or CPU counters (every verdict says which checks did not run).
@@ -86,7 +88,21 @@ prova run default --select <test>
 prova history <test>            # new failure, flaky, or pre-existing?
 prova output <run>              # the kept excerpt; --test <name> for one failing test's output
 prova run default --repeat 5    # is it flaky? each test's tally over 5 runs
+prova sizes                     # small / medium / large by what each test used
 ```
+
+While a run goes, failures print as they happen. On a terminal a live line
+below them shows the elapsed time, the counts and the test running now (or
+the command's latest output line, when prova cannot see individual tests);
+it is erased before the result. Agents and CI logs get compact output: no
+live line, one progress line every 30 s.
+
+Sizes follow what a test used, never its duration: one process and no
+network is small, more processes or `localhost` is medium, another host is
+large ([ADR 0025](adr/0025-sizes-by-resources.md)). prova can tell only for
+tests it sees alone or in their own process (nextest runs each test so);
+`prova sizes` says how many it could not see, and `prova history <test>`
+shows a test's size with the reason.
 
 A run whose results were not real (a broken fixture, a stale report) can be
 taken out of every test's history: `prova forget <run> --reason "..."`.

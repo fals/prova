@@ -170,6 +170,11 @@ flowchart LR
 - Processes that outlive the run are reported as leaked and killed.
 - The tree is the group plus every descendant, even one in a group of its
   own: nextest starts each test so.
+- While a wait goes on, failures, slow tests and stalls print as they
+  happen. When stderr is a terminal, a live line is redrawn every 0.5 s
+  (elapsed time, counts, the running test, or the command's last output
+  line when no test is visible) and erased before anything else prints;
+  otherwise one line every 30 s, so agents' and CI logs stay compact.
 
 ## Test sizes
 
