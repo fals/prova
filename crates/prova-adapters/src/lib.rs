@@ -268,7 +268,21 @@ impl Observer for Ladder {
                 outcomes.len()
             ));
         }
-        if self.live.total() > seen {
+        // Passing tests seen one by one: the output was not quiet, so verbose
+        // output is not the advice (round 12 audit: a collection error or a
+        // subtest the framework counts on its own line).
+        let passes_seen = outcomes
+            .values()
+            .any(|o| *o == prova_core::model::Outcome::Passed);
+        if self.live.total() > seen && passes_seen {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "the framework counted {} tests but prova saw {seen} individually: the rest left no \
+                     per-test result prova reads (a collection or setup error?); `prova output` shows the run",
+                    self.live.total()
+                ),
+            });
+        } else if self.live.total() > seen {
             report.events.push(EventKind::RunNote {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \

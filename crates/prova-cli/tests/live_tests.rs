@@ -196,3 +196,24 @@ fn wait_on_a_finished_run_reports_done() {
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
 }
+
+/// Round 12 count audit: verbose output with a collection error was told
+/// to "run with verbose output". Medium: the CLI's notes.
+#[test]
+fn a_gap_in_verbose_output_is_not_blamed_on_quiet_output() {
+    let d = workspace("gap-verbose");
+    let s = json(&prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'tests/test_a.py::test_one PASSED  [100%]'; echo 'ERROR tests/test_b.py'; echo '===== 1 passed, 1 error in 0.01s ====='; exit 1",
+        ],
+    ));
+    let notes = s["notes"].to_string();
+    assert!(notes.contains("left no per-test result"), "{s}");
+    assert!(!notes.contains("verbose output"), "{s}");
+}

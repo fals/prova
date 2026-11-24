@@ -323,6 +323,16 @@ impl Recognizers {
         let mut n = 0;
         for part in body.split([';', ',']) {
             let mut w = part.split_whitespace();
+            // pytest 9: "7 subtests passed" (failed subtests are in "failed").
+            if let (Some(num), Some("subtests"), Some("passed" | "skipped")) = (
+                part.split_whitespace().next(),
+                part.split_whitespace().nth(1),
+                part.split_whitespace().nth(2),
+            ) && let Ok(v) = num.parse::<u64>()
+            {
+                n += v;
+                continue;
+            }
             if let (Some(num), Some(word)) = (w.next(), w.next())
                 && let Ok(v) = num.parse::<u64>()
                 && [
@@ -588,7 +598,15 @@ impl Recognizers {
                 };
                 // Go test names cannot contain '/': one that does is a
                 // subtest (`t.Run`).
-                self.result(key(t), outcome, elapsed, msg, Level::Native, t.contains('/'), out);
+                self.result(
+                    key(t),
+                    outcome,
+                    elapsed,
+                    msg,
+                    Level::Native,
+                    t.contains('/'),
+                    out,
+                );
             }
             ("fail", None) => {
                 // Package failed without any failing test: build error or crash.
@@ -724,6 +742,9 @@ impl Recognizers {
     /// teardown). Setup starts the test (or ends it when it fails or skips),
     /// call ends it.
     fn reportlog(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        if v["$report_type"] == "SubTestReport" {
+            return self.reportlog_subtest(v, out);
+        }
         if v["$report_type"] != "TestReport" {
             return;
         }
@@ -762,6 +783,50 @@ impl Recognizers {
         };
         let duration = v["duration"].as_f64().map(|s| (s * 1000.0).round() as u64);
         self.finished(key, outcome, duration, msg, Level::Native, out);
+    }
+
+    /// pytest 9 subtests (`subtests.test(...)`, unittest's `subTest`): one
+    /// report per subtest, labelled like pytest's own output.
+    fn reportlog_subtest(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        let (Some(id), Some(result)) = (v["nodeid"].as_str(), v["outcome"].as_str()) else {
+            return;
+        };
+        lift(&mut self.level, Level::Native);
+        let ctx = &v["_subtest.context"];
+        let mut label = String::new();
+        if let Some(m) = ctx["msg"].as_str() {
+            label.push_str(&format!("[{m}] "));
+        }
+        if let Some(kw) = ctx["kwargs"].as_object()
+            && !kw.is_empty()
+        {
+            let args: Vec<String> = kw
+                .iter()
+                .map(|(k, x)| format!("{k}={}", x.as_str().map_or(x.to_string(), str::to_owned)))
+                .collect();
+            label.push_str(&format!("({})", args.join(", ")));
+        }
+        let outcome = match result {
+            "passed" => Outcome::Passed,
+            "failed" => Outcome::Failed,
+            "skipped" => Outcome::Skipped,
+            _ => return,
+        };
+        let key = pytest_subtest(pytest_key(id), label.trim());
+        let longrepr = &v["longrepr"];
+        let msg = if outcome.is_failure() {
+            let text = reportlog_text(longrepr);
+            if !text.is_empty() {
+                self.failure_output.push((key.clone(), text));
+            }
+            longrepr["reprcrash"]["message"]
+                .as_str()
+                .or(longrepr.as_str())
+                .map(|m| m.trim().to_owned())
+        } else {
+            None
+        };
+        self.result(key, outcome, None, msg, Level::Native, true, out);
     }
 
     // ------------------------------------------------------------- go -v
@@ -913,36 +978,101 @@ impl Recognizers {
     // ------------------------------------------------------------- pytest
 
     fn pytest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
-        // Verbose: "tests/test_x.py::test_a PASSED  [ 50%]"
-        // Summary: "FAILED tests/test_x.py::test_b - AssertionError: boom"
-        for (word, outcome) in [("FAILED", Outcome::Failed), ("ERROR", Outcome::Errored)] {
-            if let Some(rest) = line.strip_prefix(word).and_then(|r| r.strip_prefix(' '))
-                && rest.contains("::")
-            {
-                let (id, msg) = match rest.split_once(" - ") {
-                    Some((i, m)) => (i.trim(), Some(m.trim().to_owned())),
-                    None => (rest.trim(), None),
-                };
-                self.finished(pytest_key(id), outcome, None, msg, Level::Recognized, out);
-                return true;
+        // Summary lines (`-rA`, and failures always):
+        //   "FAILED tests/test_x.py::test_b - AssertionError: boom"
+        //   "SUBFAILED[case] (i=2) tests/test_x.py::test_b - assert 2 != 2"
+        for (word, outcome) in [
+            ("FAILED", Outcome::Failed),
+            ("ERROR", Outcome::Errored),
+            ("PASSED", Outcome::Passed),
+            ("XPASS", Outcome::Passed),
+            ("XFAIL", Outcome::Skipped),
+            ("SUBFAILED", Outcome::Failed),
+            ("SUBPASSED", Outcome::Passed),
+        ] {
+            let Some(rest) = line.strip_prefix(word) else {
+                continue;
+            };
+            let sub = word.starts_with("SUB");
+            if !sub && !rest.starts_with(' ') {
+                continue;
+            }
+            let (left, msg) = match rest.split_once(" - ") {
+                Some((i, m)) => (i, Some(m.trim().to_owned())),
+                None => (rest, None),
+            };
+            // The id is the word with ".py::" (a subtest's label comes first).
+            let Some(at) = left.find(".py::") else {
+                continue;
+            };
+            let start = left[..at].rfind(' ').map_or(0, |i| i + 1);
+            let id = left[start..].trim();
+            let label = left[..start].trim();
+            let key = pytest_key(id);
+            let (key, sub) = if sub {
+                (pytest_subtest(key, label), true)
+            } else {
+                (key, false)
+            };
+            let msg = msg.filter(|_| outcome.is_failure());
+            self.result(key, outcome, None, msg, Level::Recognized, sub, out);
+            return true;
+        }
+        // Verbose: "tests/test_x.py::test_a[g h] PASSED  [ 50%]",
+        // "tests/test_x.py::test_c SUBPASSED[case] (i=0)  [100%]". An id may
+        // contain spaces: the status word decides where it ends.
+        if !line.contains(".py::") {
+            return false;
+        }
+        const STATUS: [(&str, Outcome); 9] = [
+            ("SUBPASSED", Outcome::Passed),
+            ("SUBFAILED", Outcome::Failed),
+            ("SUBSKIPPED", Outcome::Skipped),
+            ("PASSED", Outcome::Passed),
+            ("FAILED", Outcome::Failed),
+            ("SKIPPED", Outcome::Skipped),
+            ("ERROR", Outcome::Errored),
+            // As pytest's own reports: an expected failure is skipped, an
+            // unexpected (non-strict) pass is a pass. A strict XPASS prints
+            // FAILED.
+            ("XFAIL", Outcome::Skipped),
+            ("XPASS", Outcome::Passed),
+        ];
+        let mut found: Option<(usize, &str, Outcome)> = None;
+        for (word, outcome) in STATUS {
+            for (i, _) in line.match_indices(&format!(" {word}")) {
+                let after = &line[i + 1 + word.len()..];
+                let bounded = after.is_empty()
+                    || after.starts_with([' ', '[', '('])
+                    || word.starts_with("SUB");
+                // Never inside the id's own parameters.
+                if bounded && line[..i].contains(".py::") && found.is_none_or(|f| i > f.0) {
+                    found = Some((i, word, outcome));
+                }
             }
         }
-        let Some((id, rest)) = line.split_once(' ') else {
+        let Some((i, word, outcome)) = found else {
             return false;
         };
-        if !id.contains("::") || !id.contains(".py") {
-            return false;
+        let id = line[..i].trim();
+        if id.contains(' ') && !id.contains('[') {
+            return false; // not an id: prose that mentions a test file
         }
-        let outcome = match rest.split_whitespace().next() {
-            Some("PASSED") | Some("XFAIL") => Outcome::Passed,
-            Some("FAILED") | Some("XPASS") => Outcome::Failed,
-            Some("SKIPPED") => Outcome::Skipped,
-            Some("ERROR") => Outcome::Errored,
-            _ => return false,
-        };
+        let key = pytest_key(id);
+        if word.starts_with("SUB") {
+            let rest = &line[i + 1 + word.len()..];
+            // Drop the progress column: "[100%]".
+            let label = match rest.trim_end().rsplit_once(" [") {
+                Some((l, p)) if p.ends_with("%]") => l,
+                _ => rest,
+            };
+            let key = pytest_subtest(key, label.trim());
+            self.result(key, outcome, None, None, Level::Recognized, true, out);
+            return true;
+        }
         // Failures are recorded now to keep first-failure fast; the message
         // only appears later in the summary section.
-        self.finished(pytest_key(id), outcome, None, None, Level::Recognized, out);
+        self.finished(key, outcome, None, None, Level::Recognized, out);
         true
     }
 
@@ -1404,11 +1534,38 @@ fn split_rust_path(name: &str) -> (Vec<String>, String) {
     }
 }
 
+/// A pytest subtest: the parent's key, named as pytest prints it
+/// ("test_b [case] (i=2)", "test_b (i=1)").
+fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
+    if !label.is_empty() {
+        parent.name = format!("{} {label}", parent.name);
+    }
+    parent
+}
+
 /// "tests/test_x.py::TestCls::test_a[p]" -> path ["tests.test_x.TestCls"],
 /// name "test_a[p]": the same key pytest's JUnit report produces
 /// (classname, name), so live and file results are one test.
 fn pytest_key(id: &str) -> TestKey {
-    let mut parts: Vec<&str> = id.split("::").collect();
+    // "::" inside a parameter id ("test[c::d]") is not a separator.
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    let b = id.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b':' if depth <= 0 && b.get(i + 1) == Some(&b':') => {
+                parts.push(&id[from..i]);
+                from = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&id[from..]);
     let name = parts.pop().unwrap_or(id).to_owned();
     let mut class: Vec<String> = Vec::new();
     if let Some(file) = parts.first() {
@@ -1529,6 +1686,121 @@ mod tests {
             ]
         );
         assert!(matches!(ev.last(), Some(EventKind::TestSlow { .. })));
+    }
+
+    fn subtests(events: &[EventKind]) -> Vec<(String, Outcome)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    outcome,
+                    subtest: true,
+                    ..
+                } => Some((test.display(), *outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Round 12 count audit: pytest's own counts, in text.
+    #[test]
+    fn pytest_text_counts_as_pytest_does() {
+        let (r, ev) = feed(
+            "tests/t.py::test_xfail XFAIL (not yet)                     [ 20%]\n\
+             tests/t.py::test_xpass XPASS (fixed)                       [ 40%]\n\
+             tests/t.py::test_p[g h] PASSED                             [ 60%]\n\
+             tests/t.py::test_p[c::d] FAILED                            [ 80%]\n\
+             tests/t.py::test_p[x PASSED y] PASSED                      [100%]\n\
+             FAILED tests/t.py::test_p[c::d] - assert 1 == 2\n\
+             ===== 1 failed, 2 passed, 1 xfailed, 1 xpassed in 0.01s =====",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.t::test_xfail".into(), Outcome::Skipped),
+                ("tests.t::test_xpass".into(), Outcome::Passed),
+                ("tests.t::test_p[g h]".into(), Outcome::Passed),
+                ("tests.t::test_p[c::d]".into(), Outcome::Failed),
+                ("tests.t::test_p[x PASSED y]".into(), Outcome::Passed),
+            ]
+        );
+        assert_eq!((r.total(), r.failed_reported()), (5, 1));
+    }
+
+    /// `-rA`: the short summary names passing tests too.
+    #[test]
+    fn pytest_short_summary_names_passes() {
+        let (_, ev) = feed("PASSED tests/t.py::test_a\nXFAIL tests/t.py::test_b - reason");
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.t::test_a".into(), Outcome::Passed),
+                ("tests.t::test_b".into(), Outcome::Skipped),
+            ]
+        );
+    }
+
+    /// pytest 9.2's subtests, as it prints them (round 12 count audit: a
+    /// failing unittest subTest was recorded as a pass).
+    #[test]
+    fn pytest_subtests_in_text_are_subtests() {
+        let (r, ev) = feed(
+            "tests/test_s.py::T::test_subs_fail PASSED                                [ 33%]\n\
+             tests/test_s.py::T::test_subs_pass PASSED                                [ 66%]\n\
+             tests/test_s.py::test_native_subtests SUBPASSED[case] (i=0)              [100%]\n\
+             tests/test_s.py::test_native_subtests SUBPASSED[case] (i=1)              [100%]\n\
+             tests/test_s.py::test_native_subtests SUBFAILED[case] (i=2)              [100%]\n\
+             tests/test_s.py::test_native_subtests FAILED                             [100%]\n\
+             SUBFAILED(i=1) tests/test_s.py::T::test_subs_fail - AssertionError: 1 == 1\n\
+             SUBFAILED[case] (i=2) tests/test_s.py::test_native_subtests - assert 2 != 2\n\
+             FAILED tests/test_s.py::test_native_subtests - contains 1 failed subtest\n\
+             ================ 3 failed, 2 passed, 7 subtests passed in 0.02s ================",
+        );
+        assert_eq!(
+            subtests(&ev),
+            vec![
+                (
+                    "tests.test_s::test_native_subtests [case] (i=0)".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=1)".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=2)".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "tests.test_s.T::test_subs_fail (i=1)".into(),
+                    Outcome::Failed
+                ),
+            ]
+        );
+        assert_eq!(r.total(), 12);
+    }
+
+    #[test]
+    fn pytest_reportlog_subtests_are_subtests() {
+        let (_, ev) = feed(concat!(
+            r#"{"nodeid": "tests/test_s.py::T::test_subs_fail", "when": "call", "outcome": "failed", "_subtest.context": {"msg": null, "kwargs": {"i": "1"}}, "longrepr": {"reprcrash": {"message": "AssertionError: 1 == 1"}}, "$report_type": "SubTestReport"}"#,
+            "\n",
+            r#"{"nodeid": "tests/test_s.py::test_native_subtests", "when": "call", "outcome": "passed", "_subtest.context": {"msg": "case", "kwargs": {"i": "0"}}, "$report_type": "SubTestReport"}"#,
+        ));
+        assert_eq!(
+            subtests(&ev),
+            vec![
+                (
+                    "tests.test_s.T::test_subs_fail (i=1)".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=0)".into(),
+                    Outcome::Passed
+                ),
+            ]
+        );
     }
 
     #[test]
