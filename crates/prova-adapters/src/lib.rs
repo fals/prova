@@ -284,7 +284,11 @@ impl Observer for Ladder {
             .seen
             .values()
             .any(|(_, o)| *o == prova_core::model::Outcome::Passed);
+        // One note per cause (round 14: gotestsum's note and the generic
+        // quiet-output note said the same thing twice).
+        let mut quiet_explained = false;
         if self.live.gotestsum_seen && !self.live.gotestsum_stream && hid_passes {
+            quiet_explained = true;
             report.events.push(EventKind::RunNote {
                 message: "gotestsum's default output prints only failures: passing tests are not recorded, so flaky detection is blind; add `inject = [\"gotestsum-json\"]` to the suite in prova.toml (prova reads gotestsum's own event stream) or run it with `--format testname`".into(),
             });
@@ -297,6 +301,7 @@ impl Observer for Ladder {
                 .any(|(_, o)| *o == prova_core::model::Outcome::Passed)
             && finals.is_empty()
         {
+            quiet_explained = true;
             report.events.push(EventKind::RunNote {
                 message: "`go test` without -v or -json prints only failures: passing tests are not recorded, so flaky detection is blind; run `go test -json` (prova adopt proposes it; if prova.toml has such a suite, run that suite)".into(),
             });
@@ -414,7 +419,7 @@ impl Observer for Ladder {
                     self.live.total()
                 ),
             });
-        } else if self.live.total() > seen {
+        } else if self.live.total() > seen && !quiet_explained {
             report.events.push(EventKind::RunNote {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \

@@ -1074,3 +1074,19 @@ fn event_timestamps_never_go_back() {
         .collect();
     assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ev}");
 }
+
+/// Round 14: gotestsum's default output gave two notes saying the same
+/// thing (its own, and the generic quiet-output one).
+#[test]
+fn gotestsum_quiet_output_is_explained_once() {
+    let d = workspace("gts-once");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\n' '✓  example.com/m (1ms)' '✖  example.com/m/b (2ms)' '' '=== Failed' '=== FAIL: example.com/m/b TestB (0.00s)' '    b_test.go:9: boom' '' 'DONE 5 tests, 1 failure in 0.1s'; exit 1";
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", script]);
+    let v = json(&o);
+    let notes = v["notes"].to_string();
+    assert_eq!(
+        notes.matches("passing tests are not recorded").count(),
+        1,
+        "{notes}"
+    );
+}
