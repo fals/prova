@@ -34,6 +34,18 @@ Contents: [Failure history](#failure-history) ·
   those passes prove little. Say so when you report the suite green.
 - `environment-dependent, not flaky`: the test passed on this code only
   with different environment variables (named); find which one matters.
+- `warning: N known flaky test(s) did not run: ...`: the command left a
+  known flaky test out (an exclude filter, a narrower suite). That is not a
+  pass of it, and the run is unverified. To set a flaky test aside in the
+  open instead, `prova quarantine add <test> --reason "..."` (expires in 14
+  days, `--days N` up to 90): it still runs and keeps its history; if it is
+  the only failure the run passes, verified for the rest. Every summary
+  lists it as `quarantined: <test> <result> (<reason>; expires in Nd)`;
+  `prova quarantine list` and `remove` manage it. Do not quarantine a test
+  that fails every time now; that is a real failure.
+- `slow tests: a 1.5s, b 1.1s (prova slowest)`: the slowest tests of this run
+  (1 s or more). `prova slowest [--suite S] [-n N]` lists p50 and p95 from
+  history, worst first.
 
 ## Run state
 

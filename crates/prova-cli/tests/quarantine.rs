@@ -1,0 +1,239 @@
+//! Medium tests for ADR 0027 (usability round 13): quarantine of known-flaky
+//! tests, the warning for a flaky test left out of the command, and slow
+//! tests. Real runs are needed: both come from the store's history across
+//! suites. A medium test because a smaller one cannot run the CLI end to end.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const PROVA: &str = env!("CARGO_BIN_EXE_prova");
+
+fn workspace(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-q-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(".gitignore"), "state\nn\n").unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    d
+}
+
+fn prova(dir: &Path, args: &[&str]) -> Output {
+    Command::new(PROVA)
+        .args(args)
+        .current_dir(dir)
+        .env("PROVA_HOME", format!("{}.home", dir.display()))
+        .output()
+        .expect("run prova")
+}
+
+fn text(o: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// Some real work first: prova does not believe results printed by a
+/// command that used no CPU (round 10). `calc::ok` and `calc::y` always
+/// pass; `calc::x` follows the file `state`.
+const BUSY: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done;";
+fn full() -> String {
+    format!(
+        "{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi"
+    )
+}
+/// The same suite as `full`, with the flaky test left out of the command.
+fn without_x() -> String {
+    format!("{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::y ... ok'")
+}
+
+fn suites(d: &Path) {
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n\n[suite.stable]\nrun = {:?}\n",
+            full(),
+            without_x()
+        ),
+    )
+    .unwrap();
+}
+
+fn run(d: &Path, suite: &str, state: &str) -> Output {
+    std::fs::write(d.join("state"), state).unwrap();
+    prova(d, &["run", suite])
+}
+
+/// `calc::x` is known to prova and flaky: it passed and failed on one code.
+fn flaky_history(d: &Path) {
+    suites(d);
+    run(d, "make", "pass");
+    run(d, "make", "fail");
+}
+
+#[test]
+fn a_quarantined_test_that_fails_does_not_fail_the_run_and_is_listed() {
+    let d = workspace("fails");
+    flaky_history(&d);
+    let o = prova(
+        &d,
+        &["quarantine", "add", "calc::x", "--reason", "clock tick"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = run(&d, "make", "fail");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains("PASSED") && !out.contains("unverified"),
+        "verified for the rest: {out}"
+    );
+    assert!(
+        out.contains("quarantined")
+            && out.contains("calc::x")
+            && out.contains("failed")
+            && out.contains("clock tick"),
+        "{out}"
+    );
+    // History keeps the failure: quarantine hides nothing from it.
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(h.contains("fail"), "{h}");
+}
+
+#[test]
+fn a_quarantined_pass_is_verified_and_still_listed() {
+    let d = workspace("passes");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&run(&d, "make", "pass"));
+    assert!(
+        out.contains("PASSED") && !out.contains("unverified") && !out.contains("known flaky"),
+        "{out}"
+    );
+    assert!(
+        out.contains("quarantined") && out.contains("calc::x"),
+        "{out}"
+    );
+}
+
+#[test]
+fn another_failure_next_to_a_quarantined_one_still_fails_the_run() {
+    let d = workspace("other");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{BUSY} if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; echo 'test calc::z ... ok'; else echo 'test calc::x ... FAILED'; echo 'test calc::z ... FAILED'; exit 1; fi"
+            )
+        ),
+    )
+    .unwrap();
+    run(&d, "make", "pass");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "make", "fail");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("FAIL calc::z"), "{out}");
+}
+
+#[test]
+fn quarantine_list_remove_and_unknown_tests() {
+    let d = workspace("cli");
+    flaky_history(&d);
+    let o = prova(&d, &["quarantine", "add", "calc::nope", "--reason", "r"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    prova(
+        &d,
+        &["quarantine", "add", "calc::x", "--reason", "clock tick"],
+    );
+    let l = text(&prova(&d, &["quarantine", "list"]));
+    assert!(l.contains("calc::x") && l.contains("clock tick"), "{l}");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["quarantine", "list", "--json"]))).unwrap();
+    assert_eq!(j[0]["test"], "calc::x");
+    let o = prova(&d, &["quarantine", "remove", "calc::x"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let l = text(&prova(&d, &["quarantine", "list"]));
+    assert!(
+        !l.contains("calc::x") && l.contains("no quarantined"),
+        "{l}"
+    );
+    // Back to counting: a known flaky pass is unverified again.
+    let out = text(&run(&d, "make", "pass"));
+    assert!(out.contains("known flaky"), "{out}");
+}
+
+/// Round 13: excluding the flaky test in the command gave a clean verified
+/// pass, because the new suite had no history of its own.
+#[test]
+fn leaving_a_known_flaky_test_out_of_another_suite_is_warned_about() {
+    let d = workspace("leftout");
+    flaky_history(&d);
+    let out = text(&run(&d, "stable", "pass"));
+    assert!(
+        out.contains("PASSED (unverified")
+            && out.contains("1 known flaky test(s) did not run: calc::x"),
+        "{out}"
+    );
+    // Setting it aside openly is accepted, and listed as not run.
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&run(&d, "stable", "pass"));
+    assert!(
+        out.contains("PASSED") && !out.contains("unverified") && !out.contains("did not run"),
+        "{out}"
+    );
+    assert!(
+        out.contains("quarantined") && out.contains("not run"),
+        "{out}"
+    );
+}
+
+/// Round 13: nothing listed slow tests. The script really takes over a
+/// second and a half, so the reported 1.5 s is possible (a longer test than the run is
+/// an impossible result, ADR 0022).
+#[test]
+fn slow_tests_are_named_in_the_summary_and_listed_by_slowest() {
+    let d = workspace("slow");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{BUSY} sleep 1.7; echo '--- PASS: TestSlow (1.50s)'; echo '--- PASS: TestFast (0.01s)'"
+            )
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make"]));
+    assert!(out.contains("slow tests: TestSlow 1.5s"), "{out}");
+    assert!(!out.contains("TestFast 0"), "{out}");
+    let s = text(&prova(&d, &["slowest"]));
+    let slow = s.find("TestSlow").expect("listed");
+    let fast = s.find("TestFast").expect("listed");
+    assert!(slow < fast, "worst first: {s}");
+    assert!(s.contains("p50") && s.contains("p95"), "{s}");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["slowest", "-n", "1", "--json"]))).unwrap();
+    assert_eq!(j.as_array().unwrap().len(), 1);
+    assert_eq!(j[0]["test"], "TestSlow");
+}
