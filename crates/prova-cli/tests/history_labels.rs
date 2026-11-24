@@ -632,3 +632,118 @@ fn a_cancelled_run_is_cancelled_in_json_too() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["history"]["last"]["outcome"], "cancelled", "{v}");
 }
+
+/// Round 13 (Rust): an old run's labels were recomputed from today's
+/// history ("failed 8x before" on a run that followed 3 failures; a test
+/// called known-flaky before it ever flaked), and the run list showed
+/// unverified passes as plain "passed".
+#[test]
+fn a_runs_labels_are_as_of_that_run() {
+    let d = workspace("as-of");
+    suites(&d);
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    let second: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["status", "last", "--json"]))).unwrap();
+    let second = second["run"].as_str().unwrap().to_owned();
+    run(&d, "make", "fail");
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let then = text(&prova(&d, &["status", &second]));
+    assert!(then.contains("FAIL calc::x [failed 1x before]"), "{then}");
+    assert!(!then.contains("FLAKY"), "{then}");
+    // The latest pass is of a now-flaky test: unverified in the list too.
+    run(&d, "make", "pass");
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        list.lines().next().is_some_and(|l| l.contains("passed?")),
+        "{list}"
+    );
+}
+
+/// Round 13 (Java): five runs whose selection matched nothing (each run
+/// failed, no test ran) were tallied as "every test passed every time".
+#[test]
+fn repeat_never_calls_runs_without_tests_green() {
+    let d = workspace("repeat-empty");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'No tests matching pattern'; exit 1\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "t", "--repeat", "2"]);
+    let out = text(&o);
+    assert!(!out.contains("every test passed"), "{out}");
+    assert!(out.contains("2 of 2 run(s) ran no test"), "{out}");
+    let progress = String::from_utf8_lossy(&o.stderr);
+    assert!(progress.contains("(no test ran)"), "{progress}");
+}
+
+/// Round 13 red team: VSTest's console names NUnit/MSTest tests by bare
+/// method, so two classes' `Divide` were told apart by console order; when
+/// the order flipped, their histories swapped and a test failing every run
+/// was called FLAKY ("nothing else failed"). The TRX's qualified names are
+/// the identity.
+#[test]
+fn bare_console_names_take_the_result_files_identity() {
+    let d = workspace("trx-identity");
+    let trx = r#"<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><TestDefinitions><UnitTest name="Divide" id="1"><TestMethod className="P.CalcTests" name="Divide"/></UnitTest><UnitTest name="Divide" id="2"><TestMethod className="P.MathTests" name="Divide"/></UnitTest></TestDefinitions><Results><UnitTestResult testId="1" testName="Divide" outcome="Failed"/><UnitTestResult testId="2" testName="Divide" outcome="Passed"/></Results></TestRun>"#;
+    std::fs::write(d.join("r.trx.src"), trx).unwrap();
+    let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
+    let lines = |first: &str, second: &str| {
+        format!(
+            "{busy}; printf '  {first} Divide [1 ms]\\n  {second} Divide [1 ms]\\n'; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
+        )
+    };
+    for (a, b) in [
+        ("Failed", "Passed"),
+        ("Passed", "Failed"),
+        ("Failed", "Passed"),
+    ] {
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &lines(a, b)]));
+        assert!(!out.contains("FLAKY"), "{out}");
+        assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
+    }
+    let h = text(&prova(&d, &["history", "P.CalcTests.Divide"]));
+    assert!(h.contains("3 runs with a result, 3 failed"), "{h}");
+}
+
+/// Round 13 (Go): selecting a subtest ran its parent, which passed there;
+/// with the full runs' failures on the same code the parent became FLAKY
+/// and every later green run "proved little".
+#[test]
+fn a_parent_run_for_its_selected_subtest_is_not_evidence() {
+    let d = workspace("subtest-parent");
+    let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.t]\nrun = \"{busy}; printf '=== RUN   TestX\\\\n=== RUN   TestX/bad\\\\n    --- FAIL: TestX/bad (0.00s)\\\\n=== RUN   TestX/ok\\\\n    --- PASS: TestX/ok (0.00s)\\\\n--- FAIL: TestX (0.00s)\\\\n'; exit 1\"\nselect = \"{busy}; printf '=== RUN   TestX\\\\n=== RUN   TestX/ok\\\\n    --- PASS: TestX/ok (0.00s)\\\\n--- PASS: TestX (0.00s)\\\\n'\"\n"
+        ),
+    )
+    .unwrap();
+    text(&prova(&d, &["run", "t"]));
+    text(&prova(&d, &["run", "t", "--select", "TestX/ok"]));
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(!out.contains("FLAKY"), "{out}");
+    assert!(out.contains("FAIL TestX [failed 1x before]"), "{out}");
+}
+
+/// Round 13: `next: done` under an unverified pass, and a `next:` that
+/// suggested `--select` to a suite without a `select` template (it failed
+/// with a usage error).
+#[test]
+fn next_lines_are_honest_and_runnable() {
+    let d = workspace("next-lines");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let out = run(&d, "make", "pass");
+    assert!(
+        out.contains("next: done, but this pass is unverified"),
+        "{out}"
+    );
+    let out = run(&d, "make", "fail");
+    assert!(out.contains("`prova run make --repeat 5`"), "{out}");
+    assert!(!out.contains("--select"), "{out}");
+}

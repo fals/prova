@@ -395,7 +395,7 @@ pub fn judge(
         pct(lo),
         pct(hi),
         if capped {
-            " (cut at the 100% maximum)"
+            " (upper bound cut at 100%: the interval of differences reaches the whole baseline median, i.e. the candidate is far better, not that it takes no time)"
         } else {
             ""
         }
@@ -2312,15 +2312,36 @@ fn satisfies_spec(
         ""
     };
     // The decisive line, so the reader need not open the log.
-    let last = text
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
+    let last = decisive_line(&text)
         .map(|l| l.chars().take(200).collect::<String>())
         .unwrap_or_else(|| format!("oracle `{oracle}` failed, printing nothing"));
     Ok(Err(SpecFail::Violated(format!(
         "{last} (full log: prova exp log <experiment> {arm_log}){hint}"
     ))))
+}
+
+/// A line that only says "something failed" (`go run`'s `exit status 1`,
+/// a test runner's `FAIL`, make's and CI's trailers), never what.
+fn is_generic_trailer(l: &str) -> bool {
+    let low = l.to_ascii_lowercase();
+    low.starts_with("exit status")
+        || low == "fail"
+        || low.starts_with("fail\t")
+        || low.starts_with("make: ***")
+        || low.starts_with("make[")
+        || low.starts_with("error: process completed")
+        || low.starts_with("error: process exited")
+        || low.starts_with("error: command failed")
+}
+
+/// The most informative line of a failed oracle's output: the last one that
+/// is not a generic trailer (usability round 13: `exit status 1` hid
+/// `CountPrimes(2) = 1, specification says 0`). Falls back to the last line.
+fn decisive_line(text: &str) -> Option<&str> {
+    let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .rfind(|l| !is_generic_trailer(l))
+        .or_else(|| lines().next_back())
 }
 
 /// Why a variant does not satisfy the specification: it does not, or the
@@ -2857,6 +2878,20 @@ mod load_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::decisive_line;
+
+    #[test]
+    fn the_decisive_oracle_line_skips_generic_trailers() {
+        let t = "CountPrimes(2) = 1, specification says 0\nexit status 1\nFAIL\nmake: *** [Makefile:3: conform] Error 1\nError: Process completed with exit code 2.\n";
+        assert_eq!(
+            decisive_line(t),
+            Some("CountPrimes(2) = 1, specification says 0")
+        );
+        assert_eq!(decisive_line("only\nexit status 1\n"), Some("only"));
+        assert_eq!(decisive_line("exit status 1\n"), Some("exit status 1"));
+        assert_eq!(decisive_line("\n\n"), None);
+    }
+
     use super::*;
 
     #[test]

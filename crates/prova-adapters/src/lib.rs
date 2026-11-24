@@ -52,10 +52,14 @@ impl Stream {
     }
 }
 
-pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
+/// Built before the process starts: the result files already on disk are
+/// remembered, so only the ones this run writes are read at the end.
+pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
+    let mut files = results::ResultFiles::new(&spec.results);
+    files.snapshot(root);
     Box::new(Ladder {
         live: recognize::Recognizers::default(),
-        files: results::ResultFiles::new(&spec.results),
+        files,
         inject: spec.inject.clone(),
         inject_dir: None,
         streams: Vec::new(),
@@ -168,6 +172,31 @@ impl Observer for Ladder {
                 (base.to_owned(), *o, false)
             })
             .collect();
+        // The live key each `live` entry came from (same order).
+        let live_keys: Vec<prova_core::model::TestKey> = self
+            .live
+            .seen
+            .iter()
+            .map(|(unique, (d, _))| {
+                let file = unique
+                    .split_once('\u{1f}')
+                    .map(|(f, _)| f)
+                    .filter(|f| !f.is_empty());
+                prova_core::model::TestKey {
+                    file: file.map(str::to_owned),
+                    path: Vec::new(),
+                    name: d.clone(),
+                }
+            })
+            .collect();
+        // A bare live name the file qualifies (VSTest's console `Divide`,
+        // the TRX's `Ns.CalcTests.Divide`): the file's name is the test's
+        // identity. Keeping the bare one made two classes' `Divide` swap
+        // histories with the console's order, and a deterministic failure
+        // read as flaky (round 13).
+        let qualifies =
+            |l: &str, d: &str| d != l && !l.contains("::") && d.ends_with(&format!(".{l}"));
+        let mut superseded: Vec<(usize, usize)> = Vec::new();
         let covers = |l: &str, d: &str| {
             l == d || d.ends_with(&format!("::{l}")) || d.ends_with(&format!(".{l}"))
         };
@@ -186,6 +215,9 @@ impl Observer for Ladder {
             })
             .collect();
         let mut covered = vec![false; report.events.len()];
+        // A failure on either side wins (round 13: live pass, file fail
+        // recorded as passed while the framework said 1 failed).
+        let mut disagreed: Vec<(usize, String)> = Vec::new();
         type Same = fn(prova_core::model::Outcome, prova_core::model::Outcome) -> bool;
         let passes: [Same; 3] = [
             |a, b| a == b,
@@ -197,20 +229,53 @@ impl Observer for Ladder {
                 if covered[*i] {
                     continue;
                 }
-                if let Some(l) = live
-                    .iter_mut()
-                    .find(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
+                if let Some(j) = live
+                    .iter()
+                    .position(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
                 {
+                    let l = &mut live[j];
                     l.2 = true;
-                    covered[*i] = true;
+                    if qualifies(&l.0, d) {
+                        // The file's result stays; the live one is replaced.
+                        superseded.push((j, *i));
+                    } else if o.is_failure() && !l.1.is_failure() {
+                        // The file's failure stays as an event.
+                        disagreed.push((*i, d.clone()));
+                    } else {
+                        covered[*i] = true;
+                    }
                 }
             }
         }
+        // The engine drops a second result for a test already finished as
+        // passed, so the file's failure is recorded under its own name.
+        for (i, _) in &disagreed {
+            if let EventKind::TestFinished { test, .. } = &mut report.events[*i] {
+                test.name = format!("{} (result file)", test.name);
+            }
+        }
+        let supersede: Vec<EventKind> = superseded
+            .iter()
+            .filter_map(|(j, i)| match &report.events[*i] {
+                EventKind::TestFinished { test, .. } => Some(EventKind::TestSuperseded {
+                    test: live_keys[*j].clone(),
+                    by: test.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
         let mut i = 0;
         report.events.retain(|_| {
             i += 1;
             !covered[i - 1]
         });
+        // After the file results they name (the store links the two).
+        report.events.extend(supersede);
+        for (_, d) in disagreed {
+            report.contradictions.push(format!(
+                "{d}: the live output said it passed but the result file says it failed (the failure is recorded)"
+            ));
+        }
         // `go test` without -v or -json prints failures only (round 5).
         // (Not with -v: its `=== RUN` lines show it; round 9 noted it anyway.)
         if self.live.go_package_lines > 0
@@ -232,7 +297,14 @@ impl Observer for Ladder {
             .iter()
             .filter(|e| matches!(e, EventKind::TestFinished { .. }))
             .count() as u64;
-        let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
+        // A superseded live result and the file's one are one test.
+        let replaced = report
+            .events
+            .iter()
+            .filter(|e| matches!(e, EventKind::TestSuperseded { .. }))
+            .count() as u64;
+        let seen =
+            (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
         if self.live.summary_seen {
             report.events.push(EventKind::RunTotals {
                 tests: self.live.total(),
@@ -337,7 +409,7 @@ impl Observer for Ladder {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \
                      passing tests are not recorded, so flaky detection and durations are incomplete. \
-                     Run the framework with verbose output or a JUnit report (`prova adopt --write` sets it up).",
+                     Run the framework with verbose output or a JUnit report (`prova adopt` proposes a suite that does).",
                     self.live.total()
                 ),
             });
@@ -357,5 +429,62 @@ impl Observer for Ladder {
             (a, b) => a.or(b),
         };
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prova_core::model::Outcome;
+
+    /// Live pass, file failure: the failure is recorded (round 13: pytest
+    /// said 1 failed, prova recorded a pass). Temp dir: the file is the point.
+    #[test]
+    fn a_failure_in_the_result_file_beats_a_live_pass() {
+        let root = std::env::temp_dir().join(format!("prova-ladder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("junit.xml"),
+            r#"<testsuite><testcase classname="tests.t" name="test_a"><failure message="boom"/></testcase></testsuite>"#,
+        )
+        .unwrap();
+        let mut ladder = Ladder {
+            live: recognize::Recognizers::default(),
+            files: results::ResultFiles::new(&[]),
+            inject: Vec::new(),
+            inject_dir: None,
+            streams: Vec::new(),
+            expect_tests: true,
+        };
+        let live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        assert!(matches!(
+            live.last(),
+            Some(EventKind::TestFinished {
+                outcome: Outcome::Passed,
+                ..
+            })
+        ));
+        let report = ladder.on_exit(&root, 0);
+        let _ = std::fs::remove_dir_all(&root);
+        let failed: Vec<_> = report
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EventKind::TestFinished {
+                        outcome: Outcome::Failed,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", report.events);
+        assert!(
+            report.contradictions.iter().any(|c| c.contains("test_a")),
+            "{:?}",
+            report.contradictions
+        );
     }
 }

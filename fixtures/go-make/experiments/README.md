@@ -23,7 +23,8 @@ time (the count grows by one exactly at primes, never decreases, excludes
 answer for every n below 3000 and `go run ./cmd/conform` compares
 `CountPrimes` with each.
 
-    prova exp new primes --spec spec/Primes.lean --oracle "sh spec/oracle.sh" \
+    prova exp new primes --hypothesis "the sieve counts primes faster, same results" \
+      --spec spec/Primes.lean --oracle "sh spec/oracle.sh" \
       --metric BenchmarkCountPrimes.ns_per_op --min-effect 5% -- \
       go test -run '^$' -bench CountPrimes -count 3 .
 

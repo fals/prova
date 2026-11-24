@@ -111,10 +111,16 @@ pub fn test_runs_with(
                    -- bug look flaky)
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
                                                   AND w.payload LIKE '%; no evidence about the tests%'))
-                   AND r3.id NOT IN (SELECT run_id FROM forgotten)))
-         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env
+                   AND r3.id NOT IN (SELECT run_id FROM forgotten)
+                   -- labels of a run are as of that run: later runs do not
+                   -- rewrite them (round 13: 'failed 8x before' on a run
+                   -- that followed 3 failures)
+                   AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
+         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
+                json_extract(r.spec, '$.selection')
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
+           AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
@@ -130,11 +136,30 @@ pub fn test_runs_with(
             r.get::<_, Option<String>>(6)?,
             r.get::<_, Option<String>>(7)?,
             r.get::<_, String>(8)?,
+            r.get::<_, Option<String>>(9)?,
         ))
     })?;
+    // A parent run only because its subtest was selected (Go runs the
+    // parent of `-run TestX/case`) says nothing about the parent: its pass
+    // there made a parent that fails in full runs FLAKY (round 13, Go).
+    let leaf = |n: &str| n.rsplit("::").next().unwrap_or(n).to_owned();
+    let this: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT display FROM tests WHERE id = ?1",
+            params![test_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .map(|d| leaf(&d));
     let mut out: Vec<TestRun> = Vec::new();
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env) = row?;
+        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection) = row?;
+        if let (Some(sel), Some(this)) = (&selection, &this)
+            && leaf(sel).starts_with(&format!("{this}/"))
+        {
+            continue;
+        }
         let env: BTreeMap<String, String> = serde_json::from_str::<serde_json::Value>(&env)
             .ok()
             .and_then(|v| {
@@ -373,6 +398,17 @@ pub fn most_recent(store: &Store, candidates: &[(String, String, String)]) -> Re
 
 /// Flaky tests among those seen in the last `runs` runs of any suite.
 pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<TestStats>> {
+    flaky_as_of(store, suite, window, None)
+}
+
+/// Tests flaky as of run `as_of` (its history up to it, its own result
+/// included): a run's labels do not change when later runs come in.
+pub fn flaky_as_of(
+    store: &Store,
+    suite: Option<&str>,
+    window: usize,
+    as_of: Option<&str>,
+) -> Result<Vec<TestStats>> {
     let mut stmt = store.conn().prepare(
         // Any test that failed somewhere: its history is shared across
         // suites (ADR 0018), so a flip between suites counts (round 6).
@@ -384,7 +420,7 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
         .collect::<rusqlite::Result<_>>()?;
     let mut out: Vec<TestStats> = Vec::new();
     for id in ids {
-        if let Some(s) = stats(store, &id, window)?
+        if let Some(s) = stats_with(store, &id, window, as_of)?
             && s.flaky
             && !out.iter().any(|o| {
                 o.display == s.display
@@ -764,4 +800,75 @@ mod tests {
         assert_eq!(percentile(&[7], 95.0), Some(7));
         assert_eq!(percentile(&[], 50.0), None);
     }
+}
+
+/// One test's typical duration over its recent results (ADR 0027 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlowRow {
+    pub test: String,
+    pub suites: Vec<String>,
+    /// Results with a duration the numbers come from.
+    pub runs: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+}
+
+/// The `n` slowest tests, worst first by p50 then p95, over each test's
+/// last `window` finished results with a duration. Like history, one test
+/// seen in several suites is one row. Forgotten runs and runs that are no
+/// evidence about the tests do not count (as in `test_runs`).
+pub fn slowest(
+    store: &Store,
+    suite: Option<&str>,
+    n: usize,
+    window: usize,
+) -> Result<Vec<SlowRow>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT t.display, t.suite, a.duration_ms FROM (
+             SELECT a.test_id, a.duration_ms,
+                    row_number() OVER (PARTITION BY a.test_id ORDER BY a.ts_ms DESC) AS rn
+               FROM attempts a JOIN runs r ON r.id = a.run_id
+              WHERE a.duration_ms IS NOT NULL AND a.outcome IN ('passed', 'failed')
+                AND r.status = 'finished'
+                AND r.id NOT IN (SELECT run_id FROM forgotten)
+                AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
+                                  AND w.payload LIKE '%; no evidence about the tests%')
+         ) a JOIN tests t ON t.id = a.test_id
+         WHERE a.rn <= ?1 AND (?2 IS NULL OR t.suite = ?2)",
+    )?;
+    let rows = stmt.query_map(params![window as i64, suite], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+        ))
+    })?;
+    let mut by_test: BTreeMap<String, (BTreeSet<String>, Vec<u64>)> = BTreeMap::new();
+    for row in rows {
+        let (display, suite, ms) = row?;
+        let e = by_test.entry(display).or_default();
+        e.0.insert(suite);
+        e.1.push(ms);
+    }
+    let mut out: Vec<SlowRow> = by_test
+        .into_iter()
+        .filter_map(|(test, (suites, mut ms))| {
+            ms.sort_unstable();
+            Some(SlowRow {
+                test,
+                suites: suites.into_iter().collect(),
+                runs: ms.len(),
+                p50_ms: percentile(&ms, 50.0)?,
+                p95_ms: percentile(&ms, 95.0)?,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.p50_ms
+            .cmp(&a.p50_ms)
+            .then(b.p95_ms.cmp(&a.p95_ms))
+            .then(a.test.cmp(&b.test))
+    });
+    out.truncate(n);
+    Ok(out)
 }

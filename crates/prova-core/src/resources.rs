@@ -115,7 +115,22 @@ pub fn runs_one_test(cmdline: &str) -> bool {
 /// test started: one test's process (`--exact`), a Go test binary
 /// (`-test.` flags) or a cargo test binary (`target/…/deps/`).
 pub fn runner_process(cmdline: &str) -> bool {
-    runs_one_test(cmdline)
+    // Build and test tooling a framework starts on its own: MSBuild nodes,
+    // the C# compiler server, VSTest's test host, Surefire's forked JVM,
+    // Gradle's workers. Their children still count (round 13: every Java
+    // and C# test was bounded by its own test host).
+    const TOOLING: &[&str] = &[
+        "/nodemode:",
+        "VBCSCompiler",
+        "testhost",
+        "vstest.console",
+        "surefirebooter",
+        "surefire/",
+        "GradleWorkerMain",
+        "GradleDaemon",
+    ];
+    TOOLING.iter().any(|t| cmdline.contains(t))
+        || runs_one_test(cmdline)
         || cmdline.split(' ').any(|a| a.starts_with("-test."))
         || cmdline
             .split(' ')

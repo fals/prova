@@ -55,6 +55,46 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Subcommand)]
+enum QuarantineCmd {
+    /// Quarantine a test prova has seen, with the reason it is set aside.
+    #[command(after_help = "\
+Example:
+  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"")]
+    Add {
+        /// The test's full name, or a substring that matches one test.
+        test: String,
+        /// Why it is set aside (shown in every run that touches it).
+        #[arg(long)]
+        reason: String,
+        /// Days until the quarantine expires and the test counts again.
+        #[arg(long, value_name = "DAYS", default_value_t = prova_core::quarantine::DEFAULT_DAYS,
+              value_parser = clap::value_parser!(u32).range(1..=prova_core::quarantine::MAX_DAYS as i64))]
+        days: u32,
+    },
+    /// List the quarantined tests.
+    #[command(after_help = "\
+Examples:
+  prova quarantine list
+  prova quarantine list --all --json")]
+    List {
+        /// Include removed quarantines.
+        #[arg(long)]
+        all: bool,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// End a quarantine: the test counts again.
+    #[command(after_help = "\
+Example:
+  prova quarantine remove calc::flaky_clock")]
+    Remove {
+        /// The quarantined test's name, or a substring that matches one.
+        test: String,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum UntilArg {
     FirstFailure,
@@ -270,7 +310,7 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// Test sizes from what each test used (processes, network), with the reason (ADR 0025).
+    /// Test sizes from what each test used (processes, network), with the reason.
     #[command(after_help = "\
 Examples:
   prova sizes                  counts, and each medium or large test with what it used
@@ -282,6 +322,38 @@ Examples:
         /// JSON instead of text (every test).
         #[arg(long)]
         json: bool,
+    },
+    /// The slowest tests from history: p50 and p95, worst first.
+    #[command(after_help = "\
+Examples:
+  prova slowest                 the 10 slowest tests of this repository
+  prova slowest -n 30           more of them
+  prova slowest --suite unit    one suite, as JSON with --json")]
+    Slowest {
+        /// Only runs of this suite.
+        #[arg(long, add = ArgValueCompleter::new(complete_suites))]
+        suite: Option<String>,
+        /// How many tests to list.
+        #[arg(short = 'n', long, value_name = "N", default_value_t = 10)]
+        count: usize,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set known-flaky tests aside from the verdict, in the open.
+    #[command(after_help = "\
+Examples:
+  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"
+  prova quarantine add calc::flaky_clock --reason \"still flaky\" --days 30
+  prova quarantine list           what is set aside now, and until when
+  prova quarantine list --all     including removed ones
+  prova quarantine remove calc::flaky_clock
+
+A quarantined test still runs and keeps its history. If it is the only thing
+that fails, the run passes; every summary lists it. A quarantine expires.")]
+    Quarantine {
+        #[command(subcommand)]
+        action: QuarantineCmd,
     },
     /// Compare per-test results of two runs.
     #[command(after_help = "\
@@ -424,6 +496,10 @@ struct ProtocolChange {
     /// Adds a specification file (repeatable).
     #[arg(long = "spec")]
     specs: Vec<PathBuf>,
+    /// Removes a specification file from the protocol, before the first
+    /// trial (repeatable), e.g. `--no-spec spec/old.lean`.
+    #[arg(long = "no-spec")]
+    no_specs: Vec<PathBuf>,
     /// Command that must succeed for a variant to satisfy the specification.
     #[arg(long)]
     oracle: Option<String>,
@@ -770,6 +846,48 @@ fn spec_files(files: &[PathBuf], root: &Path) -> Result<Vec<experiment::SpecFile
             })
         })
         .collect()
+}
+
+/// Paths the oracle command names (existing files or directories of the
+/// repository) that no `--spec` covers: the oracle's own files are part of
+/// the specification, and a candidate may edit them unless they are frozen
+/// (usability round 13).
+fn unfrozen_oracle_paths(p: &experiment::Protocol, root: &Path) -> Vec<String> {
+    let Some(oracle) = &p.oracle else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tok in oracle.split_whitespace() {
+        let t = tok.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')' | '&' | '|'));
+        let t = t.strip_prefix("./").unwrap_or(t);
+        if t.is_empty() || t.starts_with('-') || t.starts_with('/') || t.contains("..") || t == "."
+        {
+            continue;
+        }
+        let t = t.trim_end_matches('/');
+        let path = root.join(t);
+        let covered = p
+            .specs
+            .iter()
+            .any(|s| s.path == t || (path.is_dir() && s.path.starts_with(&format!("{t}/"))));
+        if path.exists() && !covered && !out.iter().any(|o| o == t) {
+            out.push(t.to_owned());
+        }
+    }
+    out
+}
+
+fn warn_unfrozen_oracle_paths(p: &experiment::Protocol, root: &Path) {
+    let paths = unfrozen_oracle_paths(p, root);
+    if paths.is_empty() {
+        return;
+    }
+    let flags: Vec<String> = paths.iter().map(|x| format!("--spec {x}")).collect();
+    eprintln!(
+        "warning: the oracle names {} that no --spec freezes, so a candidate can change what judges it; add {} (files only: name the files inside a directory; remove one with `prova exp protocol <name> --no-spec <file>`)",
+        paths.join(", "),
+        flags.join(" ")
+    );
 }
 
 fn parse_guardrails(list: &[String]) -> Result<Vec<experiment::Guardrail>> {
@@ -1243,7 +1361,14 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         // The filter is the framework's own syntax: a Go regex (`^TestAdd$`)
         // is anchored to the test name, not to prova's full name (round 6).
         let matches = |t: &str| filter_matches(&filter, t);
-        let unrelated: Vec<&String> = tests.iter().filter(|t| !matches(t)).collect();
+        // The parent of a selected subtest runs too (Go runs `TestX` for
+        // `-run TestX/case`): it is not unrelated (round 13, Go).
+        let leaf = |n: &str| n.rsplit("::").next().unwrap_or(n).to_owned();
+        let parent_of_selected = |t: &str| leaf(&filter).starts_with(&format!("{}/", leaf(t)));
+        let unrelated: Vec<&String> = tests
+            .iter()
+            .filter(|t| !matches(t) && !parent_of_selected(t))
+            .collect();
         // The framework's own "nothing matched" beats a level diagnosis: an
         // opaque run with that message means the filter's syntax is wrong
         // for the framework, not the level (round 8: surefire with -q).
@@ -1360,6 +1485,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     p.min_effect * 100.0
                 );
             }
+            warn_unfrozen_oracle_paths(&p, &root);
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
             // The baseline as a commit, not only a ref name (round 9).
             let sha = experiment::variant(&store, &name, "baseline")?
@@ -1415,10 +1541,31 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             if c.setup.is_some() {
                 p.setup = c.setup;
             }
+            for f in &c.no_specs {
+                // The file may be gone from the tree: match the path as
+                // given when it cannot be resolved.
+                let rel = spec_files(std::slice::from_ref(f), &root)
+                    .ok()
+                    .and_then(|v| v.into_iter().next().map(|s| s.path))
+                    .unwrap_or_else(|| f.to_string_lossy().into_owned());
+                let before = p.specs.len();
+                p.specs.retain(|s| s.path != rel);
+                if p.specs.len() == before {
+                    bail!(
+                        "{rel} is not a specification file of {name} (registered: {})",
+                        p.specs
+                            .iter()
+                            .map(|s| s.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
             for f in spec_files(&c.specs, &root)? {
                 p.specs.retain(|s| s.path != f.path);
                 p.specs.push(f);
             }
+            warn_unfrozen_oracle_paths(&p, &root);
             if c.oracle.is_some() {
                 p.oracle = c.oracle;
             }
@@ -1620,7 +1767,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     println!("{n:40} {v:>16.3} {}", u.as_deref().unwrap_or(""));
                 }
                 println!(
-                    "next: prova exp new <name> --metric <one of these> --better lower|higher -- {}",
+                    "next: prova exp new <name> --hypothesis \"<FILL IN: what you expect and why>\" --metric <one of these> --better lower|higher -- {}",
                     sh_quote(&command)
                 );
             }
@@ -1684,6 +1831,96 @@ fn main() -> ExitCode {
                 || e.downcast_ref::<config::ConfigError>()
                     .is_some_and(config::ConfigError::is_usage);
             ExitCode::from(if usage { exit::USAGE } else { exit::INFRA })
+        }
+    }
+}
+
+/// `prova quarantine ...` (ADR 0027).
+fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
+    use prova_core::quarantine as q;
+    match action {
+        QuarantineCmd::Add { test, reason, days } => {
+            let found = analysis::find_tests(store, &test, None)?;
+            let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
+            names.sort();
+            names.dedup();
+            let name = if names.contains(&test) {
+                test.clone()
+            } else {
+                match names.as_slice() {
+                    [one] => one.clone(),
+                    [] => {
+                        return Err(UsageError(format!(
+                            "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                        ))
+                        .into());
+                    }
+                    many => {
+                        return Err(UsageError(format!(
+                            "{} tests match {test:?}; be more specific: {}",
+                            many.len(),
+                            many.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                        ))
+                        .into());
+                    }
+                }
+            };
+            let e = q::add(store, &name, &reason, days, now_ms())?;
+            println!(
+                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it",
+                render::clean(&e.test),
+                render::clean(&e.reason),
+                render::expires_in(e.expires_ms)
+            );
+            Ok(exit::PASSED)
+        }
+        QuarantineCmd::List { all, json } => {
+            let list = q::list(store, all)?;
+            if json {
+                println!("{}", serde_json::to_string(&list)?);
+            } else if list.is_empty() {
+                println!("no quarantined tests");
+            } else {
+                for e in &list {
+                    let state = if e.removed_ms.is_some() {
+                        "removed".to_owned()
+                    } else {
+                        render::expires_in(e.expires_ms)
+                    };
+                    println!(
+                        "{}  ({}; {})",
+                        render::clean(&e.test),
+                        render::clean(&e.reason),
+                        state
+                    );
+                }
+            }
+            Ok(exit::PASSED)
+        }
+        QuarantineCmd::Remove { test } => {
+            let open: Vec<String> = q::list(store, false)?.into_iter().map(|e| e.test).collect();
+            let name = match open.iter().find(|n| **n == test) {
+                Some(n) => n.clone(),
+                None => {
+                    let hits: Vec<&String> = open.iter().filter(|n| n.contains(&test)).collect();
+                    match hits.as_slice() {
+                        [one] => (*one).clone(),
+                        _ => {
+                            return Err(UsageError(format!(
+                                "{} quarantined tests match {test:?} (`prova quarantine list` shows them)",
+                                hits.len()
+                            ))
+                            .into());
+                        }
+                    }
+                }
+            };
+            q::remove(store, &name, now_ms())?;
+            println!(
+                "removed the quarantine of {}: it counts again",
+                render::clean(&name)
+            );
+            Ok(exit::PASSED)
         }
     }
 }
@@ -1787,7 +2024,11 @@ fn print_output(
     let spool = store.run_dir(id).join("output.log");
     if !store.run(id)?.status.is_terminal() && spool.exists() {
         let mut f = std::fs::File::open(&spool).with_context(|| format!("{}", spool.display()))?;
-        std::io::copy(&mut f, &mut std::io::stdout())?;
+        let n = std::io::copy(&mut f, &mut std::io::stdout())?;
+        if n == 0 {
+            // Silence is not an answer (round 13: nothing, exit 0).
+            println!("(run {id} has printed nothing yet)");
+        }
         return Ok(exit::PASSED);
     }
     if let Some(full) = output::run_full(store, id)? {
@@ -2096,8 +2337,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     out.push(serde_json::json!({ "repo": k, "runs": runs }));
                 } else if !runs.is_empty() {
                     println!("== {}  ({})", k.name, k.workspace);
-                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-                    render::runs(&runs, &store.unverified(&ids)?, false);
+                    render::runs(&runs, &engine::unverified_runs(&store, &runs)?, false);
                 }
             }
             if json {
@@ -2117,7 +2357,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     } else {
                         WaitReason::Running
                     };
-                    let s = engine::summarize(&store, &id, reason, seq)?;
+                    let mut s = engine::summarize(&store, &id, reason, seq)?;
+                    // A stalled run is STALLED here as in `wait` (round 13:
+                    // status said RUNNING seconds after wait said STALLED).
+                    if s.reason == WaitReason::Running && s.stalled_ms.is_some() {
+                        s = engine::summarize(&store, &id, WaitReason::Stall, seq)?;
+                    }
                     render::summary(&s, json);
                     Ok(exit_code(&s))
                 }
@@ -2126,8 +2371,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     if engine::reap_orphans(&store, &runs)? {
                         runs = store.recent_runs(20)?;
                     }
-                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-                    render::runs(&runs, &store.unverified(&ids)?, json);
+                    render::runs(&runs, &engine::unverified_runs(&store, &runs)?, json);
                     Ok(exit::PASSED)
                 }
             }
@@ -2291,6 +2535,18 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             Ok(exit::PASSED)
         }
+        Cmd::Slowest { suite, count, json } => {
+            let (store, _, _) = open_here()?;
+            render::slowest(
+                &analysis::slowest(&store, suite.as_deref(), count, 20)?,
+                json,
+            );
+            Ok(exit::PASSED)
+        }
+        Cmd::Quarantine { action } => {
+            let (store, _, _) = open_here()?;
+            quarantine_cmd(&store, action)
+        }
         Cmd::Diff { base, head, json } => {
             let (store, _, _) = open_here()?;
             let d = analysis::diff(
@@ -2383,6 +2639,10 @@ fn repeat_runs(
     let mut tally: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
     let mut runs = Vec::new();
     let mut any_failed = false;
+    // Runs that ran no test, and runs that failed with no failing test:
+    // never "every test passed" (round 13: five runs whose selection matched
+    // nothing were tallied as all green).
+    let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2404,6 +2664,12 @@ fn repeat_runs(
             return Ok(exit::RUNNING);
         }
         any_failed |= s.outcome != Some(Outcome::Passed);
+        let ran = s.counts.results();
+        if ran == 0 {
+            no_tests += 1;
+        } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
+            failed_otherwise += 1;
+        }
         for e in store.events_after(&id, 0)? {
             if let prova_core::model::EventKind::TestFinished { test, outcome, .. } = e.kind {
                 let t = tally.entry(test.display()).or_default();
@@ -2416,14 +2682,20 @@ fn repeat_runs(
         }
         if !json {
             let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            let why = if !failing.is_empty() {
+                format!(" ({})", failing.join(", "))
+            } else if ran == 0 {
+                " (no test ran)".to_owned()
+            } else if let (Some(Outcome::Failed | Outcome::Errored), Some(d)) =
+                (s.outcome, &s.detail)
+            {
+                format!(" ({})", render::clean(d))
+            } else {
+                String::new()
+            };
             eprintln!(
-                "run {i}/{n} {id}: {}{}",
+                "run {i}/{n} {id}: {}{why}",
                 s.outcome.map(|o| o.as_str()).unwrap_or("?"),
-                if failing.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", failing.join(", "))
-                }
             );
         }
         runs.push(serde_json::json!({ "run": id, "outcome": s.outcome }));
@@ -2456,8 +2728,20 @@ fn repeat_runs(
             println!("  FAIL {}: failed every time", render::clean(t));
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
-        if mixed.is_empty() && always.is_empty() {
+        if no_tests > 0 {
+            println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
+        }
+        if failed_otherwise > 0 {
+            println!(
+                "  {failed_otherwise} of {done} run(s) failed with no failing test (see each run's status)"
+            );
+        }
+        if tally.is_empty() {
+            // Nothing to say about tests.
+        } else if mixed.is_empty() && always.is_empty() && no_tests == 0 && failed_otherwise == 0 {
             println!("  every test passed every time");
+        } else if mixed.is_empty() && always.is_empty() {
+            println!("  {steady} test(s) passed whenever they ran");
         } else if steady > 0 {
             println!("  {steady} other test(s) passed every time");
         }

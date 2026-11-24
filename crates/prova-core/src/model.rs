@@ -213,6 +213,13 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         subtest: bool,
     },
+    /// A live result whose name was ambiguous (VSTest's console names
+    /// NUnit and MSTest tests by bare method) replaced by the result file's
+    /// qualified one: `by` counts and keeps the history, `test` does not.
+    TestSuperseded {
+        test: TestKey,
+        by: TestKey,
+    },
     RunStalled {
         idle_ms: u64,
         basis: StallBasis,
@@ -271,6 +278,7 @@ impl EventKind {
             EventKind::RunNote { .. } => "run_note",
             EventKind::RunWarning { .. } => "run_warning",
             EventKind::RunTotals { .. } => "run_totals",
+            EventKind::TestSuperseded { .. } => "test_superseded",
             EventKind::TestSize { .. } => "test_size",
             EventKind::RunSize { .. } => "run_size",
             EventKind::RunFinished { .. } => "run_finished",

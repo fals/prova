@@ -199,19 +199,86 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
                 .join(", ")
         );
     }
+    for q in s.quarantined.iter().take(5) {
+        println!(
+            "quarantined: {} {} ({}; {})",
+            clean(&q.test),
+            q.result,
+            clean(&q.reason),
+            expires_in(q.expires_ms)
+        );
+    }
+    if s.quarantined.len() > 5 {
+        println!(
+            "quarantined: ... and {} more (prova quarantine list)",
+            s.quarantined.len() - 5
+        );
+    }
     for n in &s.notes {
+        // The detail line says it already (round 13: printed twice).
+        if s.detail.as_deref() == Some(n.as_str()) {
+            continue;
+        }
         println!("note: {}", clean(n));
+    }
+    if !s.slowest.is_empty() {
+        println!(
+            "slow tests: {} (prova slowest)",
+            s.slowest
+                .iter()
+                .map(|t| format!(
+                    "{} {}",
+                    clean(&t.test),
+                    format_duration(std::time::Duration::from_millis(t.duration_ms))
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     if let Some(d) = &s.detail {
         println!("detail: {d}");
     }
     if !s.leaked.is_empty() {
-        println!("leaked processes (killed): {:?}", s.leaked);
+        // Say what it means (round 13: a bare list of pids, unexplained).
+        println!(
+            "leaked processes (killed): {:?}: still alive when the command ended (a server or build daemon it started, such as the MSBuild server); prova stopped them",
+            s.leaked
+        );
     }
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
     }
     println!("next: {}", next(s, until));
+}
+
+/// "expires in 13d", or "expired", from the current time.
+pub fn expires_in(expires_ms: u64) -> String {
+    let now = prova_core::ids::now_ms();
+    if expires_ms <= now {
+        "expired".to_owned()
+    } else {
+        format!("expires in {}d", (expires_ms - now).div_ceil(86_400_000))
+    }
+}
+
+pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(rows).unwrap_or_default());
+        return;
+    }
+    if rows.is_empty() {
+        println!("no test durations recorded yet");
+        return;
+    }
+    for r in rows {
+        println!(
+            "p50 {:>7}  p95 {:>7}  {:3} runs  {}",
+            format_duration(std::time::Duration::from_millis(r.p50_ms)),
+            format_duration(std::time::Duration::from_millis(r.p95_ms)),
+            r.runs,
+            clean(&r.test)
+        );
+    }
 }
 
 fn context(f: &prova_core::engine::Failure) -> String {
@@ -425,6 +492,13 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
             "prova cancel {}  (or `prova wait {} --after {}` if it is expected)",
             s.run, s.run, s.last_seq
         ),
+        WaitReason::Done
+            if s.outcome == Some(Outcome::Passed)
+                && (!s.warnings.is_empty() || !s.flaky_passed.is_empty()) =>
+        {
+            // Not "done": the pass is unverified (round 13).
+            "done, but this pass is unverified: act on the warnings above".into()
+        }
         WaitReason::Done if s.outcome == Some(Outcome::Passed) => "done".into(),
         WaitReason::Done if all_known_flaky(s) => {
             // The test's own name, not a placeholder (round 10).
@@ -435,12 +509,11 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
                 .unwrap_or_default();
             let confirm = if s.suite.starts_with("cmd:") {
                 format!("`prova history {t}`")
+            } else if s.can_select {
+                format!("`prova run {} --select '{t}' --repeat 5`", s.suite)
             } else {
-                // Not every suite can select (round 11: `make` cannot).
-                format!(
-                    "`prova run {} --select '{t}' --repeat 5` (or `--repeat 5` alone if the suite cannot select)",
-                    s.suite
-                )
+                // `make` cannot select (round 13: the suggestion failed).
+                format!("`prova run {} --repeat 5`", s.suite)
             };
             format!(
                 "only known flaky test(s) failed: confirm with {confirm}, and report them; nothing else failed"
@@ -628,6 +701,9 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
         // A thin pass is not a plain "passed" in the list either (round 9).
         let outcome = match r.outcome {
             Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
+            // A cancelled or killed run has no test outcome of its own:
+            // "cancelled errored" read as a test error (round 13).
+            _ if matches!(r.status, prova_core::model::Status::Cancelled) => "-",
             o => o.map(Outcome::as_str).unwrap_or("-"),
         };
         let dur = match (r.started_ms, r.ended_ms) {
@@ -971,6 +1047,7 @@ mod live_tests {
 
     fn summary(passed: u64, failed: u64, running: &[&str]) -> Summary {
         Summary {
+            can_select: false,
             run: "r".into(),
             suite: "s".into(),
             command: "make test".into(),
@@ -1002,6 +1079,8 @@ mod live_tests {
             store: String::new(),
             flaky_passed: vec![],
             history: None,
+            quarantined: vec![],
+            slowest: vec![],
         }
     }
 

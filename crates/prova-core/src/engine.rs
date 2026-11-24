@@ -251,6 +251,10 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
+    /// From the first output line to the end: the phase of a run whose
+    /// tests are known only from result files at the end (round 13: Java
+    /// and C# stayed "unknown" after 25 runs).
+    whole: Option<Phase>,
 }
 
 /// What the run's tree used while its tests ran, beyond the runner.
@@ -262,6 +266,39 @@ struct Phase {
     /// runner's teardown, so only earlier ones count.
     last_event: Instant,
     samples: Vec<(Instant, crate::resources::Seen)>,
+}
+
+/// One sample of a run phase: what it used beyond the runner (ADR 0026).
+fn sample_phase(
+    p: &mut Phase,
+    now: &crate::resources::Usage,
+    now_boot: Option<u64>,
+    first_line_ms: Option<u64>,
+) {
+    let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
+    if let (Some(from), Some(to), Some(since)) = (p.start_ms, now_boot, first_line_ms) {
+        s.processes = crate::resources::started_within(now, from, to, since);
+    } else {
+        s.processes = now
+            .procs
+            .iter()
+            .filter(|(pid, (_, cmd))| {
+                !p.base_pids.contains(pid) && !crate::resources::runner_process(cmd)
+            })
+            .map(|(_, (_, cmd))| {
+                cmd.split(' ')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
+    s.samples = 1;
+    p.samples.push((Instant::now(), s));
 }
 
 /// One running test's size observation (ADR 0025).
@@ -554,14 +591,35 @@ impl Supervisor<'_> {
     /// The run's test phase as one observation: samples taken before its
     /// last test event, at least two of them, or nothing (ADR 0026 §2).
     fn phase_seen(&self) -> Option<crate::resources::Seen> {
-        let p = self.phase.as_ref()?;
-        let mut seen = crate::resources::Seen::default();
-        for (at, s) in &p.samples {
-            if p.last_event.saturating_duration_since(*at) >= SIZE_GUARD {
-                seen.absorb(s);
+        let from = |p: &Phase, guard: bool| {
+            let mut seen = crate::resources::Seen::default();
+            for (at, s) in &p.samples {
+                if !guard || p.last_event.saturating_duration_since(*at) >= SIZE_GUARD {
+                    seen.absorb(s);
+                }
             }
+            (seen.samples >= 2).then_some(seen)
+        };
+        match &self.phase {
+            Some(p) if p.samples.len() >= 2 => from(p, true),
+            // No test event came while the command ran: the whole run.
+            _ => self.whole.as_ref().and_then(|w| from(w, false)),
         }
-        (seen.samples >= 2).then_some(seen)
+    }
+
+    /// Starts the whole-run phase at the first output line.
+    fn start_whole(&mut self, at: Arrived) {
+        if self.pgid == 0 || self.whole.is_some() {
+            return;
+        }
+        let _ = self.usage_now();
+        self.whole = Some(Phase {
+            start_ms: at.boot_ms,
+            base_pids: self.known_pids.clone(),
+            base_sockets: self.known_sockets.clone(),
+            last_event: at.at,
+            samples: Vec::new(),
+        });
     }
 
     /// A snapshot of the command's group, reused when under 50 ms old.
@@ -593,32 +651,12 @@ impl Supervisor<'_> {
     fn observe_sizes(&mut self, now: &crate::resources::Usage) {
         let now_boot = crate::process::uptime_ms();
         // The run's test phase: what started inside it, beyond the runner.
-        if let Some(p) = &mut self.phase {
-            let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
-            if let (Some(from), Some(to), Some(since)) = (p.start_ms, now_boot, self.first_line_ms)
-            {
-                s.processes = crate::resources::started_within(now, from, to, since);
-            } else {
-                s.processes = now
-                    .procs
-                    .iter()
-                    .filter(|(pid, (_, cmd))| {
-                        !p.base_pids.contains(pid) && !crate::resources::runner_process(cmd)
-                    })
-                    .map(|(_, (_, cmd))| {
-                        cmd.split(' ')
-                            .next()
-                            .unwrap_or("")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("")
-                            .to_owned()
-                    })
-                    .filter(|n| !n.is_empty())
-                    .collect();
-            }
-            s.samples = 1;
-            p.samples.push((Instant::now(), s));
+        let first_line_ms = self.first_line_ms;
+        for p in [self.phase.as_mut(), self.whole.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            sample_phase(p, now, now_boot, first_line_ms);
         }
         let alone = self.running.len() <= 1;
         let first_line = self.first_line_ms;
@@ -741,6 +779,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         line_at: None,
         first_line_ms: None,
         phase: None,
+        whole: None,
         one_test_procs: BTreeMap::new(),
         declared: spec.size,
     };
@@ -877,6 +916,7 @@ fn observe_child(
                     sup.line_at = Some(at);
                     if sup.first_line_ms.is_none() {
                         sup.first_line_ms = at.boot_ms;
+                        sup.start_whole(at);
                     }
                     sup.line(i, &l, observer);
                     sup.line_at = None;
@@ -951,46 +991,69 @@ fn observe_child(
         sup.flush()?;
     };
 
+    // The command's wall time is what the run lasted, however long the
+    // recording that follows takes (issue #91).
+    let exited_ms = now_ms();
     // Collect remaining output; leaked processes may hold the pipes open,
     // so never wait on EOF without a bound. The bound is on waiting for
     // output, not on recording it: every line that arrived before the
     // deadline is recorded however long that takes (round 12: with history,
     // recording 723 Go results took over 1 s and two thirds were dropped
     // from a run that still passed).
-    let drain = |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| {
-        let until = Instant::now() + DRAIN_AFTER_EXIT;
-        while *open > 0 {
-            let chunk = match rx.try_recv() {
-                Ok(c) => c,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-                Err(mpsc::TryRecvError::Empty) => {
-                    let Some(left) = until.checked_duration_since(Instant::now()) else {
-                        break;
-                    };
-                    match rx.recv_timeout(left) {
-                        Ok(c) => c,
-                        Err(_) => break,
+    //
+    // Recording can lag far behind the command (issue #91), so the drain
+    // flushes as it goes (a failure is visible as soon as it is recorded) and
+    // honours `prova cancel`, which the main loop no longer sees.
+    let drain =
+        |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| -> Result<bool> {
+            let until = Instant::now() + DRAIN_AFTER_EXIT;
+            let mut checked = Instant::now();
+            while *open > 0 {
+                if checked.elapsed() >= TICK {
+                    checked = Instant::now();
+                    sup.flush()?;
+                    if store.cancel_requested(run)? {
+                        return Ok(true);
                     }
                 }
-            };
-            match chunk {
-                // A leaked process still writing: what came after the
-                // deadline is not waited for.
-                Chunk::Line(_, _, a) if a.at > until => break,
-                // A read boundary mid-line sends a partial too: judged by
-                // when it arrived, like a line (round 12 CI: 388 of 400).
-                Chunk::Partial(_, _, a) if a.at > until => break,
-                Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                Chunk::Partial(i, p, _) => sup.partial(i, &p),
-                Chunk::Eof => *open -= 1,
+                let chunk = match rx.try_recv() {
+                    Ok(c) => c,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        let Some(left) = until.checked_duration_since(Instant::now()) else {
+                            break;
+                        };
+                        match rx.recv_timeout(left) {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        }
+                    }
+                };
+                match chunk {
+                    // A leaked process still writing: what came after the
+                    // deadline is not waited for.
+                    Chunk::Line(_, _, a) if a.at > until => break,
+                    // A read boundary mid-line sends a partial too: judged by
+                    // when it arrived, like a line (round 12 CI: 388 of 400).
+                    Chunk::Partial(_, _, a) if a.at > until => break,
+                    Chunk::Line(i, l, _) => sup.line(i, &l, observer),
+                    Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                    Chunk::Eof => *open -= 1,
+                }
             }
-        }
-    };
-    drain(sup, &mut open_streams, observer);
+            Ok(false)
+        };
+    let mut cancelled_late = drain(sup, &mut open_streams, observer)?;
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
-    if !leaked.is_empty() {
+    if !leaked.is_empty() && !cancelled_late {
         process::kill_group(pgid);
-        drain(sup, &mut open_streams, observer);
+        cancelled_late = drain(sup, &mut open_streams, observer)?;
+    }
+    if cancelled_late && terminating.is_none() {
+        // Cancelled while its output was still being recorded: what was not
+        // recorded yet is dropped, and the run says it was cancelled.
+        sup.terminating = true;
+        terminating = Some((Instant::now(), Status::Cancelled, "cancelled".into()));
     }
     // The test phase's size (ADR 0026 §2): what tests prova could not
     // isolate are held to. Only when the phase was sampled at least twice
@@ -1068,6 +1131,8 @@ fn observe_child(
         });
     }
     let mut warnings = report.warnings;
+    // Tests set aside by hand, as they were when this run was created (0027).
+    let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
     if spec.expects_tests() && status == Status::Finished {
         // A selection that only skipped tests ran none (round 11: vitest -t
@@ -1101,6 +1166,11 @@ fn observe_child(
             if let Some((prev, missing, total)) =
                 missing_since_last_pass(store, run, &sup.suite, &current)?
             {
+                // A quarantined test left out is set aside in the open (0027).
+                let missing: Vec<String> = missing
+                    .into_iter()
+                    .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
+                    .collect();
                 // Quiet output can hide every test while the framework counted
                 // them: that is not "none ran" (round 9).
                 if current.is_empty() && observed == 0 && sup.framework_total.unwrap_or(0) == 0 {
@@ -1134,12 +1204,19 @@ fn observe_child(
             }
         }
     }
+    // A known-flaky test left out of the command is no pass of it (0027).
+    if spec.expects_tests() && status == Status::Finished && spec.selection.is_none() {
+        sup.flush()?;
+        if let Some(w) = left_out_flaky(store, run, &sup.suite, &quarantine)? {
+            warnings.push(w);
+        }
+    }
     // Results that cannot come from this run: a test reported (or known
     // from history) to take longer than the whole run (round 9: a Makefile
     // that echoes `test x ... ok`, a stale JUnit file refreshed by touch).
     if status == Status::Finished && spec.expects_tests() {
         sup.flush()?;
-        let wall = now_ms().saturating_sub(started_ms);
+        let wall = exited_ms.saturating_sub(started_ms);
         let mut stmt = store.conn().prepare(
             "SELECT t.display, a.duration_ms,
                     -- the same code only: changed code may be faster
@@ -1197,7 +1274,9 @@ fn observe_child(
             };
             let mut was_passing = Vec::new();
             for (id, display) in skipped {
-                if warnings.iter().any(|w| w.contains(&display)) {
+                if warnings.iter().any(|w| w.contains(&display))
+                    || crate::quarantine::covers(&quarantine, &display).is_some()
+                {
                     continue;
                 }
                 // Skipped here last time too: this suite does not run it (a
@@ -1329,15 +1408,32 @@ fn observe_child(
         if let Some((prev, missing, _)) = missing_since_last_run(store, run, &sup.suite, &current)?
             && !missing.is_empty()
         {
-            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
-            sup.emit(EventKind::RunNote {
-                message: format!(
+            let lines: Vec<String> = sup.tail.iter().cloned().collect();
+            let (suspects, class) = narrow_by_running(&missing, &lines);
+            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let message = match class {
+                Some(c) => format!(
+                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {}{}",
+                    suspects.len(),
+                    names.join(", "),
+                    if suspects.len() > names.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                ),
+                None => format!(
                     "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {}{}",
                     missing.len(),
                     names.join(", "),
-                    if missing.len() > names.len() { ", ..." } else { "" }
+                    if missing.len() > names.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
                 ),
-            });
+            };
+            sup.emit(EventKind::RunNote { message });
         }
     }
     if let Some(code @ (126 | 127)) = exit_code {
@@ -1360,7 +1456,25 @@ fn observe_child(
     let _ = sup.lifecycle.exited(exit_code);
     // Tests still open at the end become errored (spec: end closes open tests).
     let closed = sup.lifecycle.end(status).unwrap_or_default();
-    let outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
+    let mut outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
+    // Only quarantined tests failed: the run passes without them (ADR 0027
+    // §4), on top of the lifecycle's verdict, under a strict guard.
+    if outcome == Outcome::Failed
+        && status == Status::Finished
+        && closed.is_empty()
+        && contradictions.is_empty()
+        && sup.level >= Level::Recognized
+        && let Some(names) =
+            quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code)
+    {
+        outcome = Outcome::Passed;
+        sup.emit(EventKind::RunNote {
+            message: format!(
+                "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
+                names.join(", ")
+            ),
+        });
+    }
     if outcome == Outcome::Passed {
         if let Some((line, text)) = sup.distiller.first_crash() {
             warnings.push(format!(
@@ -1380,6 +1494,10 @@ fn observe_child(
             stmt.query_map(rusqlite::params![run], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let rerun: Vec<String> = rerun
+            .into_iter()
+            .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
+            .collect();
         if !rerun.is_empty() {
             warnings.push(format!(
                 "{} test(s) failed, then passed on a retry: flaky, not green: {}",
@@ -1464,7 +1582,7 @@ fn observe_child(
     store.finish_run(
         run,
         sup.seq + 1,
-        now_ms(),
+        exited_ms,
         status,
         Some(outcome),
         exit_code,
@@ -1547,6 +1665,99 @@ fn missing_since(
         .map(|(_, d)| d.clone())
         .collect();
     Ok(Some((prev, missing, earlier.len())))
+}
+
+/// The display name of a lifecycle key (`file<US>name`).
+fn key_display(key: &str) -> &str {
+    key.rsplit('\u{1f}').next().unwrap_or(key)
+}
+
+/// The names of the failed tests when every failing test of the run is
+/// quarantined and plainly `failed` (not errored), and the command's exit
+/// code is a test failure's (not 126/127 or a signal): the quarantined
+/// failures are then the run's only problem (ADR 0027 §4). `None` otherwise.
+fn quarantined_only_failures(
+    outcomes: &BTreeMap<String, Outcome>,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+    exit_code: Option<i32>,
+) -> Option<Vec<String>> {
+    if quarantine.is_empty() || matches!(exit_code, None | Some(0 | 126 | 127)) {
+        return None;
+    }
+    let mut names = Vec::new();
+    for (key, o) in outcomes {
+        if !o.is_failure() {
+            continue;
+        }
+        let display = key_display(key);
+        if *o != Outcome::Failed || crate::quarantine::covers(quarantine, display).is_none() {
+            return None;
+        }
+        names.push(display.to_owned());
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// Whether the tests of `run` share a test with any of `suites`: a suite
+/// that runs part of what another suite runs (0027 §6).
+fn overlaps(store: &Store, run: &str, suites: &[String]) -> Result<bool> {
+    for suite in suites {
+        let hit: bool = store.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t1 ON t1.id = a.test_id
+                              JOIN tests t2 ON t2.display = t1.display
+                             WHERE a.run_id = ?1 AND t2.suite = ?2)",
+            rusqlite::params![run, suite],
+            |r| r.get(0),
+        )?;
+        if hit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The warning for known-flaky tests that have no result in this full run
+/// although this suite, or a suite sharing tests with it, ran them: leaving a
+/// flaky test out of the command proves nothing about it (ADR 0027 §6).
+/// Quarantined tests are set aside in the open and not named.
+fn left_out_flaky(
+    store: &Store,
+    run: &str,
+    suite: &str,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+) -> Result<Option<String>> {
+    let ran: std::collections::BTreeSet<String> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id WHERE a.run_id = ?1",
+        )?;
+        stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if ran.is_empty() {
+        return Ok(None);
+    }
+    let mut left: Vec<String> = Vec::new();
+    for f in crate::analysis::flaky(store, None, 50)? {
+        if ran.contains(&f.display)
+            || left.contains(&f.display)
+            || crate::quarantine::covers(quarantine, &f.display).is_some()
+        {
+            continue;
+        }
+        if f.suites.iter().any(|s| s == suite) || overlaps(store, run, &f.suites)? {
+            left.push(f.display);
+        }
+    }
+    if left.is_empty() {
+        return Ok(None);
+    }
+    left.sort();
+    Ok(Some(format!(
+        "{} known flaky test(s) did not run: {}{}; leaving a flaky test out of the command hides it (set it aside in the open: prova quarantine add <test> --reason ...)",
+        left.len(),
+        left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+        if left.len() > 5 { ", ..." } else { "" }
+    )))
 }
 
 // ------------------------------------------------------------------ wait
@@ -1671,10 +1882,40 @@ pub struct Summary {
     /// Known flaky tests (ADR 0018) that passed in this run: luck, not proof.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flaky_passed: Vec<String>,
+    /// The suite has a `select` template, so `--select` works with it.
+    #[serde(skip)]
+    pub can_select: bool,
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
+    /// Tests set aside by `prova quarantine` that this run touched or could
+    /// have run, with their result here (ADR 0027): never hidden.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub quarantined: Vec<QuarantinedTest>,
+    /// The slowest tests of this finished run, 1 s or more, worst first.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub slowest: Vec<SlowestTest>,
 }
+
+/// One quarantined test as a run saw it.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuarantinedTest {
+    pub test: String,
+    /// `passed`, `failed`, `errored`, `skipped`, or `not run`.
+    pub result: String,
+    pub reason: String,
+    pub expires_ms: u64,
+}
+
+/// A test of the run that took long.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowestTest {
+    pub test: String,
+    pub duration_ms: u64,
+}
+
+/// A test this slow (ms) is named in the summary (ADR 0027 §8).
+const SLOWEST_MIN_MS: i64 = 1000;
 
 fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
     match kind {
@@ -1761,6 +2002,8 @@ pub fn wait(
     let deadline = Instant::now() + max_wait;
     let mut cursor = after;
     let mut version = -1;
+    // A quarantined test's failure is no reason to wake up (0027 §5).
+    let quarantine = crate::quarantine::for_run(store, run).unwrap_or_default();
     loop {
         let v = store.data_version()?;
         if v != version {
@@ -1769,6 +2012,12 @@ pub fn wait(
             for e in &events {
                 cursor = e.seq;
                 if let Some(reason) = matches(until, &e.kind) {
+                    if reason == WaitReason::Failure
+                        && let EventKind::TestFinished { test, .. } = &e.kind
+                        && crate::quarantine::covers(&quarantine, &test.display()).is_some()
+                    {
+                        continue;
+                    }
                     return summarize(store, run, reason, e.seq);
                 }
             }
@@ -1786,6 +2035,53 @@ pub fn wait(
 
 /// Last `n` lines of a run's output: from the live spool, or from the
 /// excerpt kept once the run ended.
+/// The suspects of a hang narrowed by the framework's own last `Running
+/// <class>` line (Maven Surefire, `[INFO] Running calc.CalcTest`): the
+/// hung test is in the class it was running, not anywhere in the last run
+/// (round 13: the note listed tests that had not even started).
+fn narrow_by_running<'a>(
+    missing: &'a [String],
+    lines: &[String],
+) -> (Vec<&'a String>, Option<String>) {
+    let running = lines.iter().rev().find_map(|l| {
+        let t = l.trim().trim_start_matches("[INFO]").trim();
+        let name = t.strip_prefix("Running ")?.split_whitespace().next()?;
+        (name.contains('.') && !name.contains('/')).then(|| name.to_owned())
+    });
+    if let Some(class) = &running {
+        let narrowed: Vec<&String> = missing
+            .iter()
+            .filter(|m| m.starts_with(&format!("{class}::")) || m.starts_with(&format!("{class}.")))
+            .collect();
+        if !narrowed.is_empty() {
+            return (narrowed, running);
+        }
+    }
+    (missing.iter().collect(), None)
+}
+
+/// The excerpt as a person reads it: `go test -json` lines become their
+/// own output text (round 13: 30 lines of raw JSON under a failure prova
+/// had already decoded).
+fn readable(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            if !t.starts_with('{') {
+                return Some(l);
+            }
+            match serde_json::from_str::<serde_json::Value>(t) {
+                Ok(v) if v.get("Action").is_some() => v["Output"]
+                    .as_str()
+                    .map(|o| o.trim_end().to_owned())
+                    .filter(|o| !o.trim().is_empty()),
+                _ => Some(l),
+            }
+        })
+        .collect()
+}
+
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
     if let Ok(crate::output::Kept::Excerpt(e)) = crate::output::run_excerpt(store, run) {
         return e.tail(n);
@@ -1810,6 +2106,25 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
         .map(str::to_owned)
         .collect();
     lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+/// Runs whose pass verified little: a warning (ADR 0017), or a known flaky
+/// test that passed. The run list marks them `passed?`.
+pub fn unverified_runs(
+    store: &Store,
+    runs: &[RunRow],
+) -> Result<std::collections::BTreeSet<String>> {
+    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+    let mut out = store.unverified(&ids)?;
+    for r in runs {
+        if r.outcome == Some(Outcome::Passed) && !out.contains(&r.id) {
+            let s = summarize(store, &r.id, WaitReason::Done, 0)?;
+            if !s.flaky_passed.is_empty() {
+                out.insert(r.id.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
@@ -1897,6 +2212,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             EventKind::RunNote { message } => notes.push(message.clone()),
             EventKind::RunWarning { message } => warnings.push(message.clone()),
             EventKind::RunTotals { tests, failed } => framework = Some((*tests, *failed)),
+            EventKind::TestSuperseded { test, .. } => {
+                finals.remove(&test.unique());
+            }
             _ => {}
         }
     }
@@ -1922,6 +2240,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
+    // Quarantined tests are listed apart, with their result (ADR 0027).
+    let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
+    failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
     // Did the same suite (same selection) pass on exactly this code before?
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
@@ -1962,13 +2283,71 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             .map(|(k, _, _, _, _)| k.display())
             .collect();
         if !passed.is_empty() {
-            for f in crate::analysis::flaky(store, None, 50)? {
-                if passed.contains(&f.display) && !flaky_passed.contains(&f.display) {
+            for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
+                if passed.contains(&f.display)
+                    && !flaky_passed.contains(&f.display)
+                    && crate::quarantine::covers(&quarantine, &f.display).is_none()
+                {
                     flaky_passed.push(f.display);
                 }
             }
         }
     }
+    // Quarantined tests of this run, with their result: relevant when they
+    // ran here, or their suite (or one sharing tests with this run) did.
+    let mut quarantined: Vec<QuarantinedTest> = Vec::new();
+    if row.status.is_terminal() {
+        for (name, q) in &quarantine {
+            let result = finals
+                .values()
+                .filter(|f| !f.4 && f.0.display() == *name)
+                .map(|f| f.1.as_str().to_owned())
+                .next();
+            if result.is_none() {
+                let suites: Vec<String> = {
+                    let mut stmt = store
+                        .conn()
+                        .prepare("SELECT DISTINCT suite FROM tests WHERE display = ?1")?;
+                    stmt.query_map(rusqlite::params![name], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                if !suites.contains(&row.suite) && !overlaps(store, run, &suites)? {
+                    continue;
+                }
+            }
+            quarantined.push(QuarantinedTest {
+                test: name.clone(),
+                result: result.unwrap_or_else(|| "not run".to_owned()),
+                reason: q.reason.clone(),
+                expires_ms: q.expires_ms,
+            });
+        }
+        // A quarantine that ran out is no longer set aside: say so.
+        for q in crate::quarantine::expired_at(store, row.created_ms)? {
+            if finals.values().any(|f| !f.4 && f.0.display() == q.test) {
+                notes.push(format!(
+                    "quarantine of {} expired ({}); it counts again: fix it, or `prova quarantine add` it again with a reason",
+                    q.test, q.reason
+                ));
+            }
+        }
+    }
+    // The slowest tests of a finished run (ADR 0027 §8).
+    let slowest: Vec<SlowestTest> = if row.status.is_terminal() {
+        let mut stmt = store.conn().prepare(
+            "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id = ?1 AND a.duration_ms >= ?2 GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
+        )?;
+        stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
+            Ok(SlowestTest {
+                test: r.get(0)?,
+                duration_ms: r.get::<_, i64>(1)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    } else {
+        Vec::new()
+    };
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
     // Raw output only when it adds something: a stall, or a failure that
@@ -2006,13 +2385,23 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         if let Some((prev, missing, _)) = missing_since_last_run(store, run, &row.suite, &current)?
             && !missing.is_empty()
         {
-            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
-            notes.push(format!(
-                "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
-                missing.len(),
-                names.join(", "),
-                if missing.len() > names.len() { ", ..." } else { "" }
-            ));
+            let lines = output_tail(store, run, 30);
+            let (suspects, class) = narrow_by_running(&missing, &lines);
+            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            notes.push(match class {
+                Some(c) => format!(
+                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {}{}",
+                    suspects.len(),
+                    names.join(", "),
+                    if suspects.len() > names.len() { ", ..." } else { "" }
+                ),
+                None => format!(
+                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
+                    missing.len(),
+                    names.join(", "),
+                    if missing.len() > names.len() { ", ..." } else { "" }
+                ),
+            });
         }
     }
     // A selection that ran nothing must not look like a pass.
@@ -2023,12 +2412,22 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && row.level == Level::Opaque
         && row.status == Status::Finished
         && ran == 0
+        // The framework already said no test ran: one statement, not a
+        // second that contradicts it (round 13, Rust).
+        && !notes.iter().any(|n| n.contains("no test ran"))
     {
         notes.push(format!(
             "selection {sel:?}: no per-test results seen, so prova cannot tell whether any test matched"
         ));
     }
+    // A `next:` that suggests --select must not fail with a usage error
+    // (round 13: `make` has no `select`).
+    let can_select = crate::config::load(store.root())
+        .ok()
+        .and_then(|c| c.suite.get(&row.suite).map(|s| s.select.is_some()))
+        .unwrap_or(false);
     Ok(Summary {
+        can_select,
         run: row.id.clone(),
         suite: row.suite.clone(),
         command,
@@ -2067,8 +2466,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }),
         warnings,
         flaky_passed,
+        quarantined,
+        slowest,
         output_tail: if want_tail {
-            output_tail(store, run, 30)
+            readable(output_tail(store, run, 30))
         } else {
             Vec::new()
         },
@@ -2092,9 +2493,21 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     // passes were named).
     let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
     let thin = store.unverified(&ids)?;
-    let last_passed = prev
+    // A pass that relied on a known flaky test is no "last green" either
+    // (round 13: it named a run whose own output said "unverified").
+    let mut last_passed = None;
+    for r in prev
         .iter()
-        .find(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id));
+        .filter(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id))
+    {
+        if summarize(store, &r.id, WaitReason::Done, 0)?
+            .flaky_passed
+            .is_empty()
+        {
+            last_passed = Some(r);
+            break;
+        }
+    }
     let unverified_passes = prev
         .iter()
         .filter(|r| {
@@ -2168,4 +2581,95 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             None
         },
     })))
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+    use crate::quarantine::Entry;
+
+    fn q(names: &[&str]) -> BTreeMap<String, Entry> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_owned(),
+                    Entry {
+                        test: (*n).to_owned(),
+                        reason: "r".into(),
+                        created_ms: 0,
+                        expires_ms: 1,
+                        removed_ms: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn outcomes(list: &[(&str, Outcome)]) -> BTreeMap<String, Outcome> {
+        list.iter()
+            .map(|(k, o)| (format!("\u{1f}{k}"), *o))
+            .collect()
+    }
+
+    #[test]
+    fn only_quarantined_plain_failures_are_set_aside() {
+        let o = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), Some(1)),
+            Some(vec!["a".to_owned()])
+        );
+        // Another failing test, an error, or no quarantine: the run fails.
+        let two = outcomes(&[("a", Outcome::Failed), ("c", Outcome::Failed)]);
+        assert_eq!(quarantined_only_failures(&two, &q(&["a"]), Some(1)), None);
+        let err = outcomes(&[("a", Outcome::Errored)]);
+        assert_eq!(quarantined_only_failures(&err, &q(&["a"]), Some(1)), None);
+        assert_eq!(quarantined_only_failures(&o, &q(&[]), Some(1)), None);
+        // A command that could not start, or was killed, is no test failure.
+        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), Some(127)), None);
+        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), None), None);
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    /// Round 13 (Java): the hang note listed the last run's tests in
+    /// alphabetical order, none of them in the class Surefire was running.
+    #[test]
+    fn a_running_class_narrows_the_suspects() {
+        let missing: Vec<String> = [
+            "calc.CalcParamTest::divides",
+            "calc.CalcTest::hangs",
+            "calc.CalcTest::adds",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let lines = vec![
+            "[INFO] Running calc.CalcParamTest".to_owned(),
+            "[INFO] Running calc.CalcTest".to_owned(),
+        ];
+        let (s, c) = super::narrow_by_running(&missing, &lines);
+        assert_eq!(c.as_deref(), Some("calc.CalcTest"));
+        assert_eq!(s, vec!["calc.CalcTest::hangs", "calc.CalcTest::adds"]);
+        let (s, c) = super::narrow_by_running(&missing, &["building".to_owned()]);
+        assert_eq!((s.len(), c), (3, None));
+    }
+}
+
+#[cfg(test)]
+mod readable_tests {
+    /// Round 13 (Go): the excerpt under a failure was raw test2json.
+    #[test]
+    fn go_json_lines_read_as_their_output() {
+        let lines = vec![
+            r#"{"Action":"run","Test":"TestA"}"#.to_owned(),
+            r#"{"Action":"output","Test":"TestA","Output":"    a_test.go:9: boom\n"}"#.to_owned(),
+            "plain line".to_owned(),
+        ];
+        assert_eq!(
+            super::readable(lines),
+            vec!["    a_test.go:9: boom".to_owned(), "plain line".to_owned()]
+        );
+    }
 }

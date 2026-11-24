@@ -1110,3 +1110,74 @@ fn status_leads_with_the_best_after_a_later_reject() {
         "{out}"
     );
 }
+
+/// Usability round 13: files the oracle command reads that no `--spec`
+/// freezes are named at `exp new`, with the flag to add them (medium: needs
+/// a git repository and the binary).
+#[test]
+fn exp_new_warns_about_oracle_files_that_are_not_frozen() {
+    let d = spec_repo_with(
+        "oracle-unfrozen",
+        "test -f work.sh && test \"$(cat answer)\" = 42",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e2",
+            "--hypothesis",
+            "h",
+            "--spec",
+            "spec.txt",
+            "--oracle",
+            "test -f work.sh && test -f spec.txt",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--spec work.sh"), "{err}");
+    assert!(!err.contains("--spec spec.txt"), "{err}");
+}
+
+/// `exp protocol --no-spec` removes a frozen specification file.
+#[test]
+fn exp_protocol_can_remove_a_specification_file() {
+    let d = spec_repo("no-spec");
+    let o = prova(&d, &["exp", "protocol", "e", "--no-spec", "spec.txt"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let again = prova(&d, &["exp", "protocol", "e", "--no-spec", "spec.txt"]);
+    assert!(!again.status.success());
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert!(err.contains("not a specification file"), "{err}");
+}
+
+/// A REJECT quotes the line that matters, not the runner's trailer.
+#[test]
+fn a_rejection_skips_generic_trailers_in_the_oracle_log() {
+    let d = spec_repo_with(
+        "oracle-trailer",
+        "test \"$(cat answer)\" = 42 || { echo \"answer $(cat answer), spec says 42\"; echo 'exit status 1'; exit 1; }",
+    );
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("answer"), "41").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(reason.contains("answer 41, spec says 42"), "{reason}");
+}
+
+/// Usability round 13: the `next:` of `exp metrics` is a command that parses
+/// (it names the required --hypothesis as a placeholder to fill in).
+#[test]
+fn exp_metrics_next_line_names_the_hypothesis() {
+    let d = spec_repo("metrics-next");
+    let o = prova(&d, &["exp", "metrics", "--", "./work.sh"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("next: prova exp new <name> --hypothesis"),
+        "{out}"
+    );
+}

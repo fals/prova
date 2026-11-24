@@ -174,6 +174,9 @@ prova exp new route --hypothesis "A* expands fewer nodes than BFS, same paths" \
   that edits them is a violation. Freeze the oracle's own files too (its
   conformance test, its reference table, the Makefile target): pass each
   with `--spec`, or a candidate could weaken the check instead of the code.
+  `exp new` warns about files the oracle names that are not frozen;
+  `prova exp protocol <name> --no-spec <file>` (before the first trial)
+  unfreezes one added by mistake.
 - `prova exp protocol <name> --spec <file>` (before the first trial) changes
   only what it names and prints the resulting protocol; `prova exp status`
   shows it too.

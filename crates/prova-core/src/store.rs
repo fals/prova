@@ -37,6 +37,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0007_immutable_samples.sql"),
     include_str!("migrations/0008_forgotten_runs.sql"),
     include_str!("migrations/0009_test_sizes.sql"),
+    include_str!("migrations/0010_quarantine.sql"),
+    include_str!("migrations/0011_superseded.sql"),
+    include_str!("migrations/0012_recording_indexes.sql"),
 ];
 
 pub struct Store {
@@ -378,6 +381,20 @@ impl Store {
                     params![e.run, id, attempt, size.as_str(), evidence],
                 )?;
             }
+            if let EventKind::TestSuperseded { test, by } = &e.kind {
+                if suite.is_none() {
+                    suite = Some(tx.query_row(
+                        "SELECT suite FROM runs WHERE id = ?1",
+                        params![e.run],
+                        |r| r.get(0),
+                    )?);
+                }
+                let suite = suite.as_deref().unwrap_or_default();
+                tx.execute(
+                    "INSERT OR IGNORE INTO superseded (run_id, test_id, by_id) VALUES (?1, ?2, ?3)",
+                    params![e.run, test_id(suite, test), test_id(suite, by)],
+                )?;
+            }
             if let EventKind::TestFinished {
                 test,
                 attempt,
@@ -385,7 +402,8 @@ impl Store {
                 duration_ms,
                 message,
                 source,
-                subtest: false,
+                // Subtests have a history of their own too.
+                ..
             } = &e.kind
             {
                 if suite.is_none() {

@@ -869,3 +869,131 @@ fn console_and_trx_results_are_each_test_once() {
         "{v}"
     );
 }
+
+/// Round 13 (Java, C#): a result file the previous run wrote moments before
+/// counted for the next run (a 2 s mtime slack): a test that never ran was
+/// recorded, a selection that matched nothing passed, a real failure was
+/// overridden by an old pass. Only files this run created or changed count.
+/// Medium: result files on disk across two runs.
+#[test]
+fn a_previous_runs_result_file_is_not_this_runs() {
+    let d = workspace("stale-results");
+    let busy = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+    let first = format!(
+        "{busy}; printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"old\"><failure message=\"boom\"/></testcase></testsuite>' > junit.xml; exit 1"
+    );
+    prova(
+        &d,
+        &["run", "--json", "--until", "done", "--", "sh", "-c", &first],
+    );
+    let second = format!("{busy}; echo 'test m::new ... ok'; exit 0");
+    let o = prova(
+        &d,
+        &[
+            "run", "--json", "--until", "done", "--", "sh", "-c", &second,
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let c = &v["counts"];
+    assert_eq!(
+        (c["passed"].as_u64(), c["failed"].as_u64()),
+        (Some(1), Some(0)),
+        "{v}"
+    );
+    // The same file rewritten by this run does count.
+    let third = format!(
+        "{busy}; printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"old\"/></testsuite>' > junit.xml; exit 0"
+    );
+    let o = prova(
+        &d,
+        &["run", "--json", "--until", "done", "--", "sh", "-c", &third],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["counts"]["passed"], 1, "{v}");
+}
+
+/// Round 13 (Go, red team): subtests were never written to history (a
+/// pattern matched only non-subtests), so a failing subtest had no label
+/// and `prova history` did not know it. Medium: the store across runs.
+#[test]
+fn a_subtest_has_history() {
+    let d = workspace("subtest-history");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '=== RUN   TestA\\n=== RUN   TestA/two\\n    --- FAIL: TestA/two (0.00s)\\n--- FAIL: TestA (0.00s)\\nFAIL\\n'; exit 1";
+    prova(&d, &["run", "--until", "done", "--", "sh", "-c", script]);
+    let o = prova(&d, &["run", "--until", "done", "--", "sh", "-c", script]);
+    let out = stdout(&o);
+    assert!(out.contains("FAIL TestA/two [failed 1x before]"), "{out}");
+    let h = stdout(&prova(&d, &["history", "TestA/two"]));
+    assert!(h.contains("2 runs with a result"), "{h}");
+}
+
+/// Round 13 (Java, C#): tests known only from result files at the end had
+/// no sampled test phase, so every size stayed "unknown" after 25 runs.
+/// The whole run is their phase. Medium: real processes, sampled over time.
+#[test]
+fn tests_known_only_from_result_files_get_a_size() {
+    let d = workspace("file-sizes");
+    let script = |extra: &str| {
+        format!(
+            "echo building; end=$(($(date +%s) + 2)); while [ $(date +%s) -lt $end ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
+        )
+    };
+    prova(
+        &d,
+        &["run", "--until", "done", "--", "sh", "-c", &script("")],
+    );
+    let h = stdout(&prova(&d, &["history", "C::a"]));
+    assert!(h.contains("size: small?"), "{h}");
+    let d2 = workspace("file-sizes-child");
+    prova(
+        &d2,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            &script("sleep 1.2;"),
+        ],
+    );
+    let h = stdout(&prova(&d2, &["history", "C::a"]));
+    assert!(
+        h.contains("size: medium or less") && h.contains("sleep"),
+        "{h}"
+    );
+}
+
+/// Round 13 (C#): a cancelled run was listed as "cancelled errored", read
+/// as a test error. Medium: a real run cancelled.
+#[test]
+fn a_cancelled_run_has_no_test_outcome_in_the_list() {
+    let d = workspace("cancel-list");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--detach",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exec sleep 30",
+        ],
+    );
+    let id = serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
+    let list = stdout(&prova(&d, &["status"]));
+    let line = list
+        .lines()
+        .find(|l| l.starts_with(&id[..8]))
+        .unwrap_or_default();
+    assert!(
+        line.contains("cancelled") && !line.contains("errored"),
+        "{list}"
+    );
+}
