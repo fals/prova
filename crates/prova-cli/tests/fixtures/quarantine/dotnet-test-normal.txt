@@ -1,0 +1,34 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  Calc.Tests -> /w/bin/Debug/net9.0/Calc.Tests.dll
+Test run for /w/bin/Debug/net9.0/Calc.Tests.dll (.NETCoreApp,Version=v9.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 9.0.23)
+[xUnit.net 00:00:00.03]   Discovering: Calc.Tests
+[xUnit.net 00:00:00.05]   Discovered:  Calc.Tests
+[xUnit.net 00:00:00.05]   Starting:    Calc.Tests
+[xUnit.net 00:00:00.09]     Calc.CalcTests.FlakyClock [FAIL]
+[xUnit.net 00:00:00.09]       clock tick landed on a bad boundary
+[xUnit.net 00:00:00.09]       Stack Trace:
+[xUnit.net 00:00:00.09]         /w/CalcTests.cs(17,0): at Calc.CalcTests.FlakyClock()
+[xUnit.net 00:00:00.09]            at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+[xUnit.net 00:00:00.09]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.09]   Finished:    Calc.Tests
+  Passed Calc.CalcTests.SlowIntegration [11 ms]
+  Passed Calc.CalcTests.Divides [1 ms]
+  Failed Calc.CalcTests.FlakyClock [< 1 ms]
+  Error Message:
+   clock tick landed on a bad boundary
+  Stack Trace:
+     at Calc.CalcTests.FlakyClock() in /w/CalcTests.cs:line 17
+   at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+  Passed Calc.CalcTests.HangsWhenAsked [< 1 ms]
+  Passed Calc.CalcTests.Adds [< 1 ms]
+
+Total tests: 5
+     Passed: 4
+     Failed: 1
+Test Run Failed.
+ Total time: 0.3569 Seconds
+Results File: /w/results.trx
