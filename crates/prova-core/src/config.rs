@@ -233,6 +233,14 @@ fn dur(
 /// command's framework (round 10: Maven got prova's name unchanged and ran
 /// nothing). Framework syntax already given passes through unchanged.
 pub fn framework_filter(command: &str, filter: &str) -> String {
+    if command.contains(" -run ") || command.contains(" -run=") {
+        // A pattern the user wrote (`^TestDiv`) passes through.
+        if filter.starts_with('^') {
+            return filter.to_owned();
+        }
+        let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
+        return go_run_pattern(leaf);
+    }
     let Some((head, leaf)) = filter.rsplit_once("::") else {
         return filter.to_owned();
     };
@@ -245,12 +253,33 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         // vitest -t matches the full name, describe blocks joined by spaces
         // (round 11: prova's `calc > divides` matched nothing).
         leaf.replace(" > ", " ")
-    } else if command.contains(" -run ") || command.contains(" -k ") {
-        // go test -run, pytest -k: the test's own name.
+    } else if command.contains(" -k ") {
+        // pytest -k: the test's own name.
         leaf.to_owned()
     } else {
         filter.to_owned()
     }
+}
+
+/// `go test -run` takes one regular expression per subtest level, split
+/// on `/`: each level of the name becomes a literal, anchored pattern, so
+/// exactly that test runs (`TestEcho` no longer runs `TestEchoClient`, and
+/// a `(` in a subtest name is not an invalid regexp).
+fn go_run_pattern(name: &str) -> String {
+    name.split('/')
+        .map(|level| {
+            let mut p = String::from("^");
+            for c in level.chars() {
+                if "\\.+*?()|[]{}^$".contains(c) {
+                    p.push('\\');
+                }
+                p.push(c);
+            }
+            p.push('$');
+            p
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl Config {
@@ -319,6 +348,27 @@ impl Config {
 
 #[cfg(test)]
 mod filter_tests {
+    /// Owner's e2e suite: `go test -run` takes a regular expression per
+    /// subtest level, so a name was a pattern: `(` made an invalid regexp,
+    /// `.` matched anything, and `TestEcho` also ran `TestEchoClient`.
+    #[test]
+    fn a_go_test_name_selects_exactly_that_test() {
+        use super::framework_filter as f;
+        let go = "go test -json -run \"$PROVA_FILTER\" ./tests/scenarios -args --parallel";
+        assert_eq!(f(go, "TestEcho"), "^TestEcho$");
+        assert_eq!(
+            f(go, "TestPod/pod_recovers_on_timeout(5s)/wait_for_v1.2+#01"),
+            r"^TestPod$/^pod_recovers_on_timeout\(5s\)$/^wait_for_v1\.2\+#01$"
+        );
+        assert_eq!(
+            f(go, "example.com/clm/tests::TestA/case_[x]|y"),
+            r"^TestA$/^case_\[x\]\|y$"
+        );
+        assert_eq!(f("go test -run=$PROVA_FILTER ./...", "TestB"), "^TestB$");
+        // A pattern the user wrote is theirs.
+        assert_eq!(f(go, "^TestEcho"), "^TestEcho");
+    }
+
     #[test]
     fn prova_names_become_framework_filters() {
         use super::framework_filter as f;
@@ -341,7 +391,7 @@ mod filter_tests {
                 "go test -json -run \"$PROVA_FILTER\" ./...",
                 "example.com/calc::TestAdd"
             ),
-            "TestAdd"
+            "^TestAdd$"
         );
         assert_eq!(
             f("mvn -q test -Dtest=\"$PROVA_FILTER\"", "CalcTest#divides"),
