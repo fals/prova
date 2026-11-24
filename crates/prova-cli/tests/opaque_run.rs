@@ -1103,7 +1103,7 @@ fn tests_run_through_a_container_client_get_no_size() {
     let fake = bin.join("docker");
     std::fs::write(
         &fake,
-        "#!/bin/sh\ni=0; while [ $i -lt 400000 ]; do i=$((i+1)); done\necho 'test m::a ... ok'\n",
+        "#!/bin/sh\ni=0; while [ $i -lt 2000 ]; do i=$((i+1)); done\necho 'test m::a ... ok'\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -1123,6 +1123,8 @@ fn tests_run_through_a_container_client_get_no_size() {
         v["notes"].to_string().contains("ran through `docker`"),
         "{v}"
     );
+    // Its CPU is spent in the container: no "used no CPU" warning.
+    assert_eq!(v["verified"], true, "{v}");
     let ev = stdout(&prova(&d, &["events", "last"]));
     assert!(
         !ev.contains("\"run_size\"") && !ev.contains("\"test_size\""),

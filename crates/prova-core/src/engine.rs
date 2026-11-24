@@ -803,7 +803,9 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         known_sockets: Default::default(),
         line_at: None,
         first_line_ms: None,
-        container: None,
+        // The command itself may be the client (`docker run ... go test`):
+        // known before any sample, however short the run (round 14 CI).
+        container: crate::resources::container_client(&spec.command.display()),
         phase: None,
         whole: None,
         one_test_procs: BTreeMap::new(),
@@ -1358,7 +1360,10 @@ fn observe_child(
         // Passing tests from a command that used no CPU at all: printed, not run
         // (round 10: `echo "--- PASS: TestDiv"` passed in a Java project). Any
         // real test framework uses at least a clock tick.
+        // Not through a container client: the tests' CPU is spent in the
+        // container, out of sight (round 14).
         if status == Status::Finished
+            && sup.container.is_none()
             && sup.cpu_start.is_some()
             && process::children_ticks() == sup.cpu_start
         {
