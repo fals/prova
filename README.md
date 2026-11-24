@@ -106,8 +106,12 @@ More in [Getting started](docs/getting-started.md).
 ## For agents
 
 Run `prova init` in a repository: it installs the workflow skills, plus the
-skills of the languages it detects, into `.agents/skills` (and `.claude/skills`), adds a short section to `AGENTS.md`, and ignores
-prova's files. Then the agent knows the loop:
+skills of the languages it detects, where coding agents look for them, adds a
+short section to `AGENTS.md`, and ignores prova's files. That reaches Claude
+Code, Codex, GitHub Copilot, Cursor, Gemini CLI and Antigravity, OpenCode,
+Amp, Kimi Code, Kimchi, pi, Goose, Devin (Windsurf), Cline, Roo, Zed,
+Factory, Kiro, Junie and Warp ([what goes where](docs/getting-started.md#coding-agents)).
+Then the agent knows the loop:
 
 ```text
 prova run <suite> --until first-failure   first failure, slow test, stall or end (30 s)

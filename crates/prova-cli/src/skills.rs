@@ -112,6 +112,10 @@ Do not run test commands directly or wrap them in timeouts.
 - Suites are in `prova.toml`; no `prova.toml` yet? Start with skill
   `prova-adopt`. History lives in the prova home (`~/.local/share/prova`), shared
   by all clones and worktrees.
+- Read prova's output whole; never filter it with grep, head or tail: it is
+  short and ends with warnings and the `next:` command.
+- The skills are in `.agents/skills/<name>/SKILL.md` (also `.claude/skills/`):
+  read the one named above when its task comes up.
 <!-- prova:end -->
 ";
 

@@ -180,6 +180,25 @@ prova exp new ipam-fast --hypothesis "free list makes ADD O(1)" \
 The specification is frozen with the protocol; a candidate that fails the
 oracle is rejected without being measured.
 
+## Coding agents
+
+`prova init` puts the skills and instructions where each harness looks
+([research, with sources](research/04-agent-harnesses.md)):
+
+| Writes | Read by |
+|---|---|
+| `.agents/skills/` | Codex, GitHub Copilot, Cursor, Gemini CLI, Antigravity, OpenCode, Amp, Kimi Code, pi, Goose, Devin (Windsurf), Roo, Zed, Factory, Warp |
+| `.claude/skills/` | Claude Code, Cline, Kimchi (and Copilot, Cursor, OpenCode, Amp, Goose) |
+| `.kiro/skills/`, `.junie/skills/` | Kiro, Junie: only when `.kiro/` or `.junie/` already exists |
+| a prova section in `AGENTS.md` | nearly every harness; it says where the skills are |
+| the same section in `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.rules`, `.windsurfrules`, `.clinerules`, `.github/copilot-instructions.md` | only where the file already exists: a `CLAUDE.md` makes Claude Code skip `AGENTS.md`, Gemini CLI reads `GEMINI.md`, Zed reads only the first of these it finds |
+
+It creates none of those instruction files, so it never hides `AGENTS.md`
+from another harness, and it writes no MCP configuration (the skills drive
+the CLI). Aider reads nothing by itself: start it with
+`aider --read AGENTS.md`. Running `prova init` again updates the section in
+place.
+
 ## For MCP clients
 
 ```
