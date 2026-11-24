@@ -843,6 +843,7 @@ pub fn slowest(
                FROM attempts a JOIN runs r ON r.id = a.run_id
               WHERE a.duration_ms IS NOT NULL AND a.outcome IN ('passed', 'failed')
                 AND r.status = 'finished'
+                AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
                 AND r.id NOT IN (SELECT run_id FROM forgotten)
                 AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
                                   AND w.payload LIKE '%; no evidence about the tests%')

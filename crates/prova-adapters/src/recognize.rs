@@ -215,6 +215,22 @@ fn secs_ms(s: &str) -> Option<u64> {
 }
 
 /// A line of gotestsum's text output (held back when its stream is read).
+/// A line of `go test -v` text: a test's start, pause, result, or a
+/// package's result.
+fn is_go_text(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("=== RUN")
+        || t.starts_with("=== PAUSE")
+        || t.starts_with("=== CONT")
+        || t.starts_with("=== NAME")
+        || t.starts_with("--- PASS")
+        || t.starts_with("--- FAIL")
+        || t.starts_with("--- SKIP")
+        || matches!(line.trim_end(), "PASS" | "FAIL")
+        || line.starts_with("ok  \t")
+        || line.starts_with("FAIL\t")
+}
+
 fn is_gotestsum_text(line: &str) -> bool {
     let t = line.trim_end();
     t.starts_with("=== FAIL: ")
@@ -854,7 +870,15 @@ impl Recognizers {
             let _ = self.libtest(line, &mut out)
                 || (!self.gotestsum_stream && self.gotestsum(line, &mut out))
                 || (self.gotestsum_stream && is_gotestsum_text(line))
-                || self.go_verbose(line, &mut out)
+                // gotestsum echoes `go test -v` lines for failing tests:
+                // with its stream read, they are held like any streamed
+                // framework's text (round 15: an unqualified test that
+                // never finished).
+                || (self.gotestsum_stream && streamed && is_go_text(line))
+                || (self.gotestsum_stream
+                    && !streamed
+                    && self.hold(|r| r.go_verbose(line, &mut held)))
+                || (!self.gotestsum_stream && self.go_verbose(line, &mut out))
                 || (self.pytest_stream && !streamed && self.hold(|r| r.pytest(line, &mut held)))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)

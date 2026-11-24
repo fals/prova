@@ -253,6 +253,9 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The container client the tests run through, if any.
     container: Option<&'static str>,
+    /// Lifecycle keys of results re-keyed under another name (a Go test
+    /// once its package is known): their outcome is the new key's.
+    superseded: std::collections::BTreeSet<String>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
     /// From the first output line to the end: the phase of a run whose
@@ -467,6 +470,9 @@ impl Supervisor<'_> {
             && let Some((_, started, _, _)) = self.running.get(&test.unique())
         {
             *d = Some(started.elapsed().as_millis() as u64);
+        }
+        if let EventKind::TestSuperseded { test, .. } = &kind {
+            self.superseded.insert(test.unique());
         }
         // Guard every test event with the lifecycle (spec/run.qnt).
         let ok = match &kind {
@@ -806,6 +812,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // The command itself may be the client (`docker run ... go test`):
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
+        superseded: Default::default(),
         phase: None,
         whole: None,
         one_test_procs: BTreeMap::new(),
@@ -1495,12 +1502,16 @@ fn observe_child(
             .flatten()
             .map(|v| v as u64)
     };
-    let set_aside = quarantined_only_failures(
-        sup.lifecycle.outcomes(),
-        &quarantine,
-        exit_code,
-        &first_seen,
-    );
+    // A re-keyed result counts once, under its new name (round 15: the
+    // provisional Go name failed the guard of a quarantined test).
+    let outcomes: BTreeMap<String, Outcome> = sup
+        .lifecycle
+        .outcomes()
+        .iter()
+        .filter(|(k, _)| !sup.superseded.contains(*k))
+        .map(|(k, o)| (k.clone(), *o))
+        .collect();
+    let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
     if let Some(names) = &set_aside {
         if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -1546,12 +1557,8 @@ fn observe_child(
         && closed.is_empty()
         && contradictions.is_empty()
         && sup.level >= Level::Recognized
-        && let Some(names) = quarantined_only_failures(
-            sup.lifecycle.outcomes(),
-            &quarantine,
-            exit_code,
-            &first_seen,
-        )
+        && let Some(names) =
+            quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
     {
         outcome = Outcome::Passed;
         sup.emit(EventKind::RunNote {
@@ -2600,7 +2607,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let slowest: Vec<SlowestTest> = if row.status.is_terminal() {
         let mut stmt = store.conn().prepare(
             "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
-              WHERE a.run_id = ?1 AND a.duration_ms >= ?2 GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
+              WHERE a.run_id = ?1 AND a.duration_ms >= ?2
+                AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+              GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
         )?;
         stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
             Ok(SlowestTest {

@@ -330,3 +330,111 @@ fn a_bare_flaky_name_is_not_left_out_when_its_qualified_form_ran() {
     assert!(out.contains("PASSED"), "{out}");
     assert!(!out.contains("did not run"), "{out}");
 }
+
+/// Round 15: with gotestsum's event stream injected, its text output still
+/// fed the `go test -v` recognizer: the `=== RUN` lines gotestsum echoes
+/// for a failing test became unqualified tests that never finished
+/// (UNFINISHED, a second identity, and a quarantine that never applied).
+#[test]
+fn gotestsum_text_is_ignored_when_its_stream_is_read() {
+    let d = workspace("gts-stream-text");
+    let json = [
+        r#"{"Action":"run","Package":"example.com/calc","Test":"TestAdd"}"#,
+        r#"{"Action":"pass","Package":"example.com/calc","Test":"TestAdd","Elapsed":0}"#,
+        r#"{"Action":"run","Package":"example.com/calc","Test":"TestDiv"}"#,
+        r#"{"Action":"output","Package":"example.com/calc","Test":"TestDiv","Output":"    calc_test.go:17: Div(8, 2) = 16, want 4\n"}"#,
+        r#"{"Action":"fail","Package":"example.com/calc","Test":"TestDiv","Elapsed":0}"#,
+        r#"{"Action":"fail","Package":"example.com/calc","Elapsed":0}"#,
+    ];
+    let mut script = String::from(WORK);
+    for l in json {
+        script.push_str(&format!(
+            "printf '%s\\n' '{l}' >> \"$GOTESTSUM_JSONFILE\"; "
+        ));
+    }
+    script.push_str(
+        "printf '%s\\n' 'PASS example.com/calc.TestAdd (0.00s)' '=== RUN   TestDiv' \
+         '    calc_test.go:17: Div(8, 2) = 16, want 4' '--- FAIL: TestDiv (0.00s)' \
+         'FAIL example.com/calc.TestDiv (0.00s)' 'FAIL example.com/calc' '' '=== Failed' \
+         '=== FAIL: example.com/calc TestDiv (0.00s)' '=== RUN   TestDiv' \
+         '    calc_test.go:17: Div(8, 2) = 16, want 4' '--- FAIL: TestDiv (0.00s)' '' \
+         'DONE 2 tests, 1 failure in 0.1s'; exit 1",
+    );
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--inject",
+            "gotestsum-json",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ],
+    );
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(failing(&s), vec!["example.com/calc::TestDiv"], "{s}");
+    assert_eq!(s["counts"]["errored"], 0, "{s}");
+    assert_eq!(s["counts"]["passed"], 1, "{s}");
+}
+
+/// Round 15: `go test -v` results re-keyed under their package still
+/// counted under the provisional name: a quarantine of the qualified test
+/// never applied, and `--repeat` tallied each failure twice.
+#[test]
+fn go_verbose_failures_count_once_under_their_package() {
+    let d = workspace("gov-once");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestF' \
+         '    f_test.go:4: flake' '--- FAIL: TestF (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+    );
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(failing(&s), vec!["example.com/m::TestF"], "{s}");
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m::TestF",
+            "--reason",
+            "flake",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = prova(&d, &["run", "--repeat", "2", "--", "sh", "-c", &script]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains("FAIL example.com/m::TestF (quarantined): failed every time")
+            && !out.contains("FAIL TestF"),
+        "{out}"
+    );
+}
+
+/// Round 15: a slow `go test -v` test was listed twice among the slow
+/// tests, under its provisional name and its package's.
+#[test]
+fn a_slow_go_test_is_listed_once() {
+    let d = workspace("gov-slow");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestSlow' '--- PASS: TestSlow (1.50s)' 'PASS' 'ok  \texample.com/m\t1.5s'"
+    );
+    let o = prova(&d, &["run", "--", "sh", "-c", &script]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains("slow tests: example.com/m::TestSlow 1.5s (prova slowest)"),
+        "{out}"
+    );
+    let o = prova(&d, &["slowest"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        !out.contains("\nTestSlow") && !out.starts_with("TestSlow"),
+        "{out}"
+    );
+}

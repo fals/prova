@@ -2731,14 +2731,28 @@ fn repeat_runs(
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
             failed_otherwise += 1;
         }
+        // A result re-keyed under another name (a Go test once its package
+        // is known) counts under that name only (round 15: tallied twice).
+        // Every attempt counts (a retry's failure too).
+        let mut results: Vec<(String, String, Outcome)> = Vec::new();
+        let mut gone = std::collections::BTreeSet::new();
         for e in store.events_after(&id, 0)? {
-            if let prova_core::model::EventKind::TestFinished { test, outcome, .. } = e.kind {
-                let t = tally.entry(test.display()).or_default();
-                if outcome.is_failure() {
-                    t.1 += 1;
-                } else if outcome == Outcome::Passed {
-                    t.0 += 1;
+            match e.kind {
+                prova_core::model::EventKind::TestFinished { test, outcome, .. } => {
+                    results.push((test.unique(), test.display(), outcome));
                 }
+                prova_core::model::EventKind::TestSuperseded { test, .. } => {
+                    gone.insert(test.unique());
+                }
+                _ => {}
+            }
+        }
+        for (_, display, outcome) in results.into_iter().filter(|(u, _, _)| !gone.contains(u)) {
+            let t = tally.entry(display).or_default();
+            if outcome.is_failure() {
+                t.1 += 1;
+            } else if outcome == Outcome::Passed {
+                t.0 += 1;
             }
         }
         for q in &s.quarantined {
