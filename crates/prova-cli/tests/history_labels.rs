@@ -828,3 +828,23 @@ fn a_failure_with_no_test_is_named_and_can_be_forgotten() {
     let out = run(&d, "make", "fail");
     assert!(out.contains("failed (no test seen)"), "{out}");
 }
+
+/// Round 15: an ambiguous name listed each test once per suite ("3 tests
+/// match"), as if names that cannot be told apart.
+#[test]
+fn ambiguous_history_lists_each_name_once() {
+    let d = workspace("ambig");
+    let both = format!("{WORK_SH}echo 'test calc::x ... ok'; echo 'test calc::xy ... ok'");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.a]\nrun = {both:?}\n\n[suite.b]\nrun = {both:?}\n"),
+    )
+    .unwrap();
+    prova(&d, &["run", "a"]);
+    prova(&d, &["run", "b"]);
+    let out = text(&prova(&d, &["history", "calc::"]));
+    assert!(
+        out.contains("2 tests match") && out.contains("calc::xy  (suite a, b)"),
+        "{out}"
+    );
+}

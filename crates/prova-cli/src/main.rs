@@ -2503,9 +2503,20 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     .into());
                 }
                 _ => {
-                    println!("{} tests match {test:?}; be more specific:", found.len());
-                    for (_, display, suite) in found.iter().take(20) {
-                        println!("  {display}  (suite {suite})");
+                    // One line per name, its suites together: a name listed
+                    // once per suite read as tests no name could tell apart
+                    // (round 15).
+                    let mut by_name: std::collections::BTreeMap<&str, Vec<&str>> =
+                        Default::default();
+                    for (_, display, suite) in &found {
+                        by_name.entry(display).or_default().push(suite);
+                    }
+                    println!("{} tests match {test:?}; be more specific:", by_name.len());
+                    for (display, suites) in by_name.iter().take(20) {
+                        println!("  {display}  (suite {})", suites.join(", "));
+                    }
+                    if by_name.len() > 20 {
+                        println!("  ... and {} more", by_name.len() - 20);
                     }
                     return Ok(exit::USAGE);
                 }
