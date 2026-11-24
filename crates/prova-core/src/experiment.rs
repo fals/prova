@@ -1542,6 +1542,14 @@ fn work_comparison(
         // A weak protocol, or many experiments on the same baseline and
         // metric, make a lucky ACCEPT likelier: say so (round 11).
         let mut caveats = Vec::new();
+        // Speed is judged, not correctness: without an oracle or spec files
+        // a candidate that does less (or nothing) looks fastest (round 14).
+        if p.oracle.is_none() && p.specs.is_empty() {
+            caveats.push(
+                "no oracle or spec in the protocol: correctness was not checked, only speed"
+                    .to_owned(),
+            );
+        }
         if p.alpha > 0.1 {
             caveats.push(format!("alpha {} is weak (0.05 is usual)", p.alpha));
         }
@@ -2545,6 +2553,8 @@ fn finish(
     let decision = if verdict == Verdict::Accept {
         "keep"
     } else {
+        // Say what it was compared against (round 14).
+        reason = format!("vs {base}: {reason}");
         "discard"
     };
     tx.execute(
