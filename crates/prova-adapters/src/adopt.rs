@@ -23,6 +23,9 @@ pub struct Proposal {
     /// pytest-reportlog is importable here: Python suites get the native
     /// stream (`inject = ["pytest-reportlog"]`).
     pub reportlog: bool,
+    /// The project's own test command runs gotestsum: its event stream can
+    /// be injected (`gotestsum-json`).
+    pub gotestsum: bool,
 }
 
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
@@ -256,6 +259,10 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
     let mut p = Proposal {
         languages: frameworks.iter().map(|f| f.language.to_owned()).collect(),
         existing: existing.clone(),
+        gotestsum: make_test_recipe(root)
+            .iter()
+            .any(|l| l.contains("gotestsum"))
+            || read(root, "package.json").contains("gotestsum"),
         ..Proposal::default()
     };
     match (frameworks.as_slice(), &existing) {
@@ -408,6 +415,11 @@ pub fn to_toml(p: &Proposal) -> String {
                 }
             }
         }
+        if p.gotestsum && p.existing.as_deref() == Some(suite.run.as_str()) {
+            s.push_str(
+                "# gotestsum prints only failures by default: inject = [\"gotestsum-json\"]\n#   reads its own event stream (every test, live, with packages)\n",
+            );
+        }
         if suite.run.contains("vitest") {
             s.push_str(
                 "# every test live (native): inject = [\"vitest-stream\"] and add\n#   --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\" to run and select\n",
@@ -458,6 +470,23 @@ mod tests {
         assert_eq!(
             parsed["suite"]["default"]["run"].as_str(),
             Some("make test")
+        );
+    }
+
+    #[test]
+    fn a_make_test_running_gotestsum_gets_its_stream_hint() {
+        let p = propose(&dir(
+            "gotestsum",
+            &[
+                ("go.mod", "module x"),
+                ("Makefile", "test:\n\tgotestsum --format pkgname -- ./...\n"),
+            ],
+        ));
+        assert!(p.gotestsum);
+        assert!(
+            to_toml(&p).contains("inject = [\"gotestsum-json\"]"),
+            "{}",
+            to_toml(&p)
         );
     }
 

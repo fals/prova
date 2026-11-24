@@ -127,7 +127,7 @@ cache)? Opt in per suite, never by default:
 ```toml
 [suite.make]
 run = "make test"
-inject = ["pytest-reportlog"] # every test live; or "pytest-junit", "go-nocache"
+inject = ["pytest-reportlog"] # every test live; or "pytest-junit", "go-nocache", "gotestsum-json"
                               # also: prova run --inject <recipe> -- <command>
 ```
 

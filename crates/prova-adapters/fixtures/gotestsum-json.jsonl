@@ -1,0 +1,41 @@
+{"ImportPath":"example.com/gts/p2 [example.com/gts/p2.test]","Action":"build-output","Output":"# example.com/gts/p2 [example.com/gts/p2.test]\n"}
+{"ImportPath":"example.com/gts/p2 [example.com/gts/p2.test]","Action":"build-output","Output":"p2/b_test.go:5:32: undefined: undefinedThing\n"}
+{"ImportPath":"example.com/gts/p2 [example.com/gts/p2.test]","Action":"build-fail"}
+{"Time":"2026-11-24T13:36:18.553182693+01:00","Action":"start","Package":"example.com/gts/p1"}
+{"Time":"2026-11-24T13:36:18.553336131+01:00","Action":"start","Package":"example.com/gts/p2"}
+{"Time":"2026-11-24T13:36:18.553358263+01:00","Action":"output","Package":"example.com/gts/p2","Output":"FAIL\texample.com/gts/p2 [build failed]\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.553369145+01:00","Action":"fail","Package":"example.com/gts/p2","Elapsed":0,"FailedBuild":"example.com/gts/p2 [example.com/gts/p2.test]"}
+{"Time":"2026-11-24T13:36:18.553560345+01:00","Action":"start","Package":"example.com/gts/p3"}
+{"Time":"2026-11-24T13:36:18.55483681+01:00","Action":"run","Package":"example.com/gts/p1","Test":"TestOk"}
+{"Time":"2026-11-24T13:36:18.554858762+01:00","Action":"output","Package":"example.com/gts/p1","Test":"TestOk","Output":"=== RUN   TestOk\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.554865506+01:00","Action":"output","Package":"example.com/gts/p1","Test":"TestOk","Output":"--- PASS: TestOk (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.55486783+01:00","Action":"pass","Package":"example.com/gts/p1","Test":"TestOk","Elapsed":0}
+{"Time":"2026-11-24T13:36:18.554870114+01:00","Action":"run","Package":"example.com/gts/p1","Test":"TestBad"}
+{"Time":"2026-11-24T13:36:18.554872439+01:00","Action":"output","Package":"example.com/gts/p1","Test":"TestBad","Output":"=== RUN   TestBad\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.554874262+01:00","Action":"output","Package":"example.com/gts/p1","Test":"TestBad","Output":"    a_test.go:6: expected 4, got 16\n","OutputType":"error"}
+{"Time":"2026-11-24T13:36:18.554876978+01:00","Action":"output","Package":"example.com/gts/p1","Test":"TestBad","Output":"--- FAIL: TestBad (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.554880134+01:00","Action":"fail","Package":"example.com/gts/p1","Test":"TestBad","Elapsed":0}
+{"Time":"2026-11-24T13:36:18.554881587+01:00","Action":"output","Package":"example.com/gts/p1","Output":"FAIL\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.554988063+01:00","Action":"run","Package":"example.com/gts/p3","Test":"TestPanics"}
+{"Time":"2026-11-24T13:36:18.55501729+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"=== RUN   TestPanics\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.555024323+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"--- FAIL: TestPanics (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.555220945+01:00","Action":"output","Package":"example.com/gts/p1","Output":"FAIL\texample.com/gts/p1\t0.002s\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.555230112+01:00","Action":"fail","Package":"example.com/gts/p1","Elapsed":0.002}
+{"Time":"2026-11-24T13:36:18.5571116+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"panic: assignment to entry in nil map [recovered, repanicked]\n"}
+{"Time":"2026-11-24T13:36:18.557118804+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\n"}
+{"Time":"2026-11-24T13:36:18.557122661+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"goroutine 18 [running]:\n"}
+{"Time":"2026-11-24T13:36:18.557125226+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"testing.tRunner.func1.2({0x6bb590, 0x6f30e0})\n"}
+{"Time":"2026-11-24T13:36:18.557127821+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/usr/local/go/src/testing/testing.go:2125 +0x232\n"}
+{"Time":"2026-11-24T13:36:18.557130887+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"testing.tRunner.func1()\n"}
+{"Time":"2026-11-24T13:36:18.557135797+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/usr/local/go/src/testing/testing.go:2128 +0x329\n"}
+{"Time":"2026-11-24T13:36:18.557138081+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"panic({0x6bb590?, 0x6f30e0?})\n"}
+{"Time":"2026-11-24T13:36:18.557140456+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/usr/local/go/src/runtime/panic.go:859 +0x125\n"}
+{"Time":"2026-11-24T13:36:18.557144494+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"example.com/gts/p3.TestPanics(0x3ed1c40dc248?)\n"}
+{"Time":"2026-11-24T13:36:18.557147369+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/src/p3/c_test.go:5 +0x28\n"}
+{"Time":"2026-11-24T13:36:18.557151377+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"testing.tRunner(0x3ed1c40dc248, 0x6d9030)\n"}
+{"Time":"2026-11-24T13:36:18.557154092+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/usr/local/go/src/testing/testing.go:2195 +0xea\n"}
+{"Time":"2026-11-24T13:36:18.557156327+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"created by testing.(*T).Run in goroutine 1\n"}
+{"Time":"2026-11-24T13:36:18.557159974+01:00","Action":"output","Package":"example.com/gts/p3","Test":"TestPanics","Output":"\t/usr/local/go/src/testing/testing.go:2260 +0x4d4\n"}
+{"Time":"2026-11-24T13:36:18.557317088+01:00","Action":"fail","Package":"example.com/gts/p3","Test":"TestPanics","Elapsed":0}
+{"Time":"2026-11-24T13:36:18.557324172+01:00","Action":"output","Package":"example.com/gts/p3","Output":"FAIL\texample.com/gts/p3\t0.004s\n","OutputType":"frame"}
+{"Time":"2026-11-24T13:36:18.557329011+01:00","Action":"fail","Package":"example.com/gts/p3","Elapsed":0.004}

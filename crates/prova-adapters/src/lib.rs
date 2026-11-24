@@ -95,6 +95,7 @@ impl Observer for Ladder {
             .collect();
         self.live.pytest_stream = self.inject.iter().any(|r| r == "pytest-reportlog");
         self.live.vitest_stream = self.inject.iter().any(|r| r == "vitest-stream");
+        self.live.gotestsum_stream = self.inject.iter().any(|r| r == "gotestsum-json");
         self.inject_dir = Some(dir.clone());
         inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
@@ -278,7 +279,16 @@ impl Observer for Ladder {
         }
         // `go test` without -v or -json prints failures only (round 5).
         // (Not with -v: its `=== RUN` lines show it; round 9 noted it anyway.)
-        if self.live.go_package_lines > 0
+        let hid_passes = !self
+            .live
+            .seen
+            .values()
+            .any(|(_, o)| *o == prova_core::model::Outcome::Passed);
+        if self.live.gotestsum_seen && !self.live.gotestsum_stream && hid_passes {
+            report.events.push(EventKind::RunNote {
+                message: "gotestsum's default output prints only failures: passing tests are not recorded, so flaky detection is blind; add `inject = [\"gotestsum-json\"]` to the suite in prova.toml (prova reads gotestsum's own event stream) or run it with `--format testname`".into(),
+            });
+        } else if self.live.go_package_lines > 0
             && self.live.go_run_lines == 0
             && !self
                 .live

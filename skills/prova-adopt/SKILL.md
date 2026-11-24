@@ -50,6 +50,9 @@ project's test scripts, Makefile or CI config to adopt prova.
    - `vitest-stream`: prova's Vitest reporter; also add
      `--reporter=default --reporter="$PROVA_VITEST_REPORTER"` to the suite command;
    - `go-nocache`: `go test` reruns tests instead of replaying cached results.
+   - `gotestsum-json`: a command that runs gotestsum writes Go's own event
+     stream (`GOTESTSUM_JSONFILE`), read live: every test, with packages
+     (gotestsum's default output shows only failures).
 
    Only if no recipe fits, propose to the user (do not apply silently) one
    change that raises the level, as a separate commit they can refuse, for

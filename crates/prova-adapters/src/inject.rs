@@ -75,6 +75,19 @@ pub const RECIPES: &[Recipe] = &[
         stream: Some("vitest.jsonl"),
     },
     Recipe {
+        name: "gotestsum-json",
+        summary: "gotestsum writes go test's own event stream, read live (GOTESTSUM_JSONFILE); its text output is then ignored",
+        env: |dir| {
+            vec![(
+                "GOTESTSUM_JSONFILE",
+                dir.join("gotestsum.jsonl").display().to_string(),
+                false,
+            )]
+        },
+        files: &[],
+        stream: Some("gotestsum.jsonl"),
+    },
+    Recipe {
         name: "go-nocache",
         summary: "go test reruns tests instead of replaying cached results (GOFLAGS -count=1)",
         env: |_| vec![("GOFLAGS", "-count=1".to_owned(), true)],
@@ -168,11 +181,9 @@ mod tests {
             ]
         );
         assert!(validate(&["pytest-junit".into()]).is_ok());
-        assert!(
-            validate(&["shims".into()])
-                .unwrap_err()
-                .contains("known: pytest-junit, pytest-reportlog, vitest-stream, go-nocache")
-        );
+        assert!(validate(&["shims".into()]).unwrap_err().contains(
+            "known: pytest-junit, pytest-reportlog, vitest-stream, gotestsum-json, go-nocache"
+        ));
         assert!(
             super::env(&[], dir, |_| None).is_empty(),
             "nothing unless opted in"
