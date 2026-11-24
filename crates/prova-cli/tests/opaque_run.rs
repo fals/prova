@@ -926,3 +926,40 @@ fn a_subtest_has_history() {
     let h = stdout(&prova(&d, &["history", "TestA/two"]));
     assert!(h.contains("2 runs with a result"), "{h}");
 }
+
+/// Round 13 (Java, C#): tests known only from result files at the end had
+/// no sampled test phase, so every size stayed "unknown" after 25 runs.
+/// The whole run is their phase. Medium: real processes, sampled over time.
+#[test]
+fn tests_known_only_from_result_files_get_a_size() {
+    let d = workspace("file-sizes");
+    let script = |extra: &str| {
+        format!(
+            "echo building; end=$(($(date +%s) + 2)); while [ $(date +%s) -lt $end ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
+        )
+    };
+    prova(
+        &d,
+        &["run", "--until", "done", "--", "sh", "-c", &script("")],
+    );
+    let h = stdout(&prova(&d, &["history", "C::a"]));
+    assert!(h.contains("size: small?"), "{h}");
+    let d2 = workspace("file-sizes-child");
+    prova(
+        &d2,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            &script("sleep 1.2;"),
+        ],
+    );
+    let h = stdout(&prova(&d2, &["history", "C::a"]));
+    assert!(
+        h.contains("size: medium or less") && h.contains("sleep"),
+        "{h}"
+    );
+}

@@ -251,6 +251,10 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
+    /// From the first output line to the end: the phase of a run whose
+    /// tests are known only from result files at the end (round 13: Java
+    /// and C# stayed "unknown" after 25 runs).
+    whole: Option<Phase>,
 }
 
 /// What the run's tree used while its tests ran, beyond the runner.
@@ -262,6 +266,39 @@ struct Phase {
     /// runner's teardown, so only earlier ones count.
     last_event: Instant,
     samples: Vec<(Instant, crate::resources::Seen)>,
+}
+
+/// One sample of a run phase: what it used beyond the runner (ADR 0026).
+fn sample_phase(
+    p: &mut Phase,
+    now: &crate::resources::Usage,
+    now_boot: Option<u64>,
+    first_line_ms: Option<u64>,
+) {
+    let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
+    if let (Some(from), Some(to), Some(since)) = (p.start_ms, now_boot, first_line_ms) {
+        s.processes = crate::resources::started_within(now, from, to, since);
+    } else {
+        s.processes = now
+            .procs
+            .iter()
+            .filter(|(pid, (_, cmd))| {
+                !p.base_pids.contains(pid) && !crate::resources::runner_process(cmd)
+            })
+            .map(|(_, (_, cmd))| {
+                cmd.split(' ')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
+    s.samples = 1;
+    p.samples.push((Instant::now(), s));
 }
 
 /// One running test's size observation (ADR 0025).
@@ -554,14 +591,35 @@ impl Supervisor<'_> {
     /// The run's test phase as one observation: samples taken before its
     /// last test event, at least two of them, or nothing (ADR 0026 §2).
     fn phase_seen(&self) -> Option<crate::resources::Seen> {
-        let p = self.phase.as_ref()?;
-        let mut seen = crate::resources::Seen::default();
-        for (at, s) in &p.samples {
-            if p.last_event.saturating_duration_since(*at) >= SIZE_GUARD {
-                seen.absorb(s);
+        let from = |p: &Phase, guard: bool| {
+            let mut seen = crate::resources::Seen::default();
+            for (at, s) in &p.samples {
+                if !guard || p.last_event.saturating_duration_since(*at) >= SIZE_GUARD {
+                    seen.absorb(s);
+                }
             }
+            (seen.samples >= 2).then_some(seen)
+        };
+        match &self.phase {
+            Some(p) if p.samples.len() >= 2 => from(p, true),
+            // No test event came while the command ran: the whole run.
+            _ => self.whole.as_ref().and_then(|w| from(w, false)),
         }
-        (seen.samples >= 2).then_some(seen)
+    }
+
+    /// Starts the whole-run phase at the first output line.
+    fn start_whole(&mut self, at: Arrived) {
+        if self.pgid == 0 || self.whole.is_some() {
+            return;
+        }
+        let _ = self.usage_now();
+        self.whole = Some(Phase {
+            start_ms: at.boot_ms,
+            base_pids: self.known_pids.clone(),
+            base_sockets: self.known_sockets.clone(),
+            last_event: at.at,
+            samples: Vec::new(),
+        });
     }
 
     /// A snapshot of the command's group, reused when under 50 ms old.
@@ -593,32 +651,12 @@ impl Supervisor<'_> {
     fn observe_sizes(&mut self, now: &crate::resources::Usage) {
         let now_boot = crate::process::uptime_ms();
         // The run's test phase: what started inside it, beyond the runner.
-        if let Some(p) = &mut self.phase {
-            let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
-            if let (Some(from), Some(to), Some(since)) = (p.start_ms, now_boot, self.first_line_ms)
-            {
-                s.processes = crate::resources::started_within(now, from, to, since);
-            } else {
-                s.processes = now
-                    .procs
-                    .iter()
-                    .filter(|(pid, (_, cmd))| {
-                        !p.base_pids.contains(pid) && !crate::resources::runner_process(cmd)
-                    })
-                    .map(|(_, (_, cmd))| {
-                        cmd.split(' ')
-                            .next()
-                            .unwrap_or("")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("")
-                            .to_owned()
-                    })
-                    .filter(|n| !n.is_empty())
-                    .collect();
-            }
-            s.samples = 1;
-            p.samples.push((Instant::now(), s));
+        let first_line_ms = self.first_line_ms;
+        for p in [self.phase.as_mut(), self.whole.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            sample_phase(p, now, now_boot, first_line_ms);
         }
         let alone = self.running.len() <= 1;
         let first_line = self.first_line_ms;
@@ -741,6 +779,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         line_at: None,
         first_line_ms: None,
         phase: None,
+        whole: None,
         one_test_procs: BTreeMap::new(),
         declared: spec.size,
     };
@@ -877,6 +916,7 @@ fn observe_child(
                     sup.line_at = Some(at);
                     if sup.first_line_ms.is_none() {
                         sup.first_line_ms = at.boot_ms;
+                        sup.start_whole(at);
                     }
                     sup.line(i, &l, observer);
                     sup.line_at = None;
