@@ -62,6 +62,18 @@ pub struct Recognizers {
     /// human output is then ignored, so one source decides each test.
     pub pytest_stream: bool,
     pub vitest_stream: bool,
+    /// gotestsum's own stream is injected (`gotestsum-json`): its text is
+    /// not read, or every test would count twice.
+    pub gotestsum_stream: bool,
+    /// gotestsum's text was recognized (its `DONE` line or result lines).
+    pub gotestsum_seen: bool,
+    /// A gotestsum `=== FAIL:` block being read: its lines are the message.
+    gts_pending: Option<(TestKey, Outcome, Option<u64>, Vec<String>)>,
+    /// `FAIL <pkg>` lines (`testname` format), kept until the end: only a
+    /// confirmed gotestsum run makes them package failures.
+    gts_pkg_failed: Vec<String>,
+    /// Packages with a failing test (`testname` format).
+    gts_pkg_with_failure: std::collections::BTreeSet<String>,
     /// nextest: a FAIL line held while its captured output follows.
     nextest_pending: Option<(TestKey, Option<u64>, Vec<String>)>,
     /// A passing test's captured output (`--success-output final`): did
@@ -118,6 +130,25 @@ fn lift(level: &mut Option<Level>, l: Level) {
     }
 }
 
+/// "0.00s" or "0.00" seconds as ms.
+fn secs_ms(s: &str) -> Option<u64> {
+    s.trim()
+        .trim_end_matches('s')
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * 1000.0).round() as u64)
+}
+
+/// A line of gotestsum's text output (held back when its stream is read).
+fn is_gotestsum_text(line: &str) -> bool {
+    let t = line.trim_end();
+    t.starts_with("=== FAIL: ")
+        || t.starts_with("=== SKIP: ")
+        || t == "=== Failed"
+        || t == "=== Errors"
+        || t == "=== Skipped"
+}
+
 fn message(lines: &[String]) -> Option<String> {
     let kept: Vec<&str> = lines
         .iter()
@@ -126,6 +157,15 @@ fn message(lines: &[String]) -> Option<String> {
         .collect();
     if kept.is_empty() {
         return None;
+    }
+    // A Go panic: the panic line and the test's own frame, not the last
+    // goroutine frames (round 13, gotestsum: "testing.tRunner.func1.2").
+    if let Some(p) = kept.iter().position(|l| l.starts_with("panic: ")) {
+        let mut m = vec![kept[p]];
+        if let Some(frame) = kept[p..].iter().find(|l| l.contains("_test.go:")) {
+            m.push(frame);
+        }
+        return Some(m.join("\n"));
     }
     let tail = &kept[kept.len().saturating_sub(MAX_MESSAGE_LINES)..];
     Some(tail.join("\n"))
@@ -264,6 +304,33 @@ impl Recognizers {
     /// Framework summary lines: "test result: ok. 4 passed; 1 failed; 0 ignored"
     /// (libtest) or "1 failed, 4 passed in 1.52s" (pytest).
     fn totals(&mut self, line: &str) {
+        // gotestsum: "DONE 3 tests, 1 skipped, 3 failures, 1 error in 0.004s".
+        if let Some(rest) = line.trim().strip_prefix("DONE ")
+            && let Some((counts, _)) = rest.rsplit_once(" in ")
+            && counts.contains(" test")
+        {
+            let mut total = None;
+            let mut failed = 0;
+            for part in counts.split(", ") {
+                let mut w = part.split_whitespace();
+                if let (Some(n), Some(word)) =
+                    (w.next().and_then(|n| n.parse::<u64>().ok()), w.next())
+                {
+                    match word {
+                        "test" | "tests" => total = Some(n),
+                        "failure" | "failures" => failed += n,
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(n) = total {
+                self.summary_seen = true;
+                self.gotestsum_seen = true;
+                self.reported_total += n;
+                self.reported_failed += failed;
+                return;
+            }
+        }
         let t = line.trim().trim_matches('=').trim();
         self.no_tests(t);
         self.build_failed(t);
@@ -632,6 +699,8 @@ impl Recognizers {
             let streamed = self.level >= Some(Level::Native);
             let mut held = std::mem::take(&mut self.held_text_events);
             let _ = self.libtest(line, &mut out)
+                || (!self.gotestsum_stream && self.gotestsum(line, &mut out))
+                || (self.gotestsum_stream && is_gotestsum_text(line))
                 || self.go_verbose(line, &mut out)
                 || (self.pytest_stream && !streamed && self.hold(|r| r.pytest(line, &mut held)))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
@@ -652,9 +721,142 @@ impl Recognizers {
         r
     }
 
+    // ------------------------------------------------------------- gotestsum
+
+    /// gotestsum's text formats. `pkgname` (its default) prints only the
+    /// failures, at the end: `=== FAIL: p1 TestBad (0.00s)` then the
+    /// test's output, `=== FAIL: p2  (0.00s)` for a package that failed
+    /// without a test (a build error). `testname`: `PASS p1.TestOk
+    /// (0.00s)`, `FAIL p1.TestBad (0.00s)`, `FAIL p2` (round 13: prova saw
+    /// none of it). Names match `go test -v`'s (the package is relative).
+    fn gotestsum(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        let t = line.trim_end();
+        if t.starts_with("=== ") || t.starts_with("DONE ") {
+            self.flush_gotestsum(out);
+        }
+        for (prefix, outcome) in [
+            ("=== FAIL: ", Outcome::Failed),
+            ("=== SKIP: ", Outcome::Skipped),
+        ] {
+            if let Some(rest) = t.strip_prefix(prefix) {
+                let (head, dur) = match rest.rsplit_once(" (") {
+                    Some((h, d)) => (h, secs_ms(d.trim_end_matches(')'))),
+                    None => (rest, None),
+                };
+                let (pkg, test) = head.split_once(' ').unwrap_or((head, ""));
+                let (key, outcome) = if test.trim().is_empty() {
+                    (
+                        TestKey::new(vec![pkg.to_owned()], "(package)"),
+                        Outcome::Errored,
+                    )
+                } else {
+                    (TestKey::new(Vec::new(), test.trim()), outcome)
+                };
+                self.gotestsum_seen = true;
+                self.gts_pending = Some((key, outcome, dur, Vec::new()));
+                return true;
+            }
+        }
+        if t == "=== Failed" || t == "=== Errors" || t == "=== Skipped" {
+            self.gotestsum_seen = true;
+            return true;
+        }
+        if let Some((_, _, _, lines)) = self.gts_pending.as_mut() {
+            lines.push(t.to_owned());
+            return true;
+        }
+        // testname: "PASS p1.TestOk (0.00s)", "FAIL p2".
+        let mut w = t.split_whitespace();
+        let (Some(word), Some(name)) = (w.next(), w.next()) else {
+            return false;
+        };
+        let dur = w
+            .next()
+            .map(|d| d.trim_matches(['(', ')']))
+            .and_then(secs_ms);
+        if w.next().is_some() {
+            return false;
+        }
+        let outcome = match word {
+            "PASS" => Outcome::Passed,
+            "FAIL" => Outcome::Failed,
+            "SKIP" => Outcome::Skipped,
+            "EMPTY" => return false,
+            _ => return false,
+        };
+        let split = ["Test", "Example", "Fuzz", "Benchmark"]
+            .iter()
+            .filter_map(|k| name.find(&format!(".{k}")))
+            .min();
+        match split {
+            Some(i) => {
+                let test = &name[i + 1..];
+                self.gotestsum_seen = true;
+                if outcome.is_failure() {
+                    self.gts_pkg_with_failure.insert(name[..i].to_owned());
+                }
+                self.result(
+                    TestKey::new(Vec::new(), test),
+                    outcome,
+                    dur,
+                    None,
+                    Level::Recognized,
+                    test.contains('/'),
+                    out,
+                );
+                true
+            }
+            None if outcome == Outcome::Failed && !name.contains("::") => {
+                // A package line: decided at the end.
+                self.gts_pkg_failed.push(name.to_owned());
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn flush_gotestsum(&mut self, out: &mut Vec<EventKind>) {
+        if let Some((key, outcome, dur, lines)) = self.gts_pending.take() {
+            let body: Vec<String> = lines
+                .iter()
+                .rev()
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .cloned()
+                .collect();
+            let msg = if outcome.is_failure() {
+                if !body.is_empty() {
+                    self.failure_output.push((key.clone(), body.join("\n")));
+                }
+                message(&body)
+            } else {
+                None
+            };
+            let sub = key.path.is_empty() && key.name.contains('/');
+            self.result(key, outcome, dur, msg, Level::Recognized, sub, out);
+        }
+    }
+
     // ------------------------------------------------------------- go json
 
     fn go_json(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        // Go 1.24+: the compiler's errors come as `build-output` events
+        // keyed by ImportPath ("pkg [pkg.test]"); they explain the
+        // package's `FailedBuild` failure.
+        if v["Action"] == "build-output"
+            && let (Some(path), Some(o)) = (v["ImportPath"].as_str(), v["Output"].as_str())
+        {
+            let pkg = path.split(' ').next().unwrap_or(path);
+            if !o.starts_with("# ") {
+                self.go_output
+                    .entry(format!("{pkg}\0"))
+                    .or_default()
+                    .push(o.trim_end().to_owned());
+            }
+            return;
+        }
         let (Some(action), Some(pkg)) = (v["Action"].as_str(), v["Package"].as_str()) else {
             return;
         };
@@ -1496,6 +1698,22 @@ impl Recognizers {
 
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
+        let mut gts = Vec::new();
+        self.flush_gotestsum(&mut gts);
+        if self.gotestsum_seen {
+            for pkg in std::mem::take(&mut self.gts_pkg_failed) {
+                if !self.gts_pkg_with_failure.contains(&pkg) {
+                    self.finished(
+                        TestKey::new(vec![pkg], "(package)"),
+                        Outcome::Errored,
+                        None,
+                        Some("the package failed without a failing test (a build error?)".into()),
+                        Level::Recognized,
+                        &mut gts,
+                    );
+                }
+            }
+        }
         self.close_pass_output();
         self.close_libtest_running();
         self.close_libtest_block();
@@ -1504,6 +1722,7 @@ impl Recognizers {
         if self.level < Some(Level::Native) {
             out.append(&mut self.held_text_events);
         }
+        out.append(&mut gts);
         self.flush_nextest(&mut out);
         if self.vitest_stream {
             let mut held = Vec::new();
@@ -1818,6 +2037,94 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let (mut r, mut ev) = feed(input);
+        ev.extend(r.finish());
+        (r, ev)
+    }
+
+    fn messages(events: &[EventKind]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Owner's report (round 13): gotestsum's default output reported a
+    /// failure and an error, and prova saw none of it.
+    #[test]
+    fn gotestsum_default_output_names_failures_and_build_errors() {
+        let (r, ev) = feed_all(&fixture("gotestsum-pkgname.txt"));
+        let mut got = finished(&ev);
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("TestBad".into(), Outcome::Failed),
+                ("TestPanics".into(), Outcome::Failed),
+                ("p2::(package)".into(), Outcome::Errored),
+            ]
+        );
+        assert_eq!((r.total(), r.failed_reported()), (3, 3));
+        let m = messages(&ev);
+        assert!(
+            m.iter().any(|(t, m)| t == "TestPanics"
+                && m.starts_with("panic: assignment to entry in nil map")),
+            "{m:?}"
+        );
+        assert!(
+            m.iter()
+                .any(|(t, m)| t == "TestBad" && m.contains("expected 4, got 16")),
+            "{m:?}"
+        );
+    }
+
+    #[test]
+    fn gotestsum_testname_output_counts_passes_and_packages() {
+        let (_, ev) = feed_all(&fixture("gotestsum-testname.txt"));
+        let mut got = finished(&ev);
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("TestBad".into(), Outcome::Failed),
+                ("TestOk".into(), Outcome::Passed),
+                ("TestPanics".into(), Outcome::Failed),
+                ("p2::(package)".into(), Outcome::Errored),
+            ]
+        );
+    }
+
+    /// `FAIL src/a.test.js` (Jest) is not a Go package failure: only a
+    /// confirmed gotestsum run turns `FAIL <pkg>` into one.
+    #[test]
+    fn a_bare_fail_line_is_not_a_package_without_gotestsum() {
+        let (_, ev) = feed_all("FAIL src/a.test.js\nPASS src/b.test.js");
+        assert!(finished(&ev).is_empty(), "{:?}", finished(&ev));
+    }
+
+    #[test]
+    fn gotestsum_json_stream_carries_build_errors() {
+        let (_, ev) = feed_all(&fixture("gotestsum-json.jsonl"));
+        let m = messages(&ev);
+        assert!(
+            m.iter().any(|(t, m)| t == "example.com/gts/p2::(package)"
+                && m.contains("undefined: undefinedThing")),
+            "{m:?}"
+        );
     }
 
     #[test]

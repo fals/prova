@@ -112,10 +112,9 @@ fn unknown_recipes_are_refused_before_running() {
     let d = workspace("unknown");
     let o = prova(&d, &["run", "--inject", "path-shims", "--", "true"], &[]);
     assert_eq!(o.status.code(), Some(4));
-    assert!(
-        String::from_utf8_lossy(&o.stderr)
-            .contains("known: pytest-junit, pytest-reportlog, vitest-stream, go-nocache")
-    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains(
+        "known: pytest-junit, pytest-reportlog, vitest-stream, gotestsum-json, go-nocache"
+    ));
     let status = prova(&d, &["status", "--json"], &[]);
     assert_eq!(
         String::from_utf8_lossy(&status.stdout).trim(),
