@@ -48,7 +48,10 @@ Contents: [Failure history](#failure-history) ·
   naming it, or the runner's summary of failures), so another failure, an
   error, a lint, type-check or coverage step, a framework count above its
   failures, or a run killed by a signal fails the run, and `detail:` says
-  which; a parent's quarantine does not cover a
+  which. Nothing may follow the tests' summary but the command's own
+  wrap-up of the failed test step: a lint or coverage step after the tests
+  refuses the quarantine. When tests of several binaries share a name,
+  `prova quarantine add <test> --in <binary>` names which; a parent's quarantine does not cover a
   subtest first seen after it; a run where only quarantined tests ran and
   failed fails. A quarantine lives in this machine's prova store, not in
   the repository: CI and teammates do not see it. Do not quarantine a test
