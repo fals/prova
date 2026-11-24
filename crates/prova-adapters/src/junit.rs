@@ -69,6 +69,23 @@ pub fn parse(xml: &str) -> Result<Vec<Case>, ParseError> {
         "TestRun" => parse_trx(trimmed),
         _ => Err(ParseError::Unknown),
     }
+    .map(number_repeats)
+}
+
+/// Each `<testcase>` is its own result: Gradle names a JUnit 5 repetition by
+/// its display name, so two methods' `repetition 1 of 2` share classname
+/// and name, and the framework counts both. Repeats within one file get
+/// " #2", " #3" in document order, so a failing duplicate never disappears.
+fn number_repeats(mut cases: Vec<Case>) -> Vec<Case> {
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for c in &mut cases {
+        let n = seen.entry(c.key.unique()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            c.key.name = format!("{} #{n}", c.key.name);
+        }
+    }
+    cases
 }
 
 fn first_element(xml: &str) -> Result<String, ParseError> {
@@ -260,22 +277,48 @@ fn trx_duration(s: &str) -> Option<u64> {
     Some(((h * 3600.0 + m * 60.0 + sec) * 1000.0).round() as u64)
 }
 
+/// `Ns.Class, Assembly, Version=...` (MSTest) to `Ns.Class`.
+fn trx_class(raw: &str) -> &str {
+    raw.split(',').next().unwrap_or(raw).trim()
+}
+
+/// NUnit and MSTest put the bare method name in `testName`, so two classes'
+/// `Same` would merge; the class comes from the test definition. xUnit
+/// already writes `Class.Method(theory args)`: kept as is, which is also the
+/// name the live VSTest text shows for it.
+fn trx_name(class: Option<&str>, test_name: &str) -> String {
+    match class {
+        Some(c) if !c.is_empty() && !test_name.starts_with(&format!("{c}.")) => {
+            format!("{c}.{test_name}")
+        }
+        _ => test_name.to_owned(),
+    }
+}
+
 fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
     let mut r = Reader::from_str(xml);
-    let mut out = Vec::new();
-    let mut cur: Option<(String, Outcome, Option<u64>)> = None;
+    // (test id, case with the bare testName as key)
+    let mut out: Vec<(Option<String>, Case)> = Vec::new();
+    let mut classes: std::collections::HashMap<String, String> = Default::default();
+    let mut def_id: Option<String> = None;
+    let mut cur: Option<(Option<String>, String, Outcome, Option<u64>)> = None;
     let mut in_message = false;
     let mut msg = String::new();
-    let push = |c: (String, Outcome, Option<u64>), msg: &str, out: &mut Vec<Case>| {
-        out.push(Case {
-            key: TestKey::new(Vec::new(), c.0),
-            attempts: vec![Attempt {
-                outcome: c.1,
-                duration_ms: c.2,
-                message: clip(msg),
-            }],
-            output: (c.1.is_failure() && !msg.trim().is_empty()).then(|| msg.trim().to_owned()),
-        });
+    let push = |c: (Option<String>, String, Outcome, Option<u64>),
+                msg: &str,
+                out: &mut Vec<(Option<String>, Case)>| {
+        out.push((
+            c.0,
+            Case {
+                key: TestKey::new(Vec::new(), c.1),
+                attempts: vec![Attempt {
+                    outcome: c.2,
+                    duration_ms: c.3,
+                    message: clip(msg),
+                }],
+                output: (c.2.is_failure() && !msg.trim().is_empty()).then(|| msg.trim().to_owned()),
+            },
+        ));
     };
     loop {
         let ev = match r.read_event() {
@@ -288,6 +331,12 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let empty = matches!(ev, Event::Empty(_));
                 match e.local_name().as_ref() {
+                    b"UnitTest" => def_id = attr(e, b"id").filter(|_| !empty),
+                    b"TestMethod" => {
+                        if let (Some(id), Some(class)) = (def_id.as_ref(), attr(e, b"className")) {
+                            classes.insert(id.clone(), trx_class(&class).to_owned());
+                        }
+                    }
                     b"UnitTestResult" => {
                         let outcome = match attr(e, b"outcome").as_deref() {
                             Some("Passed") => Outcome::Passed,
@@ -296,6 +345,7 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
                             _ => Outcome::Errored,
                         };
                         let c = (
+                            attr(e, b"testId"),
                             attr(e, b"testName").unwrap_or_default(),
                             outcome,
                             attr(e, b"duration").as_deref().and_then(trx_duration),
@@ -314,6 +364,7 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
             Event::Text(t) if in_message => msg.push_str(&String::from_utf8_lossy(&t)),
             Event::End(e) => match e.local_name().as_ref() {
                 b"Message" => in_message = false,
+                b"UnitTest" => def_id = None,
                 b"UnitTestResult" => {
                     if let Some(c) = cur.take() {
                         push(c, &msg, &mut out);
@@ -325,7 +376,15 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
             _ => {}
         }
     }
-    Ok(out)
+    // Definitions come after the results in a TRX file: resolve at the end.
+    Ok(out
+        .into_iter()
+        .map(|(id, mut case)| {
+            let class = id.and_then(|i| classes.get(&i).map(String::as_str));
+            case.key.name = trx_name(class, &case.key.name);
+            case
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -453,5 +512,56 @@ mod tests {
         if let Ok(c) = partial {
             assert_eq!(c.len(), 1);
         }
+    }
+
+    #[test]
+    fn trx_keys_carry_the_class_from_the_test_definition() {
+        let trx = r#"<TestRun xmlns="x"><Results>
+<UnitTestResult testId="1" testName="Same" outcome="Passed" />
+<UnitTestResult testId="2" testName="Same" outcome="Failed"><Output><ErrorInfo><Message>boom</Message></ErrorInfo></Output></UnitTestResult>
+<UnitTestResult testId="3" testName="Same" outcome="Passed" />
+<UnitTestResult testId="4" testName="Same" outcome="Failed" />
+<UnitTestResult testId="5" testName="Xu.CalcTests.Slash(s: &quot;x/y&quot;)" outcome="Passed" />
+</Results><TestDefinitions>
+<UnitTest name="Same" id="1"><TestMethod codeBase="a.dll" className="Nu.CalcTests" name="Same" /></UnitTest>
+<UnitTest name="Same" id="2"><TestMethod codeBase="a.dll" className="Nu.CalcTests+Inner" name="Same" /></UnitTest>
+<UnitTest name="Same" id="3"><TestMethod codeBase="a.dll" className="Nu.OtherTests" name="Same" /></UnitTest>
+<UnitTest name="Same" id="4"><TestMethod codeBase="a.dll" className="Ms.CalcTests, Ms, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null" name="Same" /></UnitTest>
+<UnitTest name="Slash" id="5"><TestMethod codeBase="a.dll" className="Xu.CalcTests" name="Slash" /></UnitTest>
+</TestDefinitions></TestRun>"#;
+        let cases = parse(trx).unwrap();
+        assert_eq!(
+            outcomes(&cases),
+            vec![
+                ("Nu.CalcTests.Same".into(), vec![Outcome::Passed]),
+                ("Nu.CalcTests+Inner.Same".into(), vec![Outcome::Failed]),
+                ("Nu.OtherTests.Same".into(), vec![Outcome::Passed]),
+                ("Ms.CalcTests.Same".into(), vec![Outcome::Failed]),
+                (
+                    "Xu.CalcTests.Slash(s: \"x/y\")".into(),
+                    vec![Outcome::Passed]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_names_in_one_file_are_each_a_result() {
+        let xml = r#"<testsuite name="s">
+<testcase classname="C" name="repetition 1 of 2" />
+<testcase classname="C" name="repetition 2 of 2" />
+<testcase classname="C" name="repetition 1 of 2"><failure message="bad" /></testcase>
+<testcase classname="C" name="repetition 1 of 2" />
+</testsuite>"#;
+        let cases = parse(xml).unwrap();
+        assert_eq!(
+            outcomes(&cases),
+            vec![
+                ("C::repetition 1 of 2".into(), vec![Outcome::Passed]),
+                ("C::repetition 2 of 2".into(), vec![Outcome::Passed]),
+                ("C::repetition 1 of 2 #2".into(), vec![Outcome::Failed]),
+                ("C::repetition 1 of 2 #3".into(), vec![Outcome::Passed]),
+            ]
+        );
     }
 }

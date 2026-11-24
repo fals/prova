@@ -229,7 +229,10 @@ fn stats_with(
             .join(",")
     };
     let mut by_code: BTreeMap<(&str, String), BTreeSet<bool>> = BTreeMap::new();
-    for r in &counted {
+    // Outside git the code version is unknown: two runs there are never
+    // "the same code" (round 12: a fix in a project without git was
+    // called a flaky flip).
+    for r in counted.iter().filter(|r| r.code != "nogit") {
         by_code
             .entry((r.code.as_str(), env_key(r)))
             .or_default()
@@ -243,7 +246,7 @@ fn stats_with(
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
             for f in counted
                 .iter()
-                .filter(|r| r.outcome.is_failure() && r.code == p.code)
+                .filter(|r| r.outcome.is_failure() && r.code == p.code && r.code != "nogit")
             {
                 for k in p.env.keys().chain(f.env.keys()) {
                     if p.env.get(k) != f.env.get(k) {
@@ -416,52 +419,81 @@ pub const SMALL_AFTER: usize = 3;
 
 pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
     use crate::config::Size;
+    // Only finished runs are evidence (ADR 0026 §6): not cancelled or
+    // aborted ones, not forgotten ones.
     let mut stmt = store.conn().prepare(
-        "SELECT size, evidence FROM test_sizes
-          WHERE test_id = ?1 AND run_id NOT IN (SELECT run_id FROM forgotten)",
+        "SELECT s.size, s.evidence FROM test_sizes s JOIN runs r ON r.id = s.run_id
+          WHERE s.test_id = ?1 AND r.status = 'finished'
+            AND s.run_id NOT IN (SELECT run_id FROM forgotten)",
     )?;
-    let seen: Vec<(Size, String)> = stmt
+    let attributed: Vec<(Size, String)> = stmt
         .query_map(params![test_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get(1)?))
         })?
         .filter_map(|r| r.ok())
         .filter_map(|(s, e)| Some((Size::parse(&s)?, e)))
         .collect();
-    if let Some((size, evidence)) = seen.iter().max_by_key(|(s, _)| *s) {
-        let label = match size {
-            Size::Small if seen.len() >= SMALL_AFTER => {
-                format!("small ({evidence}, in {} runs)", seen.len())
-            }
-            Size::Small => format!("small? ({} of {SMALL_AFTER} runs)", seen.len()),
-            _ => format!("{} ({evidence})", size.as_str()),
-        };
-        let decided = *size != Size::Small || seen.len() >= SMALL_AFTER;
+    // Runs that ran the test but could not isolate it: their test phase
+    // decides (ADR 0026 §2).
+    let mut stmt = store.conn().prepare(
+        "SELECT json_extract(e.payload, '$.size'), json_extract(e.payload, '$.evidence')
+           FROM events e JOIN runs r ON r.id = e.run_id
+          WHERE e.kind = 'run_size' AND r.status = 'finished'
+            AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1 AND outcome <> 'skipped')
+            AND e.run_id NOT IN (SELECT run_id FROM test_sizes WHERE test_id = ?1)
+            AND e.run_id NOT IN (SELECT run_id FROM forgotten)",
+    )?;
+    let by_run: Vec<(Size, String)> = stmt
+        .query_map(params![test_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(s, e)| Some((Size::parse(&s?)?, e.unwrap_or_default())))
+        .collect();
+    if let Some((size, evidence)) = attributed
+        .iter()
+        .filter(|(s, _)| *s > Size::Small)
+        .max_by_key(|(s, _)| *s)
+    {
         return Ok(Some(SizeView {
-            size: decided.then_some(*size),
+            size: Some(*size),
             at_most: None,
-            label,
+            label: format!("{} ({evidence})", size.as_str()),
         }));
     }
-    let bound: Option<Size> = store
-        .conn()
-        .prepare(
-            "SELECT json_extract(e.payload, '$.size') FROM events e
-              WHERE e.kind = 'run_size'
-                AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1)
-                AND e.run_id NOT IN (SELECT run_id FROM forgotten)",
-        )?
-        .query_map(params![test_id], |r| r.get::<_, Option<String>>(0))?
-        .filter_map(|r| r.ok().flatten())
-        .filter_map(|s| Size::parse(&s))
-        .max();
-    Ok(bound.map(|b| SizeView {
-        size: None,
-        at_most: Some(b),
-        label: format!(
-            "{} or less (never seen alone or in its own process, so its own use is unknown)",
-            b.as_str()
-        ),
-    }))
+    let small = attributed.len() + by_run.iter().filter(|(s, _)| *s == Size::Small).count();
+    let bound = by_run
+        .iter()
+        .filter(|(s, _)| *s > Size::Small)
+        .max_by_key(|(s, _)| *s);
+    if small >= SMALL_AFTER {
+        return Ok(Some(SizeView {
+            size: Some(Size::Small),
+            at_most: None,
+            label: format!("small (no other process or socket seen, in {small} runs)"),
+        }));
+    }
+    if let Some((b, evidence)) = bound {
+        return Ok(Some(SizeView {
+            size: None,
+            at_most: Some(*b),
+            label: format!(
+                "{} or less (never seen on its own, and its run {evidence})",
+                b.as_str()
+            ),
+        }));
+    }
+    if small > 0 {
+        return Ok(Some(SizeView {
+            size: None,
+            at_most: None,
+            label: format!("small? (nothing more seen in {small} of {SMALL_AFTER} runs)"),
+        }));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -478,6 +510,9 @@ pub struct SizeReport {
     pub warning: Option<String>,
     /// Medium and large tests with what made them so: (test, label).
     pub larger: Vec<(String, String)>,
+    /// Every test with its size label, or "unknown" (round 12: counts
+    /// without names could not be checked).
+    pub tests: Vec<(String, String)>,
 }
 
 pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
@@ -485,12 +520,27 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
     let mut stmt = store.conn().prepare(
         "SELECT id, display FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
     )?;
-    let tests: Vec<(String, String)> = stmt
+    let rows: Vec<(String, String)> = stmt
         .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut r = SizeReport::default();
-    for (id, display) in tests {
+    // One test, one count: the same test in several suites shares its
+    // history (round 12: a 5-test project showed 12 tests). The most
+    // decided view wins.
+    let mut views: BTreeMap<String, Option<SizeView>> = BTreeMap::new();
+    for (id, display) in rows {
         let view = observed_size(store, &id)?;
+        let e = views.entry(display).or_insert(None);
+        let better = match (&*e, &view) {
+            (None, Some(_)) => true,
+            (Some(old), Some(new)) => new.size > old.size,
+            _ => false,
+        };
+        if better {
+            *e = view;
+        }
+    }
+    let mut r = SizeReport::default();
+    for (display, view) in views {
         match view.as_ref().and_then(|v| v.size) {
             Some(Size::Small) => r.small += 1,
             Some(Size::Medium) => r.medium += 1,
@@ -502,11 +552,15 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
                 }
             }
         }
-        if let Some(v) = view
+        if let Some(v) = &view
             && matches!(v.size, Some(Size::Medium | Size::Large))
         {
-            r.larger.push((display, v.label));
+            r.larger.push((display.clone(), v.label.clone()));
         }
+        r.tests.push((
+            display,
+            view.map_or_else(|| "unknown".to_owned(), |v| v.label),
+        ));
     }
     r.total = r.small + r.medium + r.large + r.unknown;
     r.larger
@@ -624,6 +678,10 @@ pub struct FailureContext {
     pub failed_before: usize,
     /// It passed in an earlier finished run.
     pub passed_before: bool,
+    /// How many earlier results of this test passed: a "new failure"
+    /// after one pass is thin evidence (round 12).
+    #[serde(default)]
+    pub passes_before: usize,
     /// Failed its last 3 runs in a row (this one included): no flaky hint.
     #[serde(default)]
     pub failing_now: bool,
@@ -674,11 +732,17 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
         .filter(|r| r.run != run && r.outcome.is_failure())
         .count();
     let passed_before = last_passed_code.is_some();
+    let passes_before = s
+        .recent
+        .iter()
+        .filter(|r| r.run != run && r.outcome == Outcome::Passed)
+        .count();
     Ok(Some(FailureContext {
         first_seen,
         seen_before,
         failed_before,
         passed_before,
+        passes_before,
         run_cut_short,
         failing_now: s.failing_now,
         env_dependent: s.env_dependent.clone(),

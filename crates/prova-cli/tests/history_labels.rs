@@ -8,10 +8,32 @@ use std::process::{Command, Output};
 
 const PROVA: &str = env!("CARGO_BIN_EXE_prova");
 
+/// A git repository whose `state` file (what the test script reads) is
+/// ignored: runs that only change it are the same code. Outside git every
+/// run is a code version of its own (round 12).
 fn workspace(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-hl-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(".gitignore"), "state\n").unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
     d
 }
 
@@ -277,7 +299,10 @@ fn a_known_flaky_pass_is_named_and_not_called_fixed() {
     let failed: serde_json::Value = serde_json::from_str(&failed).unwrap();
     let out = run(&d, "make", "pass");
     assert!(
-        out.contains("note: 1 known flaky test(s) passed this time, which proves little: calc::x"),
+        out.contains("PASSED (unverified: see warnings)")
+            && out.contains(
+                "warning: 1 known flaky test(s) passed this time, which proves little (not verified): calc::x"
+            ),
         "{out}"
     );
     let diff = text(&prova(
@@ -568,4 +593,42 @@ fn a_forgotten_run_no_longer_counts() {
     );
     assert!(o.status.success(), "{}", text(&o));
     assert!(!text(&prova(&d, &["flaky"])).contains("calc::x"));
+}
+
+/// Round 12: outside git every run looked like the same code, so a fix
+/// (fail, edit, pass) was labelled a flaky flip.
+#[test]
+fn a_fix_outside_git_is_not_flaky() {
+    let d = std::env::temp_dir().join(format!("prova-hl-nogit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    suites(&d);
+    run(&d, "make", "fail");
+    let out = run(&d, "make", "pass");
+    assert!(!out.contains("flaky"), "{out}");
+    let flaky = text(&prova(&d, &["flaky"]));
+    assert!(!flaky.contains("calc::x"), "{flaky}");
+}
+
+/// Round 12: the JSON history called a cancelled run "errored" while the
+/// text said "cancelled".
+#[test]
+fn a_cancelled_run_is_cancelled_in_json_too() {
+    let d = workspace("cancelled-json");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"if [ \\\"$(cat state)\\\" = hang ]; then exec sleep 30; fi; echo 'test m::a ... ok'\"\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("state"), "hang").unwrap();
+    let o = prova(&d, &["run", "t", "--detach", "--json"]);
+    let id = serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    prova(&d, &["cancel", &id]);
+    std::fs::write(d.join("state"), "pass").unwrap();
+    let o = prova(&d, &["run", "t", "--json", "--until", "done"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["history"]["last"]["outcome"], "cancelled", "{v}");
 }

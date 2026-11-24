@@ -22,7 +22,9 @@ fn headline(s: &Summary) -> String {
         WaitReason::Slow => "SLOW TEST (run still going)".into(),
         WaitReason::Failure => "FAILING (run still going)".into(),
         WaitReason::Done => match (s.status, s.outcome) {
-            (Status::Finished, Some(Outcome::Passed)) if !s.warnings.is_empty() => {
+            (Status::Finished, Some(Outcome::Passed))
+                if !s.warnings.is_empty() || !s.flaky_passed.is_empty() =>
+            {
                 "PASSED (unverified: see warnings)".into()
             }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
@@ -76,6 +78,14 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         return;
     }
     let dur = format_duration(std::time::Duration::from_millis(s.elapsed_ms));
+    // The command's own output first, prova's verdict last: what is read
+    // last is what prova concluded (passed, failed, history, next).
+    if !s.output_tail.is_empty() {
+        println!("output (last {} lines):", s.output_tail.len());
+        for l in &s.output_tail {
+            println!("  | {}", clean(l));
+        }
+    }
     println!("run {}  suite {}  `{}`", s.run, s.suite, s.command);
     let mut line = format!("{}  {dur}", headline(s));
     if let Some(c) = s.exit_code {
@@ -95,7 +105,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     ));
     println!("{line}");
     let c = &s.counts;
-    let seen = c.passed + c.failed + c.skipped + c.errored;
+    let seen = c.results();
     // When the framework counted more than prova saw, say both (ADR 0018).
     let counted = match s.framework {
         Some((n, f)) if n > seen => {
@@ -123,8 +133,18 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {errored}, {} skipped{counted}",
-            c.passed, c.failed, c.skipped
+            "tests: {} passed, {} failed, {errored}, {} skipped{}{counted}",
+            c.passed,
+            c.failed,
+            c.skipped,
+            if c.subtests > 0 {
+                format!(
+                    " (and {} subtests, {} failed)",
+                    c.subtests, c.subtests_failed
+                )
+            } else {
+                String::new()
+            }
         );
     }
     for f in &s.failures {
@@ -169,7 +189,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     if !s.flaky_passed.is_empty() {
         println!(
-            "note: {} known flaky test(s) passed this time, which proves little: {}",
+            "warning: {} known flaky test(s) passed this time, which proves little (not verified): {}",
             s.flaky_passed.len(),
             s.flaky_passed
                 .iter()
@@ -187,12 +207,6 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     if !s.leaked.is_empty() {
         println!("leaked processes (killed): {:?}", s.leaked);
-    }
-    if !s.output_tail.is_empty() {
-        println!("output (last {} lines):", s.output_tail.len());
-        for l in &s.output_tail {
-            println!("  | {}", clean(l));
-        }
     }
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
@@ -219,7 +233,12 @@ fn context(f: &prova_core::engine::Failure) -> String {
     } else if c.failed_before > 0 {
         parts.push(format!("failed {}x before", c.failed_before));
     } else if c.passed_before && !c.flaky {
-        parts.push("new failure".to_owned());
+        // Thin evidence is said (round 12: "new failure" after one pass
+        // sent the agent after its own fix).
+        parts.push(match c.passes_before {
+            0 | 1 => "new failure (it passed only once before)".to_owned(),
+            _ => "new failure".to_owned(),
+        });
     } else if !c.flaky {
         parts.push("has not passed yet".to_owned());
     }
@@ -357,7 +376,11 @@ fn history_line(h: &serde_json::Value) -> String {
                 o["suite"].as_str().unwrap_or("?"),
                 o["run"].as_str().unwrap_or("?")
             ),
-            None => "none of them passed".into(),
+            None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+                0 => "none of them passed".into(),
+                // (round 12: "none of them passed; on this exact code: passed?")
+                u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
+            },
         }),
         None => {}
     }
@@ -432,7 +455,8 @@ fn all_known_flaky(s: &Summary) -> bool {
     // Not when the run failed for another reason too (a crash, round 10).
     s.detail.is_none()
         && !s.failures.is_empty()
-        && s.failures.len() == s.counts.failed as usize + s.counts.errored as usize
+        && s.failures.len()
+            == (s.counts.failed + s.counts.errored + s.counts.subtests_failed) as usize
         && s.failures.iter().all(|f| {
             f.context
                 .as_ref()
@@ -538,7 +562,21 @@ pub fn heartbeat(s: &Summary) {
         c.skipped
     );
     if !s.running.is_empty() {
-        let names: Vec<String> = s.running.iter().take(3).map(|t| clean(t)).collect();
+        // Logs are read too: a 3000-character test name made a 3000-character
+        // line (round 12).
+        let names: Vec<String> = s
+            .running
+            .iter()
+            .take(3)
+            .map(|t| {
+                let c = clean(t);
+                if c.chars().count() > 100 {
+                    c.chars().take(99).collect::<String>() + "…"
+                } else {
+                    c
+                }
+            })
+            .collect();
         line.push_str(&format!("; running now: {}", names.join(", ")));
     }
     eprintln!("{line}");
@@ -646,6 +684,28 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
     );
     println!("hypothesis: {}", clean(&r.hypothesis));
     println!("{}", protocol_line(&r.protocol));
+    // The current best leads, with how it became best, before the latest
+    // comparison (which may be a later REJECT).
+    if r.best != "baseline" {
+        let how = r
+            .decisions
+            .iter()
+            .rev()
+            .find(|d| d["candidate"] == r.best.as_str() && d["decision"] != "discard")
+            .map(|d| {
+                let why = clean(d["reason"].as_str().unwrap_or(""));
+                if d["decision"] == "reset" {
+                    format!("set by hand: {why}")
+                } else {
+                    format!(
+                        "ACCEPT, comparison {}: {why}",
+                        d["comparison"].as_str().unwrap_or("")
+                    )
+                }
+            })
+            .unwrap_or_else(|| "accepted".to_owned());
+        println!("best: {} ({how})", r.best);
+    }
     if let Some(c) = &r.comparison {
         let head = match (c.status.as_str(), c.verdict.as_deref()) {
             ("decided", Some(v)) => v.to_uppercase(),
@@ -677,7 +737,7 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment, Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) on this baseline and metric (revalidations count), Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
                     num("baseline_median"),
@@ -786,6 +846,10 @@ mod label_tests {
     use prova_core::engine::Failure;
 
     fn label(seen_before: usize, flaky: bool) -> String {
+        label_after(seen_before, flaky, 5)
+    }
+
+    fn label_after(seen_before: usize, flaky: bool, passes_before: usize) -> String {
         super::context(&Failure {
             test: "t".into(),
             outcome: prova_core::model::Outcome::Failed,
@@ -795,6 +859,7 @@ mod label_tests {
                 seen_before,
                 failed_before: seen_before,
                 passed_before: true,
+                passes_before,
                 run_cut_short: false,
                 flaky,
                 last_passed_code: None,
@@ -810,6 +875,11 @@ mod label_tests {
     fn a_flaky_test_is_not_a_new_failure() {
         assert_eq!(label(0, true), " [FLAKY]");
         assert_eq!(label(0, false), " [new failure]");
+        // Round 12: one earlier pass is thin evidence, and is said.
+        assert_eq!(
+            label_after(0, false, 1),
+            " [new failure (it passed only once before)]"
+        );
         assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
             test: "t".into(),
@@ -818,6 +888,7 @@ mod label_tests {
             context: Some(FailureContext {
                 failed_before: 0,
                 passed_before: false,
+                passes_before: 0,
                 run_cut_short: false,
                 first_seen: true,
                 seen_before: 0,
@@ -839,6 +910,7 @@ mod label_tests {
                 seen_before: 0,
                 failed_before: 0,
                 passed_before: false,
+                passes_before: 0,
                 run_cut_short: false,
                 flaky: false,
                 last_passed_code: None,
@@ -911,8 +983,7 @@ mod live_tests {
             counts: Counts {
                 passed,
                 failed,
-                skipped: 0,
-                errored: 0,
+                ..Counts::default()
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             framework: None,

@@ -40,9 +40,11 @@ Contents: [Failure history](#failure-history) ·
 - `UNFINISHED`: the test was still running when the run ended (cancel,
   kill); it says nothing about the code.
 - `[run cancelled or aborted: no evidence about the code]`: the run did
-  not finish (cancel, `--kill-after`, a dead supervisor); its failures are
-  often the cancel itself and count nowhere. Cancelled or aborted runs
-  never count as evidence: cancelling a hung test does not make it flaky.
+  not finish (cancel, `--kill-after`, a dead supervisor). Tests it cut off
+  are often failed by the cancel itself and count nowhere: cancelling a
+  hung test does not make it flaky. Tests that finished before the cancel
+  are real results and stay in history; a cut-short run says nothing about
+  sizes.
 - `SLOW`: over the test's budget; the line says where it came from (3x its
   usual time, the suite's default, or the test runner's own warning).
 - A stall ends any wait, including a plain `prova run -- ...`: cancel it.
@@ -90,3 +92,8 @@ A run fails, even with exit 0, when:
   passing tests). Take them seriously: flaky detection depends on it.
 - `framework counted N` gives the framework's own count when its output
   hid individual tests.
+- `(and N subtests, M failed)`: results nested under a test that reports
+  its own (Go's `TestX/case` under `TestX`). The counts before it are
+  tests; each subtest still has its own history and failure line.
+- The run's output excerpt, when shown, comes first; prova's verdict
+  (counts, failures, history, `next:`) always comes last.

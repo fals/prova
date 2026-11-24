@@ -22,11 +22,16 @@ pub struct Usage {
     pub procs: BTreeMap<u32, (u32, String)>,
     /// socket key (inode on Linux) -> (holding pid, peer).
     pub sockets: BTreeMap<u64, (u32, Peer)>,
+    /// pid -> when it started, in ms since boot (Linux; ADR 0026).
+    pub starts: BTreeMap<u32, u64>,
 }
 
 /// What one test was seen to use, beyond what it started with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Seen {
+    /// Samples taken inside the test (or the run's test phase): without
+    /// one, nothing was observed and no size can be claimed (ADR 0026).
+    pub samples: usize,
     /// Other processes the test ran (command names).
     pub processes: BTreeSet<String>,
     /// Sockets to this machine (count).
@@ -46,7 +51,8 @@ impl Seen {
         }
     }
 
-    /// Why it has this size, in a few words.
+    /// Why it has this size, in a few words. Small is the absence of
+    /// evidence, and says so (ADR 0026).
     pub fn evidence(&self) -> String {
         let mut parts = Vec::new();
         if let Some(h) = self.remote.iter().next() {
@@ -60,13 +66,18 @@ impl Seen {
             parts.push(format!("{} local socket(s)", self.local_sockets));
         }
         if parts.is_empty() {
-            "one process, no sockets".into()
+            format!(
+                "no other process or socket seen ({} sample{})",
+                self.samples,
+                if self.samples == 1 { "" } else { "s" }
+            )
         } else {
             parts.join("; ")
         }
     }
 
     pub fn absorb(&mut self, other: &Seen) {
+        self.samples += other.samples;
         self.processes.extend(other.processes.iter().cloned());
         self.local_sockets = self.local_sockets.max(other.local_sockets);
         self.remote.extend(other.remote.iter().cloned());
@@ -98,6 +109,40 @@ pub fn names_test(cmdline: &str, test: &str) -> bool {
 /// (libtest's `--exact <name>`, as nextest starts each test).
 pub fn runs_one_test(cmdline: &str) -> bool {
     cmdline.split(' ').skip(1).any(|a| a == "--exact")
+}
+
+/// Whether a process is the test runner's own rather than something a
+/// test started: one test's process (`--exact`), a Go test binary
+/// (`-test.` flags) or a cargo test binary (`target/…/deps/`).
+pub fn runner_process(cmdline: &str) -> bool {
+    runs_one_test(cmdline)
+        || cmdline.split(' ').any(|a| a.starts_with("-test."))
+        || cmdline
+            .split(' ')
+            .next()
+            .is_some_and(|exe| exe.contains("/target/") && exe.contains("/deps/"))
+}
+
+/// What a test used that started inside its window, `[from, to]` in ms
+/// since boot (ADR 0026): processes by their start time (a process the
+/// test started at once counts, though it was there when its start line
+/// was read), except the runner's own. Sockets have no start time:
+/// `seen_new` covers them.
+/// `runner_since`: when the run's first output line arrived; a process
+/// that started before it was set up before anything was printed (the
+/// script or runner itself), never by a test.
+pub fn started_within(now: &Usage, from: u64, to: u64, runner_since: u64) -> BTreeSet<String> {
+    now.procs
+        .iter()
+        .filter(|(pid, (_, cmd))| {
+            now.starts
+                .get(pid)
+                .is_some_and(|t| *t + 10 >= from && *t + 10 <= to && *t >= runner_since)
+                && !runner_process(cmd)
+        })
+        .map(|(_, (_, cmd))| command_name(cmd))
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
 /// Pids in `usage` that descend from `root` (not `root` itself).
@@ -135,6 +180,7 @@ pub fn seen_new(pids: &BTreeSet<u32>, sockets: &BTreeSet<u64>, now: &Usage) -> S
     let base = Usage {
         procs: pids.iter().map(|p| (*p, (0, String::new()))).collect(),
         sockets: sockets.iter().map(|k| (*k, (0, Peer::Local))).collect(),
+        starts: BTreeMap::new(),
     };
     seen_since(&base, now, None)
 }
@@ -166,6 +212,7 @@ pub fn seen_since(base: &Usage, now: &Usage, own: Option<u32>) -> Seen {
             .filter(|(k, _)| new.contains(k))
             .map(|(k, v)| (*k, v.clone()))
             .collect(),
+        starts: BTreeMap::new(),
     };
     count_sockets(&fresh, |_| true, &mut seen);
     seen
@@ -185,19 +232,6 @@ fn count_sockets(usage: &Usage, holder: impl Fn(u32) -> bool, seen: &mut Seen) {
         }
     }
     seen.local_sockets = seen.local_sockets.max(local);
-}
-
-/// The whole command's use (ADR 0025 §3): more than one process or any
-/// socket makes the run medium, another host large.
-pub fn run_seen(all: &Usage, leader: u32) -> Seen {
-    let mut seen = Seen::default();
-    for (pid, (_, cmd)) in &all.procs {
-        if *pid != leader {
-            seen.processes.insert(command_name(cmd));
-        }
-    }
-    count_sockets(all, |_| true, &mut seen);
-    seen
 }
 
 /// Peer of one `/proc/net/{tcp,udp}[6]` row's remote address column:
@@ -286,13 +320,17 @@ pub fn sample(pgid: u32) -> Usage {
         } else {
             cmd
         };
-        let ppid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|s| {
-                let rest = &s[s.rfind(')')? + 2..];
-                rest.split_whitespace().nth(1)?.parse().ok()
-            })
-            .unwrap_or(0);
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let fields: Vec<&str> = stat
+            .rfind(')')
+            .map(|i| stat[i + 2..].split_whitespace().collect())
+            .unwrap_or_default();
+        let ppid = fields.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        // Field 22, start time in clock ticks since boot; USER_HZ is 100 on
+        // Linux.
+        if let Some(t) = fields.get(19).and_then(|v| v.parse::<u64>().ok()) {
+            u.starts.insert(*pid, t * 10);
+        }
         u.procs.insert(*pid, (ppid, cmd));
         if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
             for fd in fds.flatten() {
@@ -466,6 +504,7 @@ mod tests {
                 .iter()
                 .map(|(k, p, s)| (*k, (*p, s.clone())))
                 .collect(),
+            starts: BTreeMap::new(),
         }
     }
 

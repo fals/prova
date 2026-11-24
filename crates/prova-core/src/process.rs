@@ -223,6 +223,21 @@ pub fn kill_run_processes(pgid: u32, run: &str) -> usize {
     n
 }
 
+/// Milliseconds since boot, the clock process start times are measured in
+/// (Linux, `CLOCK_BOOTTIME`); None elsewhere. Not `/proc/uptime`: its 10 ms
+/// truncation put the runner's own start after its first output line
+/// (round 12 CI).
+#[cfg(target_os = "linux")]
+pub fn uptime_ms() -> Option<u64> {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    Some(t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn uptime_ms() -> Option<u64> {
+    None
+}
+
 pub fn terminate_group(pgid: u32) {
     signal_group(pgid, Signal::TERM);
 }

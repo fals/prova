@@ -1407,15 +1407,23 @@ fn work_comparison(
             let missing: Vec<&String> = oracle_tests.iter().filter(|t| !passed.contains(t)).collect();
             match missing.first() {
                 None => Ok(()),
-                Some(first) => Err(format!(
+                Some(first) => Err(SpecFail::Violated(format!(
                     "oracle `{oracle}` exited 0, but {} test(s) that passed in the baseline's oracle did not pass in the candidate's (e.g. {first}): its checks failed or were skipped (`prova exp log <experiment> {name}`)",
                     missing.len()
-                )),
+                ))),
             }
         });
         c.check_spec(*arm, verdict.is_ok());
-        if let Err(why) = verdict {
-            let why = why.replace("<experiment>", &exp);
+        if let Err(fail) = verdict {
+            let why = match fail {
+                SpecFail::Infra(why) => {
+                    // Nothing was measured or judged: not a verdict on
+                    // either arm.
+                    let reason = why.replace("<experiment>", &exp);
+                    return end_failed(store, &exp, comparison, &cand_name, &reason);
+                }
+                SpecFail::Violated(why) => why.replace("<experiment>", &exp),
+            };
             if *arm == Arm::Baseline {
                 let reason = format!(
                     "baseline violates the specification: {why}; measure only implementations that satisfy it"
@@ -2228,22 +2236,22 @@ fn satisfies_spec(
     dir: &Path,
     logs: &Path,
     arm: Arm,
-) -> Result<std::result::Result<(), String>> {
+) -> Result<std::result::Result<(), SpecFail>> {
     for f in &p.specs {
         let found = std::fs::read(dir.join(&f.path)).map(|b| sha256_hex(&b));
         match found {
             Ok(h) if h == f.sha256 => {}
             Ok(_) => {
-                return Ok(Err(format!(
+                return Ok(Err(SpecFail::Violated(format!(
                     "{} differs from the registered specification",
                     f.path
-                )));
+                ))));
             }
             Err(_) => {
-                return Ok(Err(format!(
+                return Ok(Err(SpecFail::Violated(format!(
                     "{} is missing (commit the specification before registering it)",
                     f.path
-                )));
+                ))));
             }
         }
     }
@@ -2252,7 +2260,7 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    let ok = sandboxed(
+    let status = sandboxed(
         dir,
         "sh",
         &["-c".to_owned(), oracle.clone()],
@@ -2266,33 +2274,60 @@ fn satisfies_spec(
     .stdout(log.try_clone()?)
     .stderr(log)
     .status()
-    .map(|s| s.success())
-    .unwrap_or(false);
+    .ok();
+    let ok = status.is_some_and(|s| s.success());
     // A process the oracle leaves behind would run into the trials and be
     // blamed on them (round 10: a daemon from the candidate's oracle was
     // reported as the baseline trial's leak).
     let left = process::reap_orphans();
     if let Some(l) = left.first() {
-        return Ok(Err(format!(
+        return Ok(Err(SpecFail::Violated(format!(
             "the oracle left process {l} running after it ended; it would disturb the trials"
-        )));
+        ))));
     }
-    Ok(if ok {
-        Ok(())
-    } else {
-        // The checkouts' tracked files are read-only: an oracle that writes
-        // one (go generate) fails for that, not for the spec (round 10).
-        let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
-        let hint = if text.contains("ermission denied") || text.contains("Read-only file system") {
-            "; its log shows a write was refused: during experiments the checkouts' tracked files are read-only, so an oracle must not rewrite them (generate into a temporary directory instead)"
+    if ok {
+        return Ok(Ok(()));
+    }
+    let arm_log = name.trim_end_matches(".log");
+    // 126 and 127 are the shell saying it could not execute the oracle (not
+    // executable, command not found): nothing was checked, so the code is
+    // not to blame (usability round: `lake: command not found` was reported
+    // as the baseline violating the specification).
+    if let Some(code @ (126 | 127)) = status.and_then(|s| s.code()) {
+        let what = if code == 127 {
+            "command not found"
         } else {
-            ""
+            "not executable"
         };
-        Err(format!(
-            "oracle `{oracle}` failed (`prova exp log <experiment> {}`){hint}",
-            name.trim_end_matches(".log")
-        ))
-    })
+        return Ok(Err(SpecFail::Infra(format!(
+            "the oracle could not run (exit {code}: {what}; see `prova exp log <experiment> {arm_log}`): install what it needs"
+        ))));
+    }
+    // The checkouts' tracked files are read-only: an oracle that writes
+    // one (go generate) fails for that, not for the spec (round 10).
+    let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
+    let hint = if text.contains("ermission denied") || text.contains("Read-only file system") {
+        "; its log shows a write was refused: during experiments the checkouts' tracked files are read-only, so an oracle must not rewrite them (generate into a temporary directory instead)"
+    } else {
+        ""
+    };
+    // The decisive line, so the reader need not open the log.
+    let last = text
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| l.chars().take(200).collect::<String>())
+        .unwrap_or_else(|| format!("oracle `{oracle}` failed, printing nothing"));
+    Ok(Err(SpecFail::Violated(format!(
+        "{last} (full log: prova exp log <experiment> {arm_log}){hint}"
+    ))))
+}
+
+/// Why a variant does not satisfy the specification: it does not, or the
+/// oracle could not run (which says nothing about the code).
+enum SpecFail {
+    Violated(String),
+    Infra(String),
 }
 
 fn fingerprint_of(store: &Store, comparison: &str, seq: u32) -> Result<String> {

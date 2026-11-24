@@ -179,44 +179,53 @@ flowchart LR
 ## Test sizes
 
 A test's size is what it used, never how long it took
-([ADR 0025](adr/0025-sizes-by-resources.md), after Software Engineering at
-Google, ch. 11): one process and no network is small; more processes or
-`localhost` is medium; another host is large.
+([ADR 0025](adr/0025-sizes-by-resources.md), [ADR 0026](adr/0026-sizes-from-process-start-times-and-the-run.md),
+after Software Engineering at Google, ch. 11): one process and no network
+is small; more processes or `localhost` is medium; another host is large.
 
 ```mermaid
 flowchart TB
     subgraph Sample["Supervisor: every 0.5 s, and at each test start and finish"]
-        T["Process tree<br/>group + descendants in other groups<br/>(/proc, ps)"]
+        T["Process tree, with start times<br/>group + descendants in other groups<br/>(/proc, ps)"]
         K["Sockets of the tree<br/>/proc/pid/fd + /proc/net/*, lsof<br/>local or another host"]
     end
     T --> A{"Can prova tell<br/>which test used it?"}
     K --> A
     A -->|"a process names the test<br/>(nextest --exact): its subtree"| OWN["Own process"]
-    A -->|"only test running, first seen<br/>50 ms inside its start and finish lines"| SOLO["Solo window"]
-    A -->|"tests overlap, or too short<br/>to be sampled"| NONE["Not attributed"]
-    OWN --> TS["test_size event<br/>size + evidence"]
+    A -->|"only test running: processes started<br/>inside its window, sockets first seen<br/>in a sample inside it"| SOLO["Solo window"]
+    A -->|"tests overlap, too short to sample,<br/>or output came all at once"| NONE["Not attributed"]
+    OWN --> TS["test_size event<br/>size + evidence (only if sampled)"]
     SOLO --> TS
-    NONE --> RS["run_size event<br/>the whole command: an upper bound"]
+    NONE --> RS["run_size event<br/>the test phase beyond the runner<br/>(sampled at least twice)"]
     TS --> DB[("test_sizes table")]
     RS --> DB
-    DB --> R["prova sizes · prova history<br/>small after 3 runs; medium and large at once;<br/>else 'medium or less' or unknown"]
+    DB --> R["prova sizes · prova history<br/>medium and large at once; small after 3 runs<br/>of nothing more seen; else 'medium or less'<br/>naming the run's use, or unknown"]
     TS -->|"suite declared smaller"| NOTE["run note naming the resource"]
+    RS -->|"suite declared smaller"| NOTE
 ```
 
-- Each sample records the run's process tree and the sockets it holds
-  (`/proc/<pid>/fd` against `/proc/net/{tcp,tcp6,udp,udp6,unix}` on Linux,
-  `lsof` on macOS), each socket as local or another host.
+- Each sample records the run's process tree with each process's start time
+  (Linux) and the sockets it holds (`/proc/<pid>/fd` against
+  `/proc/net/{tcp,tcp6,udp,udp6,unix}` on Linux, `lsof` on macOS), each
+  socket as local or another host. Output lines carry the time they
+  arrived.
 - A test is held to what it used when prova can tell: its own process and
   descendants (a process whose arguments name it, as nextest's `--exact`),
-  or what was first seen while it was the only test running, in a sample
-  taken well inside its start and finish lines (the program may already be
-  in the next test when a line is read).
-- Observations are lower bounds: what lives between two samples is missed.
-  Small needs 3 attributed runs that saw nothing more; medium and large are
-  decided by one. A test never attributed shows the run's size as an upper
-  bound, or is unknown.
-- A suite's declared `size` is checked: a test that uses more gets a run note
-  naming what it used.
+  or, while it is the only test running, the processes that started inside
+  its window (by start time, so a child started at once counts) and the
+  sockets first seen in a sample well inside it. A process that started
+  before the run's first output line is the runner's. A test with no sample
+  inside its window gets no size: nothing seen is not evidence.
+- Tests prova cannot isolate take their run's test phase (first to last
+  test event, beyond the runner's own processes, sampled at least twice):
+  small when it showed nothing more, else a bound that names what the run
+  used ("medium or less: the run started postgres").
+- Small is the absence of evidence and says so ("no other process or socket
+  seen"); it needs 3 finished runs. Medium and large are decided by one.
+  Sleeps and timers are invisible. Cancelled runs and skipped tests are no
+  evidence.
+- A declared `size` is checked against each test and against the run: a
+  suite declared smaller than what it used gets a run note naming it.
 
 ## Memory: history and flaky tests
 

@@ -125,6 +125,10 @@
         "source": {
           "$ref": "#/$defs/Level"
         },
+        "subtest": {
+          "description": "A result nested in another test that reports its own (Go's\n`TestX/case`, pytest's subtests): counted apart from tests.",
+          "type": "boolean"
+        },
         "test": {
           "$ref": "#/$defs/TestKey"
         }

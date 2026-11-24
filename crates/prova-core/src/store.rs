@@ -385,6 +385,7 @@ impl Store {
                 duration_ms,
                 message,
                 source,
+                subtest: false,
             } = &e.kind
             {
                 if suite.is_none() {

@@ -407,6 +407,9 @@ enum ExpCmd {
         against: Option<String>,
         #[arg(long)]
         detach: bool,
+        /// Longest foreground wait (default 9m), then `exp wait` continues.
+        #[arg(long)]
+        max_wait: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -415,6 +418,9 @@ enum ExpCmd {
         name: String,
         #[arg(long)]
         detach: bool,
+        /// Longest foreground wait (default 9m), then `exp wait` continues.
+        #[arg(long)]
+        max_wait: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -566,14 +572,34 @@ fn exp_exit(r: &experiment::Report) -> u8 {
     }
 }
 
+/// `exp status` exit: the experiment's state. A REJECT after an accepted best
+/// is not a failure of the experiment; a running comparison stays 5.
+fn exp_status_exit(r: &experiment::Report) -> u8 {
+    let code = exp_exit(r);
+    let rejected = r
+        .comparison
+        .as_ref()
+        .is_some_and(|c| c.status == "decided" && c.verdict.as_deref() == Some("reject"));
+    if rejected && r.best != "baseline" {
+        exit::PASSED
+    } else {
+        code
+    }
+}
+
 fn exp_start(
     store: &Store,
     name: &str,
     candidate: &str,
     against: Option<&str>,
     detach: bool,
+    max_wait: Option<&str>,
     json: bool,
 ) -> Result<u8> {
+    let budget = match max_wait {
+        Some(m) => parse_duration(m).ok_or_else(|| anyhow!("invalid --max-wait {m:?}"))?,
+        None => Duration::from_secs(9 * 60),
+    };
     let id = experiment::start(store, name, candidate, against)?;
     let best = experiment::get(store, name)?.best;
     let live = experiment::live_tree_variants(store, name, &[candidate, against.unwrap_or(&best)]);
@@ -620,9 +646,10 @@ fn exp_start(
     // Bounded like `prova run --until done` (round 11: a foreground
     // comparison blocked with no limit): 9 minutes, then the command to
     // continue; the comparison goes on in the background.
-    let deadline = std::time::Instant::now() + Duration::from_secs(9 * 60);
+    let deadline = std::time::Instant::now() + budget;
     loop {
-        let r = experiment::wait(store, name, Duration::from_secs(30))?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let r = experiment::wait(store, name, left.min(Duration::from_secs(30)))?;
         if exp_exit(&r) != exit::RUNNING {
             let _ = child.wait();
             render::experiment(&r, json);
@@ -631,7 +658,10 @@ fn exp_start(
         if std::time::Instant::now() >= deadline {
             render::experiment(&r, json);
             if !json {
-                println!("next: prova exp wait {name} --max-wait 9m");
+                println!(
+                    "next: prova exp wait {name} --max-wait {}",
+                    max_wait.unwrap_or("9m")
+                );
             }
             return Ok(exit::RUNNING);
         }
@@ -679,9 +709,13 @@ fn init() -> Result<u8> {
             dirs.push(skills);
         }
     }
+    let mut failures: Vec<String> = Vec::new();
     let mut files = 0;
     for dir in &dirs {
-        files = write_skills(&root.join(dir), &names)?;
+        match write_skills(&root.join(dir), &names) {
+            Ok(n) => files = n,
+            Err(e) => failures.push(format!("{dir}: {e}")),
+        }
     }
     println!(
         "installed {} skills ({files} files) into {}: {}",
@@ -694,10 +728,9 @@ fn init() -> Result<u8> {
     // harness from reading it: CLAUDE.md (Claude Code then ignores
     // AGENTS.md), GEMINI.md (Gemini CLI's default), and the files Zed reads
     // first. None of those is created: a new one would hide AGENTS.md.
+    // Every target is processed; failures are reported with their path.
     let mut updated = Vec::new();
-    if upsert_section(&root.join("AGENTS.md"), true)? {
-        updated.push("AGENTS.md");
-    }
+    let mut targets: Vec<(&str, bool)> = vec![("AGENTS.md", true)];
     for f in [
         "CLAUDE.md",
         ".claude/CLAUDE.md",
@@ -709,8 +742,16 @@ fn init() -> Result<u8> {
         ".github/copilot-instructions.md",
     ] {
         let path = root.join(f);
-        if path.is_file() && upsert_section(&path, false)? {
-            updated.push(f);
+        if path.is_file() || path.is_symlink() {
+            targets.push((f, false));
+        }
+    }
+    for (f, create) in targets {
+        match upsert_section(&root, &root.join(f), create) {
+            Ok(Section::Changed) => updated.push(f),
+            Ok(Section::Unchanged) => {}
+            Ok(Section::Skipped(why)) => eprintln!("skipped {f}: {why}"),
+            Err(e) => failures.push(format!("{f}: {e}")),
         }
     }
     if !updated.is_empty() {
@@ -727,43 +768,116 @@ fn init() -> Result<u8> {
         } else {
             "\n"
         };
-        std::fs::write(&gi, format!("{ignore}{sep}.prova/\n"))?;
-        println!("added .prova/ to .gitignore");
+        match std::fs::write(&gi, format!("{ignore}{sep}.prova/\n")) {
+            Ok(()) => println!("added .prova/ to .gitignore"),
+            Err(e) => failures.push(format!(".gitignore: {e}")),
+        }
     }
     if !root.join("prova.toml").exists() {
         println!("next: prova adopt   (proposes prova.toml for this project)");
     }
-    Ok(exit::PASSED)
+    if failures.is_empty() {
+        return Ok(exit::PASSED);
+    }
+    for f in &failures {
+        eprintln!("error: {f}");
+    }
+    eprintln!(
+        "init finished with {} failure(s); every other file was done",
+        failures.len()
+    );
+    Ok(exit::INFRA)
+}
+
+/// What `upsert_section` did to one instruction file.
+enum Section {
+    Changed,
+    Unchanged,
+    /// Left alone on purpose, with the reason.
+    Skipped(String),
 }
 
 /// Puts the prova section into an instruction file: replaces it between
 /// its markers, or appends it. A file that imports AGENTS.md (`@AGENTS.md`)
 /// already has it. Returns whether the file changed.
-fn upsert_section(path: &Path, create: bool) -> Result<bool> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+///
+/// Only a well-formed file (one begin, one end, begin first) is updated in
+/// place; any other marker state is an error and the file stays untouched.
+/// A symlink resolving outside `root` is never written through. The file's
+/// line ending (LF or CRLF) is kept.
+fn upsert_section(root: &Path, path: &Path, create: bool) -> Result<Section> {
+    const BEGIN: &str = "<!-- prova:begin -->";
+    const END: &str = "<!-- prova:end -->";
+    let name = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if path.is_symlink() {
+        let root_real = root.canonicalize()?;
+        match path.canonicalize() {
+            Ok(real) if real.starts_with(&root_real) => {}
+            Ok(real) => {
+                return Ok(Section::Skipped(format!(
+                    "symlink points outside the repository ({})",
+                    real.display()
+                )));
+            }
+            Err(_) => return Ok(Section::Skipped("dangling symlink".to_owned())),
+        }
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
     if text.is_empty() && !create {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
     if text.lines().any(|l| l.trim() == "@AGENTS.md") {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
-    let section = skills::AGENTS_SECTION;
-    let new = match (
-        text.find("<!-- prova:begin -->"),
-        text.find("<!-- prova:end -->"),
-    ) {
-        (Some(a), Some(b)) if b > a => {
-            let end = b + "<!-- prova:end -->".len();
-            format!("{}{}{}", &text[..a], section.trim_end(), &text[end..])
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let section = if crlf {
+        skills::AGENTS_SECTION.replace('\n', "\r\n")
+    } else {
+        skills::AGENTS_SECTION.to_owned()
+    };
+    let broken = |what: &str| {
+        anyhow::anyhow!("{name}: prova section markers are broken ({what}); fix them by hand")
+    };
+    let new = match (text.matches(BEGIN).count(), text.matches(END).count()) {
+        (0, 0) if text.is_empty() => section,
+        (0, 0) => {
+            let mut t = text.clone();
+            if !t.ends_with('\n') {
+                t.push_str(eol);
+            }
+            t.push_str(eol);
+            t.push_str(&section);
+            t
         }
-        _ if text.is_empty() => section.to_owned(),
-        _ => format!("{}\n\n{}", text.trim_end(), section),
+        (1, 1) => match (text.find(BEGIN), text.find(END)) {
+            (Some(a), Some(b)) if a < b => {
+                format!(
+                    "{}{}{}",
+                    &text[..a],
+                    section.trim_end(),
+                    &text[b + END.len()..]
+                )
+            }
+            _ => return Err(broken("end before begin")),
+        },
+        (_, 0) => return Err(broken("begin without end")),
+        (0, _) => return Err(broken("end without begin")),
+        _ => return Err(broken("duplicate markers")),
     };
     if new == text {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
     std::fs::write(path, new)?;
-    Ok(true)
+    Ok(Section::Changed)
 }
 
 /// Whether a test prova names `calc.CalcTest::divides` is one a framework
@@ -1061,6 +1175,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             candidate,
             against,
             detach,
+            max_wait,
             json,
         } => {
             let candidate = match candidate {
@@ -1071,14 +1186,35 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     .map(|v| v.name.clone())
                     .ok_or_else(|| anyhow!("no candidate yet: prova exp candidate {name}"))?,
             };
-            exp_start(&store, &name, &candidate, against.as_deref(), detach, json)
+            exp_start(
+                &store,
+                &name,
+                &candidate,
+                against.as_deref(),
+                detach,
+                max_wait.as_deref(),
+                json,
+            )
         }
-        ExpCmd::Revalidate { name, detach, json } => {
+        ExpCmd::Revalidate {
+            name,
+            detach,
+            max_wait,
+            json,
+        } => {
             let e = experiment::get(&store, &name)?;
             if e.best == "baseline" {
                 bail!("nothing to revalidate: no candidate has been kept");
             }
-            exp_start(&store, &name, &e.best, Some("baseline"), detach, json)
+            exp_start(
+                &store,
+                &name,
+                &e.best,
+                Some("baseline"),
+                detach,
+                max_wait.as_deref(),
+                json,
+            )
         }
         ExpCmd::Wait {
             name,
@@ -1093,7 +1229,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
         ExpCmd::Status { name, json } => {
             let r = experiment::report(&store, &name)?;
             render::experiment(&r, json);
-            Ok(exp_exit(&r))
+            Ok(exp_status_exit(&r))
         }
         ExpCmd::Best {
             name,
@@ -1225,6 +1361,18 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
     }
 }
 
+/// A mistake in how prova was asked: exit 2.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 fn main() -> ExitCode {
     // `prova ... | head` closes stdout early; exit quietly like other tools.
     let default_hook = std::panic::take_hook();
@@ -1244,7 +1392,12 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("prova: error: {e:#}");
-            ExitCode::from(exit::INFRA)
+            // A mistake in how prova was asked is exit 2, not an
+            // infrastructure failure (round 12).
+            let usage = e.downcast_ref::<UsageError>().is_some()
+                || e.downcast_ref::<config::ConfigError>()
+                    .is_some_and(config::ConfigError::is_usage);
+            ExitCode::from(if usage { exit::USAGE } else { exit::INFRA })
         }
     }
 }
@@ -1452,12 +1605,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                         .map(|(n, _)| n)
                         .collect();
                     match with.first() {
-                        Some(n) => bail!(
+                        Some(n) => return Err(UsageError(format!(
                             "--select runs one test through a suite's select template, not a command after --: prova run {n} --select <test>"
-                        ),
-                        None => bail!(
-                            "--select runs one test through a suite's select template; there is none yet: `prova adopt --write` proposes one"
-                        ),
+                        )).into()),
+                        None => return Err(UsageError(
+                            "--select runs one test through a suite's select template; there is none yet: `prova adopt --write` proposes one".into()
+                        ).into()),
                     }
                 }
                 let rel = cwd
@@ -1743,7 +1896,10 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     analysis::most_recent(&store, &found)?
                 }
                 (_, []) => {
-                    bail!("no test matching {test:?}; tests are recorded from level 1 runs on")
+                    return Err(UsageError(format!(
+                        "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                    ))
+                    .into());
                 }
                 _ => {
                     println!("{} tests match {test:?}; be more specific:", found.len());
@@ -1827,7 +1983,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
                 if d.unknown > 0 {
                     println!(
-                        "unknown: {} seen small in fewer than {} runs so far; the others were never seen alone (a framework that reports each test's start: go test -json, pytest-reportlog, the Vitest reporter) or in their own process (nextest). A test shorter than prova's 0.5 s samples is rarely seen",
+                        "unknown: {} seen small in fewer than {} runs so far; the others were never seen on their own (one test running, or its own process) and their runs were not sampled in time to tell (their output came all at once). Sizes are a lower bound: prova samples every 0.5 s and cannot see sleeps",
                         d.small_so_far,
                         analysis::SMALL_AFTER
                     );

@@ -60,9 +60,11 @@ cargo install --git https://github.com/fals/prova --tag v0.1.2 prova-cli
 On macOS, prova watches test processes through `ps` instead of `/proc`,
 and a test's sockets through `lsof` (installed with macOS; without it, sizes
 see processes only).
-Two checks need counters macOS does not give: a pass whose command used
-no CPU at all is not flagged there, and experiments run without a
-sandbox or CPU counters (every verdict says which checks did not run).
+Some checks need counters macOS does not give: a pass whose command used
+no CPU at all is not flagged there; a quiet loop of commands that each
+last milliseconds can look idle and be reported as a stall; sizes have no
+process start times there; and experiments run without a sandbox or CPU
+counters (every verdict says which checks did not run).
 
 Experiments isolate each arm in a sandbox when
 [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
@@ -150,11 +152,13 @@ most of a suite should be small (Google's rough guide is 80/15/5).
 
 What prova does for you, on every run, with no configuration:
 
-- **Observes what each test used:** its processes and its sockets, local or
-  to another host. A test is held to what prova saw in its own process (one
-  process per test, as nextest runs them) or while it was the only test
-  running; prova never guesses, and never charges one test for another's
-  resources.
+- **Observes what each test used:** its processes (with when they started)
+  and its sockets, local or to another host. A test is held to what started
+  in its own process (one process per test, as nextest runs them) or while
+  it was the only test running; prova never charges one test for another's
+  resources. Tests too fast to isolate take what their whole run used:
+  small when the run used nothing beyond the test runner, otherwise a bound
+  that names it ("medium or less: the run started postgres").
 - **Names what to fix.** `prova sizes` counts small, medium and large tests
   and lists each medium or large one with the reason: `started postgres`,
   `2 local socket(s)`, `connected to 10.0.3.7:5432`. Replace that dependency
@@ -171,10 +175,11 @@ What prova does for you, on every run, with no configuration:
   (60 s, 5 min), and a test is killed at 60 s (300 s, 900 s). A hung test
   costs seconds, not a CI timeout.
 
-What prova cannot see: what a test starts and stops between two samples
-(every 0.5 s); a test is called small only after 3 runs that saw nothing
-more, and a test it never saw alone or in its own process shows the run's
-size as an upper bound, or "unknown". Split small tests into their own
+What prova cannot see: a socket opened and closed between two samples
+(every 0.5 s), and sleeps or timers. So small means "no other process or
+socket seen", and needs 3 runs; medium and large are evidence. "Unknown"
+means prova could not observe at all, for instance when the framework's
+output reached it all at once at the end. Split small tests into their own
 suite and run that one in the fix loop:
 
 ```toml

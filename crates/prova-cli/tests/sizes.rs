@@ -95,7 +95,10 @@ fn sizes_follow_processes_and_sockets_not_time() {
     let first = run();
     // One attributed run is not enough to call a test small (ADR 0025 §5).
     let h = text(&prova(&d, port, &["history", "m::computes"]));
-    assert!(h.contains("size: small? (1 of 3 runs)"), "{h}");
+    assert!(
+        h.contains("size: small? (nothing more seen in 1 of 3 runs)"),
+        "{h}"
+    );
 
     let sizes = sizes_of(&d, port, &first);
     let get = |n: &str| {
@@ -125,7 +128,7 @@ fn sizes_follow_processes_and_sockets_not_time() {
     run();
     let h = text(&prova(&d, port, &["history", "m::computes"]));
     assert!(
-        h.contains("size: small (one process, no sockets, in 3 runs)"),
+        h.contains("size: small (no other process or socket seen, in 3 runs)"),
         "{h}"
     );
 
@@ -137,4 +140,121 @@ fn sizes_follow_processes_and_sockets_not_time() {
     );
     assert!(report.contains("started sleep"), "{report}");
     drop(listener);
+}
+
+/// Runs the suite `n` times; returns the last run id.
+fn runs(d: &Path, port: u16, n: usize) -> String {
+    let mut last = String::new();
+    for _ in 0..n {
+        let o = prova(d, port, &["run", "t", "--json"]);
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+        last = v["run"].as_str().unwrap().to_owned();
+    }
+    last
+}
+
+fn suite(d: &Path, body: &str, declared: Option<&str>) {
+    let lib = r#"S() { echo "{\"type\":\"test\",\"event\":\"started\",\"name\":\"$1\"}"; }
+OK() { echo "{\"type\":\"test\",\"name\":\"$1\",\"event\":\"ok\"}"; }
+spin() { end=$((SECONDS + $1)); while [ $SECONDS -lt $end ]; do :; done; }
+"#;
+    std::fs::write(d.join("t.sh"), format!("{lib}{body}")).unwrap();
+    let size = declared.map_or(String::new(), |s| format!("size = \"{s}\"\n"));
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.t]\nrun = \"bash t.sh\"\n{size}"),
+    )
+    .unwrap();
+}
+
+/// Round 12: a test that starts a child the moment it begins had it in the
+/// snapshot taken when its start line was read, so it looked small. Start
+/// times decide (ADR 0026 §1).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_started_at_once_is_the_tests() {
+    let d = workspace("at-once");
+    // As runners do: something printed before the test starts.
+    suite(
+        &d,
+        "echo running 1 test\nspin 1\nS m::kid\nsleep 1.6\nOK m::kid\n",
+        None,
+    );
+    let run = runs(&d, 0, 1);
+    let sizes = sizes_of(&d, 0, &run);
+    assert!(
+        sizes
+            .iter()
+            .any(|(t, s, e)| t.ends_with("kid") && s == "medium" && e.contains("sleep")),
+        "{sizes:?}"
+    );
+}
+
+/// Round 12: output that reaches prova all at once (a buffered pipe) gave
+/// "small" with no sample inside the test. Nothing sampled, nothing
+/// claimed (ADR 0026 §3, §4).
+#[test]
+fn output_that_comes_at_once_claims_no_size() {
+    let d = workspace("buffered");
+    suite(
+        &d,
+        "{ S m::net; sleep 1.2; OK m::net; S m::b; OK m::b; } > buf.txt\ncat buf.txt\n",
+        None,
+    );
+    let run = runs(&d, 0, 3);
+    assert!(
+        sizes_of(&d, 0, &run).is_empty(),
+        "{:?}",
+        sizes_of(&d, 0, &run)
+    );
+    let h = text(&prova(&d, 0, &["history", "m::net"]));
+    assert!(!h.contains("size: small"), "{h}");
+}
+
+/// Tests prova cannot isolate are held to their run's test phase: a run
+/// that used a socket bounds them and names it, and a suite declared small
+/// is told (ADR 0026 §2, §5).
+#[test]
+fn overlapping_tests_are_bounded_by_what_their_run_used() {
+    let d = workspace("overlap");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    suite(
+        &d,
+        // Waits in whole seconds (bash 3.2): the socket is held at least
+        // 2 s, so the phase is sampled several times.
+        "S m::a\nS m::b\nspin 2\nexec 3<>/dev/tcp/127.0.0.1/$PORT\nspin 3\nexec 3>&-\nOK m::a\nOK m::b\n",
+        Some("small"),
+    );
+    let run = runs(&d, port, 1);
+    let status = text(&prova(&d, port, &["status", &run]));
+    assert!(
+        status.contains("this suite is declared small but its run 1 local socket(s)"),
+        "{status}"
+    );
+    let h = text(&prova(&d, port, &["history", "m::a"]));
+    assert!(
+        h.contains("size: medium or less (never seen on its own, and its run 1 local socket(s))"),
+        "{h}"
+    );
+    drop(listener);
+}
+
+/// A test too fast to be sampled on its own is small when its whole run
+/// showed nothing beyond the runner, after 3 runs (ADR 0026 §2).
+#[test]
+fn fast_tests_in_a_clean_run_become_small() {
+    let d = workspace("clean");
+    suite(
+        &d,
+        "S m::fast1\nOK m::fast1\nspin 3\nS m::fast2\nOK m::fast2\n",
+        None,
+    );
+    runs(&d, 0, 3);
+    let h = text(&prova(&d, 0, &["history", "m::fast1"]));
+    assert!(
+        h.contains("size: small (no other process or socket seen, in 3 runs)"),
+        "{h}"
+    );
 }

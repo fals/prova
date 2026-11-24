@@ -26,6 +26,10 @@ pub struct Recognizers {
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
+    /// VSTest `Total tests:` block seen: its `Failed:` line follows.
+    vstest_totals: bool,
+    /// nextest `SKIP` lines named individually.
+    nextest_skip_lines: u64,
     /// libtest: the test binary currently running ("Running tests/x.rs (...)").
     libtest_binary: Option<String>,
     started: BTreeSet<String>,
@@ -73,6 +77,10 @@ pub struct Recognizers {
     pub harness_stopped: Vec<String>,
     /// Text results held while an injected stream is expected.
     held_text_events: Vec<EventKind>,
+    /// Parsing into `held_text_events`: a held result is a fallback, not a
+    /// report, so it must not mark its test seen or started, or the
+    /// stream's own result is dropped as a duplicate (round 12).
+    holding: bool,
     /// The longest time one of the framework's own summaries says its tests
     /// took (libtest `finished in`, go `ok pkg 1.5s`, pytest `in 1.50s`;
     /// packages may run in parallel, so not a sum): more than the
@@ -120,6 +128,10 @@ fn message(lines: &[String]) -> Option<String> {
 impl Recognizers {
     fn started(&mut self, key: TestKey, out: &mut Vec<EventKind>) {
         let d = key.unique();
+        if self.holding {
+            out.push(EventKind::TestStarted { test: key });
+            return;
+        }
         // A stream can report a start after another source reported the end
         // (pytest -v text before its reportlog line): never restart a test.
         if self.seen.contains_key(&d) {
@@ -157,6 +169,7 @@ impl Recognizers {
             duration_ms,
             message,
             source: Level::Native,
+            subtest: false,
         });
     }
 
@@ -169,8 +182,46 @@ impl Recognizers {
         level: Level,
         out: &mut Vec<EventKind>,
     ) {
+        self.result(key, outcome, duration_ms, message, level, false, out);
+    }
+
+    /// A test's or a subtest's result. Only the recognizer knows what is a
+    /// subtest (Go: a `/` in the name; pytest: a subtest report): a name
+    /// rule applied to every framework took JUnit and xUnit display names
+    /// for subtests (round 12 audit).
+    #[allow(clippy::too_many_arguments)]
+    fn result(
+        &mut self,
+        key: TestKey,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        level: Level,
+        subtest: bool,
+        out: &mut Vec<EventKind>,
+    ) {
         let d = key.unique();
-        if self.seen.contains_key(&d) {
+        if self.holding {
+            out.push(EventKind::TestFinished {
+                test: key,
+                attempt: 1,
+                outcome,
+                duration_ms,
+                message,
+                source: level,
+                subtest,
+            });
+            return;
+        }
+        if let Some((_, before)) = self.seen.get(&d) {
+            // A different result under the same name is another test (two
+            // test binaries both with `tests::it_works`, round 12): keep it,
+            // or a failure hides behind a pass.
+            if before.is_failure() != outcome.is_failure() {
+                let mut other = key.clone();
+                other.name = format!("{} (second result)", key.name);
+                return self.result(other, outcome, duration_ms, message, level, subtest, out);
+            }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
             if self.libtest_binary.is_some() && key.file == self.libtest_binary {
@@ -192,6 +243,7 @@ impl Recognizers {
             duration_ms,
             message,
             source: level,
+            subtest,
         });
     }
 
@@ -220,6 +272,85 @@ impl Recognizers {
                 self.reported_total += total;
             }
             self.reported_failed += field("Failed:").unwrap_or(0);
+            return;
+        }
+        // VSTest console at normal verbosity: "Total tests: 14", then
+        // "     Failed: 4" (Passed and Skipped lines add nothing).
+        if let Some(n) = t.strip_prefix("Total tests:") {
+            if let Ok(v) = n.trim().parse::<u64>() {
+                self.summary_seen = true;
+                self.reported_total += v;
+                self.vstest_totals = true;
+            }
+            return;
+        }
+        if self.vstest_totals {
+            if let Some(n) = t.strip_prefix("Failed:") {
+                if let Ok(v) = n.trim().parse::<u64>() {
+                    self.reported_failed += v;
+                }
+                self.vstest_totals = false;
+            } else if t.starts_with("Total time:") {
+                self.vstest_totals = false;
+            }
+            return;
+        }
+        // nextest "Summary [ 0.2s] 11 tests run: 8 passed, 3 failed, 2 skipped".
+        // Its skipped count also covers tests a filter left out, which no
+        // framework counts as tests: only those it named with SKIP lines
+        // are added.
+        if t.starts_with("Summary [")
+            && let Some((_, rest)) = t.split_once("] ")
+            && let Some((head, counts)) = rest.split_once(" run: ")
+            && let Some(n) = head
+                .split_whitespace()
+                .next()
+                .map(|w| w.rsplit('/').next().unwrap_or(w))
+                .and_then(|w| w.parse::<u64>().ok())
+            && (head.ends_with(" tests") || head.ends_with(" test"))
+        {
+            let mut skipped = 0;
+            let mut failed = 0;
+            for part in counts.split(',') {
+                let mut w = part.split_whitespace();
+                if let (Some(num), Some(word)) = (w.next(), w.next())
+                    && let Ok(v) = num.parse::<u64>()
+                {
+                    match word {
+                        "failed" | "timed" => failed += v,
+                        "skipped" => skipped += v,
+                        _ => {}
+                    }
+                }
+            }
+            self.summary_seen = true;
+            self.reported_total += n + skipped.min(self.nextest_skip_lines);
+            self.reported_failed += failed;
+            return;
+        }
+        // Maven Surefire's aggregate "Tests run: 22, Failures: 4, Errors: 1,
+        // Skipped: 2": the per-class lines also say "Time elapsed".
+        if let Some(rest) = t
+            .strip_prefix("[INFO] ")
+            .or_else(|| t.strip_prefix("[ERROR] "))
+            .or_else(|| t.strip_prefix("[WARNING] "))
+            .unwrap_or(t)
+            .strip_prefix("Tests run:")
+            && !rest.contains("Time elapsed")
+        {
+            let field = |name: &str| {
+                rest.split(',').find_map(|p| {
+                    p.trim()
+                        .strip_prefix(name)
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                })
+            };
+            if let Some(n) = field("") {
+                self.summary_seen = true;
+                self.reported_total += n;
+                self.reported_failed +=
+                    field("Failures:").unwrap_or(0) + field("Errors:").unwrap_or(0);
+            }
             return;
         }
         // Jest "Tests:       1 failed, 4 passed, 5 total"; Vitest
@@ -275,6 +406,16 @@ impl Recognizers {
         let mut n = 0;
         for part in body.split([';', ',']) {
             let mut w = part.split_whitespace();
+            // pytest 9: "7 subtests passed" (failed subtests are in "failed").
+            if let (Some(num), Some("subtests"), Some("passed" | "skipped")) = (
+                part.split_whitespace().next(),
+                part.split_whitespace().nth(1),
+                part.split_whitespace().nth(2),
+            ) && let Ok(v) = num.parse::<u64>()
+            {
+                n += v;
+                continue;
+            }
             if let (Some(num), Some(word)) = (w.next(), w.next())
                 && let Ok(v) = num.parse::<u64>()
                 && [
@@ -478,15 +619,22 @@ impl Recognizers {
             let mut held = std::mem::take(&mut self.held_text_events);
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
-                || (self.pytest_stream && !streamed && self.pytest(line, &mut held))
+                || (self.pytest_stream && !streamed && self.hold(|r| r.pytest(line, &mut held)))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)
-                || (self.vitest_stream && !streamed && self.vitest(line, &mut held))
+                || (self.vitest_stream && !streamed && self.hold(|r| r.vitest(line, &mut held)))
                 || (!self.vitest_stream && self.vitest(line, &mut out))
                 || self.tap(line, &mut out);
             self.held_text_events = held;
         }
         out
+    }
+
+    fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        self.holding = true;
+        let r = f(self);
+        self.holding = false;
+        r
     }
 
     // ------------------------------------------------------------- go json
@@ -531,7 +679,17 @@ impl Recognizers {
                 } else {
                     None
                 };
-                self.finished(key(t), outcome, elapsed, msg, Level::Native, out);
+                // Go test names cannot contain '/': one that does is a
+                // subtest (`t.Run`).
+                self.result(
+                    key(t),
+                    outcome,
+                    elapsed,
+                    msg,
+                    Level::Native,
+                    t.contains('/'),
+                    out,
+                );
             }
             ("fail", None) => {
                 // Package failed without any failing test: build error or crash.
@@ -667,6 +825,9 @@ impl Recognizers {
     /// teardown). Setup starts the test (or ends it when it fails or skips),
     /// call ends it.
     fn reportlog(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        if v["$report_type"] == "SubTestReport" {
+            return self.reportlog_subtest(v, out);
+        }
         if v["$report_type"] != "TestReport" {
             return;
         }
@@ -707,6 +868,50 @@ impl Recognizers {
         self.finished(key, outcome, duration, msg, Level::Native, out);
     }
 
+    /// pytest 9 subtests (`subtests.test(...)`, unittest's `subTest`): one
+    /// report per subtest, labelled like pytest's own output.
+    fn reportlog_subtest(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
+        let (Some(id), Some(result)) = (v["nodeid"].as_str(), v["outcome"].as_str()) else {
+            return;
+        };
+        lift(&mut self.level, Level::Native);
+        let ctx = &v["_subtest.context"];
+        let mut label = String::new();
+        if let Some(m) = ctx["msg"].as_str() {
+            label.push_str(&format!("[{m}] "));
+        }
+        if let Some(kw) = ctx["kwargs"].as_object()
+            && !kw.is_empty()
+        {
+            let args: Vec<String> = kw
+                .iter()
+                .map(|(k, x)| format!("{k}={}", x.as_str().map_or(x.to_string(), str::to_owned)))
+                .collect();
+            label.push_str(&format!("({})", args.join(", ")));
+        }
+        let outcome = match result {
+            "passed" => Outcome::Passed,
+            "failed" => Outcome::Failed,
+            "skipped" => Outcome::Skipped,
+            _ => return,
+        };
+        let key = pytest_subtest(pytest_key(id), label.trim());
+        let longrepr = &v["longrepr"];
+        let msg = if outcome.is_failure() {
+            let text = reportlog_text(longrepr);
+            if !text.is_empty() {
+                self.failure_output.push((key.clone(), text));
+            }
+            longrepr["reprcrash"]["message"]
+                .as_str()
+                .or(longrepr.as_str())
+                .map(|m| m.trim().to_owned())
+        } else {
+            None
+        };
+        self.result(key, outcome, None, msg, Level::Native, true, out);
+    }
+
     // ------------------------------------------------------------- go -v
 
     fn go_verbose(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
@@ -743,12 +948,13 @@ impl Recognizers {
                 } else {
                     None
                 };
-                self.finished(
+                self.result(
                     TestKey::new(Vec::new(), name),
                     outcome,
                     dur.map(|s| (s * 1000.0).round() as u64),
                     msg,
                     Level::Recognized,
+                    name.contains('/'),
                     out,
                 );
                 return true;
@@ -836,7 +1042,11 @@ impl Recognizers {
                 s if s.starts_with("ignored") => Outcome::Skipped,
                 _ => return false,
             };
-            let key = self.libtest_key(name.trim());
+            // Text says `name - should panic`, JSON and nextest say `name`:
+            // one test, one history.
+            let name = name.trim();
+            let name = name.strip_suffix(" - should panic").unwrap_or(name);
+            let key = self.libtest_key(name);
             self.finished(key, outcome, None, None, Level::Recognized, out);
             return true;
         }
@@ -855,36 +1065,101 @@ impl Recognizers {
     // ------------------------------------------------------------- pytest
 
     fn pytest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
-        // Verbose: "tests/test_x.py::test_a PASSED  [ 50%]"
-        // Summary: "FAILED tests/test_x.py::test_b - AssertionError: boom"
-        for (word, outcome) in [("FAILED", Outcome::Failed), ("ERROR", Outcome::Errored)] {
-            if let Some(rest) = line.strip_prefix(word).and_then(|r| r.strip_prefix(' '))
-                && rest.contains("::")
-            {
-                let (id, msg) = match rest.split_once(" - ") {
-                    Some((i, m)) => (i.trim(), Some(m.trim().to_owned())),
-                    None => (rest.trim(), None),
-                };
-                self.finished(pytest_key(id), outcome, None, msg, Level::Recognized, out);
-                return true;
+        // Summary lines (`-rA`, and failures always):
+        //   "FAILED tests/test_x.py::test_b - AssertionError: boom"
+        //   "SUBFAILED[case] (i=2) tests/test_x.py::test_b - assert 2 != 2"
+        for (word, outcome) in [
+            ("FAILED", Outcome::Failed),
+            ("ERROR", Outcome::Errored),
+            ("PASSED", Outcome::Passed),
+            ("XPASS", Outcome::Passed),
+            ("XFAIL", Outcome::Skipped),
+            ("SUBFAILED", Outcome::Failed),
+            ("SUBPASSED", Outcome::Passed),
+        ] {
+            let Some(rest) = line.strip_prefix(word) else {
+                continue;
+            };
+            let sub = word.starts_with("SUB");
+            if !sub && !rest.starts_with(' ') {
+                continue;
+            }
+            let (left, msg) = match rest.split_once(" - ") {
+                Some((i, m)) => (i, Some(m.trim().to_owned())),
+                None => (rest, None),
+            };
+            // The id is the word with ".py::" (a subtest's label comes first).
+            let Some(at) = left.find(".py::") else {
+                continue;
+            };
+            let start = left[..at].rfind(' ').map_or(0, |i| i + 1);
+            let id = left[start..].trim();
+            let label = left[..start].trim();
+            let key = pytest_key(id);
+            let (key, sub) = if sub {
+                (pytest_subtest(key, label), true)
+            } else {
+                (key, false)
+            };
+            let msg = msg.filter(|_| outcome.is_failure());
+            self.result(key, outcome, None, msg, Level::Recognized, sub, out);
+            return true;
+        }
+        // Verbose: "tests/test_x.py::test_a[g h] PASSED  [ 50%]",
+        // "tests/test_x.py::test_c SUBPASSED[case] (i=0)  [100%]". An id may
+        // contain spaces: the status word decides where it ends.
+        if !line.contains(".py::") {
+            return false;
+        }
+        const STATUS: [(&str, Outcome); 9] = [
+            ("SUBPASSED", Outcome::Passed),
+            ("SUBFAILED", Outcome::Failed),
+            ("SUBSKIPPED", Outcome::Skipped),
+            ("PASSED", Outcome::Passed),
+            ("FAILED", Outcome::Failed),
+            ("SKIPPED", Outcome::Skipped),
+            ("ERROR", Outcome::Errored),
+            // As pytest's own reports: an expected failure is skipped, an
+            // unexpected (non-strict) pass is a pass. A strict XPASS prints
+            // FAILED.
+            ("XFAIL", Outcome::Skipped),
+            ("XPASS", Outcome::Passed),
+        ];
+        let mut found: Option<(usize, &str, Outcome)> = None;
+        for (word, outcome) in STATUS {
+            for (i, _) in line.match_indices(&format!(" {word}")) {
+                let after = &line[i + 1 + word.len()..];
+                let bounded = after.is_empty()
+                    || after.starts_with([' ', '[', '('])
+                    || word.starts_with("SUB");
+                // Never inside the id's own parameters.
+                if bounded && line[..i].contains(".py::") && found.is_none_or(|f| i > f.0) {
+                    found = Some((i, word, outcome));
+                }
             }
         }
-        let Some((id, rest)) = line.split_once(' ') else {
+        let Some((i, word, outcome)) = found else {
             return false;
         };
-        if !id.contains("::") || !id.contains(".py") {
-            return false;
+        let id = line[..i].trim();
+        if id.contains(' ') && !id.contains('[') {
+            return false; // not an id: prose that mentions a test file
         }
-        let outcome = match rest.split_whitespace().next() {
-            Some("PASSED") | Some("XFAIL") => Outcome::Passed,
-            Some("FAILED") | Some("XPASS") => Outcome::Failed,
-            Some("SKIPPED") => Outcome::Skipped,
-            Some("ERROR") => Outcome::Errored,
-            _ => return false,
-        };
+        let key = pytest_key(id);
+        if word.starts_with("SUB") {
+            let rest = &line[i + 1 + word.len()..];
+            // Drop the progress column: "[100%]".
+            let label = match rest.trim_end().rsplit_once(" [") {
+                Some((l, p)) if p.ends_with("%]") => l,
+                _ => rest,
+            };
+            let key = pytest_subtest(key, label.trim());
+            self.result(key, outcome, None, None, Level::Recognized, true, out);
+            return true;
+        }
         // Failures are recorded now to keep first-failure fast; the message
         // only appears later in the summary section.
-        self.finished(pytest_key(id), outcome, None, None, Level::Recognized, out);
+        self.finished(key, outcome, None, None, Level::Recognized, out);
         true
     }
 
@@ -993,7 +1268,13 @@ impl Recognizers {
         else {
             return false;
         };
-        if name.contains(char::is_whitespace) || name.is_empty() {
+        // A name with spaces (a theory's `Slash(s: "x/y")`, MSTest's
+        // `Slash ("x/y")`) only counts on VSTest's own two-space indent:
+        // prose that starts with "Failed " is not a result.
+        if name.is_empty()
+            || (name.contains(char::is_whitespace)
+                && (!line.starts_with("  ") || line.starts_with("   ")))
+        {
             return false;
         }
         let ms = dur
@@ -1040,6 +1321,8 @@ impl Recognizers {
             || t == "Stack Trace:"
             || t.starts_with("Failed ")
             || t.starts_with("Passed ")
+            || t.starts_with("Skipped ")
+            || t.starts_with("Total tests:")
             || t.starts_with("Failed!")
         {
             let msg = lines.join("\n");
@@ -1120,7 +1403,10 @@ impl Recognizers {
                 self.nextest_pass_output = Some((key.display(), false, false));
                 self.finished(key, Outcome::Passed, ms, None, Level::Recognized, out)
             }
-            "SKIP" => self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out),
+            "SKIP" => {
+                self.nextest_skip_lines += 1;
+                self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out)
+            }
             _ => {
                 // FAIL, TIMEOUT, SIGSEGV, ABORT, LEAK-FAIL: hold for the output.
                 self.flush_nextest(out);
@@ -1346,11 +1632,38 @@ fn split_rust_path(name: &str) -> (Vec<String>, String) {
     }
 }
 
+/// A pytest subtest: the parent's key, named as pytest prints it
+/// ("test_b [case] (i=2)", "test_b (i=1)").
+fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
+    if !label.is_empty() {
+        parent.name = format!("{} {label}", parent.name);
+    }
+    parent
+}
+
 /// "tests/test_x.py::TestCls::test_a[p]" -> path ["tests.test_x.TestCls"],
 /// name "test_a[p]": the same key pytest's JUnit report produces
 /// (classname, name), so live and file results are one test.
 fn pytest_key(id: &str) -> TestKey {
-    let mut parts: Vec<&str> = id.split("::").collect();
+    // "::" inside a parameter id ("test[c::d]") is not a separator.
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    let b = id.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b':' if depth <= 0 && b.get(i + 1) == Some(&b':') => {
+                parts.push(&id[from..i]);
+                from = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&id[from..]);
     let name = parts.pop().unwrap_or(id).to_owned();
     let mut class: Vec<String> = Vec::new();
     if let Some(file) = parts.first() {
@@ -1471,6 +1784,121 @@ mod tests {
             ]
         );
         assert!(matches!(ev.last(), Some(EventKind::TestSlow { .. })));
+    }
+
+    fn subtests(events: &[EventKind]) -> Vec<(String, Outcome)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    outcome,
+                    subtest: true,
+                    ..
+                } => Some((test.display(), *outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Round 12 count audit: pytest's own counts, in text.
+    #[test]
+    fn pytest_text_counts_as_pytest_does() {
+        let (r, ev) = feed(
+            "tests/t.py::test_xfail XFAIL (not yet)                     [ 20%]\n\
+             tests/t.py::test_xpass XPASS (fixed)                       [ 40%]\n\
+             tests/t.py::test_p[g h] PASSED                             [ 60%]\n\
+             tests/t.py::test_p[c::d] FAILED                            [ 80%]\n\
+             tests/t.py::test_p[x PASSED y] PASSED                      [100%]\n\
+             FAILED tests/t.py::test_p[c::d] - assert 1 == 2\n\
+             ===== 1 failed, 2 passed, 1 xfailed, 1 xpassed in 0.01s =====",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.t::test_xfail".into(), Outcome::Skipped),
+                ("tests.t::test_xpass".into(), Outcome::Passed),
+                ("tests.t::test_p[g h]".into(), Outcome::Passed),
+                ("tests.t::test_p[c::d]".into(), Outcome::Failed),
+                ("tests.t::test_p[x PASSED y]".into(), Outcome::Passed),
+            ]
+        );
+        assert_eq!((r.total(), r.failed_reported()), (5, 1));
+    }
+
+    /// `-rA`: the short summary names passing tests too.
+    #[test]
+    fn pytest_short_summary_names_passes() {
+        let (_, ev) = feed("PASSED tests/t.py::test_a\nXFAIL tests/t.py::test_b - reason");
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.t::test_a".into(), Outcome::Passed),
+                ("tests.t::test_b".into(), Outcome::Skipped),
+            ]
+        );
+    }
+
+    /// pytest 9.2's subtests, as it prints them (round 12 count audit: a
+    /// failing unittest subTest was recorded as a pass).
+    #[test]
+    fn pytest_subtests_in_text_are_subtests() {
+        let (r, ev) = feed(
+            "tests/test_s.py::T::test_subs_fail PASSED                                [ 33%]\n\
+             tests/test_s.py::T::test_subs_pass PASSED                                [ 66%]\n\
+             tests/test_s.py::test_native_subtests SUBPASSED[case] (i=0)              [100%]\n\
+             tests/test_s.py::test_native_subtests SUBPASSED[case] (i=1)              [100%]\n\
+             tests/test_s.py::test_native_subtests SUBFAILED[case] (i=2)              [100%]\n\
+             tests/test_s.py::test_native_subtests FAILED                             [100%]\n\
+             SUBFAILED(i=1) tests/test_s.py::T::test_subs_fail - AssertionError: 1 == 1\n\
+             SUBFAILED[case] (i=2) tests/test_s.py::test_native_subtests - assert 2 != 2\n\
+             FAILED tests/test_s.py::test_native_subtests - contains 1 failed subtest\n\
+             ================ 3 failed, 2 passed, 7 subtests passed in 0.02s ================",
+        );
+        assert_eq!(
+            subtests(&ev),
+            vec![
+                (
+                    "tests.test_s::test_native_subtests [case] (i=0)".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=1)".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=2)".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "tests.test_s.T::test_subs_fail (i=1)".into(),
+                    Outcome::Failed
+                ),
+            ]
+        );
+        assert_eq!(r.total(), 12);
+    }
+
+    #[test]
+    fn pytest_reportlog_subtests_are_subtests() {
+        let (_, ev) = feed(concat!(
+            r#"{"nodeid": "tests/test_s.py::T::test_subs_fail", "when": "call", "outcome": "failed", "_subtest.context": {"msg": null, "kwargs": {"i": "1"}}, "longrepr": {"reprcrash": {"message": "AssertionError: 1 == 1"}}, "$report_type": "SubTestReport"}"#,
+            "\n",
+            r#"{"nodeid": "tests/test_s.py::test_native_subtests", "when": "call", "outcome": "passed", "_subtest.context": {"msg": "case", "kwargs": {"i": "0"}}, "$report_type": "SubTestReport"}"#,
+        ));
+        assert_eq!(
+            subtests(&ev),
+            vec![
+                (
+                    "tests.test_s.T::test_subs_fail (i=1)".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "tests.test_s::test_native_subtests [case] (i=0)".into(),
+                    Outcome::Passed
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1776,6 +2204,65 @@ mod tests {
         );
     }
 
+    /// Round 12 (blocker): with an injected stream, pytest -v and Vitest
+    /// print a test's result before the stream file is read. The held text
+    /// result marked the test as seen, so the stream's result was dropped as
+    /// a duplicate and the held one discarded: fast tests, failures among
+    /// them, vanished from the run and from history.
+    #[test]
+    fn a_held_text_result_never_hides_the_streams_result() {
+        let mut r = Recognizers {
+            pytest_stream: true,
+            ..Recognizers::default()
+        };
+        assert!(r.line("tests/test_calc.py::test_div FAILED").is_empty());
+        let ev = r.line(r#"{"nodeid": "tests/test_calc.py::test_div", "when": "call", "outcome": "failed", "duration": 0.0, "longrepr": {"reprcrash": {"message": "assert 16 == 4"}}, "$report_type": "TestReport"}"#);
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.test_calc::test_div".into(), Outcome::Failed)],
+            "{ev:?}"
+        );
+        let mut v = Recognizers {
+            vitest_stream: true,
+            ..Recognizers::default()
+        };
+        v.line(" ❯ src/calc.test.ts (5 tests | 1 failed) 6ms");
+        v.line("   × calc > divides 4ms");
+        let ev = v.line(r#"{"type":"test","name":"calc > divides","file":"src/calc.test.ts","event":"failed","exec_time":0.004,"message":"expected 16 to be 4"}"#);
+        let f = finished(&ev);
+        assert!(
+            f.len() == 1 && f[0].0.contains("divides") && f[0].1 == Outcome::Failed,
+            "{ev:?}"
+        );
+    }
+
+    /// Round 12 (false pass): two test binaries with the same test name
+    /// (`tests::it_works` in lib.rs and main.rs); the second, failing,
+    /// result was dropped as a duplicate of the first, passing one.
+    #[test]
+    fn a_second_result_under_the_same_name_is_kept() {
+        let (_, events) = feed(concat!(
+            "test tests::it_works ... ok\n",
+            "test tests::it_works ... FAILED\n",
+        ));
+        let f = finished(&events);
+        assert!(
+            f.iter().any(|(_, o)| *o == Outcome::Failed),
+            "the failure must not be dropped: {f:?}"
+        );
+        let (_, events) = feed(concat!(
+            r#"{"type":"test","event":"started","name":"m::a"}"#,
+            "\n",
+            r#"{"type":"test","name":"m::a","event":"ok"}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"m::a"}"#,
+            "\n",
+            r#"{"type":"test","name":"m::a","event":"failed"}"#,
+            "\n",
+        ));
+        assert!(finished(&events).iter().any(|(_, o)| *o == Outcome::Failed));
+    }
+
     #[test]
     fn nextest_ignored_tests_are_skipped_at_suite_end() {
         let (_, events) = feed(concat!(
@@ -1936,6 +2423,63 @@ mod tests {
         let (_, ev) = feed("ok  \texample.com/calc\t(cached)\nok  \texample.com/other\t(cached)");
         assert_eq!(ev.len(), 1);
         assert!(matches!(&ev[0], EventKind::RunNote { message } if message.contains("-count=1")));
+    }
+
+    #[test]
+    fn vstest_names_with_spaces_and_console_totals() {
+        let (r, ev) = feed(
+            "  Passed Xu.CalcTests.Adds [1 ms]\n  Failed Xu.CalcTests.Slash(s: \"x/y\") [1 ms]\n  Error Message:\n   boom\n  Stack Trace:\n  Failed Slash (\"x/y\") [< 1 ms]\n  Skipped Unsure [< 1 ms]\nTotal tests: 14\n     Passed: 9\n     Failed: 4\n    Skipped: 1\n Total time: 0.3 Seconds\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("Xu.CalcTests.Adds".into(), Outcome::Passed),
+                ("Xu.CalcTests.Slash(s: \"x/y\")".into(), Outcome::Failed),
+                ("Slash (\"x/y\")".into(), Outcome::Failed),
+                ("Unsure".into(), Outcome::Skipped),
+            ]
+        );
+        assert_eq!(r.total(), 14);
+        assert_eq!(r.failed_reported(), 4);
+        let (_, ev) = feed("Failed all the tests we could [1 ms]\n");
+        assert!(finished(&ev).is_empty(), "prose is not a result");
+    }
+
+    #[test]
+    fn nextest_summary_is_the_total_and_named_skips_count() {
+        let (r, _) = feed(
+            "        PASS [   0.005s] ( 1/3) rc tests::a\n        FAIL [   0.005s] ( 2/3) rc tests::b\n     Summary [   0.206s] 3 tests run: 2 passed, 1 failed, 2 skipped\n",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (3, 1));
+        let (r, ev) = feed(
+            "        SKIP [         ] rc tests::ig\n        PASS [   0.005s] ( 1/1) rc tests::a\n     Summary [   0.006s] 1 test run: 1 passed, 1 skipped\n",
+        );
+        assert_eq!(finished(&ev).len(), 2);
+        assert_eq!(r.total(), 2, "the skipped test seen by name counts");
+    }
+
+    #[test]
+    fn surefire_aggregate_line_is_the_total() {
+        let (r, _) = feed(
+            "[ERROR] Tests run: 19, Failures: 4, Errors: 0, Skipped: 2, Time elapsed: 0.001 s <<< FAILURE! -- in ex.CalcTest\n[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.019 s -- in ex.OtherTest\n[ERROR] Tests run: 22, Failures: 4, Errors: 1, Skipped: 2\n",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (22, 5));
+        let (r, _) = feed("Tests run: 3, Failures: 0, Errors: 0, Skipped: 1\n");
+        assert_eq!(r.total(), 3);
+    }
+
+    #[test]
+    fn libtest_text_should_panic_has_the_json_name() {
+        let (_, ev) = feed(
+            "test tests::panics - should panic ... ok\ntest tests::bad - should panic ... FAILED\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests::panics".into(), Outcome::Passed),
+                ("tests::bad".into(), Outcome::Failed),
+            ]
+        );
     }
 
     #[test]

@@ -12,9 +12,7 @@ use crate::ids::{parse_duration, sha256_hex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error(
-        "{0} is the old name of this file (prova was called prova): rename it to prova.toml; prova does not read prova.toml"
-    )]
+    #[error("prova does not read {0}: rename it to prova.toml")]
     OldName(PathBuf),
     #[error("reading {0}: {1}")]
     Read(PathBuf, std::io::Error),
@@ -34,6 +32,14 @@ pub enum ConfigError {
         "invalid selection {0:?}: must be non-empty, not start with '-', no control characters"
     )]
     BadSelection(String),
+}
+
+impl ConfigError {
+    /// The user's mistake in prova.toml or on the command line (exit 2),
+    /// rather than a failure to read the file (exit 4).
+    pub fn is_usage(&self) -> bool {
+        !matches!(self, ConfigError::Read(..))
+    }
 }
 
 #[derive(

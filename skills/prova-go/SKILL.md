@@ -16,6 +16,8 @@ description: Gives the go test flags and prova.toml settings that let prova see 
 - Single test: `select = "go test -json -count=1 -run {filter} ./..."`. `-run` is a
   regular expression; anchor it (`^TestDiv$`) when names share prefixes.
 - Subtests appear as `TestParent/sub`; select them with `-run 'TestParent/sub'`.
+  They are counted apart: `tests: 3 passed ... (and 18 subtests, 0 failed)`.
+  JSON and `-v` text give the same counts.
 - A package that fails to build shows as test `<package>::(package)`, errored.
 - Fail fast: add `-failfast` to `select` for the fix loop.
 - Sizes are what a test uses, not how long it takes: a test that starts a

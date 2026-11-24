@@ -70,6 +70,29 @@ fn result_files_lift_runs_to_level_one_with_per_test_outcomes() {
 #[test]
 fn history_marks_flips_on_same_code_and_retry_passes_as_flaky() {
     let d = workspace("flaky");
+    // The same code: a git repository whose files (the state and the
+    // reports each run writes) are all ignored. Outside git every run is a
+    // code version of its own (round 12).
+    std::fs::write(d.join(".gitignore"), "*\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-f", ".gitignore"],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    ] {
+        Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .output()
+            .unwrap();
+    }
     run(&d, "fail");
     run(&d, "pass");
     let third = run(&d, "fail");

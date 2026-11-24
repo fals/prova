@@ -136,12 +136,33 @@ pub fn spawn_supervisor(store: &Store, exe: &Path, run: &str) -> std::io::Result
 use std::os::unix::process::CommandExt;
 
 enum Chunk {
-    /// A complete line from stream 0 (stdout) or 1 (stderr).
-    Line(usize, String),
+    /// A complete line from stream 0 (stdout) or 1 (stderr), with when its
+    /// bytes arrived (ADR 0026: test windows are timed by arrival).
+    Line(usize, String, Arrived),
     /// The start of a line not finished yet (pytest's progress dots before
     /// a hang): shown in the live output at once (round 8).
-    Partial(usize, String),
+    Partial(usize, String, Arrived),
     Eof,
+}
+
+/// When a chunk's bytes arrived: on the monotonic clock (timers) and on
+/// the boot clock process start times use (Linux). The boot clock is read
+/// here, not derived from the monotonic one: a paused VM advances one and
+/// not the other (round 12, arm64 CI: the runner's own bash looked started
+/// inside a test).
+#[derive(Clone, Copy)]
+struct Arrived {
+    at: Instant,
+    boot_ms: Option<u64>,
+}
+
+impl Arrived {
+    fn now() -> Arrived {
+        Arrived {
+            at: Instant::now(),
+            boot_ms: crate::process::uptime_ms(),
+        }
+    }
 }
 
 fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Chunk>) {
@@ -156,13 +177,13 @@ fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Ch
                     while let Some(i) = pending.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = pending.drain(..=i).collect();
                         let line = String::from_utf8_lossy(&line).into_owned();
-                        if tx.send(Chunk::Line(id, line)).is_err() {
+                        if tx.send(Chunk::Line(id, line, Arrived::now())).is_err() {
                             return;
                         }
                     }
                     if !pending.is_empty() {
                         let part = String::from_utf8_lossy(&pending).into_owned();
-                        if tx.send(Chunk::Partial(id, part)).is_err() {
+                        if tx.send(Chunk::Partial(id, part, Arrived::now())).is_err() {
                             return;
                         }
                     }
@@ -173,6 +194,7 @@ fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Ch
             let _ = tx.send(Chunk::Line(
                 id,
                 String::from_utf8_lossy(&pending).into_owned(),
+                Arrived::now(),
             ));
         }
         let _ = tx.send(Chunk::Eof);
@@ -209,8 +231,6 @@ struct Supervisor<'a> {
     pgid: u32,
     /// What each running test was seen to use (ADR 0025).
     sizes: BTreeMap<String, SizeTrack>,
-    /// Everything the command's group was seen to hold, for its own size.
-    run_usage: crate::resources::Usage,
     /// The last snapshot and when it was taken: reused for 20 ms, so a
     /// burst of short tests does not rescan the process table each time.
     last_usage: Option<(Instant, crate::resources::Usage)>,
@@ -225,6 +245,23 @@ struct Supervisor<'a> {
     one_test_procs: BTreeMap<u32, (String, crate::resources::Seen)>,
     /// The suite's declared size, checked against what tests use.
     declared: Option<crate::config::Size>,
+    /// When the line being handled arrived (None for stream files).
+    line_at: Option<Arrived>,
+    /// When the run's first output line arrived, in ms since boot.
+    first_line_ms: Option<u64>,
+    /// The run's test phase, from its first test event (ADR 0026 §2).
+    phase: Option<Phase>,
+}
+
+/// What the run's tree used while its tests ran, beyond the runner.
+struct Phase {
+    start_ms: Option<u64>,
+    base_pids: std::collections::BTreeSet<u32>,
+    base_sockets: std::collections::BTreeSet<u64>,
+    /// When the latest test event arrived: samples after it may be the
+    /// runner's teardown, so only earlier ones count.
+    last_event: Instant,
+    samples: Vec<(Instant, crate::resources::Seen)>,
 }
 
 /// One running test's size observation (ADR 0025).
@@ -239,8 +276,9 @@ struct SizeTrack {
     /// Its own process, when the runner started one for it.
     own: Option<u32>,
     seen: crate::resources::Seen,
-    /// When its start line was read.
+    /// When its start line was read, and that in ms since boot (Linux).
     started: Instant,
+    start_ms: Option<u64>,
     /// The latest sample's observation, kept until it is known to fall
     /// inside the test: the program may already be in the next test when
     /// prova reads a line, so a sample counts only when taken
@@ -257,6 +295,27 @@ impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
         if let EventKind::RunTotals { tests, .. } = &kind {
             self.framework_total = Some(*tests);
+        }
+        // The run's test phase starts at its first test event (ADR 0026).
+        if matches!(
+            kind,
+            EventKind::TestStarted { .. } | EventKind::TestFinished { .. }
+        ) && self.pgid != 0
+        {
+            let arrived = self.line_at.unwrap_or_else(Arrived::now);
+            let at = arrived.at;
+            if self.phase.is_none() {
+                let _ = self.usage_now();
+                self.phase = Some(Phase {
+                    start_ms: arrived.boot_ms,
+                    base_pids: self.known_pids.clone(),
+                    base_sockets: self.known_sockets.clone(),
+                    last_event: at,
+                    samples: Vec::new(),
+                });
+            } else if let Some(p) = &mut self.phase {
+                p.last_event = at;
+            }
         }
         // Sizes (ADR 0025): a snapshot at each test's start and finish.
         let mut sized: Option<(TestKey, u32)> = None;
@@ -281,10 +340,19 @@ impl Supervisor<'_> {
                         solo: alone,
                         own: None,
                         seen: Default::default(),
-                        started: Instant::now(),
+                        started: self.line_at.map_or_else(Instant::now, |a| a.at),
+                        start_ms: self.line_at.unwrap_or_else(Arrived::now).boot_ms,
                         pending: None,
                     },
                 );
+            }
+            EventKind::TestFinished {
+                outcome: Outcome::Skipped,
+                test,
+                ..
+            } => {
+                // A skipped test used nothing: no evidence about its size.
+                self.sizes.remove(&test.unique());
             }
             EventKind::TestFinished { test, attempt, .. }
                 if !self.sizes.contains_key(&test.unique()) =>
@@ -315,6 +383,7 @@ impl Supervisor<'_> {
                             own: Some(0),
                             seen,
                             started: Instant::now(),
+                            start_ms: None,
                             pending: None,
                         },
                     );
@@ -326,9 +395,10 @@ impl Supervisor<'_> {
             {
                 // Not observed now: the program may already be in the next
                 // test. Only a sample taken well before this line counts.
+                let read = self.line_at.map_or_else(Instant::now, |a| a.at);
                 if let Some(t) = self.sizes.get_mut(&test.unique())
                     && let Some((at, seen)) = t.pending.take()
-                    && at.elapsed() >= SIZE_GUARD
+                    && read.saturating_duration_since(at) >= SIZE_GUARD
                 {
                     t.seen.absorb(&seen);
                 }
@@ -401,6 +471,9 @@ impl Supervisor<'_> {
         if let Some((test, attempt)) = sized
             && let Some(t) = self.sizes.remove(&test.unique())
             && (t.own.is_some() || t.solo)
+            // Nothing sampled inside it (its lines came at once, or it was
+            // too short): no size can be claimed (ADR 0026).
+            && t.seen.samples > 0
         {
             let size = t.seen.size();
             let evidence = t.seen.evidence();
@@ -478,6 +551,19 @@ impl Supervisor<'_> {
         }
     }
 
+    /// The run's test phase as one observation: samples taken before its
+    /// last test event, at least two of them, or nothing (ADR 0026 §2).
+    fn phase_seen(&self) -> Option<crate::resources::Seen> {
+        let p = self.phase.as_ref()?;
+        let mut seen = crate::resources::Seen::default();
+        for (at, s) in &p.samples {
+            if p.last_event.saturating_duration_since(*at) >= SIZE_GUARD {
+                seen.absorb(s);
+            }
+        }
+        (seen.samples >= 2).then_some(seen)
+    }
+
     /// A snapshot of the command's group, reused when under 50 ms old.
     fn usage_now(&mut self) -> crate::resources::Usage {
         if let Some((at, u)) = &self.last_usage
@@ -486,8 +572,6 @@ impl Supervisor<'_> {
             return u.clone();
         }
         let u = crate::resources::sample(self.pgid);
-        self.run_usage.procs.extend(u.procs.clone());
-        self.run_usage.sockets.extend(u.sockets.clone());
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
         for (pid, (_, cmd)) in &u.procs {
@@ -507,7 +591,37 @@ impl Supervisor<'_> {
     /// subtree of a process that names it, or, while it runs alone,
     /// whatever appeared in the group since it started.
     fn observe_sizes(&mut self, now: &crate::resources::Usage) {
+        let now_boot = crate::process::uptime_ms();
+        // The run's test phase: what started inside it, beyond the runner.
+        if let Some(p) = &mut self.phase {
+            let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
+            if let (Some(from), Some(to), Some(since)) = (p.start_ms, now_boot, self.first_line_ms)
+            {
+                s.processes = crate::resources::started_within(now, from, to, since);
+            } else {
+                s.processes = now
+                    .procs
+                    .iter()
+                    .filter(|(pid, (_, cmd))| {
+                        !p.base_pids.contains(pid) && !crate::resources::runner_process(cmd)
+                    })
+                    .map(|(_, (_, cmd))| {
+                        cmd.split(' ')
+                            .next()
+                            .unwrap_or("")
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_owned()
+                    })
+                    .filter(|n| !n.is_empty())
+                    .collect();
+            }
+            s.samples = 1;
+            p.samples.push((Instant::now(), s));
+        }
         let alone = self.running.len() <= 1;
+        let first_line = self.first_line_ms;
         for t in self.sizes.values_mut() {
             if t.own.is_none() {
                 t.own = now
@@ -518,7 +632,9 @@ impl Supervisor<'_> {
             }
             if let Some(own) = t.own {
                 // A process tree cannot belong to the next test.
-                t.seen.absorb(&crate::resources::seen_in_subtree(now, own));
+                let mut s = crate::resources::seen_in_subtree(now, own);
+                s.samples = 1;
+                t.seen.absorb(&s);
             } else if !alone {
                 t.solo = false;
                 t.pending = None;
@@ -528,10 +644,15 @@ impl Supervisor<'_> {
                 if let Some((_, seen)) = t.pending.take() {
                     t.seen.absorb(&seen);
                 }
-                t.pending = Some((
-                    Instant::now(),
-                    crate::resources::seen_new(&t.base_pids, &t.base_sockets, now),
-                ));
+                let mut s = crate::resources::seen_new(&t.base_pids, &t.base_sockets, now);
+                // Where start times exist, a process is the test's if it
+                // started inside it, though it was there when its start
+                // line was read (ADR 0026 §1).
+                if let (Some(from), Some(to), Some(since)) = (t.start_ms, now_boot, first_line) {
+                    s.processes = crate::resources::started_within(now, from, to, since);
+                }
+                s.samples = 1;
+                t.pending = Some((Instant::now(), s));
             }
         }
     }
@@ -614,10 +735,12 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         cpu_start: None,
         pgid: 0,
         sizes: BTreeMap::new(),
-        run_usage: Default::default(),
         last_usage: None,
         known_pids: Default::default(),
         known_sockets: Default::default(),
+        line_at: None,
+        first_line_ms: None,
+        phase: None,
         one_test_procs: BTreeMap::new(),
         declared: spec.size,
     };
@@ -749,11 +872,16 @@ fn observe_child(
         let deadline = Instant::now() + TICK;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok(Chunk::Line(i, l)) => {
+                Ok(Chunk::Line(i, l, at)) => {
                     last_activity = Instant::now();
+                    sup.line_at = Some(at);
+                    if sup.first_line_ms.is_none() {
+                        sup.first_line_ms = at.boot_ms;
+                    }
                     sup.line(i, &l, observer);
+                    sup.line_at = None;
                 }
-                Ok(Chunk::Partial(i, p)) => {
+                Ok(Chunk::Partial(i, p, _)) => {
                     last_activity = Instant::now();
                     sup.partial(i, &p);
                 }
@@ -824,18 +952,37 @@ fn observe_child(
     };
 
     // Collect remaining output; leaked processes may hold the pipes open,
-    // so never wait on EOF without a bound.
+    // so never wait on EOF without a bound. The bound is on waiting for
+    // output, not on recording it: every line that arrived before the
+    // deadline is recorded however long that takes (round 12: with history,
+    // recording 723 Go results took over 1 s and two thirds were dropped
+    // from a run that still passed).
     let drain = |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| {
         let until = Instant::now() + DRAIN_AFTER_EXIT;
         while *open > 0 {
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
-                break;
+            let chunk = match rx.try_recv() {
+                Ok(c) => c,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let Some(left) = until.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match rx.recv_timeout(left) {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    }
+                }
             };
-            match rx.recv_timeout(left) {
-                Ok(Chunk::Line(i, l)) => sup.line(i, &l, observer),
-                Ok(Chunk::Partial(i, p)) => sup.partial(i, &p),
-                Ok(Chunk::Eof) => *open -= 1,
-                Err(_) => break,
+            match chunk {
+                // A leaked process still writing: what came after the
+                // deadline is not waited for.
+                Chunk::Line(_, _, a) if a.at > until => break,
+                // A read boundary mid-line sends a partial too: judged by
+                // when it arrived, like a line (round 12 CI: 388 of 400).
+                Chunk::Partial(_, _, a) if a.at > until => break,
+                Chunk::Line(i, l, _) => sup.line(i, &l, observer),
+                Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                Chunk::Eof => *open -= 1,
             }
         }
     };
@@ -845,14 +992,24 @@ fn observe_child(
         process::kill_group(pgid);
         drain(sup, &mut open_streams, observer);
     }
-    // The whole command's size (ADR 0025): the bound for tests prova
-    // could not attribute.
-    if !sup.run_usage.procs.is_empty() {
-        let seen = crate::resources::run_seen(&sup.run_usage, pgid);
-        sup.emit(EventKind::RunSize {
-            size: seen.size(),
-            evidence: seen.evidence(),
-        });
+    // The test phase's size (ADR 0026 §2): what tests prova could not
+    // isolate are held to. Only when the phase was sampled at least twice
+    // (lines that all came at the end tell nothing about when tests ran).
+    if let Some(seen) = sup.phase_seen() {
+        let size = seen.size();
+        let evidence = seen.evidence();
+        // A declared size is checked against the run as well (§5).
+        if let Some(declared) = sup.declared
+            && size > declared
+        {
+            sup.emit(EventKind::RunNote {
+                message: format!(
+                    "this suite is declared {} but its run {evidence} (ADR 0025: size is what tests use)",
+                    declared.as_str()
+                ),
+            });
+        }
+        sup.emit(EventKind::RunSize { size, evidence });
     }
 
     let report = observer.on_exit(Path::new(store.root()), started_ms);
@@ -903,7 +1060,12 @@ fn observe_child(
             });
         }
     } else {
-        contradictions.retain(|c| !c.contains("never reported a result"));
+        // prova stopped it: a harness that never finished, or a test
+        // binary cut off before its summary, is the cancel, not a test
+        // that exits early (round 12).
+        contradictions.retain(|c| {
+            !c.contains("never reported a result") && !c.contains("the tests after it never ran")
+        });
     }
     let mut warnings = report.warnings;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
@@ -1271,6 +1433,7 @@ fn observe_child(
             duration_ms,
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
+            subtest: false,
         };
         sup.pending.push(Event {
             v: EVENT_VERSION,
@@ -1432,10 +1595,29 @@ pub struct SlowTest {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Counts {
+    /// Tests, not counting subtests: a Go `t.Run` inside a test that reports
+    /// its own result is counted once, under `subtests`.
     pub passed: u64,
     pub failed: u64,
     pub skipped: u64,
     pub errored: u64,
+    /// Results nested under another test of this run (`TestX/case`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests: u64,
+    /// Of them, failed or errored.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests_failed: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Counts {
+    /// Every result seen, subtests included.
+    pub fn results(&self) -> u64 {
+        self.passed + self.failed + self.skipped + self.errored + self.subtests
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1645,7 +1827,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     };
     let events = store.events_after(run, 0)?;
     // Final outcome per test: the last attempt counts, retries do not.
-    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
+    // (test, outcome, message, seq, subtest)
+    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64, bool)> =
+        BTreeMap::new();
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
     let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
@@ -1662,13 +1846,14 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 test,
                 outcome,
                 message,
+                subtest,
                 ..
             } => {
                 running.retain(|(u, _)| *u != test.unique());
                 slow.remove(&test.unique());
                 finals.insert(
                     test.unique(),
-                    (test.clone(), *outcome, message.clone(), e.seq),
+                    (test.clone(), *outcome, message.clone(), e.seq, *subtest),
                 );
             }
             EventKind::TestSlow {
@@ -1716,8 +1901,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     let mut counts = Counts::default();
-    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64)> = Vec::new();
+    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64, bool)> = Vec::new();
     for f in finals.values() {
+        if f.4 {
+            counts.subtests += 1;
+            counts.subtests_failed += u64::from(f.1.is_failure());
+            if f.1.is_failure() {
+                failing.push(f);
+            }
+            continue;
+        }
         match f.1 {
             Outcome::Passed => counts.passed += 1,
             Outcome::Failed => counts.failed += 1,
@@ -1746,7 +1939,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         })
     };
     let mut failures = Vec::new();
-    for (key, outcome, message, _) in failing.iter().take(20).copied() {
+    for (key, outcome, message, _, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
         failures.push(Failure {
             test: key.display(),
@@ -1765,8 +1958,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     if row.status == Status::Finished {
         let passed: std::collections::BTreeSet<String> = finals
             .values()
-            .filter(|(_, o, _, _)| *o == Outcome::Passed)
-            .map(|(k, _, _, _)| k.display())
+            .filter(|(_, o, _, _, _)| *o == Outcome::Passed)
+            .map(|(k, _, _, _, _)| k.display())
             .collect();
         if !passed.is_empty() {
             for f in crate::analysis::flaky(store, None, 50)? {
@@ -1823,7 +2016,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     // A selection that ran nothing must not look like a pass.
-    let ran = counts.passed + counts.failed + counts.skipped + counts.errored;
+    let ran = counts.results();
     // (A selection that matched nothing at level 1+ fails the run, with
     // its own note; at level 0 prova cannot tell.)
     if let Some(sel) = &selection
@@ -1867,10 +2060,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         },
         leaked,
         notes,
-        verified: row
-            .status
-            .is_terminal()
-            .then(|| row.outcome == Some(Outcome::Passed) && warnings.is_empty()),
+        // A pass that rests on a known flaky test passing proves little
+        // (round 12: `verified: true` next to `flaky_passed`).
+        verified: row.status.is_terminal().then(|| {
+            row.outcome == Some(Outcome::Passed) && warnings.is_empty() && flaky_passed.is_empty()
+        }),
         warnings,
         flaky_passed,
         output_tail: if want_tail {
@@ -1901,6 +2095,14 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     let last_passed = prev
         .iter()
         .find(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id));
+    let unverified_passes = prev
+        .iter()
+        .filter(|r| {
+            r.status == Status::Finished
+                && r.outcome == Some(Outcome::Passed)
+                && thin.contains(&r.id)
+        })
+        .count();
     // Only finished runs are evidence of "the same failure" (round 8: a
     // cancelled hang was counted as seen before).
     let same = row
@@ -1931,7 +2133,18 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         "previous_runs": finished,
         "cut_short_runs": prev.len() - finished,
         "selection": selection,
-        "last": { "run": last.id, "outcome": last.outcome, "code": last.code },
+        // A cut-short run is named by its status (round 12: JSON said
+        // "errored" where the text said "cancelled").
+        "last": {
+            "run": last.id,
+            "outcome": if last.status == Status::Finished {
+                last.outcome.map(|o| o.as_str().to_owned())
+            } else {
+                Some(last.status.as_str().to_owned())
+            },
+            "code": last.code,
+        },
+        "unverified_passes": unverified_passes,
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
@@ -1942,8 +2155,9 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             store
                 .conn()
                 .query_row(
-                    "SELECT id, suite FROM runs r WHERE code = ?1 AND suite <> ?2 AND status = 'finished'
-                       AND outcome = 'passed'
+                    "SELECT id, suite FROM runs r WHERE code = ?1 AND code <> 'nogit' AND suite <> ?2
+                       AND status = 'finished' AND outcome = 'passed'
+                       AND json_extract(spec, '$.selection') IS NULL
                        AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
                      ORDER BY created_ms DESC LIMIT 1",
                     rusqlite::params![row.code, row.suite],

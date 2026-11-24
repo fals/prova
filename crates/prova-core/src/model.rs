@@ -208,6 +208,10 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
         source: Level,
+        /// A result nested in another test that reports its own (Go's
+        /// `TestX/case`, pytest's subtests): counted apart from tests.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        subtest: bool,
     },
     RunStalled {
         idle_ms: u64,
@@ -309,6 +313,7 @@ mod tests {
                 duration_ms: Some(3),
                 message: Some("boom".into()),
                 source: Level::Recognized,
+                subtest: false,
             },
             EventKind::RunStalled {
                 idle_ms: 60_000,
