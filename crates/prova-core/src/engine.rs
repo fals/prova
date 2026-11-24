@@ -1629,6 +1629,25 @@ fn observe_child(
             )
         });
     }
+    // Only quarantined tests failed, and nothing else passed: the run fails
+    // (ADR 0028 §3), and says why (round 15: no detail at all).
+    let failing: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| o.is_failure())
+        .map(|(k, _)| key_display(k))
+        .collect();
+    if outcome == Outcome::Failed
+        && reason.is_none()
+        && !failing.is_empty()
+        && failing
+            .iter()
+            .all(|d| crate::quarantine::covers(&quarantine, d).is_some())
+    {
+        reason = Some(format!(
+            "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
+            failing.join(", ")
+        ));
+    }
     let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
         // A failure no test explains: say so, and show the first error.

@@ -348,6 +348,12 @@ fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
     .unwrap();
     let o = prova(&d, &["run", "only"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    // Round 15: and it says why.
+    assert!(
+        text(&o).contains("only quarantined test(s) failed (calc::x), and no other test passed"),
+        "{}",
+        text(&o)
+    );
 }
 
 /// Round 15: `--repeat` over quiet output said a test that failed once in
