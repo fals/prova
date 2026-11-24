@@ -377,11 +377,21 @@ impl Observer for Ladder {
             });
         }
         // ADR 0017: evidence against a pass, and passes that verified little.
+        // Keyed by name; two tests of one name (nextest's `tests::it_works`
+        // in two binaries) keep their own identity, or a pass hides a
+        // failure (round 15).
+        let mut by_name: std::collections::BTreeMap<&String, usize> = Default::default();
+        for (d, _) in self.live.seen.values() {
+            *by_name.entry(d).or_default() += 1;
+        }
         let mut outcomes: std::collections::BTreeMap<String, prova_core::model::Outcome> = self
             .live
             .seen
-            .values()
-            .map(|(d, o)| (d.clone(), *o))
+            .iter()
+            .map(|(u, (d, o))| {
+                let shared = by_name.get(d).is_some_and(|n| *n > 1);
+                (if shared { u.clone() } else { d.clone() }, *o)
+            })
             .collect();
         outcomes.extend(finals.iter().map(|(k, o)| (k.clone(), *o)));
         let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64;
@@ -389,6 +399,25 @@ impl Observer for Ladder {
         if failed_reported > failed_seen {
             report.contradictions.push(format!(
                 "the framework reported {failed_reported} failed test(s) but prova recorded {failed_seen}: its summary is believed over its exit code"
+            ));
+        }
+        // Jest's own totals against what was recognized: console output or
+        // an odd layout can add or lose tests (round 15). A note, since the
+        // exit code and the totals still decide.
+        if self.live.jest_files > 0
+            && self.live.summary_seen
+            && (seen > self.live.total() && self.live.total() > 0 || failed_seen > failed_reported)
+        {
+            report.warnings.push(format!(
+                "Jest's totals say {} test(s), {failed_reported} failed, but prova recorded {seen}, {failed_seen} failed: some recognized lines may not be tests (console output?)",
+                self.live.total()
+            ));
+        }
+        // Errors no test owns (Vitest `Errors  1 error`): a pass may hide them.
+        if self.live.unhandled_errors > 0 && !self.live.unhandled_block {
+            report.warnings.push(format!(
+                "Vitest reported {} unhandled error(s) outside any test: this pass is unverified",
+                self.live.unhandled_errors
             ));
         }
         // A test file that fails to load fails no test: its framework counts
@@ -574,6 +603,73 @@ mod tests {
             report.contradictions.iter().any(|c| c.contains("test_a")),
             "{:?}",
             report.contradictions
+        );
+    }
+
+    fn run_lines(lines: &[&str]) -> (Vec<EventKind>, ExitReport) {
+        let mut ladder = Ladder {
+            live: recognize::Recognizers::default(),
+            files: results::ResultFiles::new(&[]),
+            inject: Vec::new(),
+            inject_dir: None,
+            streams: Vec::new(),
+            expect_tests: true,
+        };
+        let mut live = Vec::new();
+        for l in lines {
+            live.extend(ladder.on_line(l, 0));
+        }
+        let root = std::env::temp_dir().join(format!("prova-r15fw-{}", std::process::id()));
+        let report = ladder.on_exit(&root, 0);
+        (live, report)
+    }
+
+    /// Two test binaries both with `tests::it_works`: one failing, one
+    /// passing. The framework's one failure is not lost behind the pass.
+    #[test]
+    fn nextest_text_failure_in_one_binary_is_recorded_not_contradicted() {
+        let (_, report) = run_lines(&[
+            "        FAIL [   0.004s] crate_a tests::it_works",
+            "        PASS [   0.003s] crate_b tests::it_works",
+            "------------",
+            "     Summary [   0.007s] 2 tests run: 1 passed, 1 failed, 0 skipped",
+        ]);
+        assert!(
+            report.contradictions.is_empty(),
+            "{:?}",
+            report.contradictions
+        );
+    }
+
+    /// Console output that Jest's own totals do not agree with is noted.
+    #[test]
+    fn jest_totals_that_disagree_with_the_recognized_tests_are_noted() {
+        let (_, report) = run_lines(&[
+            " PASS  src/a.test.js",
+            "  deploy",
+            "    \u{2713} plans (4 ms)",
+            "    \u{2713} extra (4 ms)",
+            "Tests: 1 passed, 1 total",
+        ]);
+        let all = [report.warnings.clone(), report.contradictions.clone()].concat();
+        assert!(
+            all.iter()
+                .any(|w| w.contains("Jest") && w.contains("recorded 2")),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn vitest_errors_line_without_a_block_is_a_warning() {
+        let (_, report) = run_lines(&[
+            " \u{2713} src/a.test.ts > adds 1ms",
+            "      Tests  1 passed (1)",
+            "     Errors  1 error",
+        ]);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("unhandled")),
+            "{:?}",
+            report.warnings
         );
     }
 }

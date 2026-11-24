@@ -262,7 +262,13 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     // file) selects with spaces (round 14: it matched nothing).
     if command.contains(" -t ") || command.contains("--testNamePattern") {
         let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
-        return leaf.replace(" > ", " ");
+        let name = leaf.replace(" > ", " ");
+        // `-t` is a regular expression: a name with `(1, 2)` is a literal
+        // unless the user wrote a pattern (`^add`, `sub$`) (round 15).
+        if name.starts_with('^') || name.ends_with('$') {
+            return name;
+        }
+        return regex_escape(&name);
     }
     let Some((head, leaf)) = filter.rsplit_once("::") else {
         return filter.to_owned();
@@ -278,6 +284,18 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     } else {
         filter.to_owned()
     }
+}
+
+/// A name as a literal in a JavaScript regular expression.
+fn regex_escape(name: &str) -> String {
+    let mut p = String::with_capacity(name.len());
+    for c in name.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    p
 }
 
 /// `go test -run` takes one regular expression per subtest level, split
@@ -438,6 +456,22 @@ mod filter_tests {
             f("jest --testNamePattern \"$PROVA_FILTER\"", "a > b"),
             "a b"
         );
+    }
+
+    /// Round 15: `-t` takes a regular expression; a test named
+    /// `add(1, 2) -> 3` selected nothing.
+    #[test]
+    fn a_vitest_or_jest_name_is_escaped_for_the_regex() {
+        use super::framework_filter as f;
+        let jest = "npx jest -t \"$PROVA_FILTER\"";
+        assert_eq!(f(jest, "add(1, 2) -> 3"), r"add\(1, 2\) -> 3");
+        assert_eq!(
+            f(jest, "src/x.test.ts::math > add(1, 2) -> 3"),
+            r"math add\(1, 2\) -> 3"
+        );
+        assert_eq!(f(jest, "a.b+c"), r"a\.b\+c");
+        // A pattern the user wrote is theirs.
+        assert_eq!(f(jest, "^add|sub$"), "^add|sub$");
     }
 
     #[test]
