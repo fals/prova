@@ -754,7 +754,16 @@ impl Recognizers {
         }
         let body = match t.strip_prefix("test result: ") {
             Some(rest) => rest.split_once(". ").map(|(_, b)| b).unwrap_or(""),
-            None if t.contains(" in ")
+            // pytest's summary ends in its duration (`in 0.12s`): tsc's
+            // `Found 1 error in src/calc.ts:4` is no test summary (round 16).
+            None if t
+                .trim_matches('=')
+                .trim()
+                .rsplit_once(" in ")
+                .and_then(|(_, d)| d.split_whitespace().next())
+                .is_some_and(|d| {
+                    d.ends_with('s') && d.starts_with(|c: char| c.is_ascii_digit())
+                })
                 && [
                     " passed",
                     " failed",

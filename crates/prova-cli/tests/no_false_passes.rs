@@ -614,3 +614,16 @@ fn an_older_pytest_subtests_failure_names_its_test() {
         "{s}"
     );
 }
+
+/// Round 16: tsc's `Found 1 error in src/calc.ts:4` was read as pytest's
+/// summary: "the framework's summary counts 0 tests: nothing ran".
+#[test]
+fn a_type_checker_count_is_no_test_summary() {
+    let d = workspace("tsc_count");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' \"src/calc.ts(4,14): error TS2322: Type 'string' is not assignable to type 'number'.\" '' 'Found 1 error in src/calc.ts:4'; exit 2",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    assert!(!s.to_string().contains("summary counts 0 tests"), "{s}");
+}
