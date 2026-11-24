@@ -1827,7 +1827,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
                 if d.unknown > 0 {
                     println!(
-                        "unknown: {} seen small in fewer than {} runs so far; the others were never seen alone (a framework that reports each test's start: go test -json, pytest-reportlog, the Vitest reporter) or in their own process (nextest). A test shorter than prova's 0.5 s samples is rarely seen",
+                        "unknown: {} seen small in fewer than {} runs so far; the others were never seen on their own (one test running, or its own process) and their runs were not sampled in time to tell (their output came all at once). Sizes are a lower bound: prova samples every 0.5 s and cannot see sleeps",
                         d.small_so_far,
                         analysis::SMALL_AFTER
                     );

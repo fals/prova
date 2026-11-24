@@ -223,6 +223,14 @@ pub fn kill_run_processes(pgid: u32, run: &str) -> usize {
     n
 }
 
+/// Milliseconds since boot (Linux `/proc/uptime`), the clock process start
+/// times are measured in; None elsewhere.
+pub fn uptime_ms() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    Some((secs * 1000.0) as u64)
+}
+
 pub fn terminate_group(pgid: u32) {
     signal_group(pgid, Signal::TERM);
 }
