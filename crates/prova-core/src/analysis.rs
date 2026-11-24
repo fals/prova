@@ -263,7 +263,14 @@ fn stats_with(
             .or_default()
             .insert(r.outcome.is_failure());
     }
-    let flips = by_code.values().filter(|s| s.len() == 2).count();
+    // Code versions, not (code, environment) pairs: one code that flipped
+    // in two environments is one (round 14: "2 code version(s)" for one).
+    let flips = by_code
+        .iter()
+        .filter(|(_, s)| s.len() == 2)
+        .map(|((code, _), _)| *code)
+        .collect::<BTreeSet<_>>()
+        .len();
     // Same code, opposite results, different environments: name the
     // variables that differ between a pass and a failure.
     let mut env_dependent: BTreeSet<String> = BTreeSet::new();

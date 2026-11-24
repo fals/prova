@@ -776,3 +776,30 @@ fn passes_with_a_flaky_test_are_cheap_to_check_and_named_as_passes() {
     );
     assert!(list.contains("passed?"), "{list}");
 }
+
+/// Round 14: a test that flipped on one code in two environments was
+/// "both passed and failed on 2 code version(s)".
+#[test]
+fn flips_count_code_versions_not_environments() {
+    let d = workspace("flipenv");
+    suites(&d);
+    let with_env = |state: &str| {
+        std::fs::write(d.join("state"), state).unwrap();
+        Command::new(PROVA)
+            .args(["run", "make"])
+            .current_dir(&d)
+            .env("PROVA_HOME", format!("{}.home", d.display()))
+            .env("BADENV", "1")
+            .output()
+            .unwrap()
+    };
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    with_env("pass");
+    with_env("fail");
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("both passed and failed on 1 code version(s)"),
+        "{h}"
+    );
+}

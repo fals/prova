@@ -2514,7 +2514,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else {
                 for s in &list {
                     println!(
-                        "{:5.1}% fail  {:2} retry-passes  {:2} same-code flips  {}",
+                        "{:5.1}% fail  {:2} retry-passes  flipped on {:2} code version(s)  {}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
