@@ -368,7 +368,9 @@ fn repeat_tallies_say_what_was_not_seen() {
          if [ $((n % 2)) -eq 1 ]; then echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 2 passed; 1 failed; 0 ignored'; exit 101; \
          else echo 'test result: ok. 3 passed; 0 failed; 0 ignored'; fi"
     );
-    let idle = "echo 'test calc::y ... ok'".to_owned();
+    // Every test skipped: a pass that proved little on every platform (the
+    // no-CPU check needs Linux's child CPU times).
+    let idle = format!("{BUSY} echo 'test calc::y ... ignored'");
     std::fs::write(
         d.join("prova.toml"),
         format!("[suite.quiet]\nrun = {quiet:?}\n\n[suite.idle]\nrun = {idle:?}\n"),
