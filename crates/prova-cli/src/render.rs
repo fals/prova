@@ -199,8 +199,37 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
                 .join(", ")
         );
     }
+    for q in s.quarantined.iter().take(5) {
+        println!(
+            "quarantined: {} {} ({}; {})",
+            clean(&q.test),
+            q.result,
+            clean(&q.reason),
+            expires_in(q.expires_ms)
+        );
+    }
+    if s.quarantined.len() > 5 {
+        println!(
+            "quarantined: ... and {} more (prova quarantine list)",
+            s.quarantined.len() - 5
+        );
+    }
     for n in &s.notes {
         println!("note: {}", clean(n));
+    }
+    if !s.slowest.is_empty() {
+        println!(
+            "slow tests: {} (prova slowest)",
+            s.slowest
+                .iter()
+                .map(|t| format!(
+                    "{} {}",
+                    clean(&t.test),
+                    format_duration(std::time::Duration::from_millis(t.duration_ms))
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     if let Some(d) = &s.detail {
         println!("detail: {d}");
@@ -212,6 +241,36 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         println!("history: {}", history_line(h));
     }
     println!("next: {}", next(s, until));
+}
+
+/// "expires in 13d", or "expired", from the current time.
+pub fn expires_in(expires_ms: u64) -> String {
+    let now = prova_core::ids::now_ms();
+    if expires_ms <= now {
+        "expired".to_owned()
+    } else {
+        format!("expires in {}d", (expires_ms - now).div_ceil(86_400_000))
+    }
+}
+
+pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(rows).unwrap_or_default());
+        return;
+    }
+    if rows.is_empty() {
+        println!("no test durations recorded yet");
+        return;
+    }
+    for r in rows {
+        println!(
+            "p50 {:>7}  p95 {:>7}  {:3} runs  {}",
+            format_duration(std::time::Duration::from_millis(r.p50_ms)),
+            format_duration(std::time::Duration::from_millis(r.p95_ms)),
+            r.runs,
+            clean(&r.test)
+        );
+    }
 }
 
 fn context(f: &prova_core::engine::Failure) -> String {
@@ -1002,6 +1061,8 @@ mod live_tests {
             store: String::new(),
             flaky_passed: vec![],
             history: None,
+            quarantined: vec![],
+            slowest: vec![],
         }
     }
 

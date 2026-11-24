@@ -1068,6 +1068,8 @@ fn observe_child(
         });
     }
     let mut warnings = report.warnings;
+    // Tests set aside by hand, as they were when this run was created (0027).
+    let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
     if spec.expects_tests() && status == Status::Finished {
         // A selection that only skipped tests ran none (round 11: vitest -t
@@ -1101,6 +1103,11 @@ fn observe_child(
             if let Some((prev, missing, total)) =
                 missing_since_last_pass(store, run, &sup.suite, &current)?
             {
+                // A quarantined test left out is set aside in the open (0027).
+                let missing: Vec<String> = missing
+                    .into_iter()
+                    .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
+                    .collect();
                 // Quiet output can hide every test while the framework counted
                 // them: that is not "none ran" (round 9).
                 if current.is_empty() && observed == 0 && sup.framework_total.unwrap_or(0) == 0 {
@@ -1132,6 +1139,13 @@ fn observe_child(
                     ));
                 }
             }
+        }
+    }
+    // A known-flaky test left out of the command is no pass of it (0027).
+    if spec.expects_tests() && status == Status::Finished && spec.selection.is_none() {
+        sup.flush()?;
+        if let Some(w) = left_out_flaky(store, run, &sup.suite, &quarantine)? {
+            warnings.push(w);
         }
     }
     // Results that cannot come from this run: a test reported (or known
@@ -1197,7 +1211,9 @@ fn observe_child(
             };
             let mut was_passing = Vec::new();
             for (id, display) in skipped {
-                if warnings.iter().any(|w| w.contains(&display)) {
+                if warnings.iter().any(|w| w.contains(&display))
+                    || crate::quarantine::covers(&quarantine, &display).is_some()
+                {
                     continue;
                 }
                 // Skipped here last time too: this suite does not run it (a
@@ -1360,7 +1376,25 @@ fn observe_child(
     let _ = sup.lifecycle.exited(exit_code);
     // Tests still open at the end become errored (spec: end closes open tests).
     let closed = sup.lifecycle.end(status).unwrap_or_default();
-    let outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
+    let mut outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
+    // Only quarantined tests failed: the run passes without them (ADR 0027
+    // §4), on top of the lifecycle's verdict, under a strict guard.
+    if outcome == Outcome::Failed
+        && status == Status::Finished
+        && closed.is_empty()
+        && contradictions.is_empty()
+        && sup.level >= Level::Recognized
+        && let Some(names) =
+            quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code)
+    {
+        outcome = Outcome::Passed;
+        sup.emit(EventKind::RunNote {
+            message: format!(
+                "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
+                names.join(", ")
+            ),
+        });
+    }
     if outcome == Outcome::Passed {
         if let Some((line, text)) = sup.distiller.first_crash() {
             warnings.push(format!(
@@ -1380,6 +1414,10 @@ fn observe_child(
             stmt.query_map(rusqlite::params![run], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let rerun: Vec<String> = rerun
+            .into_iter()
+            .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
+            .collect();
         if !rerun.is_empty() {
             warnings.push(format!(
                 "{} test(s) failed, then passed on a retry: flaky, not green: {}",
@@ -1549,6 +1587,99 @@ fn missing_since(
     Ok(Some((prev, missing, earlier.len())))
 }
 
+/// The display name of a lifecycle key (`file<US>name`).
+fn key_display(key: &str) -> &str {
+    key.rsplit('\u{1f}').next().unwrap_or(key)
+}
+
+/// The names of the failed tests when every failing test of the run is
+/// quarantined and plainly `failed` (not errored), and the command's exit
+/// code is a test failure's (not 126/127 or a signal): the quarantined
+/// failures are then the run's only problem (ADR 0027 §4). `None` otherwise.
+fn quarantined_only_failures(
+    outcomes: &BTreeMap<String, Outcome>,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+    exit_code: Option<i32>,
+) -> Option<Vec<String>> {
+    if quarantine.is_empty() || matches!(exit_code, None | Some(0 | 126 | 127)) {
+        return None;
+    }
+    let mut names = Vec::new();
+    for (key, o) in outcomes {
+        if !o.is_failure() {
+            continue;
+        }
+        let display = key_display(key);
+        if *o != Outcome::Failed || crate::quarantine::covers(quarantine, display).is_none() {
+            return None;
+        }
+        names.push(display.to_owned());
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// Whether the tests of `run` share a test with any of `suites`: a suite
+/// that runs part of what another suite runs (0027 §6).
+fn overlaps(store: &Store, run: &str, suites: &[String]) -> Result<bool> {
+    for suite in suites {
+        let hit: bool = store.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t1 ON t1.id = a.test_id
+                              JOIN tests t2 ON t2.display = t1.display
+                             WHERE a.run_id = ?1 AND t2.suite = ?2)",
+            rusqlite::params![run, suite],
+            |r| r.get(0),
+        )?;
+        if hit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The warning for known-flaky tests that have no result in this full run
+/// although this suite, or a suite sharing tests with it, ran them: leaving a
+/// flaky test out of the command proves nothing about it (ADR 0027 §6).
+/// Quarantined tests are set aside in the open and not named.
+fn left_out_flaky(
+    store: &Store,
+    run: &str,
+    suite: &str,
+    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
+) -> Result<Option<String>> {
+    let ran: std::collections::BTreeSet<String> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id WHERE a.run_id = ?1",
+        )?;
+        stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if ran.is_empty() {
+        return Ok(None);
+    }
+    let mut left: Vec<String> = Vec::new();
+    for f in crate::analysis::flaky(store, None, 50)? {
+        if ran.contains(&f.display)
+            || left.contains(&f.display)
+            || crate::quarantine::covers(quarantine, &f.display).is_some()
+        {
+            continue;
+        }
+        if f.suites.iter().any(|s| s == suite) || overlaps(store, run, &f.suites)? {
+            left.push(f.display);
+        }
+    }
+    if left.is_empty() {
+        return Ok(None);
+    }
+    left.sort();
+    Ok(Some(format!(
+        "{} known flaky test(s) did not run: {}{}; leaving a flaky test out of the command hides it (set it aside in the open: prova quarantine add <test> --reason ...)",
+        left.len(),
+        left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+        if left.len() > 5 { ", ..." } else { "" }
+    )))
+}
+
 // ------------------------------------------------------------------ wait
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1674,7 +1805,34 @@ pub struct Summary {
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
+    /// Tests set aside by `prova quarantine` that this run touched or could
+    /// have run, with their result here (ADR 0027): never hidden.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub quarantined: Vec<QuarantinedTest>,
+    /// The slowest tests of this finished run, 1 s or more, worst first.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub slowest: Vec<SlowestTest>,
 }
+
+/// One quarantined test as a run saw it.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuarantinedTest {
+    pub test: String,
+    /// `passed`, `failed`, `errored`, `skipped`, or `not run`.
+    pub result: String,
+    pub reason: String,
+    pub expires_ms: u64,
+}
+
+/// A test of the run that took long.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlowestTest {
+    pub test: String,
+    pub duration_ms: u64,
+}
+
+/// A test this slow (ms) is named in the summary (ADR 0027 §8).
+const SLOWEST_MIN_MS: i64 = 1000;
 
 fn matches(until: Until, kind: &EventKind) -> Option<WaitReason> {
     match kind {
@@ -1761,6 +1919,8 @@ pub fn wait(
     let deadline = Instant::now() + max_wait;
     let mut cursor = after;
     let mut version = -1;
+    // A quarantined test's failure is no reason to wake up (0027 §5).
+    let quarantine = crate::quarantine::for_run(store, run).unwrap_or_default();
     loop {
         let v = store.data_version()?;
         if v != version {
@@ -1769,6 +1929,12 @@ pub fn wait(
             for e in &events {
                 cursor = e.seq;
                 if let Some(reason) = matches(until, &e.kind) {
+                    if reason == WaitReason::Failure
+                        && let EventKind::TestFinished { test, .. } = &e.kind
+                        && crate::quarantine::covers(&quarantine, &test.display()).is_some()
+                    {
+                        continue;
+                    }
                     return summarize(store, run, reason, e.seq);
                 }
             }
@@ -1922,6 +2088,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
+    // Quarantined tests are listed apart, with their result (ADR 0027).
+    let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
+    failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
     // Did the same suite (same selection) pass on exactly this code before?
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
@@ -1963,12 +2132,70 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             .collect();
         if !passed.is_empty() {
             for f in crate::analysis::flaky(store, None, 50)? {
-                if passed.contains(&f.display) && !flaky_passed.contains(&f.display) {
+                if passed.contains(&f.display)
+                    && !flaky_passed.contains(&f.display)
+                    && crate::quarantine::covers(&quarantine, &f.display).is_none()
+                {
                     flaky_passed.push(f.display);
                 }
             }
         }
     }
+    // Quarantined tests of this run, with their result: relevant when they
+    // ran here, or their suite (or one sharing tests with this run) did.
+    let mut quarantined: Vec<QuarantinedTest> = Vec::new();
+    if row.status.is_terminal() {
+        for (name, q) in &quarantine {
+            let result = finals
+                .values()
+                .filter(|f| !f.4 && f.0.display() == *name)
+                .map(|f| f.1.as_str().to_owned())
+                .next();
+            if result.is_none() {
+                let suites: Vec<String> = {
+                    let mut stmt = store
+                        .conn()
+                        .prepare("SELECT DISTINCT suite FROM tests WHERE display = ?1")?;
+                    stmt.query_map(rusqlite::params![name], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                if !suites.contains(&row.suite) && !overlaps(store, run, &suites)? {
+                    continue;
+                }
+            }
+            quarantined.push(QuarantinedTest {
+                test: name.clone(),
+                result: result.unwrap_or_else(|| "not run".to_owned()),
+                reason: q.reason.clone(),
+                expires_ms: q.expires_ms,
+            });
+        }
+        // A quarantine that ran out is no longer set aside: say so.
+        for q in crate::quarantine::expired_at(store, row.created_ms)? {
+            if finals.values().any(|f| !f.4 && f.0.display() == q.test) {
+                notes.push(format!(
+                    "quarantine of {} expired ({}); it counts again: fix it, or `prova quarantine add` it again with a reason",
+                    q.test, q.reason
+                ));
+            }
+        }
+    }
+    // The slowest tests of a finished run (ADR 0027 §8).
+    let slowest: Vec<SlowestTest> = if row.status.is_terminal() {
+        let mut stmt = store.conn().prepare(
+            "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id = ?1 AND a.duration_ms >= ?2 GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
+        )?;
+        stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
+            Ok(SlowestTest {
+                test: r.get(0)?,
+                duration_ms: r.get::<_, i64>(1)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    } else {
+        Vec::new()
+    };
     let end = row.ended_ms.unwrap_or_else(now_ms);
     let failed_run = matches!(row.outcome, Some(o) if o != Outcome::Passed);
     // Raw output only when it adds something: a stall, or a failure that
@@ -2067,6 +2294,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }),
         warnings,
         flaky_passed,
+        quarantined,
+        slowest,
         output_tail: if want_tail {
             output_tail(store, run, 30)
         } else {
@@ -2168,4 +2397,52 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             None
         },
     })))
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+    use crate::quarantine::Entry;
+
+    fn q(names: &[&str]) -> BTreeMap<String, Entry> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_owned(),
+                    Entry {
+                        test: (*n).to_owned(),
+                        reason: "r".into(),
+                        created_ms: 0,
+                        expires_ms: 1,
+                        removed_ms: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn outcomes(list: &[(&str, Outcome)]) -> BTreeMap<String, Outcome> {
+        list.iter()
+            .map(|(k, o)| (format!("\u{1f}{k}"), *o))
+            .collect()
+    }
+
+    #[test]
+    fn only_quarantined_plain_failures_are_set_aside() {
+        let o = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
+        assert_eq!(
+            quarantined_only_failures(&o, &q(&["a"]), Some(1)),
+            Some(vec!["a".to_owned()])
+        );
+        // Another failing test, an error, or no quarantine: the run fails.
+        let two = outcomes(&[("a", Outcome::Failed), ("c", Outcome::Failed)]);
+        assert_eq!(quarantined_only_failures(&two, &q(&["a"]), Some(1)), None);
+        let err = outcomes(&[("a", Outcome::Errored)]);
+        assert_eq!(quarantined_only_failures(&err, &q(&["a"]), Some(1)), None);
+        assert_eq!(quarantined_only_failures(&o, &q(&[]), Some(1)), None);
+        // A command that could not start, or was killed, is no test failure.
+        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), Some(127)), None);
+        assert_eq!(quarantined_only_failures(&o, &q(&["a"]), None), None);
+    }
 }

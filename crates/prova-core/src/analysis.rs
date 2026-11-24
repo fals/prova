@@ -765,3 +765,74 @@ mod tests {
         assert_eq!(percentile(&[], 50.0), None);
     }
 }
+
+/// One test's typical duration over its recent results (ADR 0027 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlowRow {
+    pub test: String,
+    pub suites: Vec<String>,
+    /// Results with a duration the numbers come from.
+    pub runs: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+}
+
+/// The `n` slowest tests, worst first by p50 then p95, over each test's
+/// last `window` finished results with a duration. Like history, one test
+/// seen in several suites is one row. Forgotten runs and runs that are no
+/// evidence about the tests do not count (as in `test_runs`).
+pub fn slowest(
+    store: &Store,
+    suite: Option<&str>,
+    n: usize,
+    window: usize,
+) -> Result<Vec<SlowRow>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT t.display, t.suite, a.duration_ms FROM (
+             SELECT a.test_id, a.duration_ms,
+                    row_number() OVER (PARTITION BY a.test_id ORDER BY a.ts_ms DESC) AS rn
+               FROM attempts a JOIN runs r ON r.id = a.run_id
+              WHERE a.duration_ms IS NOT NULL AND a.outcome IN ('passed', 'failed')
+                AND r.status = 'finished'
+                AND r.id NOT IN (SELECT run_id FROM forgotten)
+                AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
+                                  AND w.payload LIKE '%; no evidence about the tests%')
+         ) a JOIN tests t ON t.id = a.test_id
+         WHERE a.rn <= ?1 AND (?2 IS NULL OR t.suite = ?2)",
+    )?;
+    let rows = stmt.query_map(params![window as i64, suite], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+        ))
+    })?;
+    let mut by_test: BTreeMap<String, (BTreeSet<String>, Vec<u64>)> = BTreeMap::new();
+    for row in rows {
+        let (display, suite, ms) = row?;
+        let e = by_test.entry(display).or_default();
+        e.0.insert(suite);
+        e.1.push(ms);
+    }
+    let mut out: Vec<SlowRow> = by_test
+        .into_iter()
+        .filter_map(|(test, (suites, mut ms))| {
+            ms.sort_unstable();
+            Some(SlowRow {
+                test,
+                suites: suites.into_iter().collect(),
+                runs: ms.len(),
+                p50_ms: percentile(&ms, 50.0)?,
+                p95_ms: percentile(&ms, 95.0)?,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.p50_ms
+            .cmp(&a.p50_ms)
+            .then(b.p95_ms.cmp(&a.p95_ms))
+            .then(a.test.cmp(&b.test))
+    });
+    out.truncate(n);
+    Ok(out)
+}

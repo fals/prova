@@ -55,6 +55,46 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Subcommand)]
+enum QuarantineCmd {
+    /// Quarantine a test prova has seen, with the reason it is set aside.
+    #[command(after_help = "\
+Example:
+  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"")]
+    Add {
+        /// The test's full name, or a substring that matches one test.
+        test: String,
+        /// Why it is set aside (shown in every run that touches it).
+        #[arg(long)]
+        reason: String,
+        /// Days until the quarantine expires and the test counts again.
+        #[arg(long, value_name = "DAYS", default_value_t = prova_core::quarantine::DEFAULT_DAYS,
+              value_parser = clap::value_parser!(u32).range(1..=prova_core::quarantine::MAX_DAYS as i64))]
+        days: u32,
+    },
+    /// List the quarantined tests.
+    #[command(after_help = "\
+Examples:
+  prova quarantine list
+  prova quarantine list --all --json")]
+    List {
+        /// Include removed quarantines.
+        #[arg(long)]
+        all: bool,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// End a quarantine: the test counts again.
+    #[command(after_help = "\
+Example:
+  prova quarantine remove calc::flaky_clock")]
+    Remove {
+        /// The quarantined test's name, or a substring that matches one.
+        test: String,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum UntilArg {
     FirstFailure,
@@ -282,6 +322,38 @@ Examples:
         /// JSON instead of text (every test).
         #[arg(long)]
         json: bool,
+    },
+    /// The slowest tests from history: p50 and p95, worst first (ADR 0027).
+    #[command(after_help = "\
+Examples:
+  prova slowest                 the 10 slowest tests of this repository
+  prova slowest -n 30           more of them
+  prova slowest --suite unit    one suite, as JSON with --json")]
+    Slowest {
+        /// Only runs of this suite.
+        #[arg(long, add = ArgValueCompleter::new(complete_suites))]
+        suite: Option<String>,
+        /// How many tests to list.
+        #[arg(short = 'n', long, value_name = "N", default_value_t = 10)]
+        count: usize,
+        /// JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set known-flaky tests aside from the verdict, in the open (ADR 0027).
+    #[command(after_help = "\
+Examples:
+  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"
+  prova quarantine add calc::flaky_clock --reason \"still flaky\" --days 30
+  prova quarantine list           what is set aside now, and until when
+  prova quarantine list --all     including removed ones
+  prova quarantine remove calc::flaky_clock
+
+A quarantined test still runs and keeps its history. If it is the only thing
+that fails, the run passes; every summary lists it. A quarantine expires.")]
+    Quarantine {
+        #[command(subcommand)]
+        action: QuarantineCmd,
     },
     /// Compare per-test results of two runs.
     #[command(after_help = "\
@@ -1688,6 +1760,96 @@ fn main() -> ExitCode {
     }
 }
 
+/// `prova quarantine ...` (ADR 0027).
+fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
+    use prova_core::quarantine as q;
+    match action {
+        QuarantineCmd::Add { test, reason, days } => {
+            let found = analysis::find_tests(store, &test, None)?;
+            let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
+            names.sort();
+            names.dedup();
+            let name = if names.contains(&test) {
+                test.clone()
+            } else {
+                match names.as_slice() {
+                    [one] => one.clone(),
+                    [] => {
+                        return Err(UsageError(format!(
+                            "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                        ))
+                        .into());
+                    }
+                    many => {
+                        return Err(UsageError(format!(
+                            "{} tests match {test:?}; be more specific: {}",
+                            many.len(),
+                            many.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                        ))
+                        .into());
+                    }
+                }
+            };
+            let e = q::add(store, &name, &reason, days, now_ms())?;
+            println!(
+                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it",
+                render::clean(&e.test),
+                render::clean(&e.reason),
+                render::expires_in(e.expires_ms)
+            );
+            Ok(exit::PASSED)
+        }
+        QuarantineCmd::List { all, json } => {
+            let list = q::list(store, all)?;
+            if json {
+                println!("{}", serde_json::to_string(&list)?);
+            } else if list.is_empty() {
+                println!("no quarantined tests");
+            } else {
+                for e in &list {
+                    let state = if e.removed_ms.is_some() {
+                        "removed".to_owned()
+                    } else {
+                        render::expires_in(e.expires_ms)
+                    };
+                    println!(
+                        "{}  ({}; {})",
+                        render::clean(&e.test),
+                        render::clean(&e.reason),
+                        state
+                    );
+                }
+            }
+            Ok(exit::PASSED)
+        }
+        QuarantineCmd::Remove { test } => {
+            let open: Vec<String> = q::list(store, false)?.into_iter().map(|e| e.test).collect();
+            let name = match open.iter().find(|n| **n == test) {
+                Some(n) => n.clone(),
+                None => {
+                    let hits: Vec<&String> = open.iter().filter(|n| n.contains(&test)).collect();
+                    match hits.as_slice() {
+                        [one] => (*one).clone(),
+                        _ => {
+                            return Err(UsageError(format!(
+                                "{} quarantined tests match {test:?} (`prova quarantine list` shows them)",
+                                hits.len()
+                            ))
+                            .into());
+                        }
+                    }
+                }
+            };
+            q::remove(store, &name, now_ms())?;
+            println!(
+                "removed the quarantine of {}: it counts again",
+                render::clean(&name)
+            );
+            Ok(exit::PASSED)
+        }
+    }
+}
+
 fn open_here() -> Result<(Store, PathBuf, PathBuf)> {
     let cwd = std::env::current_dir()?;
     let root = config::find_root(&cwd);
@@ -2290,6 +2452,18 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 }
             }
             Ok(exit::PASSED)
+        }
+        Cmd::Slowest { suite, count, json } => {
+            let (store, _, _) = open_here()?;
+            render::slowest(
+                &analysis::slowest(&store, suite.as_deref(), count, 20)?,
+                json,
+            );
+            Ok(exit::PASSED)
+        }
+        Cmd::Quarantine { action } => {
+            let (store, _, _) = open_here()?;
+            quarantine_cmd(&store, action)
         }
         Cmd::Diff { base, head, json } => {
             let (store, _, _) = open_here()?;

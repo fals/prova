@@ -91,7 +91,10 @@ needs attention.
 - `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
   flaky test that changed is listed apart (`changed, but known flaky`), never
   as fixed.
-- `prova flaky` known flaky tests. `prova sizes` how many tests of each size,
+- `prova flaky` known flaky tests; `prova quarantine add <test> --reason ...`
+  sets one aside in the open (listed in every run, expires), so the rest can
+  be verified green. `prova slowest` the slowest tests (p50, p95).
+  `prova sizes` how many tests of each size,
   and what made each medium or large one so ("started postgres", "1 local
   socket"). `prova history <test>` shows its `size:` and why; `small?`
   means nothing more seen in fewer than 3 runs, `medium or less` that prova
