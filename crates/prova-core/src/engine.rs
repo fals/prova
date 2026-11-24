@@ -1916,6 +1916,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             EventKind::RunNote { message } => notes.push(message.clone()),
             EventKind::RunWarning { message } => warnings.push(message.clone()),
             EventKind::RunTotals { tests, failed } => framework = Some((*tests, *failed)),
+            EventKind::TestSuperseded { test, .. } => {
+                finals.remove(&test.unique());
+            }
             _ => {}
         }
     }

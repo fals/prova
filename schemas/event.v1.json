@@ -142,6 +142,27 @@
       ]
     },
     {
+      "description": "A live result whose name was ambiguous (VSTest's console names\nNUnit and MSTest tests by bare method) replaced by the result file's\nqualified one: `by` counts and keeps the history, `test` does not.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/TestKey"
+        },
+        "kind": {
+          "type": "string",
+          "const": "test_superseded"
+        },
+        "test": {
+          "$ref": "#/$defs/TestKey"
+        }
+      },
+      "required": [
+        "kind",
+        "test",
+        "by"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "basis": {

@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0007_immutable_samples.sql"),
     include_str!("migrations/0008_forgotten_runs.sql"),
     include_str!("migrations/0009_test_sizes.sql"),
+    include_str!("migrations/0010_superseded.sql"),
 ];
 
 pub struct Store {
@@ -376,6 +377,20 @@ impl Store {
                     "INSERT OR IGNORE INTO test_sizes (run_id, test_id, attempt, size, evidence)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![e.run, id, attempt, size.as_str(), evidence],
+                )?;
+            }
+            if let EventKind::TestSuperseded { test, by } = &e.kind {
+                if suite.is_none() {
+                    suite = Some(tx.query_row(
+                        "SELECT suite FROM runs WHERE id = ?1",
+                        params![e.run],
+                        |r| r.get(0),
+                    )?);
+                }
+                let suite = suite.as_deref().unwrap_or_default();
+                tx.execute(
+                    "INSERT OR IGNORE INTO superseded (run_id, test_id, by_id) VALUES (?1, ?2, ?3)",
+                    params![e.run, test_id(suite, test), test_id(suite, by)],
                 )?;
             }
             if let EventKind::TestFinished {

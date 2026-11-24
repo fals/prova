@@ -678,3 +678,32 @@ fn repeat_never_calls_runs_without_tests_green() {
     let progress = String::from_utf8_lossy(&o.stderr);
     assert!(progress.contains("(no test ran)"), "{progress}");
 }
+
+/// Round 13 red team: VSTest's console names NUnit/MSTest tests by bare
+/// method, so two classes' `Divide` were told apart by console order; when
+/// the order flipped, their histories swapped and a test failing every run
+/// was called FLAKY ("nothing else failed"). The TRX's qualified names are
+/// the identity.
+#[test]
+fn bare_console_names_take_the_result_files_identity() {
+    let d = workspace("trx-identity");
+    let trx = r#"<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><TestDefinitions><UnitTest name="Divide" id="1"><TestMethod className="P.CalcTests" name="Divide"/></UnitTest><UnitTest name="Divide" id="2"><TestMethod className="P.MathTests" name="Divide"/></UnitTest></TestDefinitions><Results><UnitTestResult testId="1" testName="Divide" outcome="Failed"/><UnitTestResult testId="2" testName="Divide" outcome="Passed"/></Results></TestRun>"#;
+    std::fs::write(d.join("r.trx.src"), trx).unwrap();
+    let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
+    let lines = |first: &str, second: &str| {
+        format!(
+            "{busy}; printf '  {first} Divide [1 ms]\\n  {second} Divide [1 ms]\\n'; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
+        )
+    };
+    for (a, b) in [
+        ("Failed", "Passed"),
+        ("Passed", "Failed"),
+        ("Failed", "Passed"),
+    ] {
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &lines(a, b)]));
+        assert!(!out.contains("FLAKY"), "{out}");
+        assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
+    }
+    let h = text(&prova(&d, &["history", "P.CalcTests.Divide"]));
+    assert!(h.contains("3 runs with a result, 3 failed"), "{h}");
+}

@@ -119,6 +119,7 @@ pub fn test_runs_with(
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
+           AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",

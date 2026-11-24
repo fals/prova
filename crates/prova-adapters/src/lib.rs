@@ -172,6 +172,31 @@ impl Observer for Ladder {
                 (base.to_owned(), *o, false)
             })
             .collect();
+        // The live key each `live` entry came from (same order).
+        let live_keys: Vec<prova_core::model::TestKey> = self
+            .live
+            .seen
+            .iter()
+            .map(|(unique, (d, _))| {
+                let file = unique
+                    .split_once('\u{1f}')
+                    .map(|(f, _)| f)
+                    .filter(|f| !f.is_empty());
+                prova_core::model::TestKey {
+                    file: file.map(str::to_owned),
+                    path: Vec::new(),
+                    name: d.clone(),
+                }
+            })
+            .collect();
+        // A bare live name the file qualifies (VSTest's console `Divide`,
+        // the TRX's `Ns.CalcTests.Divide`): the file's name is the test's
+        // identity. Keeping the bare one made two classes' `Divide` swap
+        // histories with the console's order, and a deterministic failure
+        // read as flaky (round 13).
+        let qualifies =
+            |l: &str, d: &str| d != l && !l.contains("::") && d.ends_with(&format!(".{l}"));
+        let mut superseded: Vec<(usize, usize)> = Vec::new();
         let covers = |l: &str, d: &str| {
             l == d || d.ends_with(&format!("::{l}")) || d.ends_with(&format!(".{l}"))
         };
@@ -204,12 +229,16 @@ impl Observer for Ladder {
                 if covered[*i] {
                     continue;
                 }
-                if let Some(l) = live
-                    .iter_mut()
-                    .find(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
+                if let Some(j) = live
+                    .iter()
+                    .position(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
                 {
+                    let l = &mut live[j];
                     l.2 = true;
-                    if o.is_failure() && !l.1.is_failure() {
+                    if qualifies(&l.0, d) {
+                        // The file's result stays; the live one is replaced.
+                        superseded.push((j, *i));
+                    } else if o.is_failure() && !l.1.is_failure() {
                         // The file's failure stays as an event.
                         disagreed.push((*i, d.clone()));
                     } else {
@@ -225,11 +254,23 @@ impl Observer for Ladder {
                 test.name = format!("{} (result file)", test.name);
             }
         }
+        let supersede: Vec<EventKind> = superseded
+            .iter()
+            .filter_map(|(j, i)| match &report.events[*i] {
+                EventKind::TestFinished { test, .. } => Some(EventKind::TestSuperseded {
+                    test: live_keys[*j].clone(),
+                    by: test.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
         let mut i = 0;
         report.events.retain(|_| {
             i += 1;
             !covered[i - 1]
         });
+        // After the file results they name (the store links the two).
+        report.events.extend(supersede);
         for (_, d) in disagreed {
             report.contradictions.push(format!(
                 "{d}: the live output said it passed but the result file says it failed (the failure is recorded)"
@@ -256,7 +297,14 @@ impl Observer for Ladder {
             .iter()
             .filter(|e| matches!(e, EventKind::TestFinished { .. }))
             .count() as u64;
-        let seen = self.live.seen.len() as u64 + self.live.repeats + file_only;
+        // A superseded live result and the file's one are one test.
+        let replaced = report
+            .events
+            .iter()
+            .filter(|e| matches!(e, EventKind::TestSuperseded { .. }))
+            .count() as u64;
+        let seen =
+            (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
         if self.live.summary_seen {
             report.events.push(EventKind::RunTotals {
                 tests: self.live.total(),
