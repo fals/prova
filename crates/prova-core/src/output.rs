@@ -238,7 +238,7 @@ pub struct Distiller {
     after: usize,
     /// Every line that looks like an error, whatever the excerpt's budget,
     /// up to `ERROR_LINES` (a quarantine must account for each, ADR 0029).
-    error_lines: Vec<(u64, String, Option<String>)>,
+    error_lines: Vec<ErrorLine>,
     /// More error lines came than were kept.
     error_overflow: bool,
     /// The test whose section of the output is being read (pytest's
@@ -286,6 +286,10 @@ fn ends_section(t: &str) -> bool {
         || t.starts_with("FAIL\t")
         || t.starts_with("ok  \t")
 }
+
+/// An error-looking line: its number, its text, and the test whose section
+/// of the output it is in.
+pub type ErrorLine = (u64, String, Option<String>);
 
 /// Error-looking lines kept for the quarantine guard.
 const ERROR_LINES: usize = 2000;
@@ -400,7 +404,7 @@ impl Distiller {
     /// Every line that looks like an error (a `go test -json` event's
     /// output decoded), with the test whose section it is in, and whether
     /// more came than were kept.
-    pub fn error_lines(&self) -> (&[(u64, String, Option<String>)], bool) {
+    pub fn error_lines(&self) -> (&[ErrorLine], bool) {
         (&self.error_lines, self.error_overflow)
     }
 

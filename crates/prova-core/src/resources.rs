@@ -142,6 +142,68 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
     (!viewer).then_some(client)
 }
 
+/// Whether the client's command line starts a container (`docker run`),
+/// the only kind whose container this run can name.
+pub fn container_client_runs(cmdline: &str) -> bool {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    words.iter().take(2).enumerate().any(|(i, w)| {
+        matches!(w.rsplit('/').next(), Some("docker" | "podman" | "nerdctl"))
+            && words.get(i + 1) == Some(&"run")
+    })
+}
+
+/// The container a `docker run` command line names: `--name X`, or the id
+/// in its `--cidfile`. None when it names neither (not attributable).
+pub fn container_of(cmdline: &str) -> Option<String> {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    let value = |flag: &str| {
+        words.iter().enumerate().find_map(|(i, w)| {
+            if *w == flag {
+                words.get(i + 1).map(|v| (*v).to_owned())
+            } else {
+                w.strip_prefix(&format!("{flag}=")).map(str::to_owned)
+            }
+        })
+    };
+    if let Some(name) = value("--name") {
+        return Some(name);
+    }
+    let file = value("--cidfile")?;
+    let id = std::fs::read_to_string(file).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// Kills a container by name or id with its client; true when it did.
+/// Bounded: a client that hangs is abandoned.
+pub fn kill_container(client: &str, target: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(client)
+        .args(["kill", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// Whether a process is a test runner's process for a single test
 /// (libtest's `--exact <name>`, as nextest starts each test).
 pub fn runs_one_test(cmdline: &str) -> bool {

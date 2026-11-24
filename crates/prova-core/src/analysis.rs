@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::model::Outcome;
@@ -314,7 +314,11 @@ fn stats_with(
     };
     // Only a test history calls flaky can be "failing now" instead; one that
     // never passed has simply not passed yet (round 11).
-    let failing_now = streak >= needed && (retry > 0 || flips > 0);
+    // And on enough history for the rate to mean something: one earlier
+    // pass and three failures is a thin record (round 15: "failing now",
+    // then it passed again).
+    let failing_now =
+        streak >= needed && counted.len() >= FAILING_NOW_MIN_RUNS && (retry > 0 || flips > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -457,6 +461,10 @@ pub struct SizeView {
     pub label: String,
 }
 
+/// Runs of history a test needs before a streak of failures overrides its
+/// flakiness.
+pub const FAILING_NOW_MIN_RUNS: usize = 5;
+
 /// Attributed runs that must all show one process and no socket before a
 /// test is called small (ADR 0025 §5): sampling can miss what is brief.
 pub const SMALL_AFTER: usize = 3;
@@ -542,6 +550,32 @@ pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
             ),
         }));
     }
+    // Its runs went through a container client: what the tests use is out
+    // of sight, and no amount of sampling will change that (round 15).
+    let client: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT json_extract(e.payload, '$.message')
+               FROM events e JOIN runs r ON r.id = e.run_id
+              WHERE e.kind = 'run_note' AND r.status = 'finished'
+                AND json_extract(e.payload, '$.message') LIKE 'the tests ran through `%'
+                AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1)
+                AND e.run_id NOT IN (SELECT run_id FROM forgotten)
+              LIMIT 1",
+            params![test_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(note) = client {
+        let name = note.split('`').nth(1).unwrap_or("a container client");
+        return Ok(Some(SizeView {
+            size: None,
+            at_most: None,
+            label: format!(
+                "unknown (ran through {name}: out of sight, so its size cannot be observed; declare it with `size` in prova.toml)"
+            ),
+        }));
+    }
     Ok(None)
 }
 
@@ -555,6 +589,9 @@ pub struct SizeReport {
     pub unknown: usize,
     /// Of the unknown, those seen small in fewer runs than needed.
     pub small_so_far: usize,
+    /// Of the unknown, those whose runs went through a container client:
+    /// their size cannot be observed, only declared.
+    pub out_of_sight: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     /// Medium and large tests with what made them so: (test, label).
@@ -598,6 +635,12 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
                 r.unknown += 1;
                 if view.as_ref().is_some_and(|v| v.label.starts_with("small?")) {
                     r.small_so_far += 1;
+                }
+                if view
+                    .as_ref()
+                    .is_some_and(|v| v.label.starts_with("unknown (ran through"))
+                {
+                    r.out_of_sight += 1;
                 }
             }
         }

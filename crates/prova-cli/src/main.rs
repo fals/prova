@@ -1376,6 +1376,91 @@ fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
     }
 }
 
+/// The wrapper this project's earlier runs put in front of the test command
+/// (`./dev`, `nix develop -c`), from the newest run that had one.
+fn earlier_wrapper(store: &Store) -> Option<String> {
+    store.recent_runs(30).ok()?.into_iter().find_map(|r| {
+        let argv: Vec<String> = r.spec["command"]["argv"]
+            .as_array()?
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_owned))
+            .collect();
+        prova_adapters::adopt::wrapper_of(&argv)
+    })
+}
+
+/// What the framework named in a filter's syntax, for the framework the
+/// command runs.
+fn filter_syntax_advice(command: &str) -> &'static str {
+    let c = command;
+    if c.contains("pytest") {
+        "pytest selects with a `-k` expression (a substring of the test name) or a node id (tests/test_x.py::test_name)"
+    } else if c.contains("vitest") || c.contains("jest") {
+        "Vitest and Jest select with `-t <name pattern>`"
+    } else if c.contains("go test") || c.contains("gotestsum") {
+        "Go selects with `-run <regex>` (anchor it: ^TestName$)"
+    } else if c.contains("mvn") || c.contains("gradle") {
+        "Maven selects with `-Dtest=Class#method` (Gradle: `--tests Class.method`)"
+    } else if c.contains("dotnet") {
+        ".NET selects with `--filter FullyQualifiedName~Name`"
+    } else if c.contains("cargo") {
+        "cargo selects with a substring of the test path"
+    } else {
+        "use the framework's own filter syntax"
+    }
+}
+
+/// The part of a filter a framework's "not found" line names, when the
+/// filter has spaces and the line quotes only a piece of it: a wrapper or
+/// shell split it into words (round 15: `./dev` re-splits `$*`).
+fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
+    if !filter.contains(' ') {
+        return None;
+    }
+    lines.iter().find_map(|l| {
+        let (_, frag) = l.split_once("not found:")?;
+        let frag = frag.trim();
+        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
+    })
+}
+
+/// Why a run that ran no test failed on its own: the command could not
+/// start (126/127), or it exited nonzero and printed an error. None when it
+/// ran fine (exit 0), so the level is the issue.
+fn run_failure_cause(s: &Summary) -> Option<String> {
+    match s.exit_code {
+        Some(126 | 127) => s
+            .detail
+            .clone()
+            .or_else(|| Some(format!("exit {}", s.exit_code.unwrap_or_default()))),
+        Some(code) if code != 0 => {
+            let error = s.output_tail.iter().map(|l| l.trim()).find(|l| {
+                let l = l.to_lowercase();
+                [
+                    "error",
+                    "no module named",
+                    "not found",
+                    "no such file",
+                    "permission denied",
+                    "cannot",
+                ]
+                .iter()
+                .any(|w| l.contains(w))
+            });
+            let last = s
+                .output_tail
+                .iter()
+                .map(|l| l.trim())
+                .rfind(|l| !l.is_empty());
+            Some(match error.or(last) {
+                Some(line) => format!("exit {code}: {}", render::clean(line)),
+                None => format!("exit {code} with no output"),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool) -> Result<u8> {
     let (store, root, _) = open_here()?;
     if let (Some(suite), Some(filter)) = (verify, filter) {
@@ -1419,11 +1504,14 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         // The framework's own "nothing matched" beats a level diagnosis: an
         // opaque run with that message means the filter's syntax is wrong
         // for the framework, not the level (round 8: surefire with -q).
-        let nothing_matched = s
+        let lines: Vec<&String> = s
             .output_tail
             .iter()
             .chain(s.notes.iter())
             .chain(s.detail.iter())
+            .collect();
+        let nothing_matched = lines
+            .iter()
             .find(|l| {
                 let l = l.to_lowercase();
                 l.contains("no tests matching")
@@ -1431,13 +1519,33 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                     || l.contains("no tests ran")
                     || l.contains("no tests found")
                     || l.contains("no tests to run")
+                    || l.contains("file or directory not found")
             })
             .map(|l| render::clean(l.trim()));
         let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
+            let split = split_filter_fragment(&filter, &lines);
             (
                 false,
                 format!(
-                    "filter {filter:?} matched no test; the framework says: {line}. Use the framework's own filter syntax (Maven: Class#method, .NET: FullyQualifiedName~Name)"
+                    "filter {filter:?} matched no test; the framework says: {line}. {}{}",
+                    filter_syntax_advice(&s.command),
+                    split.map_or(String::new(), |f| format!(
+                        " The filter was split into words by a wrapper or the shell ({f:?} is only a part of it): use a filter without spaces (pytest: `-k` with a substring)"
+                    )),
+                ),
+            )
+        } else if let (true, Some(cause)) = (
+            tests.is_empty()
+                && (s.level == prova_core::model::Level::Opaque
+                    || matches!(s.exit_code, Some(126 | 127))),
+            run_failure_cause(&s),
+        ) {
+            // The command itself did not work: say why before anything about
+            // levels or templates (round 15: exit 127 was "level opaque").
+            (
+                false,
+                format!(
+                    "the command failed before any test ran: {cause}; fix it, then verify again"
                 ),
             )
         } else if s.level == prova_core::model::Level::Opaque {
@@ -1478,7 +1586,10 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         }
         return Ok(if ok { exit::PASSED } else { exit::FAILED });
     }
-    let p = prova_adapters::adopt::propose(&root);
+    let mut p = prova_adapters::adopt::propose(&root);
+    if let Some(wrapper) = earlier_wrapper(&store) {
+        prova_adapters::adopt::apply_wrapper(&mut p, &wrapper);
+    }
     let toml = prova_adapters::adopt::to_toml(&p);
     if json {
         println!("{}", serde_json::json!({ "proposal": p, "toml": toml }));
@@ -2593,7 +2704,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
-                if d.unknown > 0 {
+                if d.out_of_sight > 0 {
+                    println!(
+                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size` in prova.toml",
+                        d.out_of_sight
+                    );
+                }
+                if d.unknown > d.out_of_sight {
                     println!(
                         "unknown: {} seen small in fewer than {} runs so far; the others were never seen on their own (one test running, or its own process) and their runs were not sampled in time to tell (their output came all at once). Sizes are a lower bound: prova samples every 0.5 s and cannot see sleeps",
                         d.small_so_far,
@@ -3075,6 +3192,16 @@ fn exit_code(s: &Summary) -> u8 {
             // The command could not start: not a test failure (ADR 0017).
             (Some(Outcome::Errored), Status::Finished)
                 if matches!(s.exit_code, Some(126 | 127)) =>
+            {
+                exit::INFRA
+            }
+            // pytest found nothing to run (bad selection, empty collection):
+            // not a test failure either.
+            (Some(Outcome::Errored), Status::Finished)
+                if s.exit_code == Some(4)
+                    && s.detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with(engine::PYTEST_NO_TEST)) =>
             {
                 exit::INFRA
             }

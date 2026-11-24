@@ -51,6 +51,11 @@ pub trait Observer {
     fn on_line(&mut self, _line: &str, _now_ms: u64) -> Vec<EventKind> {
         Vec::new()
     }
+    /// Called with the start of an output line not finished yet (a test
+    /// runner prints a test's name before its outcome).
+    fn on_partial(&mut self, _text: &str, _now_ms: u64) -> Vec<EventKind> {
+        Vec::new()
+    }
     /// Extra environment for the process under test (opt-in injection).
     /// `run_dir` is private to this run; files written there are the
     /// observer's to read in `on_exit`.
@@ -253,6 +258,9 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The container client the tests run through, if any.
     container: Option<&'static str>,
+    /// The client's command line, to find its container when the run is
+    /// stopped (round 15).
+    container_cmd: Option<String>,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -641,6 +649,36 @@ impl Supervisor<'_> {
         });
     }
 
+    /// The run is being stopped: stopping a container client does not stop
+    /// its container. A container the run named (`--name`, `--cidfile`) is
+    /// killed; any other is not attributable, so the run says to check.
+    fn stop_container(&mut self) {
+        let Some(client) = self.container else {
+            return;
+        };
+        let cmd = self.container_cmd.clone().unwrap_or_default();
+        match crate::resources::container_of(&cmd) {
+            Some(target) if crate::resources::container_client_runs(&cmd) => {
+                let ok = crate::resources::kill_container(client, &target);
+                let message = if ok {
+                    format!("stopped the container `{target}` with `{client} kill {target}`: stopping the `{client}` client alone does not stop it")
+                } else {
+                    format!("could not stop the container `{target}` with `{client} kill {target}`: check `{client} ps` and stop it")
+                };
+                if ok {
+                    self.emit(EventKind::RunNote { message });
+                } else {
+                    self.emit(EventKind::RunWarning { message });
+                }
+            }
+            _ => self.emit(EventKind::RunWarning {
+                message: format!(
+                    "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
+                ),
+            }),
+        }
+    }
+
     /// A snapshot of the command's group, reused when under 50 ms old.
     fn usage_now(&mut self) -> crate::resources::Usage {
         if let Some((at, u)) = &self.last_usage
@@ -652,13 +690,19 @@ impl Supervisor<'_> {
         // A container client started before the tests printed anything is
         // how the command runs them: what they use is out of sight.
         if self.container.is_none() {
-            self.container = u.procs.iter().find_map(|(pid, (_, cmd))| {
+            let found = u.procs.iter().find_map(|(pid, (_, cmd))| {
                 let early = match (u.starts.get(pid), self.first_line_ms) {
                     (Some(start), Some(first)) => *start <= first,
                     _ => true,
                 };
-                crate::resources::container_client(cmd).filter(|_| early)
+                crate::resources::container_client(cmd)
+                    .filter(|_| early)
+                    .map(|c| (c, cmd.clone()))
             });
+            if let Some((client, cmd)) = found {
+                self.container = Some(client);
+                self.container_cmd = Some(cmd);
+            }
         }
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
@@ -732,12 +776,14 @@ impl Supervisor<'_> {
 
     /// The start of a line not finished yet: into the spool at once, so
     /// `prova output` and a stall summary show it.
-    fn partial(&mut self, stream: usize, text: &str) {
+    fn partial(&mut self, stream: usize, text: &str, observer: &mut dyn Observer) {
         let done = &mut self.partial[stream];
         let new = text.strip_prefix(done.as_str()).unwrap_or(text);
         let _ = self.output.write_all(new.as_bytes());
         let _ = self.output.flush();
         *done = text.to_owned();
+        let events = observer.on_partial(text, now_ms());
+        self.observed(events, observer);
     }
 
     fn line(&mut self, stream: usize, line: &str, observer: &mut dyn Observer) {
@@ -812,6 +858,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // The command itself may be the client (`docker run ... go test`):
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
+        container_cmd: Some(spec.command.display()),
         superseded: Default::default(),
         phase: None,
         whole: None,
@@ -977,7 +1024,7 @@ fn observe_child(
                 }
                 Ok(Chunk::Partial(i, p, _)) => {
                     last_activity = Instant::now();
-                    sup.partial(i, &p);
+                    sup.partial(i, &p, observer);
                 }
                 Ok(Chunk::Eof) => open_streams -= 1,
                 Err(_) => break,
@@ -1014,6 +1061,7 @@ fn observe_child(
             if terminating.is_none() && store.cancel_requested(run)? {
                 process::terminate_group(pgid);
                 sup.terminating = true;
+                sup.stop_container();
                 terminating = Some((now, Status::Cancelled, "cancelled".into()));
             }
         }
@@ -1031,6 +1079,7 @@ fn observe_child(
         if terminating.is_none() && now.duration_since(start) >= kill_after {
             process::terminate_group(pgid);
             sup.terminating = true;
+            sup.stop_container();
             let reason = format!(
                 "killed: exceeded kill_after {}",
                 crate::ids::format_duration(kill_after)
@@ -1091,7 +1140,7 @@ fn observe_child(
                     // when it arrived, like a line (round 12 CI: 388 of 400).
                     Chunk::Partial(_, _, a) if a.at > until => break,
                     Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                    Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                    Chunk::Partial(i, p, _) => sup.partial(i, &p, observer),
                     Chunk::Eof => *open -= 1,
                 }
             }
@@ -1107,6 +1156,7 @@ fn observe_child(
         // Cancelled while its output was still being recorded: what was not
         // recorded yet is dropped, and the run says it was cancelled.
         sup.terminating = true;
+        sup.stop_container();
         terminating = Some((Instant::now(), Status::Cancelled, "cancelled".into()));
     }
     // The test phase's size (ADR 0026 §2): what tests prova could not
@@ -1561,6 +1611,19 @@ fn observe_child(
             }
         ));
     }
+    // pytest exits 4 (usage error: a selection that names nothing) without
+    // running a test: that is no test failing (round 15), like a command
+    // that could not start. Exit 5 (nothing collected) stays a failure: a
+    // suite that ran no test verified nothing (ADR 0017).
+    if let Some(code @ 4) = exit_code
+        && status == Status::Finished
+        && observed == 0
+        && sup.tail.iter().any(|l| pytest_ran_nothing(l))
+    {
+        reason = Some(format!(
+            "{PYTEST_NO_TEST} (exit {code}: usage error, e.g. a selection or option pytest rejected); no test failed"
+        ));
+    }
     if !contradictions.is_empty() {
         let _ = sup.lifecycle.contradict();
         reason.get_or_insert_with(|| contradictions.join("; "));
@@ -1589,6 +1652,13 @@ fn observe_child(
                 names.join(", ")
             ),
         });
+    }
+    if outcome == Outcome::Failed
+        && reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST))
+    {
+        outcome = Outcome::Errored;
     }
     if outcome == Outcome::Passed {
         // A quarantined test's own crash is set aside with it (round 14).
@@ -1773,6 +1843,40 @@ fn observe_child(
     let _ = std::fs::remove_dir_all(&dir);
     crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
     crate::output::sweep(store)
+}
+
+/// The reason prefix of a pytest run that ran no test (exit 4 or 5).
+pub const PYTEST_NO_TEST: &str = "pytest ran no test";
+
+/// A line pytest prints when it ran no test: usage errors and empty
+/// collections.
+fn pytest_ran_nothing(line: &str) -> bool {
+    let l = line.trim();
+    l.starts_with("ERROR: file or directory not found")
+        || l.starts_with("ERROR: not found:")
+        || l.starts_with("ERROR: usage:")
+        || l.starts_with("usage: pytest")
+        || l.starts_with("usage: __main__.py")
+        || l.contains("no tests ran")
+        || l.contains("collected 0 items")
+}
+
+/// The cause a failing test's kept output names: pytest's first `E` line,
+/// or the whole output when it is one line (a short summary's message).
+fn message_from_output(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(e) = lines.iter().find_map(|l| l.strip_prefix("E ")) {
+        let e = e.trim();
+        return (!e.is_empty()).then(|| e.to_owned());
+    }
+    match lines.as_slice() {
+        [one] => Some((*one).to_owned()),
+        _ => None,
+    }
 }
 
 /// Tests of the suite's last passing full run that this run did not record:
@@ -2770,12 +2874,27 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         })
     };
     let mut failures = Vec::new();
+    // A failure reported before its message (pytest -v prints the line
+    // first, the `-rfE` summary names the cause at the end): the message is
+    // in the test's kept output (round 15).
+    let kept: BTreeMap<String, String> =
+        if row.status.is_terminal() && failing.iter().take(20).any(|f| f.2.is_none()) {
+            crate::output::test_outputs(store, run)?
+                .into_iter()
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
     for (key, outcome, message, _, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
+        let message = message.clone().or_else(|| {
+            kept.get(&key.display())
+                .and_then(|t| message_from_output(t))
+        });
         failures.push(Failure {
             test: key.display(),
             outcome: *outcome,
-            message: message.clone(),
+            message,
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
                 c.suite_passed_on_same_code = suite_passed_on_same_code;
                 c

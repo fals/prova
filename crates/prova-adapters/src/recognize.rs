@@ -135,6 +135,11 @@ pub struct Recognizers {
     /// pytest verbose text: a passing line held one line, for the same
     /// reason (pytest prints the teardown error as a second line).
     pytest_text_pass: Option<(String, TestKey)>,
+    /// pytest's FAILURES / ERRORS section is being read: its blocks
+    /// (header of `___ test_q ___`, lines), claimed by the short summary's
+    /// `FAILED id - message` lines that follow.
+    pytest_in_failures: bool,
+    pytest_blocks: Vec<(String, Vec<String>)>,
     /// Test files (Jest `Test Suites:`, Vitest `Test Files`) the framework's
     /// own summary says failed. Such a file can fail without any test of it
     /// failing (an import error), so the count is its own evidence.
@@ -899,6 +904,68 @@ impl Recognizers {
         out
     }
 
+    /// The start of an unfinished output line. A pytest `-v` line shows the
+    /// test's id, then its outcome once it ends: an id followed by a space
+    /// and nothing else is a test running now (round 15: a stall named the
+    /// test that had just passed). The previous test's held pass is
+    /// reported first, as the next line would have.
+    pub fn partial(&mut self, text: &str) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if self.pytest_stream
+            || !text.ends_with(' ')
+            || self.holding
+            || !text.contains(".py::")
+            || text.starts_with(' ')
+        {
+            return out;
+        }
+        let id = text.trim_end();
+        // Whole parameters only: a read boundary can cut the id short, and
+        // spaces are part of an id only inside its brackets.
+        let outside = {
+            let mut depth = 0i32;
+            let mut s = String::new();
+            for c in id.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ if depth == 0 => s.push(c),
+                    _ => {}
+                }
+            }
+            (depth == 0).then_some(s)
+        };
+        if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
+            return out;
+        }
+        let key = pytest_key(id);
+        if self
+            .pytest_text_pass
+            .as_ref()
+            .is_some_and(|(held, _)| held != id)
+        {
+            out.extend(self.release_held_pass());
+        }
+        self.started(key, &mut out);
+        out
+    }
+
+    /// A pytest pass held for a teardown error, when nothing followed it.
+    pub fn release_held_pass(&mut self) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if let Some((_, key)) = self.pytest_text_pass.take() {
+            self.finished(
+                key,
+                Outcome::Passed,
+                None,
+                None,
+                Level::Recognized,
+                &mut out,
+            );
+        }
+        out
+    }
+
     fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
         self.holding = true;
         let r = f(self);
@@ -1607,6 +1674,28 @@ impl Recognizers {
     // ------------------------------------------------------------- pytest
 
     fn pytest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        // pytest-xdist: "[gw0] [ 33%] FAILED tests/test_a.py::test_q" is
+        // the verbose line with the outcome first. Read it as pytest's own.
+        if let Some(rest) = line.strip_prefix("[gw")
+            && let Some((_, rest)) = rest.split_once("] ")
+        {
+            let rest = rest.trim_start();
+            let rest = match rest.strip_prefix('[') {
+                Some(r) => r.split_once("] ").map_or(rest, |(_, r)| r),
+                None => rest,
+            };
+            if let Some((word, id)) = rest.trim().split_once(' ')
+                && matches!(
+                    word,
+                    "PASSED" | "FAILED" | "SKIPPED" | "ERROR" | "XFAIL" | "XPASS"
+                )
+                && id.contains(".py::")
+            {
+                return self.pytest(&format!("{} {word}", id.trim()), out);
+            }
+            return false;
+        }
+        self.pytest_section(line);
         // A pass held one line: pytest prints a teardown error as a second
         // line for the same test, and that is the test's result.
         if let Some((id, hkey)) = self.pytest_text_pass.take() {
@@ -1694,6 +1783,17 @@ impl Recognizers {
                 (key, false)
             };
             let msg = msg.filter(|_| outcome.is_failure());
+            if outcome.is_failure() && !sub {
+                self.claim_pytest_block(&key);
+            }
+            // A teardown error after a pass the output already reported:
+            // the test is errored, once (round 15: it was another test).
+            if outcome == Outcome::Errored
+                && matches!(self.seen.get(&key.unique()), Some((_, Outcome::Passed)))
+            {
+                self.attempt_result(key, 2, outcome, None, msg, Level::Recognized, out);
+                return true;
+            }
             self.result(key, outcome, None, msg, Level::Recognized, sub, out);
             return true;
         }
@@ -1766,6 +1866,51 @@ impl Recognizers {
         }
         self.finished(key, outcome, None, None, Level::Recognized, out);
         true
+    }
+
+    /// Reads pytest's FAILURES / ERRORS section into blocks, one per
+    /// `____ test_q ____` header, to be named by the summary that follows.
+    fn pytest_section(&mut self, line: &str) {
+        let t = line.trim_end();
+        let bar = t.trim_matches('=').trim();
+        if t.starts_with("==") && matches!(bar, "FAILURES" | "ERRORS") {
+            self.pytest_in_failures = true;
+            self.pytest_blocks.clear();
+            return;
+        }
+        if !self.pytest_in_failures {
+            return;
+        }
+        if t.starts_with('=') {
+            self.pytest_in_failures = false;
+            return;
+        }
+        let head = t.trim_matches('_').trim();
+        if t.starts_with("___") && t.ends_with("___") && !head.is_empty() {
+            let head = head.strip_prefix("ERROR at teardown of ").unwrap_or(head);
+            let head = head.strip_prefix("ERROR at setup of ").unwrap_or(head);
+            self.pytest_blocks.push((head.to_owned(), Vec::new()));
+        } else if let Some((_, lines)) = self.pytest_blocks.last_mut()
+            && lines.len() < 80
+        {
+            lines.push(t.to_owned());
+        }
+    }
+
+    /// The failure block pytest printed for this test, kept as its output.
+    fn claim_pytest_block(&mut self, key: &TestKey) {
+        let Some(at) = self
+            .pytest_blocks
+            .iter()
+            .position(|(h, _)| h == &key.name || h.ends_with(&format!(".{}", key.name)))
+        else {
+            return;
+        };
+        let (_, lines) = self.pytest_blocks.remove(at);
+        let text = lines.join("\n").trim().to_owned();
+        if !text.is_empty() {
+            self.failure_output.push((key.clone(), text));
+        }
     }
 
     // ------------------------------------------------------------- vitest
@@ -3752,6 +3897,125 @@ mod tests {
         assert_eq!(
             msg_of(&ev, "tests.t::test_p[a - b]"),
             Some("AssertionError: assert 'a - b' == 'c'")
+        );
+    }
+
+    /// Round 15: a stall in `pytest -v` named the test that had just
+    /// passed, not the one hanging (its line had no outcome yet).
+    #[test]
+    fn pytest_unfinished_line_starts_that_test_and_releases_the_held_pass() {
+        let mut r = Recognizers::default();
+        let mut ev = r.line("tests/t.py::test_slow PASSED   [ 50%]");
+        // The pass waits one line for a teardown error.
+        assert!(finished(&ev).is_empty());
+        ev.extend(r.partial("tests/t.py::test_"));
+        assert!(
+            ev.iter()
+                .all(|e| !matches!(e, EventKind::TestStarted { .. }))
+        );
+        ev.extend(r.partial("tests/t.py::test_hangs "));
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_slow".to_owned(), Outcome::Passed)]
+        );
+        let started: Vec<String> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestStarted { test } => Some(test.display()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["tests.t::test_hangs".to_owned()]);
+        // The same partial again does not start it twice.
+        assert!(r.partial("tests/t.py::test_hangs ").is_empty());
+    }
+
+    /// Round 15: pytest-xdist's verbose lines put the outcome first.
+    #[test]
+    fn pytest_xdist_verbose_lines_are_recognized() {
+        let (r, ev) = feed_all(
+            "[gw0] [ 33%] FAILED tests/test_a.py::test_q\n[gw1] [ 66%] PASSED tests/test_a.py::TestC::test_ok[a b]\n[gw0] [100%] SKIPPED tests/test_a.py::test_s\n=========================== short test summary info ============================\nFAILED tests/test_a.py::test_q - assert 2 == 1\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.test_a::test_q".to_owned(), Outcome::Failed),
+                (
+                    "tests.test_a.TestC::test_ok[a b]".to_owned(),
+                    Outcome::Passed
+                ),
+                ("tests.test_a::test_s".to_owned(), Outcome::Skipped),
+            ]
+        );
+        assert_eq!(r.level, Some(Level::Recognized));
+    }
+
+    /// Round 15: -q names the failing test only in the short summary; the
+    /// FAILURES block above it becomes that test's output.
+    #[test]
+    fn pytest_q_failure_block_is_the_failing_tests_output() {
+        let (r, ev) = feed_all(concat!(
+            ".F.   [100%]\n",
+            "=================================== FAILURES ===================================\n",
+            "__________________________________ TestC.test_q ________________________________\n",
+            "\n",
+            ">       assert 2 == 1\n",
+            "E       assert 2 == 1\n",
+            "=========================== short test summary info ============================\n",
+            "FAILED tests/test_a.py::TestC::test_q - assert 2 == 1\n",
+            "1 failed, 2 passed in 0.03s\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.test_a.TestC::test_q".to_owned(), Outcome::Failed)]
+        );
+        assert_eq!(r.failure_output.len(), 1);
+        assert!(r.failure_output[0].1.contains("E       assert 2 == 1"));
+    }
+
+    /// Round 15: a pass and a teardown error is one errored test in the
+    /// verbose lines and in the `-rA` summary alike.
+    #[test]
+    fn pytest_teardown_error_is_one_errored_test_in_every_format() {
+        let (_, verbose) = feed_all(
+            "tests/t.py::test_x PASSED   [ 50%]\ntests/t.py::test_x ERROR   [ 50%]\ntests/t.py::test_y PASSED  [100%]\n",
+        );
+        let (_, summary) = feed_all(
+            "tests/t.py::test_x PASSED   [ 50%]\ntests/t.py::test_y PASSED  [100%]\n=========================== short test summary info ============================\nPASSED tests/t.py::test_x\nERROR tests/t.py::test_x - RuntimeError: teardown\n",
+        );
+        let last = |ev: &[EventKind]| {
+            let mut m: BTreeMap<String, Outcome> = BTreeMap::new();
+            for (n, o) in finished(ev) {
+                m.insert(n, o);
+            }
+            m
+        };
+        assert_eq!(last(&verbose), last(&summary));
+        assert_eq!(last(&summary)["tests.t::test_x"], Outcome::Errored);
+        assert!(
+            !finished(&summary)
+                .iter()
+                .any(|(n, _)| n.contains("second result"))
+        );
+    }
+
+    #[test]
+    fn pytest_parameter_ids_with_spaces_start_only_when_whole() {
+        let mut r = Recognizers::default();
+        assert!(r.partial("tests/t.py::test_r[negative 2/").is_empty());
+        assert!(r.partial("tests/t.py::test_r[negative ").is_empty());
+        let ev = r.partial("tests/t.py::test_r[negative 2/-4] ");
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn a_held_pass_is_released_when_output_goes_quiet() {
+        let mut r = Recognizers::default();
+        r.line("tests/t.py::test_a PASSED   [100%]");
+        let ev = r.release_held_pass();
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_a".to_owned(), Outcome::Passed)]
         );
     }
 

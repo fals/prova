@@ -242,6 +242,80 @@ pub fn propose(root: &Path) -> Proposal {
     p
 }
 
+/// Test runners and entry points a wrapper puts in front of.
+const RUNNERS: &[&str] = &[
+    "make",
+    "pytest",
+    "python",
+    "python3",
+    "py.test",
+    "mvn",
+    "mvnw",
+    "gradle",
+    "gradlew",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "bun",
+    "cargo",
+    "go",
+    "gotestsum",
+    "dotnet",
+    "vitest",
+    "jest",
+    "rake",
+    "bundle",
+    "tox",
+    "nox",
+];
+
+/// The wrapper in front of a test command an earlier run used (`./dev`,
+/// `docker compose run web`, `nix develop -c`): everything before the first
+/// word that is a test runner. None for a command that starts with its
+/// runner, or with a shell, whose arguments are not a prefix.
+pub fn wrapper_of(argv: &[String]) -> Option<String> {
+    let name = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
+    let at = argv
+        .iter()
+        .position(|w| RUNNERS.contains(&name(w).as_str()))?;
+    let prefix = &argv[..at];
+    let shell = |w: &String| matches!(name(w).as_str(), "sh" | "bash" | "zsh" | "dash");
+    if prefix.is_empty()
+        || prefix.iter().any(shell)
+        || prefix.iter().any(|w| w.contains(['"', '\'', '=', ' ']))
+    {
+        return None;
+    }
+    Some(prefix.join(" "))
+}
+
+/// Puts the project's wrapper in front of every suite's command and select
+/// (round 15: adopt proposed `python3 -m pytest` on the host when the
+/// project's own runs went through `./dev`).
+pub fn apply_wrapper(p: &mut Proposal, wrapper: &str) {
+    let wrap = |cmd: &str| {
+        // A compound command or one that starts with variable assignments
+        // cannot take a prefix as is.
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        if cmd.starts_with(wrapper) || cmd.contains(';') || first.contains('=') {
+            cmd.to_owned()
+        } else {
+            format!("{wrapper} {cmd}")
+        }
+    };
+    for s in &mut p.suites {
+        s.run = wrap(&s.run);
+        s.select = s.select.as_deref().map(wrap);
+    }
+    p.existing = p.existing.as_deref().map(wrap);
+    // Whether the host has pytest-reportlog says nothing about the wrapper.
+    p.reportlog = false;
+    p.notes.push(format!(
+        "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none"
+    ));
+}
+
 fn pytest_reportlog_installed(root: &Path) -> bool {
     std::process::Command::new("python3")
         .args(["-c", "import pytest_reportlog"])
@@ -452,6 +526,40 @@ mod tests {
             std::fs::write(d.join(f), c).unwrap();
         }
         d
+    }
+
+    #[test]
+    fn wrappers_of_earlier_runs_are_kept() {
+        let v = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(wrapper_of(&v("./dev make test")).as_deref(), Some("./dev"));
+        assert_eq!(
+            wrapper_of(&v("docker compose run web pytest -q")).as_deref(),
+            Some("docker compose run web")
+        );
+        assert_eq!(
+            wrapper_of(&v("nix develop -c cargo test")).as_deref(),
+            Some("nix develop -c")
+        );
+        assert_eq!(wrapper_of(&v("make test")), None);
+        assert_eq!(wrapper_of(&v("sh -c make")), None);
+    }
+
+    #[test]
+    fn a_wrapper_goes_in_front_of_run_and_select() {
+        let d = dir(
+            "wrapped-py",
+            &[
+                ("pyproject.toml", "[tool.pytest.ini_options]\n"),
+                ("t.py", ""),
+            ],
+        );
+        let mut p = propose(&d);
+        apply_wrapper(&mut p, "./dev");
+        for s in &p.suites {
+            assert!(s.run.starts_with("./dev "), "{s:?}");
+            assert!(s.select.as_deref().is_none_or(|x| x.starts_with("./dev ")));
+        }
+        assert!(!p.reportlog);
     }
 
     #[test]
