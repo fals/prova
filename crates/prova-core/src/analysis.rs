@@ -360,6 +360,7 @@ pub fn find_tests(
     let mut stmt = store.conn().prepare(
         "SELECT id, display, suite FROM tests
          WHERE instr(display, ?1) > 0 AND (?2 IS NULL OR suite = ?2)
+           AND id NOT IN (SELECT test_id FROM superseded)
          ORDER BY (display = ?1) DESC, length(display) ASC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![query, suite], |r| {

@@ -139,6 +139,32 @@ pub struct Recognizers {
     jest: JestState,
     /// Maven's `Failures:` / `Errors:` summary section is being read.
     surefire_section: bool,
+    /// Go text: results since the last package line. `go test -v` names the
+    /// package only after its tests, so they are reported under a provisional
+    /// name at once and re-keyed when the package is known (round 14).
+    go_pending: Vec<GoRun>,
+    /// Packages seen so far in this run, as the full import path.
+    go_segment: u32,
+    go_full_pkgs: Vec<String>,
+    /// Executions of each test so far (`-count=N`, reruns): its attempts.
+    go_attempts: BTreeMap<String, u32>,
+    /// Tests that failed and passed on a rerun: failures a summary counted.
+    go_recovered: u64,
+    /// Packages in which a test failed.
+    go_failed_pkgs: BTreeSet<String>,
+    /// Output since the last package line, for a package failure's message.
+    go_segment_text: Vec<String>,
+    /// `running tests:` of a Go test timeout is being read; the tests named.
+    go_reading_hung: bool,
+    go_hung: Vec<String>,
+    /// `ok` packages that ran tests, `ok` packages that ran none, `FAIL`.
+    go_ok_pkgs: u64,
+    go_no_tests_pkgs: u64,
+    go_fail_pkgs: u64,
+    /// gotestsum `testname` result lines (`PASS pkg.Test`): it prints every test.
+    gts_testname_lines: u64,
+    /// The held gotestsum result is a `testname` line followed by its output.
+    gts_inline: bool,
 }
 
 /// Jest's console reporter: the test file whose results are being read.
@@ -157,6 +183,20 @@ struct JestState {
     block: Option<(Option<String>, Vec<String>)>,
     /// What "Test suite failed to run" said.
     suite_error: Vec<String>,
+}
+
+/// One execution of a Go test.
+struct GoExec {
+    outcome: Outcome,
+    duration_ms: Option<u64>,
+    message: Option<String>,
+    subtest: bool,
+}
+
+/// A Go test reported before its package is known, with its executions.
+struct GoRun {
+    key: TestKey,
+    execs: Vec<GoExec>,
 }
 
 fn lift(level: &mut Option<Level>, l: Level) {
@@ -399,6 +439,7 @@ impl Recognizers {
         {
             let mut total = None;
             let mut failed = 0;
+            let mut errors = 0;
             for part in counts.split(", ") {
                 let mut w = part.split_whitespace();
                 if let (Some(n), Some(word)) =
@@ -407,6 +448,7 @@ impl Recognizers {
                     match word {
                         "test" | "tests" => total = Some(n),
                         "failure" | "failures" => failed += n,
+                        "error" | "errors" => errors += n,
                         _ => {}
                     }
                 }
@@ -415,7 +457,9 @@ impl Recognizers {
                 self.summary_seen = true;
                 self.gotestsum_seen = true;
                 self.reported_total += n;
-                self.reported_failed += failed;
+                // A build error is listed among the failures too: the larger
+                // of the two, so errors alone count and nothing counts twice.
+                self.reported_failed += failed.max(errors);
                 return;
             }
         }
@@ -652,7 +696,8 @@ impl Recognizers {
 
     /// Failures the framework reported (structured streams win over text).
     pub fn failed_reported(&self) -> u64 {
-        self.structured_failed.unwrap_or(self.reported_failed)
+        self.structured_failed
+            .unwrap_or(self.reported_failed.saturating_sub(self.go_recovered))
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
@@ -776,6 +821,9 @@ impl Recognizers {
         }
         if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
             self.go_package_lines += 1;
+            self.go_package(line, &mut out);
+        } else if !line.starts_with('{') && !line.starts_with("?   \t") {
+            self.go_segment_line(line);
         }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
@@ -838,6 +886,16 @@ impl Recognizers {
     /// none of it). Names match `go test -v`'s (the package is relative).
     fn gotestsum(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_end();
+        // A failing `testname` line is followed by what the test printed.
+        if self.gts_inline && self.gts_pending.is_some() {
+            if line.starts_with([' ', '\t']) {
+                if let Some((_, _, _, lines)) = self.gts_pending.as_mut() {
+                    lines.push(t.to_owned());
+                }
+                return true;
+            }
+            self.flush_gotestsum(out);
+        }
         if t.starts_with("=== ") || t.starts_with("DONE ") {
             self.flush_gotestsum(out);
         }
@@ -846,20 +904,21 @@ impl Recognizers {
             ("=== SKIP: ", Outcome::Skipped),
         ] {
             if let Some(rest) = t.strip_prefix(prefix) {
+                let (rest, _) = strip_rerun(rest);
+                let rest = rest.as_str();
                 let (head, dur) = match rest.rsplit_once(" (") {
                     Some((h, d)) => (h, secs_ms(d.trim_end_matches(')'))),
                     None => (rest, None),
                 };
                 let (pkg, test) = head.split_once(' ').unwrap_or((head, ""));
+                let pkg = self.go_pkg(pkg);
                 let (key, outcome) = if test.trim().is_empty() {
-                    (
-                        TestKey::new(vec![pkg.to_owned()], "(package)"),
-                        Outcome::Errored,
-                    )
+                    (TestKey::new(vec![pkg], "(package)"), Outcome::Errored)
                 } else {
-                    (TestKey::new(Vec::new(), test.trim()), outcome)
+                    (TestKey::new(vec![pkg], test.trim()), outcome)
                 };
                 self.gotestsum_seen = true;
+                self.gts_inline = false;
                 self.gts_pending = Some((key, outcome, dur, Vec::new()));
                 return true;
             }
@@ -872,8 +931,19 @@ impl Recognizers {
             lines.push(t.to_owned());
             return true;
         }
-        // testname: "PASS p1.TestOk (0.00s)", "FAIL p2".
-        let mut w = t.split_whitespace();
+        // testname: "PASS p1.TestOk (0.00s)", "FAIL p2", a rerun: "PASS
+        // p1.TestOk (re-run 1)", a package that did not build: "FAIL p2
+        // [build failed]".
+        if let Some(pkg) = t.strip_prefix("FAIL ").and_then(|r| {
+            r.strip_suffix(" [build failed]")
+                .or(r.strip_suffix(" [setup failed]"))
+        }) && !pkg.contains(' ')
+        {
+            self.gts_pkg_failed.push(pkg.to_owned());
+            return false;
+        }
+        let (stripped, _rerun) = strip_rerun(t);
+        let mut w = stripped.split_whitespace();
         let (Some(word), Some(name)) = (w.next(), w.next()) else {
             return false;
         };
@@ -899,18 +969,24 @@ impl Recognizers {
             Some(i) => {
                 let test = &name[i + 1..];
                 self.gotestsum_seen = true;
+                self.gts_testname_lines += 1;
                 if outcome.is_failure() {
                     self.gts_pkg_with_failure.insert(name[..i].to_owned());
                 }
-                self.result(
-                    TestKey::new(Vec::new(), test),
-                    outcome,
-                    dur,
-                    None,
-                    Level::Recognized,
-                    test.contains('/'),
-                    out,
-                );
+                let pkg = self.go_pkg(&name[..i]);
+                // The `--- PASS: TestOk` line before it is this result.
+                if self.go_qualify_one(test, &pkg, out) {
+                    return true;
+                }
+                let key = TestKey::new(vec![pkg], test);
+                if outcome.is_failure() && !self.seen.contains_key(&key.unique()) {
+                    // What the test printed follows: hold it for that.
+                    self.gts_inline = true;
+                    self.gts_pending = Some((key, outcome, dur, Vec::new()));
+                } else {
+                    let sub = test.contains('/');
+                    self.go_result(key, outcome, dur, None, Level::Recognized, sub, out);
+                }
                 true
             }
             None if outcome == Outcome::Failed && !name.contains("::") => {
@@ -941,8 +1017,25 @@ impl Recognizers {
             } else {
                 None
             };
-            let sub = key.path.is_empty() && key.name.contains('/');
-            self.result(key, outcome, dur, msg, Level::Recognized, sub, out);
+            // The package may have been printed in full since the header.
+            let key = match key.path.as_slice() {
+                [pkg] => TestKey::new(vec![self.go_pkg(pkg)], key.name.clone()),
+                _ => key,
+            };
+            let sub = key.name.contains('/');
+            if self.gts_inline {
+                // A `testname` result line: an execution of the test.
+                self.gts_inline = false;
+                self.go_result(key, outcome, dur, msg, Level::Recognized, sub, out);
+            } else if self.seen.contains_key(&key.unique()) {
+                // The summary block repeats a result already reported: it
+                // carries the output, not another execution.
+                if let Some(m) = msg {
+                    self.failure_fallback.push((key, m));
+                }
+            } else {
+                self.result(key, outcome, dur, msg, Level::Recognized, sub, out);
+            }
         }
     }
 
@@ -1005,7 +1098,9 @@ impl Recognizers {
                 };
                 // Go test names cannot contain '/': one that does is a
                 // subtest (`t.Run`).
-                self.result(
+                // A repeated execution (`-count=N`, gotestsum's reruns) is
+                // another attempt of the test.
+                self.go_result(
                     key(t),
                     outcome,
                     elapsed,
@@ -1018,10 +1113,11 @@ impl Recognizers {
             ("fail", None) => {
                 // Package failed without any failing test: build error or crash.
                 let prefix = format!("{pkg}\0");
-                let any_failed = self
-                    .seen
-                    .values()
-                    .any(|(d, o)| d.starts_with(&format!("{pkg}::")) && o.is_failure());
+                let any_failed = self.go_failed_pkgs.contains(pkg)
+                    || self
+                        .seen
+                        .values()
+                        .any(|(d, o)| d.starts_with(&format!("{pkg}::")) && o.is_failure());
                 let lines = self.go_output.remove(&prefix).unwrap_or_default();
                 if !any_failed {
                     self.finished(
@@ -1339,7 +1435,8 @@ impl Recognizers {
             self.go_run_lines += 1;
             let name = name.trim().to_owned();
             self.go_current = Some(name.clone());
-            self.started(TestKey::new(Vec::new(), name), out);
+            let key = self.go_key(&name);
+            self.started(key, out);
             return true;
         }
         for (prefix, outcome) in [
@@ -1367,15 +1464,11 @@ impl Recognizers {
                 } else {
                     None
                 };
-                self.result(
-                    TestKey::new(Vec::new(), name),
-                    outcome,
-                    dur.map(|s| (s * 1000.0).round() as u64),
-                    msg,
-                    Level::Recognized,
-                    name.contains('/'),
-                    out,
-                );
+                // With gotestsum's own stream the same tests come qualified.
+                if !self.gotestsum_stream {
+                    let ms = dur.map(|s| (s * 1000.0).round() as u64);
+                    self.go_bare(name, outcome, ms, msg, out);
+                }
                 return true;
             }
         }
@@ -2243,7 +2336,10 @@ impl Recognizers {
         self.flush_gotestsum(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
-                if !self.gts_pkg_with_failure.contains(&pkg) {
+                if !self.gts_pkg_with_failure.contains(&pkg)
+                    && !self.go_failed_pkgs.contains(&self.go_pkg(&pkg))
+                {
+                    let pkg = self.go_pkg(&pkg);
                     self.finished(
                         TestKey::new(vec![pkg], "(package)"),
                         Outcome::Errored,
@@ -2628,11 +2724,24 @@ mod tests {
         (r, all)
     }
 
+    /// Results that stand: a result re-keyed when its package became known
+    /// (Go text) is the re-keyed one only.
     fn finished(events: &[EventKind]) -> Vec<(String, Outcome)> {
+        let superseded: BTreeSet<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestSuperseded { test, .. } => Some(test.unique()),
+                _ => None,
+            })
+            .collect();
         events
             .iter()
             .filter_map(|e| match e {
-                EventKind::TestFinished { test, outcome, .. } => Some((test.display(), *outcome)),
+                EventKind::TestFinished { test, outcome, .. }
+                    if !superseded.contains(&test.unique()) =>
+                {
+                    Some((test.display(), *outcome))
+                }
                 _ => None,
             })
             .collect()
@@ -2672,21 +2781,21 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("TestBad".into(), Outcome::Failed),
-                ("TestPanics".into(), Outcome::Failed),
-                ("p2::(package)".into(), Outcome::Errored),
+                ("example.com/gts/p2::(package)".into(), Outcome::Errored),
+                ("p1::TestBad".into(), Outcome::Failed),
+                ("p3::TestPanics".into(), Outcome::Failed),
             ]
         );
         assert_eq!((r.total(), r.failed_reported()), (3, 3));
         let m = messages(&ev);
         assert!(
-            m.iter().any(|(t, m)| t == "TestPanics"
+            m.iter().any(|(t, m)| t == "p3::TestPanics"
                 && m.starts_with("panic: assignment to entry in nil map")),
             "{m:?}"
         );
         assert!(
             m.iter()
-                .any(|(t, m)| t == "TestBad" && m.contains("expected 4, got 16")),
+                .any(|(t, m)| t == "p1::TestBad" && m.contains("expected 4, got 16")),
             "{m:?}"
         );
     }
@@ -2699,10 +2808,10 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("TestBad".into(), Outcome::Failed),
-                ("TestOk".into(), Outcome::Passed),
-                ("TestPanics".into(), Outcome::Failed),
-                ("p2::(package)".into(), Outcome::Errored),
+                ("example.com/gts/p2::(package)".into(), Outcome::Errored),
+                ("p1::TestBad".into(), Outcome::Failed),
+                ("p1::TestOk".into(), Outcome::Passed),
+                ("p3::TestPanics".into(), Outcome::Failed),
             ]
         );
     }
@@ -3519,8 +3628,14 @@ mod tests {
 
     #[test]
     fn unrelated_output_is_ignored() {
-        let (_, ev) = feed("ok  \texample.com/calc\t1.502s\nFAIL\texample.com/calc\t1.5s");
+        let (_, ev) = feed("ok  \texample.com/calc\t1.502s");
         assert!(ev.is_empty(), "go package lines are not tests: {ev:?}");
+        // A failed package without a failing test is an errored package.
+        let (_, ev) = feed("FAIL\texample.com/calc\t1.5s");
+        assert_eq!(
+            finished(&ev),
+            vec![("example.com/calc::(package)".into(), Outcome::Errored)]
+        );
         let (r, ev) = feed(
             "Compiling prova v0.1.0\n{\"not\": \"go\"}\nok\nFAILED\nnote: run with RUST_BACKTRACE=1",
         );
@@ -3936,6 +4051,14 @@ pub fn passed_tests(output: &str) -> Vec<String> {
         events.extend(r.line(line));
     }
     events.extend(r.finish());
+    // A result re-keyed once its package was known is that one result.
+    let superseded: BTreeSet<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            EventKind::TestSuperseded { test, .. } => Some(test.unique()),
+            _ => None,
+        })
+        .collect();
     let mut passed: Vec<String> = events
         .into_iter()
         .filter_map(|e| match e {
@@ -3943,7 +4066,7 @@ pub fn passed_tests(output: &str) -> Vec<String> {
                 test,
                 outcome: Outcome::Passed,
                 ..
-            } => Some(test.display()),
+            } if !superseded.contains(&test.unique()) => Some(test.display()),
             _ => None,
         })
         .collect();
@@ -3957,7 +4080,10 @@ mod passed_tests_tests {
     #[test]
     fn reads_passes_of_a_finished_output() {
         let out = "=== RUN   TestConformance\n--- PASS: TestConformance (0.01s)\nPASS\nok  \texample.com/calc\t0.02s\n";
-        assert_eq!(super::passed_tests(out), vec!["TestConformance".to_owned()]);
+        assert_eq!(
+            super::passed_tests(out),
+            vec!["example.com/calc::TestConformance".to_owned()]
+        );
         assert!(super::passed_tests("ok  \texample.com/calc\t0.02s\n").is_empty());
     }
 
@@ -4089,5 +4215,582 @@ mod passed_tests_tests {
             ev.iter().any(|e| matches!(e, EventKind::TestFinished { test, outcome: Outcome::Failed, .. } if test.name.contains("add (line 3)"))),
             "{ev:?}"
         );
+    }
+}
+
+// ------------------------------------------------------------------ Go text
+
+/// A gotestsum rerun marker, ` (re-run 1)`, removed from `t`.
+fn strip_rerun(t: &str) -> (String, bool) {
+    if let Some(i) = t.find("(re-run ")
+        && let Some(len) = t[i..].find(')')
+    {
+        let mut s = t[..i].trim_end().to_owned();
+        let after = t[i + len + 1..].trim_start();
+        if !after.is_empty() {
+            s.push(' ');
+            s.push_str(after);
+        }
+        return (s, true);
+    }
+    (t.to_owned(), false)
+}
+
+impl Recognizers {
+    /// Every `go test` package that ran said `[no tests to run]` (a `-run`
+    /// typo): `ok` packages with tests, or failures, say it was not so.
+    pub fn go_no_tests_only(&self) -> bool {
+        self.go_no_tests_pkgs > 0 && self.go_ok_pkgs == 0 && self.go_fail_pkgs == 0
+    }
+
+    /// The framework prints every test it runs (`go test -v`, gotestsum
+    /// `testname`): a count above what was seen means results went missing.
+    pub fn prints_every_test(&self) -> bool {
+        self.go_run_lines > 0 || self.gts_testname_lines > 0
+    }
+
+    /// The full import path of a package printed short (gotestsum trims the
+    /// module path), when a `ok`/`FAIL` line of the run gave it.
+    fn go_pkg(&self, printed: &str) -> String {
+        self.go_full_pkgs
+            .iter()
+            .find(|f| f.as_str() == printed || f.ends_with(&format!("/{printed}")))
+            .cloned()
+            .unwrap_or_else(|| printed.to_owned())
+    }
+
+    /// The name a Go test has until its package is known. The segment keeps
+    /// the same name in two packages apart; `display` is the bare name.
+    fn go_key(&self, name: &str) -> TestKey {
+        TestKey {
+            file: Some(format!("(package pending) #{}", self.go_segment)),
+            path: Vec::new(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// One execution of a Go test whose key is final. The first is its
+    /// result; a later one is another attempt (`-count=N`, gotestsum's
+    /// `--rerun-fails`): the last decides, and a failure is kept in the
+    /// history whatever came after it. Equal passes change nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn go_result(
+        &mut self,
+        key: TestKey,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        level: Level,
+        subtest: bool,
+        out: &mut Vec<EventKind>,
+    ) {
+        let d = key.unique();
+        if outcome.is_failure()
+            && let Some(pkg) = key.path.first()
+        {
+            self.go_failed_pkgs.insert(pkg.clone());
+        }
+        let Some((_, before)) = self.seen.get(&d).cloned().filter(|_| !self.holding) else {
+            if !self.holding {
+                self.go_attempts.insert(d, 1);
+            }
+            return self.result(key, outcome, duration_ms, message, level, subtest, out);
+        };
+        self.repeats += 1;
+        if !before.is_failure() && !outcome.is_failure() {
+            return;
+        }
+        if before.is_failure() && !outcome.is_failure() {
+            self.go_recovered += 1;
+        }
+        if outcome.is_failure()
+            && let Some(m) = &message
+        {
+            self.failure_fallback.push((key.clone(), m.clone()));
+        }
+        let n = self.go_attempts.entry(d.clone()).or_insert(1);
+        *n += 1;
+        let attempt = *n;
+        self.seen.insert(d, (key.display(), outcome));
+        out.push(EventKind::TestFinished {
+            test: key,
+            attempt,
+            outcome,
+            duration_ms,
+            message,
+            source: level,
+            subtest,
+        });
+    }
+
+    /// A Go result printed without its package (`--- PASS: TestX`).
+    fn go_bare(
+        &mut self,
+        name: &str,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        out: &mut Vec<EventKind>,
+    ) {
+        let key = self.go_key(name);
+        let exec = GoExec {
+            outcome,
+            duration_ms,
+            message: message.clone(),
+            subtest: name.contains('/'),
+        };
+        match self.go_pending.iter_mut().find(|r| r.key == key) {
+            Some(run) => run.execs.push(exec),
+            None => self.go_pending.push(GoRun {
+                key: key.clone(),
+                execs: vec![exec],
+            }),
+        }
+        let sub = name.contains('/');
+        self.go_result(
+            key,
+            outcome,
+            duration_ms,
+            message,
+            Level::Recognized,
+            sub,
+            out,
+        );
+    }
+
+    /// The package of the pending results is known: they are the same
+    /// results under their full name (the provisional ones are superseded).
+    /// Returns whether a test failed in the package.
+    fn go_requalify(&mut self, run: GoRun, pkg: &str, out: &mut Vec<EventKind>) {
+        let q = TestKey::new(vec![pkg.to_owned()], run.key.name.clone());
+        let (bd, qd) = (run.key.unique(), q.unique());
+        self.seen.remove(&bd);
+        self.go_attempts.remove(&bd);
+        self.started.remove(&bd);
+        for (k, _) in self
+            .failure_fallback
+            .iter_mut()
+            .chain(self.failure_output.iter_mut())
+        {
+            if *k == run.key {
+                *k = q.clone();
+            }
+        }
+        // The executions were counted once already.
+        self.repeats = self.repeats.saturating_sub(run.execs.len() as u64 - 1);
+        if run.execs.iter().any(|e| e.outcome.is_failure()) {
+            self.go_failed_pkgs.insert(pkg.to_owned());
+        }
+        // A stream (gotestsum's JSON) may have reported them already.
+        if !self.seen.contains_key(&qd) {
+            for e in run.execs {
+                let (q, level) = (q.clone(), Level::Recognized);
+                self.go_result(
+                    q,
+                    e.outcome,
+                    e.duration_ms,
+                    e.message,
+                    level,
+                    e.subtest,
+                    out,
+                );
+            }
+        }
+        // After the results it names: the store links the two.
+        out.push(EventKind::TestSuperseded {
+            test: run.key.clone(),
+            by: q,
+        });
+    }
+
+    /// A result line with the package, `PASS pkg.TestX`: the pending result
+    /// of that name (from `--- PASS: TestX`) is it. False when none is.
+    fn go_qualify_one(&mut self, test: &str, pkg: &str, out: &mut Vec<EventKind>) -> bool {
+        let key = self.go_key(test);
+        let Some(i) = self.go_pending.iter().position(|r| r.key == key) else {
+            return false;
+        };
+        let run = self.go_pending.remove(i);
+        self.go_requalify(run, pkg, out);
+        true
+    }
+
+    /// `ok  \tpkg\t0.01s`, `FAIL\tpkg\t0.01s`, `FAIL\tpkg [build failed]`:
+    /// the package is known, and says whether it failed. A package that
+    /// failed without a failing test (a build error, `TestMain`, a crash) is
+    /// an errored `(package)` test, never covered by another test's
+    /// quarantine, whatever the exit code (round 14).
+    fn go_package(&mut self, line: &str, out: &mut Vec<EventKind>) {
+        let Some((status, rest)) = line.split_once('\t') else {
+            return;
+        };
+        let rest = rest.trim();
+        let (printed, tail) = rest
+            .split_once(char::is_whitespace)
+            .map(|(p, t)| (p, t.trim()))
+            .unwrap_or((rest, ""));
+        if printed.is_empty() {
+            return;
+        }
+        let pkg = printed.to_owned();
+        if !self.go_full_pkgs.contains(&pkg) {
+            self.go_full_pkgs.push(pkg.clone());
+        }
+        let text = std::mem::take(&mut self.go_segment_text);
+        let hung = std::mem::take(&mut self.go_hung);
+        self.go_reading_hung = false;
+        let timed_out = |name: &str| {
+            format!("{name} was still running when the test binary timed out (go test -timeout)")
+        };
+        // A test that started and never finished: the timeout stopped it.
+        if status.trim() != "ok" {
+            for name in &hung {
+                let started = self.go_key(name).unique();
+                if self.started.contains(&started) && !self.seen.contains_key(&started) {
+                    self.go_bare(name, Outcome::Errored, None, Some(timed_out(name)), out);
+                }
+            }
+        }
+        let pending = std::mem::take(&mut self.go_pending);
+        let failed_here = pending
+            .iter()
+            .any(|r| r.execs.iter().any(|e| e.outcome.is_failure()))
+            || self.go_failed_pkgs.contains(&pkg);
+        for run in pending {
+            self.go_requalify(run, &pkg, out);
+        }
+        self.go_segment += 1;
+        if status.trim() == "ok" {
+            if tail.contains("[no tests to run]") {
+                self.go_no_tests_pkgs += 1;
+            } else {
+                self.go_ok_pkgs += 1;
+            }
+            return;
+        }
+        self.go_fail_pkgs += 1;
+        let mut explained = failed_here;
+        for name in hung {
+            explained = true;
+            let message = timed_out(&name);
+            self.result(
+                TestKey::new(vec![pkg.clone()], name.clone()),
+                Outcome::Errored,
+                None,
+                Some(message),
+                Level::Recognized,
+                name.contains('/'),
+                out,
+            );
+        }
+        if !explained {
+            let mut body = text;
+            body.push(line.trim().to_owned());
+            self.result(
+                TestKey::new(vec![pkg], "(package)"),
+                Outcome::Errored,
+                None,
+                message(&body),
+                Level::Recognized,
+                false,
+                out,
+            );
+        }
+    }
+
+    /// Lines between packages: what a package failure explains itself with,
+    /// and the tests a timeout panic names under `running tests:`.
+    fn go_segment_line(&mut self, line: &str) {
+        let t = line.trim();
+        if t == "running tests:" {
+            self.go_reading_hung = true;
+            return;
+        }
+        if self.go_reading_hung {
+            // "\t\tTestHang (1m0s)"
+            if let Some((name, dur)) = t.split_once(" (")
+                && dur.ends_with(')')
+                && !name.contains(' ')
+                && line.starts_with('\t')
+            {
+                self.go_hung.push(name.to_owned());
+                return;
+            }
+            self.go_reading_hung = false;
+        }
+        if t.is_empty() || t == "PASS" || t == "FAIL" || line.starts_with("=== ") {
+            return;
+        }
+        self.go_segment_text.push(line.trim_end().to_owned());
+        if self.go_segment_text.len() > 60 {
+            self.go_segment_text.remove(0);
+        }
+    }
+}
+
+/// Round 14, Go and gotestsum: identities with the package, repeated
+/// executions, reruns, package failures.
+#[cfg(test)]
+mod go_tests {
+    use super::*;
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let mut r = Recognizers::default();
+        let mut all = Vec::new();
+        for l in input.lines() {
+            all.extend(r.line(l));
+        }
+        all.extend(r.finish());
+        (r, all)
+    }
+
+    /// What the run ends with per test: the outcomes of all attempts of each
+    /// test that was not superseded, in attempt order.
+    fn settled(events: &[EventKind]) -> BTreeMap<String, Vec<Outcome>> {
+        let superseded: BTreeSet<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestSuperseded { test, .. } => Some(test.unique()),
+                _ => None,
+            })
+            .collect();
+        let mut out: BTreeMap<String, Vec<(u32, Outcome)>> = BTreeMap::new();
+        for e in events {
+            if let EventKind::TestFinished {
+                test,
+                attempt,
+                outcome,
+                ..
+            } = e
+                && !superseded.contains(&test.unique())
+            {
+                out.entry(test.display())
+                    .or_default()
+                    .push((*attempt, *outcome));
+            }
+        }
+        out.into_iter()
+            .map(|(k, mut v)| {
+                v.sort_by_key(|(a, _)| *a);
+                (k, v.into_iter().map(|(_, o)| o).collect())
+            })
+            .collect()
+    }
+
+    fn one(s: &BTreeMap<String, Vec<Outcome>>, name: &str) -> Vec<Outcome> {
+        s.get(name)
+            .unwrap_or_else(|| panic!("no {name} in {s:?}"))
+            .clone()
+    }
+
+    #[test]
+    fn go_verbose_same_test_in_two_packages_keeps_both() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestDup\n--- PASS: TestDup (0.00s)\nPASS\nok  \texample.com/m/a\t0.01s\n",
+            "=== RUN   TestDup\n    b_test.go:7: bug\n--- FAIL: TestDup (0.00s)\nFAIL\nFAIL\texample.com/m/b\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/m/a::TestDup"), vec![Outcome::Passed]);
+        assert_eq!(one(&s, "example.com/m/b::TestDup"), vec![Outcome::Failed]);
+        assert_eq!(s.len(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn go_verbose_failure_is_live_before_its_package_is_known() {
+        let mut r = Recognizers::default();
+        let mut ev = Vec::new();
+        for l in [
+            "=== RUN   TestBad",
+            "    x_test.go:3: no",
+            "--- FAIL: TestBad (0.00s)",
+        ] {
+            ev.extend(r.line(l));
+        }
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestFinished {
+                    outcome: Outcome::Failed,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn go_count_repeats_are_attempts_of_one_test() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestRace\n--- PASS: TestRace (0.00s)\n",
+            "=== RUN   TestRace\n    race_test.go:9: lost update\n--- FAIL: TestRace (0.00s)\n",
+            "=== RUN   TestRace\n--- PASS: TestRace (0.00s)\n",
+            "FAIL\nFAIL\texample.com/m/r\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/m/r::TestRace"),
+            vec![Outcome::Passed, Outcome::Failed, Outcome::Passed]
+        );
+        assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
+    }
+
+    #[test]
+    fn gotestsum_testname_qualifies_with_the_package() {
+        let (_, ev) = feed_all(concat!(
+            "FAIL example.com/m/a.TestDup (0.00s)\n    a_test.go:7: REAL BUG\nFAIL example.com/m/a\n",
+            "PASS example.com/m/b.TestDup (0.00s)\nok   example.com/m/b\n\n",
+            "=== Failed\n=== FAIL: example.com/m/a TestDup (0.00s)\n    a_test.go:7: REAL BUG\n\n",
+            "DONE 2 tests, 1 failure in 0.2s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/m/a::TestDup"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "example.com/m/b::TestDup"), vec![Outcome::Passed]);
+        assert_eq!(s.len(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn gotestsum_rerun_that_passes_is_a_second_attempt() {
+        let (_, ev) = feed_all(concat!(
+            "FAIL example.com/m/a.TestFlaky (0.00s)\n",
+            "PASS example.com/m/a.TestFlaky (re-run 1)\n",
+            "DONE 2 tests, 1 failure in 0.2s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/m/a::TestFlaky"),
+            vec![Outcome::Failed, Outcome::Passed]
+        );
+        assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    #[test]
+    fn gotestsum_json_rerun_that_passes_is_a_second_attempt() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Elapsed":0}"#,
+            "\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed, Outcome::Passed]);
+        assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    #[test]
+    fn a_go_package_that_failed_to_build_is_an_errored_package() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestA1\n--- PASS: TestA1 (0.00s)\nPASS\nok  \texample.com/m/a\t0.002s\n",
+            "# example.com/m/b [example.com/m/b.test]\n./b_test.go:5:2: undefined: foo\n",
+            "FAIL\texample.com/m/b [build failed]\nFAIL\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/m/b::(package)"),
+            vec![Outcome::Errored]
+        );
+        let msg = ev.iter().find_map(|e| match e {
+            EventKind::TestFinished { test, message, .. } if test.name == "(package)" => {
+                message.clone()
+            }
+            _ => None,
+        });
+        assert!(msg.unwrap().contains("undefined: foo"));
+    }
+
+    #[test]
+    fn a_go_package_that_failed_without_a_failing_test_is_errored() {
+        // TestMain / goleak: only PASS lines, then the package fails.
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\ngoleak: found unexpected goroutines\n",
+            "FAIL\texample.com/m/a\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/m/a::(package)"),
+            vec![Outcome::Errored]
+        );
+        assert_eq!(one(&s, "example.com/m/a::TestA"), vec![Outcome::Passed]);
+    }
+
+    #[test]
+    fn gotestsum_package_build_failure_and_errors_count() {
+        let (r, ev) = feed_all(concat!(
+            "PASS example.com/m/a.TestA1 (0.00s)\nok   example.com/m/a\n",
+            "FAIL example.com/m/b [build failed]\n\n",
+            "=== Errors\nb/b_test.go:5:2: undefined: foo\n\n",
+            "DONE 1 tests, 1 error in 0.4s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/m/b::(package)"),
+            vec![Outcome::Errored]
+        );
+        assert_eq!(r.failed_reported(), 1);
+    }
+
+    #[test]
+    fn gotestsum_errors_are_not_counted_twice() {
+        // gotestsum lists a build error among its failures too.
+        let (r, _) = feed_all(
+            &std::fs::read_to_string(format!(
+                "{}/fixtures/gotestsum-pkgname.txt",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        );
+        assert_eq!(r.failed_reported(), 3);
+    }
+
+    #[test]
+    fn gotestsum_testname_failure_keeps_what_the_test_printed() {
+        let (_, ev) = feed_all(concat!(
+            "FAIL example.com/m/a.TestBad (0.00s)\n    a_test.go:7: want 2 got 3\n",
+            "PASS example.com/m/a.TestOk (0.00s)\nDONE 2 tests, 1 failure in 0.1s\n",
+        ));
+        let msg = ev.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                message: Some(m),
+                ..
+            } if test.name == "TestBad" => Some(m.clone()),
+            _ => None,
+        });
+        assert_eq!(msg.as_deref(), Some("a_test.go:7: want 2 got 3"));
+        assert_eq!(settled(&ev).len(), 2);
+    }
+
+    #[test]
+    fn a_go_timeout_names_the_running_test() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestHang\n",
+            "panic: test timed out after 1m0s\n\trunning tests:\n\t\tTestHang (1m0s)\n\ngoroutine 33 [running]:\n",
+            "FAIL\texample.com/m/h\t60.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/m/h::TestHang"), vec![Outcome::Errored]);
+        assert!(!s.contains_key("example.com/m/h::(package)"), "{s:?}");
+    }
+
+    #[test]
+    fn go_no_tests_to_run_in_every_package_is_noted() {
+        let (r, _) = feed_all(
+            "testing: warning: no tests to run\nPASS\nok  \texample.com/m/p\t0.001s [no tests to run]\n",
+        );
+        assert!(r.go_no_tests_only());
+        let (r, _) = feed_all(concat!(
+            "ok  \texample.com/m/p\t0.001s [no tests to run]\n",
+            "ok  \texample.com/m/q\t0.001s\n",
+        ));
+        assert!(!r.go_no_tests_only());
+        let (r, _) = feed_all(
+            "ok  \texample.com/m/p\t0.001s [no tests to run]\n?   \texample.com/m/c\t[no test files]\n",
+        );
+        assert!(r.go_no_tests_only());
     }
 }

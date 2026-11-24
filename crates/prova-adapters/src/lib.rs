@@ -379,7 +379,12 @@ impl Observer for Ladder {
                 .contradictions
                 .push(format!("the build says it failed: {line:?}"));
         }
-        if seen == 0 && self.expect_tests {
+        if seen == 0 && self.expect_tests && self.live.go_no_tests_only() {
+            // A `-run` that matches nothing: `ok pkg [no tests to run]`.
+            report.contradictions.push(
+                "the framework says no test ran: go test reported `[no tests to run]` in every package (a -run filter that matches nothing?)".into(),
+            );
+        } else if seen == 0 && self.expect_tests {
             match &self.live.no_tests_line {
                 // One package without test files is normal when others
                 // printed `ok` (round 10: a `cmd/` dir failed a green run).
@@ -419,6 +424,14 @@ impl Observer for Ladder {
         let passes_seen = outcomes
             .values()
             .any(|o| *o == prova_core::model::Outcome::Passed);
+        if self.live.total() > seen && self.live.prints_every_test() {
+            // The format shows each test as it runs: a count above what was
+            // shown means results are missing, not hidden by quiet output.
+            report.warnings.push(format!(
+                "the framework counted {} tests but its output showed only {seen}: the pass rests on the exit code for the rest",
+                self.live.total()
+            ));
+        }
         if self.live.total() > seen && passes_seen {
             report.events.push(EventKind::RunNote {
                 message: format!(
