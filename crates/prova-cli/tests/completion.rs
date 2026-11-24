@@ -72,3 +72,33 @@ fn tab_offers_suites_and_runs_and_creates_nothing() {
     let runs = complete(&d, &["output", ""]);
     assert!(runs.contains(&id), "{runs:?}");
 }
+
+/// Round 14: test names did not complete, where typos and ambiguous names
+/// happen (`--select`, `history`, `quarantine`).
+#[test]
+fn tab_offers_test_names() {
+    let d = workspace("tests");
+    let repo = d.join("repo");
+    let ran = Command::new(PROVA)
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test calc::adds ... ok'; echo 'test calc::divides ... ok'",
+        ])
+        .current_dir(&repo)
+        .env("PROVA_HOME", d.join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+    assert_eq!(complete(&d, &["history", "calc::d"]), ["calc::divides"]);
+    assert_eq!(
+        complete(&d, &["quarantine", "add", "calc::a"]),
+        ["calc::adds"]
+    );
+}

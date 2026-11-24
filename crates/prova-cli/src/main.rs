@@ -63,6 +63,7 @@ Example:
   prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"")]
     Add {
         /// The test's full name, or a substring that matches one test.
+        #[arg(add = ArgValueCompleter::new(complete_tests))]
         test: String,
         /// Why it is set aside (shown in every run that touches it).
         #[arg(long)]
@@ -91,6 +92,7 @@ Example:
   prova quarantine remove calc::flaky_clock")]
     Remove {
         /// The quarantined test's name, or a substring that matches one.
+        #[arg(add = ArgValueCompleter::new(complete_quarantined))]
         test: String,
     },
 }
@@ -128,7 +130,7 @@ Examples:
         #[arg(add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
         /// Run only tests matching this filter (uses the suite's `select`).
-        #[arg(long, value_name = "TEST")]
+        #[arg(long, value_name = "TEST", add = ArgValueCompleter::new(complete_tests))]
         select: Option<String>,
         /// Return the run id immediately; follow with `prova wait`.
         #[arg(long, conflicts_with = "until")]
@@ -265,7 +267,7 @@ Examples:
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
         /// One failing test's own output (substring of its name).
-        #[arg(long, value_name = "TEST")]
+        #[arg(long, value_name = "TEST", add = ArgValueCompleter::new(complete_tests))]
         test: Option<String>,
         /// JSON instead of text.
         #[arg(long)]
@@ -279,6 +281,7 @@ Examples:
   prova history \"\"                      every test prova knows")]
     History {
         /// Substring of the test's full name.
+        #[arg(add = ArgValueCompleter::new(complete_tests))]
         test: String,
         /// Only runs of this suite.
         #[arg(long, add = ArgValueCompleter::new(complete_suites))]
@@ -809,6 +812,41 @@ fn complete_runs(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     }
     out.retain(|c| c.get_value().to_string_lossy().starts_with(prefix.as_ref()));
     out
+}
+
+/// Test names prova has seen, by prefix (round 14: typos and ambiguous
+/// names happen exactly where test names are typed).
+fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Some(store) = existing_store() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = store.conn().prepare(
+        "SELECT DISTINCT display FROM tests WHERE substr(display, 1, length(?1)) = ?1
+          ORDER BY display LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([prefix.as_ref()], |r| r.get::<_, String>(0))
+        .map(|rows| {
+            rows.filter_map(Result::ok)
+                .map(CompletionCandidate::new)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn complete_quarantined(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Some(store) = existing_store() else {
+        return Vec::new();
+    };
+    prova_core::quarantine::list(&store, false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.test.starts_with(prefix.as_ref()))
+        .map(|e| CompletionCandidate::new(e.test).help(Some(e.reason.into())))
+        .collect()
 }
 
 fn complete_experiments(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
