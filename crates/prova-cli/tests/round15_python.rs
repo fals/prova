@@ -184,3 +184,29 @@ fn sizes_say_when_the_tests_ran_through_a_container_client() {
     let h = stdout(&prova(&d, &["history", "test_one"]));
     assert!(h.contains("size: unknown (ran through docker"), "{h}");
 }
+
+/// Round 15: an injected stream the test process never wrote (a wrapper
+/// that does not forward the variable) was silent.
+#[test]
+fn an_injected_report_that_never_appears_is_warned_about() {
+    let d = workspace("inject-lost");
+    let v = json(&prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--inject",
+            "pytest-reportlog",
+            "--",
+            "sh",
+            "-c",
+            "echo 'tests/t.py::test_a PASSED  [100%]'",
+        ],
+    ));
+    let w = v["warnings"].to_string();
+    assert!(
+        w.contains("pytest-reportlog report was never written")
+            && w.contains("did not reach the test process"),
+        "{v}"
+    );
+}

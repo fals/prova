@@ -129,6 +129,21 @@ impl Observer for Ladder {
         }
         held.extend(self.live.finish());
         let mut report = self.files.on_exit(root, started_ms);
+        // An injected recipe's stream that never appeared: the variable did
+        // not reach the test process (round 15: `./dev` did not forward
+        // PYTEST_ADDOPTS).
+        for stream in &self.streams {
+            if !stream.path.exists() {
+                let name = stream.path.file_name().and_then(|n| n.to_str());
+                let recipe = inject::RECIPES
+                    .iter()
+                    .find(|r| r.stream == name)
+                    .map_or("injected", |r| r.name);
+                report.warnings.push(format!(
+                    "the {recipe} report was never written: the variable did not reach the test process (a wrapper or container?)"
+                ));
+            }
+        }
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
             report.events.extend(injected.events);
