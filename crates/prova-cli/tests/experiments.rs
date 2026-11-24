@@ -590,6 +590,11 @@ fn extra_metric_lines_void_the_comparison() {
         reason.contains("reported t 3x per trial, the baseline's 1x"),
         "{reason}"
     );
+    // Round 15: the trial output is kept, and the reason says how to read it.
+    assert!(reason.contains("prova exp log e "), "{reason}");
+    let log = prova(&d, &["exp", "log", "e"]);
+    let text = String::from_utf8_lossy(&log.stdout);
+    assert!(text.contains("== trial"), "{text}");
 }
 
 /// Round 8 red team: a process escaping the trial's group (setsid) kept
@@ -1258,4 +1263,44 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         last["reason"].as_str().unwrap().contains("vs fast"),
         "{last}"
     );
+}
+
+/// Round 15: an experiment that failed before any trial measured nothing,
+/// so it does not count toward "other experiments on this baseline"; and
+/// the protocol line says which files are protected.
+#[test]
+fn unmeasured_experiments_do_not_count_as_other_experiments() {
+    let d = repo("caveat-count", "0.3");
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e0",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "mem_kb",
+            "--oracle",
+            "false",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let st = prova(&d, &["exp", "status", "e0"]);
+    let shown = String::from_utf8_lossy(&st.stdout).into_owned();
+    assert!(
+        shown.contains("Cargo.toml") && shown.contains("Makefile"),
+        "{shown}"
+    );
+    assert!(prova(&d, &["exp", "candidate", "e0"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e0", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    new_exp(&d, &["--metric", "mem_kb"]);
+    std::fs::write(d.join("delay"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let caveats = r["comparison"]["result"]["caveats"].to_string();
+    assert!(!caveats.contains("other experiment"), "{r}");
 }

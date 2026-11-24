@@ -346,10 +346,43 @@ pub fn become_subreaper() {}
 /// behind by a workload.
 #[cfg(target_os = "linux")]
 pub fn reap_orphans() -> Vec<String> {
-    let me = std::process::id();
+    // A sandbox's own `bwrap` may still be tearing down after its child
+    // ended: wait briefly for it (bounded) instead of calling it a leftover.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while children_of_me()
+        .iter()
+        .any(|(_, comm, state)| comm == "bwrap" && state != "Z")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let mut found = Vec::new();
+    for (pid, comm, state) in children_of_me() {
+        let Some(p) = Pid::from_raw(pid as i32) else {
+            continue;
+        };
+        if state != "Z" {
+            // The sandbox is infrastructure, not the workload's leftover;
+            // it is still killed.
+            if comm != "bwrap" {
+                found.push(format!("{pid} {comm}"));
+            }
+            // Its own group too: it may have started more.
+            let _ = rustix::process::kill_process_group(p, Signal::KILL);
+            let _ = rustix::process::kill_process(p, Signal::KILL);
+        }
+        let _ = rustix::process::waitpid(Some(p), rustix::process::WaitOptions::empty());
+    }
+    found
+}
+
+/// (pid, comm, state) of this process's children.
+#[cfg(target_os = "linux")]
+fn children_of_me() -> Vec<(u32, String, String)> {
+    let me = std::process::id();
+    let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
-        return found;
+        return out;
     };
     for entry in dir.flatten() {
         let Some(pid) = entry
@@ -371,20 +404,11 @@ pub fn reap_orphans() -> Vec<String> {
         else {
             continue;
         };
-        if ppid != me {
-            continue;
-        }
-        if let Some(p) = Pid::from_raw(pid as i32) {
-            if *state != "Z" {
-                found.push(format!("{pid} {comm}"));
-                // Its own group too: it may have started more.
-                let _ = rustix::process::kill_process_group(p, Signal::KILL);
-                let _ = rustix::process::kill_process(p, Signal::KILL);
-            }
-            let _ = rustix::process::waitpid(Some(p), rustix::process::WaitOptions::empty());
+        if ppid == me {
+            out.push((pid, comm, (*state).to_owned()));
         }
     }
-    found
+    out
 }
 
 #[cfg(not(target_os = "linux"))]

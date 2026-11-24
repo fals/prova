@@ -391,14 +391,15 @@ pub fn judge(
     // cut there rather than print a bare +100.0% (round 8).
     let capped = primary.better == Better::Lower && hi >= 1.0;
     let ci = format!(
-        "[{}, {}{}], positive = better",
+        "[{}, {}{}]{}, positive = better",
         pct(lo),
         pct(hi),
         if capped {
             " (upper bound cut at 100%: the interval of differences reaches the whole baseline median, i.e. the candidate is far better, not that it takes no time)"
         } else {
             ""
-        }
+        },
+        ratio_interval(primary.better, lo, hi)
     );
     // The change as a ratio of medians ("37.6x"), easier to read than +97%.
     let (b, c) = (primary.baseline_median, primary.candidate_median);
@@ -1156,6 +1157,17 @@ pub fn work(
     result.and(cleaned)
 }
 
+/// The latest complete trial of each arm of a comparison.
+fn last_trial_seqs(store: &Store, comparison: &str) -> Result<Vec<u32>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT MAX(seq) FROM trials WHERE comparison = ?1 AND state = 'complete' GROUP BY arm ORDER BY arm",
+    )?;
+    let v = stmt
+        .query_map(params![comparison], |r| r.get::<_, Option<u32>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(v.into_iter().flatten().collect())
+}
+
 /// After a comparison (ADR 0016): the logs of what failed (a trial, the
 /// setup) and the oracle's logs are kept as excerpts in the store; the log directory
 /// and the baseline worktrees are removed.
@@ -1174,6 +1186,15 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
             .collect::<rusqlite::Result<_>>()?
     };
     let mut keep: Vec<String> = failed_trials.iter().map(|s| s.to_string()).collect();
+    // A comparison that failed after complete trials (metrics unread or
+    // miscounted) keeps each arm's latest trial: the output to read.
+    if status == "failed" {
+        for seq in last_trial_seqs(store, comparison)? {
+            if !keep.contains(&seq.to_string()) {
+                keep.push(seq.to_string());
+            }
+        }
+    }
     for arm in ["baseline", "candidate"] {
         if status == "failed" {
             keep.push(format!("setup-{arm}"));
@@ -1524,8 +1545,18 @@ fn work_comparison(
             let usual = |v: &Vec<usize>| v.iter().copied().max().unwrap_or(0);
             let (b, c) = (usual(&l[0]), usual(&l[1]));
             if b != c || l[1].iter().any(|n| *n != c) {
+                let seqs = last_trial_seqs(store, comparison)?
+                    .iter()
+                    .map(|s| format!("`prova exp log {exp} {s}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                let see = if seqs.is_empty() {
+                    String::new()
+                } else {
+                    format!("; the last trial of each arm is kept: {seqs}")
+                };
                 let reason = format!(
-                    "the candidate's workload reported {} {}x per trial, the baseline's {b}x: extra lines are forged output, missing ones a changed workload; the comparison is void",
+                    "the candidate's workload reported {} {}x per trial, the baseline's {b}x: extra lines are forged output, missing ones a changed workload (or a unit the reader does not know); the comparison is void{see}",
                     p.metric, c
                 );
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
@@ -1563,7 +1594,9 @@ fn work_comparison(
             let others: i64 = store.conn().query_row(
                 "SELECT COUNT(DISTINCT x.name) FROM experiments x JOIN variants v ON v.experiment = x.name
                   WHERE v.name = 'baseline' AND v.commit_sha = ?1 AND x.name <> ?2
-                    AND json_extract(x.protocol, '$.metric') = ?3",
+                    AND json_extract(x.protocol, '$.metric') = ?3
+                    AND EXISTS (SELECT 1 FROM samples s JOIN comparisons k ON k.id = s.comparison
+                                 WHERE k.experiment = x.name)",
                 params![sha, exp, p.metric],
                 |r| r.get(0),
             )?;
@@ -2289,8 +2322,10 @@ fn satisfies_spec(
     // reported as the baseline trial's leak).
     let left = process::reap_orphans();
     if let Some(l) = left.first() {
-        return Ok(Err(SpecFail::Violated(format!(
-            "the oracle left process {l} running after it ended; it would disturb the trials"
+        // Not a verdict on the code: a process outliving its oracle is the
+        // sandbox or the environment (round 15).
+        return Ok(Err(SpecFail::Infra(format!(
+            "the oracle left process {l} running after it ended (an infrastructure problem, not a verdict on the code); it would disturb the trials: stop what starts it, or run the oracle in the foreground"
         ))));
     }
     if ok {
@@ -2320,8 +2355,9 @@ fn satisfies_spec(
         ""
     };
     // The decisive line, so the reader need not open the log.
-    let last = decisive_line(&text)
-        .map(|l| l.chars().take(200).collect::<String>())
+    let last = failing_test_lines(&text)
+        .or_else(|| decisive_line(&text).map(str::to_owned))
+        .map(|l| l.chars().take(300).collect::<String>())
         .unwrap_or_else(|| format!("oracle `{oracle}` failed, printing nothing"));
     Ok(Err(SpecFail::Violated(format!(
         "{last} (full log: prova exp log <experiment> {arm_log}){hint}"
@@ -2340,6 +2376,39 @@ fn is_generic_trailer(l: &str) -> bool {
         || low.starts_with("error: process completed")
         || low.starts_with("error: process exited")
         || low.starts_with("error: command failed")
+        // cargo's own trailers after a failing test binary
+        || low.starts_with("error: test failed, to rerun")
+        || low.starts_with("error: could not compile")
+        || low.starts_with("failures:")
+        || low.starts_with("test result: failed")
+}
+
+/// The most specific failure in an oracle's output: the failing test with
+/// its assertion (`---- t stdout ----` and its `panicked at` lines, or a
+/// `test t ... FAILED` line), when the output has one.
+fn failing_test_lines(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    if let Some(i) = lines
+        .iter()
+        .position(|l| l.starts_with("---- ") && l.ends_with(" ----"))
+    {
+        let body: Vec<&str> = lines[i + 1..]
+            .iter()
+            .copied()
+            .take_while(|l| !(l.starts_with("---- ") || l.starts_with("failures:")))
+            .filter(|l| !l.is_empty() && !l.starts_with("note: run with"))
+            .take(4)
+            .collect();
+        return Some(format!(
+            "{}: {}",
+            lines[i].trim_matches(|c| c == '-' || c == ' '),
+            body.join(" ")
+        ));
+    }
+    lines
+        .iter()
+        .find(|l| l.starts_with("test ") && l.ends_with("FAILED"))
+        .map(|l| (*l).to_owned())
 }
 
 /// The most informative line of a failed oracle's output: the last one that
@@ -2357,6 +2426,27 @@ fn decisive_line(text: &str) -> Option<&str> {
 enum SpecFail {
     Violated(String),
     Infra(String),
+}
+
+/// A large improvement as a ratio interval ("12.0x to 14.3x faster"): a
+/// percentage squeezed against 100% hides how big the change is.
+fn ratio_interval(better: Better, lo: f64, hi: f64) -> String {
+    let (rlo, rhi) = match better {
+        Better::Lower if lo >= 0.5 => (
+            1.0 / (1.0 - lo),
+            if hi < 1.0 {
+                Some(1.0 / (1.0 - hi))
+            } else {
+                None
+            },
+        ),
+        Better::Higher if lo >= 1.0 => (1.0 + lo, Some(1.0 + hi)),
+        _ => return String::new(),
+    };
+    match rhi {
+        Some(h) => format!(" = {rlo:.1}x to {h:.1}x better"),
+        None => format!(" = at least {rlo:.1}x better"),
+    }
 }
 
 fn fingerprint_of(store: &Store, comparison: &str, seq: u32) -> Result<String> {
@@ -2888,6 +2978,37 @@ mod load_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oracle_failure_quotes_the_failing_test_not_cargos_trailer() {
+        let log = "running 2 tests\ntest ok_one ... ok\ntest count_primes_small_values ... FAILED\n\nfailures:\n\n---- count_primes_small_values stdout ----\nthread 'x' panicked at tests/primes.rs:9:5:\nassertion `left == right` failed\n  left: 1\n right: 0\n\nfailures:\n    count_primes_small_values\n\ntest result: FAILED. 1 passed; 1 failed\nerror: test failed, to rerun pass `--test primes`\n";
+        let q = failing_test_lines(log).unwrap();
+        assert!(q.contains("count_primes_small_values stdout"), "{q}");
+        assert!(q.contains("panicked at tests/primes.rs"), "{q}");
+        assert!(q.contains("assertion"), "{q}");
+        assert!(!q.contains("to rerun"), "{q}");
+        assert_eq!(
+            failing_test_lines("test a ... ok\ntest b ... FAILED\n").unwrap(),
+            "test b ... FAILED"
+        );
+    }
+
+    #[test]
+    fn large_improvements_also_read_as_a_ratio() {
+        assert_eq!(
+            ratio_interval(Better::Lower, 0.916, 1.0),
+            " = at least 11.9x better"
+        );
+        assert_eq!(
+            ratio_interval(Better::Lower, 0.9, 0.95),
+            " = 10.0x to 20.0x better"
+        );
+        assert_eq!(ratio_interval(Better::Lower, 0.1, 0.3), "");
+        assert_eq!(
+            ratio_interval(Better::Higher, 1.0, 3.0),
+            " = 2.0x to 4.0x better"
+        );
+    }
+
     use super::decisive_line;
 
     #[test]
