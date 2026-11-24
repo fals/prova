@@ -1650,6 +1650,17 @@ fn observe_child(
             quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
     {
         outcome = Outcome::Passed;
+        // make stopped at the failing test step: the steps after it never
+        // ran, so the pass verified nothing of them (round 16: a vet step
+        // after the tests was never seen).
+        if let Some((_, line, _)) = sup.distiller.error_lines().0.iter().find(|(_, l, _)| {
+            l.trim_start().starts_with("make: ***") || l.trim_start().starts_with("make[")
+        }) {
+            warnings.push(format!(
+                "the command stopped at the failing test step ({}): any step after it did not run",
+                line.trim()
+            ));
+        }
         sup.emit(EventKind::RunNote {
             message: format!(
                 "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
@@ -2093,6 +2104,17 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
     {
         return true;
     }
+    // gotestsum's package summary, `✖  pkg (1.5s)`: red because a test of
+    // it failed (round 16: every quarantined pass under gotestsum failed on
+    // it). A package's own failure is an errored `(package)` entry.
+    if let Some(rest) = t.strip_prefix('\u{2716}') {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        return match words.as_slice() {
+            [_pkg] => true,
+            [_pkg, time] => time.starts_with('(') && time.ends_with("s)"),
+            _ => false,
+        };
+    }
     // go: `FAIL\tpkg\t0.01s` (a package's result, not a build failure).
     if (t.starts_with("FAIL\t") || t.starts_with("FAIL "))
         && !t.contains('[')
@@ -2140,7 +2162,10 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
         && let Some((target, _)) = rest.split_once(']')
     {
         let target = target.rsplit(':').next().unwrap_or(target).trim();
-        return !target.is_empty() && command.split_whitespace().any(|w| w == target);
+        return !target.is_empty()
+            && command
+                .split_whitespace()
+                .any(|w| w.trim_matches([';', '&', '|', '"', '\'', '(', ')']) == target);
     }
     false
 }

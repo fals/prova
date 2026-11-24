@@ -601,3 +601,60 @@ fn a_narrow_suite_is_not_warned_about_another_modules_flaky_test() {
     let out = text(&run(&d, "narrow", "pass"));
     assert!(!out.contains("did not run"), "{out}");
 }
+
+/// Round 16: under gotestsum's default output, its red package line for
+/// the quarantined test's package was "an error outside the quarantined
+/// test(s)", so a quarantine never applied; and a pass behind make's stop
+/// at the test step did not say later steps never ran.
+#[test]
+fn a_quarantine_applies_under_gotestsum_and_says_what_make_skipped() {
+    let d = workspace("gts-q");
+    let script = |flaky_fails: bool| {
+        let verdict = if flaky_fails { "fail" } else { "pass" };
+        let ev = |test: Option<&str>| match test {
+            Some(t) => format!(
+                r#"{{"Action":"{verdict}","Package":"example.com/calc","Test":"{t}","Elapsed":0}}"#
+            ),
+            None => format!(r#"{{"Action":"{verdict}","Package":"example.com/calc","Elapsed":0}}"#),
+        };
+        let pass_add =
+            r#"{"Action":"pass","Package":"example.com/calc","Test":"TestAdd","Elapsed":0}"#;
+        let json = format!(
+            "printf '%s\\n' '{pass_add}' '{}' '{}' >> \"$GOTESTSUM_JSONFILE\";",
+            ev(Some("TestFlaky")),
+            ev(None)
+        );
+        let text = if flaky_fails {
+            "printf '%s\\n' '\u{2716}  . (1.503s)' '' '=== Failed' '=== FAIL: . TestFlaky (0.00s)' '    calc_test.go:23: tick' '' 'DONE 2 tests, 1 failure in 0.1s' 'make: *** [Makefile:2: test] Error 1'; exit 2"
+        } else {
+            "printf '%s\\n' '\u{2713}  . (1.503s)' '' 'DONE 2 tests in 0.1s'"
+        };
+        format!("{BUSY} : make test; {json} {text}")
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.flake]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n\n[suite.ok]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n",
+            script(true),
+            script(false)
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("go.mod"), "module example.com/calc\n").unwrap();
+    prova(&d, &["run", "ok"]);
+    prova(&d, &["run", "flake"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/calc::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "flake"]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{t}");
+    assert!(t.contains("any step after it did not run"), "{t}");
+}
