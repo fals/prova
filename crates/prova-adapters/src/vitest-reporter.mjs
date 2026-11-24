@@ -84,4 +84,31 @@ export default class ProvaReporter {
       stack: stack || undefined,
     });
   }
+
+  // A test file that fails to load (an import error, a syntax error) has no
+  // test to fail: Vitest reports the file itself as failed, and the default
+  // reporter prints "FAIL file [ file ]". It is one errored entry, named
+  // `file::(file)` like a Go package that fails to build.
+  onFinished(files) {
+    for (const file of files ?? []) {
+      if (file.result?.state !== "fail") continue;
+      const errors = file.result.errors ?? [];
+      if (errors.length === 0 && hasFailedTest(file)) continue;
+      const message = errors.map((e) => e.message).join("\n") || "the test file failed to run";
+      const stack = errors.map((e) => e.stack).filter(Boolean).join("\n");
+      this.write({
+        type: "test",
+        name: "(file)",
+        file: relative(this.root, file.filepath),
+        event: "failed",
+        message,
+        stack: stack || undefined,
+      });
+    }
+  }
+}
+
+function hasFailedTest(task) {
+  if (task.type === "test" || task.type === "custom") return task.result?.state === "fail";
+  return (task.tasks ?? []).some(hasFailedTest);
 }

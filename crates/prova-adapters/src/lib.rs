@@ -336,6 +336,14 @@ impl Observer for Ladder {
                 "the framework reported {failed_reported} failed test(s) but prova recorded {failed_seen}: its summary is believed over its exit code"
             ));
         }
+        // A test file that fails to load fails no test: its framework counts
+        // it as a failed file (Jest `Test Suites:`, Vitest `Test Files`).
+        if self.live.suites_failed > 0 && failed_seen == 0 {
+            report.contradictions.push(format!(
+                "the framework reported {} failed test file(s) but no failing test: a file that failed to load (an import error?)",
+                self.live.suites_failed
+            ));
+        }
         // The build itself says it failed or crashed, whatever the exit code
         // (round 10: `mvn -fn`, a forked JVM that died, a crashed class).
         // nextest counts a test that exited 0 early as passed; its captured
@@ -467,7 +475,9 @@ mod tests {
             streams: Vec::new(),
             expect_tests: true,
         };
-        let live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        // A pytest pass is held one line (a teardown error may follow).
+        let mut live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        live.extend(ladder.on_line("", 0));
         assert!(matches!(
             live.last(),
             Some(EventKind::TestFinished {

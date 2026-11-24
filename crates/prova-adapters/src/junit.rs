@@ -114,6 +114,21 @@ struct Current {
     retries: Vec<Attempt>,
 }
 
+/// A `<testsuite>` being read: what its header says failed, and what its
+/// test cases show.
+#[derive(Default)]
+struct Frame {
+    header_failed: u64,
+    cases_failed: u64,
+    has_child_suite: bool,
+}
+
+fn header_count(e: &BytesStart<'_>, name: &[u8]) -> u64 {
+    attr(e, name)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Which child element's text we are collecting.
 enum Text {
     None,
@@ -124,12 +139,38 @@ enum Text {
 fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
     let mut r = Reader::from_str(xml);
     let mut suites: Vec<String> = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
     let mut cur: Option<Current> = None;
     let mut text = Text::None;
     let mut buf = String::new();
     let mut out = Vec::new();
 
-    let finish = |c: Current, suites: &[String], out: &mut Vec<Case>| {
+    // A suite whose header says more tests failed than its test cases show
+    // (a class that failed to initialize, a `ignoreFailures` build): the
+    // gap is an error of the suite itself.
+    let close_suite = |f: Frame, name: &str, out: &mut Vec<Case>| {
+        if !f.has_child_suite && f.header_failed > f.cases_failed {
+            out.push(Case {
+                key: TestKey::new(vec![name.to_owned()], "(suite)"),
+                attempts: vec![Attempt {
+                    outcome: Outcome::Errored,
+                    duration_ms: None,
+                    message: Some(format!(
+                        "the suite's header counts {} failure(s) or error(s) but its test cases show {}: a setup or class initialization error?",
+                        f.header_failed, f.cases_failed
+                    )),
+                }],
+                output: None,
+            });
+        }
+    };
+
+    let finish = |c: Current, suites: &[String], out: &mut Vec<Case>, frames: &mut [Frame]| {
+        if let Some(f) = frames.last_mut()
+            && c.final_kind.is_some_and(|k| k.is_failure())
+        {
+            f.cases_failed += 1;
+        }
         let path = match &c.classname {
             Some(cn) if !cn.is_empty() && *cn != c.name => vec![cn.clone()],
             _ => suites.last().cloned().into_iter().collect(),
@@ -163,7 +204,23 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                 let empty = matches!(ev, Event::Empty(_));
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"testsuite" if !empty => suites.push(attr(e, b"name").unwrap_or_default()),
+                    b"testsuite" => {
+                        if let Some(parent) = frames.last_mut() {
+                            parent.has_child_suite = true;
+                        }
+                        let f = Frame {
+                            header_failed: header_count(e, b"failures")
+                                + header_count(e, b"errors"),
+                            ..Frame::default()
+                        };
+                        let name = attr(e, b"name").unwrap_or_default();
+                        if empty {
+                            close_suite(f, &name, &mut out);
+                        } else {
+                            suites.push(name);
+                            frames.push(f);
+                        }
+                    }
                     b"testcase" => {
                         let c = Current {
                             name: attr(e, b"name").unwrap_or_default(),
@@ -173,7 +230,7 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                             ..Current::default()
                         };
                         if empty {
-                            finish(c, &suites, &mut out);
+                            finish(c, &suites, &mut out, &mut frames);
                         } else {
                             cur = Some(c);
                         }
@@ -231,11 +288,14 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
             }
             Event::End(e) => match e.local_name().as_ref() {
                 b"testsuite" => {
-                    suites.pop();
+                    let name = suites.pop().unwrap_or_default();
+                    if let Some(f) = frames.pop() {
+                        close_suite(f, &name, &mut out);
+                    }
                 }
                 b"testcase" => {
                     if let Some(c) = cur.take() {
-                        finish(c, &suites, &mut out);
+                        finish(c, &suites, &mut out, &mut frames);
                     }
                 }
                 b"failure" | b"error" | b"skipped" => {
@@ -409,6 +469,31 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Round 14: a suite's header counts an error no test case shows (a
+    /// class that failed to initialize; Gradle `ignoreFailures`).
+    #[test]
+    fn a_suite_header_with_more_failures_than_cases_is_an_error() {
+        let xml = r#"<testsuite name="com.acme.CalcTest" tests="3" errors="1" failures="0">
+            <testcase classname="com.acme.CalcTest" name="adds" time="0.1"/>
+            <testcase classname="com.acme.CalcTest" name="subs" time="0.1"/>
+            <system-err>java.lang.ExceptionInInitializerError</system-err></testsuite>"#;
+        let cases = parse(xml).unwrap();
+        assert_eq!(
+            outcomes(&cases),
+            vec![
+                ("com.acme.CalcTest::adds".into(), vec![Outcome::Passed]),
+                ("com.acme.CalcTest::subs".into(), vec![Outcome::Passed]),
+                ("com.acme.CalcTest::(suite)".into(), vec![Outcome::Errored]),
+            ]
+        );
+        // A header that agrees with its cases adds nothing.
+        let ok = r#"<testsuite name="s" tests="2" failures="1"><testcase classname="s" name="a"><failure message="x"/></testcase><testcase classname="s" name="b"/></testsuite>"#;
+        assert_eq!(parse(ok).unwrap().len(), 2);
+        // Nested suites: only the leaf's own header counts.
+        let nested = r#"<testsuites><testsuite name="outer" failures="1"><testsuite name="inner" failures="1"><testcase classname="i" name="a"><failure message="x"/></testcase></testsuite></testsuite></testsuites>"#;
+        assert_eq!(parse(nested).unwrap().len(), 1);
     }
 
     #[test]
