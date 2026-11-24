@@ -2704,6 +2704,9 @@ fn repeat_runs(
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     let mut quarantined = std::collections::BTreeSet::new();
+    let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
+    // Runs in which each test had a result.
+    let mut seen_in: std::collections::BTreeMap<String, u32> = Default::default();
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2726,10 +2729,24 @@ fn repeat_runs(
         }
         any_failed |= s.outcome != Some(Outcome::Passed);
         let ran = s.counts.results();
-        if ran == 0 {
+        // Quiet output: the framework counted tests prova did not see one
+        // by one; that is not "no test ran" (round 15).
+        let counted = s.framework.is_some_and(|(t, _)| t > 0);
+        if ran == 0 && !counted {
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
             failed_otherwise += 1;
+        }
+        if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
+            quiet += 1;
+        }
+        // A pass that proved little (cached results, warnings) is no
+        // evidence of a steady test (round 15: "every test passed every
+        // time" over replayed go test results).
+        if s.outcome == Some(Outcome::Passed)
+            && (!s.warnings.is_empty() || s.verified == Some(false))
+        {
+            unverified.push(id.clone());
         }
         // A result re-keyed under another name (a Go test once its package
         // is known) counts under that name only (round 15: tallied twice).
@@ -2747,7 +2764,11 @@ fn repeat_runs(
                 _ => {}
             }
         }
+        let mut this_run = std::collections::BTreeSet::new();
         for (_, display, outcome) in results.into_iter().filter(|(u, _, _)| !gone.contains(u)) {
+            if this_run.insert(display.clone()) {
+                *seen_in.entry(display.clone()).or_default() += 1;
+            }
             let t = tally.entry(display).or_default();
             if outcome.is_failure() {
                 t.1 += 1;
@@ -2822,11 +2843,34 @@ fn repeat_runs(
             } else {
                 ""
             };
-            println!("  FAIL {}{q}: failed every time", render::clean(t));
+            // Failing whenever seen is "every time" only if it was seen in
+            // every run (round 15: quiet output hid its passes).
+            let seen = seen_in.get(*t).copied().unwrap_or(0);
+            if seen < done {
+                println!(
+                    "  FAIL {}{q}: failed each of the {seen} time(s) it was seen; no result in the other {} run(s) (quiet output shows only failures)",
+                    render::clean(t),
+                    done - seen
+                );
+            } else {
+                println!("  FAIL {}{q}: failed every time", render::clean(t));
+            }
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
         if no_tests > 0 {
             println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
+        }
+        if quiet > 0 {
+            println!(
+                "  {quiet} of {done} run(s) showed only some tests one by one (quiet output): passes there were not seen"
+            );
+        }
+        if !unverified.is_empty() {
+            println!(
+                "  {} of {done} pass(es) verified little (warnings; e.g. cached results): {}",
+                unverified.len(),
+                unverified.join(", ")
+            );
         }
         if failed_otherwise > 0 {
             println!(
@@ -2835,7 +2879,13 @@ fn repeat_runs(
         }
         if tally.is_empty() {
             // Nothing to say about tests.
-        } else if mixed.is_empty() && always.is_empty() && no_tests == 0 && failed_otherwise == 0 {
+        } else if mixed.is_empty()
+            && always.is_empty()
+            && no_tests == 0
+            && failed_otherwise == 0
+            && quiet == 0
+            && unverified.is_empty()
+        {
             println!("  every test passed every time");
         } else if mixed.is_empty() && always.is_empty() {
             println!("  {steady} test(s) passed whenever they ran");

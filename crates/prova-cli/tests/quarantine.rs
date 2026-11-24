@@ -349,3 +349,36 @@ fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
     let o = prova(&d, &["run", "only"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
 }
+
+/// Round 15: `--repeat` over quiet output said a test that failed once in
+/// five runs "failed every time" and that four runs "ran no test"; over
+/// passes that proved little (cached results) it said "every test passed
+/// every time".
+#[test]
+fn repeat_tallies_say_what_was_not_seen() {
+    let d = workspace("repeat-quiet");
+    let quiet = format!(
+        "{BUSY} n=$(cat n 2>/dev/null || echo 0); n=$((n+1)); echo $n > n; \
+         if [ $((n % 2)) -eq 1 ]; then echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 2 passed; 1 failed; 0 ignored'; exit 101; \
+         else echo 'test result: ok. 3 passed; 0 failed; 0 ignored'; fi"
+    );
+    let idle = "echo 'test calc::y ... ok'".to_owned();
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.quiet]\nrun = {quiet:?}\n\n[suite.idle]\nrun = {idle:?}\n"),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "quiet", "--repeat", "4"]));
+    assert!(
+        out.contains("failed each of the 2 time(s) it was seen; no result in the other 2 run(s)")
+            && !out.contains("ran no test")
+            && !out.contains("failed every time"),
+        "{out}"
+    );
+    let out = text(&prova(&d, &["run", "idle", "--repeat", "2"]));
+    assert!(
+        out.contains("2 of 2 pass(es) verified little")
+            && !out.contains("every test passed every time"),
+        "{out}"
+    );
+}
