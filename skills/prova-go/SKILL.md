@@ -13,9 +13,9 @@ description: Gives the go test flags and prova.toml settings that let prova see 
   natively: per-test start, result, duration and the failure output.
 - gotestsum: its text (default `pkgname`, or `testname`) is recognized,
   failures and build errors included; the default shows only failures, so
-  add `inject = ["gotestsum-json"]` to the suite: prova then reads
-  gotestsum's own event stream (every test, with packages), and ignores
-  its text.
+  `prova adopt` proposes `inject = ["gotestsum-json"]` for the suite: prova
+  then reads gotestsum's own event stream (every test, with packages), and
+  ignores its text.
 - Plain `go test ./...` (often in `make test`) prints only failures;
   `go test -v` prints every test and is recognized live too.
 - Single test: `select = "go test -json -count=1 -run {filter} ./..."`.
