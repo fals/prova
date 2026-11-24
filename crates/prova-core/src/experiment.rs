@@ -2341,7 +2341,7 @@ fn decisive_line(text: &str) -> Option<&str> {
     let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty());
     lines()
         .rfind(|l| !is_generic_trailer(l))
-        .or_else(|| lines().last())
+        .or_else(|| lines().next_back())
 }
 
 /// Why a variant does not satisfy the specification: it does not, or the
