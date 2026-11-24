@@ -682,3 +682,22 @@ fn a_refusal_under_quiet_output_says_passes_were_only_counted() {
         "{t}"
     );
 }
+
+/// Round 16: history said "none of them passed" when earlier runs had
+/// passed with a quarantined failure set aside.
+#[test]
+fn history_counts_passes_that_set_a_quarantine_aside() {
+    let d = workspace("setaside-hist");
+    suites(&d);
+    run(&d, "make", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    run(&d, "make", "fail");
+    let out = text(&run(&d, "make", "fail"));
+    assert!(
+        out.contains(
+            "none passed with every test passing; 2 passed with quarantined failures set aside"
+        ) || out.contains("1 passed with quarantined failures set aside"),
+        "{out}"
+    );
+    assert!(!out.contains("none of them passed"), "{out}");
+}

@@ -3367,6 +3367,17 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             "code": last.code,
         },
         "unverified_passes": unverified_passes,
+        // Passes that set a quarantined failure aside: no "last green", but
+        // passes all the same (round 16: "none of them passed").
+        "set_aside_passes": prev
+            .iter()
+            .filter(|r| {
+                r.status == Status::Finished
+                    && r.outcome == Some(Outcome::Passed)
+                    && r.exit_code.is_some_and(|c| c != 0)
+            })
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>(),
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),

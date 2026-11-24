@@ -486,6 +486,14 @@ fn history_line(h: &serde_json::Value) -> String {
                 o["run"].as_str().unwrap_or("?")
             ),
             None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+                0 if h["set_aside_passes"].as_array().is_some_and(|a| !a.is_empty()) => {
+                    let a = h["set_aside_passes"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    format!(
+                        "none passed with every test passing; {} passed with quarantined failures set aside (last: run {})",
+                        a.len(),
+                        a[0].as_str().unwrap_or("?")
+                    )
+                }
                 0 => "none of them passed".into(),
                 // (round 12: "none of them passed; on this exact code: passed?")
                 u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
