@@ -1976,6 +1976,9 @@ pub struct Summary {
     /// Tests running now (started, not finished), oldest first; at most 10.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub running: Vec<String>,
+    /// How long each test of `running` has been running, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub running_for_ms: Vec<u64>,
     /// The framework's own count (tests, failed), when it printed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<(u64, u64)>,
@@ -2615,6 +2618,19 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         last_seq,
         elapsed_ms: end.saturating_sub(row.started_ms.unwrap_or(row.created_ms)),
         counts,
+        // How long each has been running: a test running for 30 s that
+        // usually takes milliseconds is the hang, before any budget says so
+        // (round 14).
+        running_for_ms: if row.status.is_terminal() {
+            Vec::new()
+        } else {
+            let now = now_ms();
+            running
+                .iter()
+                .take(10)
+                .map(|(u, _)| started_at.get(u).map_or(0, |t| now.saturating_sub(*t)))
+                .collect()
+        },
         running: if row.status.is_terminal() {
             Vec::new()
         } else {

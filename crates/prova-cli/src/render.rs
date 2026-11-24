@@ -176,7 +176,19 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         );
     }
     if !s.running.is_empty() && s.reason != WaitReason::Failure {
-        let names: Vec<String> = s.running.iter().map(|t| clean(t)).collect();
+        let names: Vec<String> = s
+            .running
+            .iter()
+            .enumerate()
+            .map(|(i, t)| match s.running_for_ms.get(i) {
+                Some(ms) if *ms >= 1000 => format!(
+                    "{} (for {})",
+                    clean(t),
+                    format_duration(std::time::Duration::from_millis(*ms))
+                ),
+                _ => clean(t),
+            })
+            .collect();
         println!("running now: {}", names.join(", "));
     }
     for t in &s.slow {
@@ -1085,6 +1097,7 @@ mod live_tests {
                 ..Counts::default()
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
+            running_for_ms: vec![],
             framework: None,
             failures: vec![],
             stalled_ms: None,

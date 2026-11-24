@@ -180,7 +180,10 @@ impl RunSpec {
     }
 }
 
-pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(60);
+/// A quiet run of a suite with no declared size stalls after this long, as
+/// a small one does: `--until first-failure` (30 s) then catches a hang
+/// on its second wait at the latest (round 14: 60 s, two waits or more).
+pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30);
 pub const DEFAULT_KILL_AFTER: Duration = Duration::from_secs(3600);
 
 /// Workspace root: nearest ancestor with `prova.toml`, else with `.git`,

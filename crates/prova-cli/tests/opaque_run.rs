@@ -1001,3 +1001,19 @@ fn a_cancelled_run_has_no_test_outcome_in_the_list() {
         "{list}"
     );
 }
+
+/// Round 14: a wait that ended on its budget named the hung test without
+/// saying how long it had been running; the stall default for a suite of
+/// no declared size (60 s) outlasted two 30 s waits.
+#[test]
+fn a_wait_says_how_long_each_running_test_has_run() {
+    let d = workspace("runningfor");
+    let run = detach(&d, &[], "printf '=== RUN   TestHang\\n'; sleep 20");
+    let o = prova(&d, &["wait", &run, "--max-wait", "2s"]);
+    let out = stdout(&o);
+    assert!(out.contains("running now: TestHang (for "), "{out}");
+    let j = json(&prova(&d, &["status", &run, "--json"]));
+    assert!(j["running_for_ms"][0].as_u64().unwrap() >= 1000, "{j}");
+    prova(&d, &["cancel", &run]);
+    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 30);
+}
