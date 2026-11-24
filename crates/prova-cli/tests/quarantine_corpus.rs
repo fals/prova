@@ -227,7 +227,11 @@ fn probe(name: &str, edit: &dyn Fn(&str) -> String, why: &str) {
         .trim()
         .parse()
         .unwrap();
-    let d = workspace(&format!("probe-{name}-{}", why.len()));
+    // Unique per call: `cargo test` runs every probe in one process, at
+    // once, and two probes of one capture must not share a store.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let d = workspace(&format!("probe-{name}-{n}"));
     std::fs::write(d.join("base.txt"), &raw).unwrap();
     std::fs::write(d.join("edited.txt"), edit(&raw)).unwrap();
     let script = |f: &str| format!("{BUSY} cat {f}; exit {code}");
