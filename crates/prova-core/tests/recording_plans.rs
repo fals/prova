@@ -18,8 +18,9 @@ fn plan(s: &Store, sql: &str) -> String {
         .join("\n")
 }
 
-fn store() -> Store {
-    let d = std::env::temp_dir().join(format!("prova-plans-{}", std::process::id()));
+/// One store per test: `cargo test` runs both in one process, at once.
+fn store(name: &str) -> Store {
+    let d = std::env::temp_dir().join(format!("prova-plans-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     Store::open_dir(&d, &d.join("store")).unwrap()
@@ -27,7 +28,7 @@ fn store() -> Store {
 
 #[test]
 fn the_unverified_run_check_uses_an_index_on_warnings() {
-    let s = store();
+    let s = store("warnings");
     let p = plan(
         &s,
         "SELECT 1 FROM runs r3 WHERE NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id \
@@ -38,7 +39,7 @@ fn the_unverified_run_check_uses_an_index_on_warnings() {
 
 #[test]
 fn the_run_size_lookup_uses_an_index_on_run_sizes() {
-    let s = store();
+    let s = store("sizes");
     let p = plan(
         &s,
         "SELECT json_extract(e.payload, '$.size') FROM events e WHERE e.kind = 'run_size' \
