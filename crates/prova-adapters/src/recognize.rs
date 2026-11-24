@@ -21,6 +21,12 @@ pub struct Recognizers {
     /// Final outcome of every test reported so far:
     /// unique key -> (display name, outcome).
     pub seen: BTreeMap<String, (String, Outcome)>,
+    /// The Go module of the run's directory (go.mod), for packages printed
+    /// as `.`.
+    pub go_module: Option<String>,
+    /// The key each `seen` entry was reported under (unique key -> key):
+    /// a result superseded later names the test it was stored as.
+    pub seen_keys: BTreeMap<String, TestKey>,
     /// Vitest: current test file header, and a failure held for its message.
     vitest_file: Option<String>,
     vitest_pending: Option<EventKind>,
@@ -132,13 +138,26 @@ pub struct Recognizers {
     /// pytest verbose text: a passing line held one line, for the same
     /// reason (pytest prints the teardown error as a second line).
     pytest_text_pass: Option<(String, TestKey)>,
+    /// pytest's FAILURES / ERRORS section is being read: its blocks
+    /// (header of `___ test_q ___`, lines), claimed by the short summary's
+    /// `FAILED id - message` lines that follow.
+    pytest_in_failures: bool,
+    pytest_blocks: Vec<(String, Vec<String>)>,
     /// Test files (Jest `Test Suites:`, Vitest `Test Files`) the framework's
     /// own summary says failed. Such a file can fail without any test of it
     /// failing (an import error), so the count is its own evidence.
     pub suites_failed: u64,
+    /// Vitest's `Errors  N error(s)` line: errors no test owns.
+    pub unhandled_errors: u64,
+    /// The `Unhandled Errors` block was seen (and recorded as an entry).
+    pub unhandled_block: bool,
+    /// Jest files read: its totals are believed against what was recognized.
+    pub jest_files: u64,
     jest: JestState,
-    /// Maven's `Failures:` / `Errors:` summary section is being read.
-    surefire_section: bool,
+    /// Maven's summary section being read (`Failures:`, `Errors:`,
+    /// `Flakes:`), and the rerun test whose `Run N:` lines are being read.
+    surefire_section: Option<SurefireSection>,
+    surefire_rerun: Option<SurefireRerun>,
     /// Go text: results since the last package line. `go test -v` names the
     /// package only after its tests, so they are reported under a provisional
     /// name at once and re-keyed when the package is known (round 14).
@@ -152,6 +171,25 @@ pub struct Recognizers {
     go_recovered: u64,
     /// Packages in which a test failed.
     go_failed_pkgs: BTreeSet<String>,
+    /// `go test -json` packages whose own result event was read: a test run
+    /// again after it is a retry, not an iteration of `-count`.
+    go_pkg_done: BTreeSet<String>,
+    /// Go text: tests started and not finished in the current package. A
+    /// package result line printed while one runs is held: a test can print
+    /// anything, `ok  \tfake\t0.1s` included.
+    go_open: BTreeSet<String>,
+    go_tentative: Option<(String, BTreeSet<String>)>,
+    /// The test whose `--- FAIL` line was the last thing printed: a panic
+    /// right after it is that test's.
+    go_after_fail: Option<String>,
+    go_panic_block: bool,
+    /// `go test -json`: per test, how many subtests were skipped and how
+    /// many were not.
+    go_subs: BTreeMap<String, (u32, u32)>,
+    /// Passing tests whose every subtest was skipped: nothing ran in them.
+    go_all_skipped: Vec<String>,
+    /// gotestsum printed a `DONE` line already.
+    gts_done_seen: bool,
     /// Output since the last package line, for a package failure's message.
     go_segment_text: Vec<String>,
     /// `running tests:` of a Go test timeout is being read; the tests named.
@@ -167,9 +205,23 @@ pub struct Recognizers {
     gts_inline: bool,
 }
 
+/// A rerun test: its key, its section, and its attempts so far.
+type SurefireRerun = (TestKey, SurefireSection, Vec<(Outcome, Option<String>)>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurefireSection {
+    Failures,
+    Errors,
+    Flakes,
+}
+
 /// Jest's console reporter: the test file whose results are being read.
 #[derive(Default)]
 struct JestState {
+    /// Verbose failures held until their `●` block gives the message.
+    held: Vec<(TestKey, Option<u64>)>,
+    /// A `Test suite failed to run` block was read in this file.
+    suite_failed_block: bool,
     file: Option<String>,
     /// The file's header said FAIL, and a failing test of it was named.
     failed: bool,
@@ -215,6 +267,22 @@ fn secs_ms(s: &str) -> Option<u64> {
 }
 
 /// A line of gotestsum's text output (held back when its stream is read).
+/// A line of `go test -v` text: a test's start, pause, result, or a
+/// package's result.
+fn is_go_text(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("=== RUN")
+        || t.starts_with("=== PAUSE")
+        || t.starts_with("=== CONT")
+        || t.starts_with("=== NAME")
+        || t.starts_with("--- PASS")
+        || t.starts_with("--- FAIL")
+        || t.starts_with("--- SKIP")
+        || matches!(line.trim_end(), "PASS" | "FAIL")
+        || line.starts_with("ok  \t")
+        || line.starts_with("FAIL\t")
+}
+
 fn is_gotestsum_text(line: &str) -> bool {
     let t = line.trim_end();
     t.starts_with("=== FAIL: ")
@@ -224,11 +292,42 @@ fn is_gotestsum_text(line: &str) -> bool {
         || t == "=== Skipped"
 }
 
+/// A Jest failure block's message: its first assertion lines, up to the code
+/// frame or the stack.
+fn jest_message(body: &[String]) -> Option<String> {
+    let frame = |l: &str| {
+        l.starts_with('>')
+            || l.split_once('|').is_some_and(|(n, _)| {
+                !n.trim().is_empty() && n.trim().bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+    let lines: Vec<&str> = body
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.is_empty())
+        .take_while(|l| !frame(l) && !l.starts_with("at "))
+        .take(3)
+        .collect();
+    if lines.is_empty() {
+        body.iter().find(|l| !l.is_empty()).cloned()
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// A ruler line (nextest's `------------`): never a message.
+fn is_separator(l: &str) -> bool {
+    let l = l.trim();
+    l.chars().count() >= 3 && l.chars().all(|c| matches!(c, '-' | '\u{2500}' | '='))
+}
+
 fn message(lines: &[String]) -> Option<String> {
     let kept: Vec<&str> = lines
         .iter()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with("=== ") && !l.starts_with("--- "))
+        .filter(|l| {
+            !l.is_empty() && !l.starts_with("=== ") && !l.starts_with("--- ") && !is_separator(l)
+        })
         .collect();
     if kept.is_empty() {
         return None;
@@ -287,6 +386,7 @@ impl Recognizers {
         let message = (outcome == Outcome::Failed)
             .then(|| v["stdout"].as_str().unwrap_or("").to_owned())
             .filter(|m| !m.is_empty());
+        self.seen_keys.insert(key.unique(), key.clone());
         self.seen.insert(key.unique(), (key.display(), outcome));
         out.push(EventKind::TestFinished {
             test: key,
@@ -313,6 +413,7 @@ impl Recognizers {
         level: Level,
         out: &mut Vec<EventKind>,
     ) {
+        self.seen_keys.insert(key.unique(), key.clone());
         self.seen.insert(key.unique(), (key.display(), outcome));
         lift(&mut self.level, level);
         out.push(EventKind::TestFinished {
@@ -416,6 +517,7 @@ impl Recognizers {
         {
             self.failure_fallback.push((key.clone(), m.clone()));
         }
+        self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         lift(&mut self.level, level);
         out.push(EventKind::TestFinished {
@@ -456,6 +558,13 @@ impl Recognizers {
             if let Some(n) = total {
                 self.summary_seen = true;
                 self.gotestsum_seen = true;
+                // `--rerun-fails` ends with `DONE 2 runs, 4 tests, ...`: the
+                // tests of every run, reruns again. The first DONE is the
+                // suite's count.
+                if self.gts_done_seen && counts.contains(" runs") {
+                    return;
+                }
+                self.gts_done_seen = true;
                 self.reported_total += n;
                 // A build error is listed among the failures too: the larger
                 // of the two, so errors alone count and nothing counts twice.
@@ -565,6 +674,18 @@ impl Recognizers {
                     field("Failures:").unwrap_or(0) + field("Errors:").unwrap_or(0);
             }
             return;
+        }
+        // Vitest "Errors  1 error": unhandled errors no test owns.
+        if let Some(rest) = t.strip_prefix("Errors ") {
+            let mut w = rest.split_whitespace();
+            if let (Some(n), Some("error" | "errors"), None) = (
+                w.next().and_then(|n| n.parse::<u64>().ok()),
+                w.next(),
+                w.next(),
+            ) {
+                self.unhandled_errors += n;
+                return;
+            }
         }
         // Jest "Test Suites: 1 failed, 1 passed, 2 total"; Vitest "Test Files
         // 1 failed | 1 passed (2)": a file that fails to load fails no test.
@@ -806,6 +927,17 @@ impl Recognizers {
             return out;
         }
         self.totals(line);
+        if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
+            self.unhandled_block = true;
+            self.finished(
+                TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
+                Outcome::Errored,
+                None,
+                Some("Vitest caught unhandled errors during the run (see its output)".to_owned()),
+                Level::Recognized,
+                &mut out,
+            );
+        }
         if self.dotnet_message.is_some() {
             if self.dotnet_collect(line) {
                 return out;
@@ -819,9 +951,15 @@ impl Recognizers {
                 self.flush_vitest(&mut out);
             }
         }
+        self.go_settle_tentative(line, &mut out);
         if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
-            self.go_package_lines += 1;
-            self.go_package(line, &mut out);
+            if self.go_open.is_empty() {
+                self.go_package_lines += 1;
+                self.go_package(line, &mut out);
+            } else {
+                // A test is running: this may be its own output.
+                self.go_tentative = Some((line.to_owned(), self.go_open.clone()));
+            }
         } else if !line.starts_with('{') && !line.starts_with("?   \t") {
             self.go_segment_line(line);
         }
@@ -854,7 +992,15 @@ impl Recognizers {
             let _ = self.libtest(line, &mut out)
                 || (!self.gotestsum_stream && self.gotestsum(line, &mut out))
                 || (self.gotestsum_stream && is_gotestsum_text(line))
-                || self.go_verbose(line, &mut out)
+                // gotestsum echoes `go test -v` lines for failing tests:
+                // with its stream read, they are held like any streamed
+                // framework's text (round 15: an unqualified test that
+                // never finished).
+                || (self.gotestsum_stream && streamed && is_go_text(line))
+                || (self.gotestsum_stream
+                    && !streamed
+                    && self.hold(|r| r.go_verbose(line, &mut held)))
+                || (!self.gotestsum_stream && self.go_verbose(line, &mut out))
                 || (self.pytest_stream && !streamed && self.hold(|r| r.pytest(line, &mut held)))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)
@@ -865,6 +1011,68 @@ impl Recognizers {
                 || self.tap(line, &mut out)
                 || self.quint(line, &mut out);
             self.held_text_events = held;
+        }
+        out
+    }
+
+    /// The start of an unfinished output line. A pytest `-v` line shows the
+    /// test's id, then its outcome once it ends: an id followed by a space
+    /// and nothing else is a test running now (round 15: a stall named the
+    /// test that had just passed). The previous test's held pass is
+    /// reported first, as the next line would have.
+    pub fn partial(&mut self, text: &str) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if self.pytest_stream
+            || !text.ends_with(' ')
+            || self.holding
+            || !text.contains(".py::")
+            || text.starts_with(' ')
+        {
+            return out;
+        }
+        let id = text.trim_end();
+        // Whole parameters only: a read boundary can cut the id short, and
+        // spaces are part of an id only inside its brackets.
+        let outside = {
+            let mut depth = 0i32;
+            let mut s = String::new();
+            for c in id.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ if depth == 0 => s.push(c),
+                    _ => {}
+                }
+            }
+            (depth == 0).then_some(s)
+        };
+        if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
+            return out;
+        }
+        let key = pytest_key(id);
+        if self
+            .pytest_text_pass
+            .as_ref()
+            .is_some_and(|(held, _)| held != id)
+        {
+            out.extend(self.release_held_pass());
+        }
+        self.started(key, &mut out);
+        out
+    }
+
+    /// A pytest pass held for a teardown error, when nothing followed it.
+    pub fn release_held_pass(&mut self) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if let Some((_, key)) = self.pytest_text_pass.take() {
+            self.finished(
+                key,
+                Outcome::Passed,
+                None,
+                None,
+                Level::Recognized,
+                &mut out,
+            );
         }
         out
     }
@@ -942,7 +1150,7 @@ impl Recognizers {
             self.gts_pkg_failed.push(pkg.to_owned());
             return false;
         }
-        let (stripped, _rerun) = strip_rerun(t);
+        let (stripped, rerun) = strip_rerun(t);
         let mut w = stripped.split_whitespace();
         let (Some(word), Some(name)) = (w.next(), w.next()) else {
             return false;
@@ -960,6 +1168,20 @@ impl Recognizers {
             "SKIP" => Outcome::Skipped,
             "EMPTY" => return false,
             _ => return false,
+        };
+        // The module's root package is printed with no package at all:
+        // `PASS TestAdd (0.00s)` is a test of `.` (round 15: its passes were
+        // dropped and `FAIL TestDiv` read as a package).
+        let root_test = dur.is_some()
+            && ["Test", "Example", "Fuzz", "Benchmark"]
+                .iter()
+                .any(|k| name.starts_with(k));
+        let rooted;
+        let name = if root_test {
+            rooted = format!("..{name}");
+            rooted.as_str()
+        } else {
+            name
         };
         let split = ["Test", "Example", "Fuzz", "Benchmark"]
             .iter()
@@ -985,7 +1207,7 @@ impl Recognizers {
                     self.gts_pending = Some((key, outcome, dur, Vec::new()));
                 } else {
                     let sub = test.contains('/');
-                    self.go_result(key, outcome, dur, None, Level::Recognized, sub, out);
+                    self.go_result(key, outcome, dur, None, Level::Recognized, sub, rerun, out);
                 }
                 true
             }
@@ -1026,7 +1248,7 @@ impl Recognizers {
             if self.gts_inline {
                 // A `testname` result line: an execution of the test.
                 self.gts_inline = false;
-                self.go_result(key, outcome, dur, msg, Level::Recognized, sub, out);
+                self.go_result(key, outcome, dur, msg, Level::Recognized, sub, false, out);
             } else if self.seen.contains_key(&key.unique()) {
                 // The summary block repeats a result already reported: it
                 // carries the output, not another execution.
@@ -1096,6 +1318,25 @@ impl Recognizers {
                 } else {
                     None
                 };
+                // A test that passed with every subtest skipped ran nothing.
+                if let Some(&(skipped, other)) = self.go_subs.get(&format!("{pkg}\0{t}"))
+                    && outcome == Outcome::Passed
+                    && skipped > 0
+                    && other == 0
+                {
+                    let name = format!("{pkg}::{t}");
+                    if !self.go_all_skipped.contains(&name) {
+                        self.go_all_skipped.push(name);
+                    }
+                }
+                if let Some((parent, _)) = t.rsplit_once('/') {
+                    let e = self.go_subs.entry(format!("{pkg}\0{parent}")).or_default();
+                    if outcome == Outcome::Skipped {
+                        e.0 += 1;
+                    } else {
+                        e.1 += 1;
+                    }
+                }
                 // Go test names cannot contain '/': one that does is a
                 // subtest (`t.Run`).
                 // A repeated execution (`-count=N`, gotestsum's reruns) is
@@ -1107,10 +1348,15 @@ impl Recognizers {
                     msg,
                     Level::Native,
                     t.contains('/'),
+                    self.go_pkg_done.contains(pkg),
                     out,
                 );
             }
+            ("pass" | "skip", None) => {
+                self.go_pkg_done.insert(pkg.to_owned());
+            }
             ("fail", None) => {
+                self.go_pkg_done.insert(pkg.to_owned());
                 // Package failed without any failing test: build error or crash.
                 let prefix = format!("{pkg}\0");
                 let any_failed = self.go_failed_pkgs.contains(pkg)
@@ -1119,7 +1365,8 @@ impl Recognizers {
                         .values()
                         .any(|(d, o)| d.starts_with(&format!("{pkg}::")) && o.is_failure());
                 let lines = self.go_output.remove(&prefix).unwrap_or_default();
-                if !any_failed {
+                let crashed = lines.iter().any(|l| go_crash_line(l));
+                if !any_failed || crashed {
                     self.finished(
                         key("(package)"),
                         Outcome::Errored,
@@ -1435,6 +1682,7 @@ impl Recognizers {
             self.go_run_lines += 1;
             let name = name.trim().to_owned();
             self.go_current = Some(name.clone());
+            self.go_open.insert(name.clone());
             let key = self.go_key(&name);
             self.started(key, out);
             return true;
@@ -1455,6 +1703,13 @@ impl Recognizers {
                     ),
                     None => (rest.trim(), None),
                 };
+                self.go_open.remove(name);
+                // Without `-v` a failure's message follows its line; with
+                // it, only a panic does.
+                if outcome == Outcome::Failed && !line.starts_with(char::is_whitespace) {
+                    self.go_current = Some(name.to_owned());
+                    self.go_after_fail = Some(name.to_owned());
+                }
                 let lines = self
                     .go_output
                     .remove(&format!("v\0{name}"))
@@ -1577,6 +1832,28 @@ impl Recognizers {
     // ------------------------------------------------------------- pytest
 
     fn pytest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        // pytest-xdist: "[gw0] [ 33%] FAILED tests/test_a.py::test_q" is
+        // the verbose line with the outcome first. Read it as pytest's own.
+        if let Some(rest) = line.strip_prefix("[gw")
+            && let Some((_, rest)) = rest.split_once("] ")
+        {
+            let rest = rest.trim_start();
+            let rest = match rest.strip_prefix('[') {
+                Some(r) => r.split_once("] ").map_or(rest, |(_, r)| r),
+                None => rest,
+            };
+            if let Some((word, id)) = rest.trim().split_once(' ')
+                && matches!(
+                    word,
+                    "PASSED" | "FAILED" | "SKIPPED" | "ERROR" | "XFAIL" | "XPASS"
+                )
+                && id.contains(".py::")
+            {
+                return self.pytest(&format!("{} {word}", id.trim()), out);
+            }
+            return false;
+        }
+        self.pytest_section(line);
         // A pass held one line: pytest prints a teardown error as a second
         // line for the same test, and that is the test's result.
         if let Some((id, hkey)) = self.pytest_text_pass.take() {
@@ -1664,6 +1941,17 @@ impl Recognizers {
                 (key, false)
             };
             let msg = msg.filter(|_| outcome.is_failure());
+            if outcome.is_failure() && !sub {
+                self.claim_pytest_block(&key);
+            }
+            // A teardown error after a pass the output already reported:
+            // the test is errored, once (round 15: it was another test).
+            if outcome == Outcome::Errored
+                && matches!(self.seen.get(&key.unique()), Some((_, Outcome::Passed)))
+            {
+                self.attempt_result(key, 2, outcome, None, msg, Level::Recognized, out);
+                return true;
+            }
             self.result(key, outcome, None, msg, Level::Recognized, sub, out);
             return true;
         }
@@ -1736,6 +2024,51 @@ impl Recognizers {
         }
         self.finished(key, outcome, None, None, Level::Recognized, out);
         true
+    }
+
+    /// Reads pytest's FAILURES / ERRORS section into blocks, one per
+    /// `____ test_q ____` header, to be named by the summary that follows.
+    fn pytest_section(&mut self, line: &str) {
+        let t = line.trim_end();
+        let bar = t.trim_matches('=').trim();
+        if t.starts_with("==") && matches!(bar, "FAILURES" | "ERRORS") {
+            self.pytest_in_failures = true;
+            self.pytest_blocks.clear();
+            return;
+        }
+        if !self.pytest_in_failures {
+            return;
+        }
+        if t.starts_with('=') {
+            self.pytest_in_failures = false;
+            return;
+        }
+        let head = t.trim_matches('_').trim();
+        if t.starts_with("___") && t.ends_with("___") && !head.is_empty() {
+            let head = head.strip_prefix("ERROR at teardown of ").unwrap_or(head);
+            let head = head.strip_prefix("ERROR at setup of ").unwrap_or(head);
+            self.pytest_blocks.push((head.to_owned(), Vec::new()));
+        } else if let Some((_, lines)) = self.pytest_blocks.last_mut()
+            && lines.len() < 80
+        {
+            lines.push(t.to_owned());
+        }
+    }
+
+    /// The failure block pytest printed for this test, kept as its output.
+    fn claim_pytest_block(&mut self, key: &TestKey) {
+        let Some(at) = self
+            .pytest_blocks
+            .iter()
+            .position(|(h, _)| h == &key.name || h.ends_with(&format!(".{}", key.name)))
+        else {
+            return;
+        };
+        let (_, lines) = self.pytest_blocks.remove(at);
+        let text = lines.join("\n").trim().to_owned();
+        if !text.is_empty() {
+            self.failure_output.push((key.clone(), text));
+        }
     }
 
     // ------------------------------------------------------------- vitest
@@ -1844,22 +2177,76 @@ impl Recognizers {
     /// The result files may name only some of the classes (a fork that
     /// died, a partial report): what the console names counts too.
     fn surefire(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
-        let Some(body) = line.trim_end().strip_prefix("[ERROR] ") else {
-            if !line.trim().starts_with("[ERROR]") {
-                self.surefire_section = false;
-            }
+        let line = line.trim_end();
+        let Some(body) = line
+            .strip_prefix("[ERROR] ")
+            .or_else(|| line.strip_prefix("[WARNING] "))
+            .or_else(|| line.strip_prefix("[INFO] "))
+        else {
+            self.surefire_flush(out);
+            self.surefire_section = None;
             return false;
         };
         let head = body.trim();
-        if head == "Failures:" || head == "Errors:" {
-            self.surefire_section = true;
+        let header = match head {
+            "Failures:" => Some(SurefireSection::Failures),
+            "Errors:" => Some(SurefireSection::Errors),
+            "Flakes:" => Some(SurefireSection::Flakes),
+            _ => None,
+        };
+        if header.is_some() {
+            self.surefire_flush(out);
+            self.surefire_section = header;
             return true;
         }
-        if !self.surefire_section {
+        let Some(section) = self.surefire_section else {
+            return false;
+        };
+        let class_ok = |c: &str| {
+            !c.is_empty()
+                && c.chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$'))
+        };
+        // `Run 1: Class.method:12 expected...` / `Run 2: PASS`: a rerun's
+        // attempts, under the test's own (unindented) name.
+        if let Some(run) = head.strip_prefix("Run ")
+            && let Some((n, rest)) = run.split_once(':')
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && let Some((_, _, runs)) = self.surefire_rerun.as_mut()
+        {
+            let rest = rest.trim();
+            let (outcome, msg) = if rest == "PASS" {
+                (Outcome::Passed, None)
+            } else {
+                let outcome = if section == SurefireSection::Errors {
+                    Outcome::Errored
+                } else {
+                    Outcome::Failed
+                };
+                (outcome, Some(rest.to_owned()).filter(|m| !m.is_empty()))
+            };
+            runs.push((outcome, msg));
+            return true;
+        }
+        self.surefire_flush(out);
+        if !body.starts_with("  ") {
+            // A rerun's test: its full name alone on the line.
+            if let Some((class, method)) = head.rsplit_once('.')
+                && class_ok(class)
+                && class_ok(method)
+            {
+                self.surefire_rerun = Some((
+                    TestKey::new(vec![class.to_owned()], method),
+                    section,
+                    Vec::new(),
+                ));
+                return true;
+            }
+            self.surefire_section = None;
             return false;
         }
-        if !body.starts_with("  ") {
-            self.surefire_section = false;
+        if section == SurefireSection::Flakes {
             return false;
         }
         let (token, rest) = head.split_once(' ').unwrap_or((head, ""));
@@ -1873,16 +2260,13 @@ impl Recognizers {
         let Some((class, method)) = id.rsplit_once('.') else {
             return false;
         };
-        if class.is_empty()
-            || method.is_empty()
-            || !class
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$'))
-        {
+        if !class_ok(class) || method.is_empty() {
             return false;
         }
         let msg = rest.trim().trim_start_matches('\u{bb}').trim();
-        let outcome = if rest.starts_with('\u{bb}') {
+        // The section says what kind of entry it is: `Errors:` lists
+        // errors whether or not the line has a `\u{bb}` (round 15).
+        let outcome = if rest.starts_with('\u{bb}') || section == SurefireSection::Errors {
             Outcome::Errored
         } else {
             Outcome::Failed
@@ -1897,6 +2281,39 @@ impl Recognizers {
             out,
         );
         true
+    }
+
+    /// The rerun test being read ended: its attempts, in order. A test that
+    /// failed and then passed is flaky; one that failed every time failed.
+    fn surefire_flush(&mut self, out: &mut Vec<EventKind>) {
+        let Some((key, _, runs)) = self.surefire_rerun.take() else {
+            return;
+        };
+        match runs.as_slice() {
+            [] => {}
+            [(outcome, msg)] => self.result(
+                key,
+                *outcome,
+                None,
+                msg.clone(),
+                Level::Recognized,
+                false,
+                out,
+            ),
+            _ => {
+                for (i, (outcome, msg)) in runs.into_iter().enumerate() {
+                    self.attempt_result(
+                        key.clone(),
+                        i as u32 + 1,
+                        outcome,
+                        None,
+                        msg,
+                        Level::Recognized,
+                        out,
+                    );
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------- jest
@@ -1923,6 +2340,7 @@ impl Recognizers {
             };
             if !rest.contains(' ') && is_js_file(rest) {
                 self.jest_close_file(out);
+                self.jest_files += 1;
                 self.jest.file = Some(rest.to_owned());
                 self.jest.failed = failed;
                 return true;
@@ -1952,6 +2370,7 @@ impl Recognizers {
             self.jest.console = None;
             let name = name.trim();
             self.jest.block = if name == "Test suite failed to run" {
+                self.jest.suite_failed_block = true;
                 Some((None, Vec::new()))
             } else if name.starts_with("Console") || name.starts_with("Obsolete") {
                 None
@@ -1964,21 +2383,33 @@ impl Recognizers {
             lines.push(t.to_owned());
             return true;
         }
-        // console.log output is indented like describe blocks: skip it.
-        if t.starts_with("console.") && indent <= 2 {
+        // console output looks like the tree (`✕ x`, `✓ y`, headings): it
+        // runs from its `console.log` header to the stack line that ends it
+        // (round 15). Nothing in it is a test.
+        if matches!(
+            t,
+            "console.log"
+                | "console.warn"
+                | "console.error"
+                | "console.info"
+                | "console.debug"
+                | "console.trace"
+                | "console.table"
+                | "console.dir"
+        ) {
             self.jest.console = Some(false);
             return true;
         }
-        if let Some(seen_at) = self.jest.console {
-            if t.is_empty() && seen_at {
-                self.jest.console = None;
-            } else if t.starts_with("at ") {
-                self.jest.console = Some(true);
-            }
-            if !t.starts_with(['✓', '✕', '○', '✎', '√', '×']) {
+        match self.jest.console {
+            Some(false) => {
+                if t.starts_with("at ") {
+                    self.jest.console = Some(true);
+                }
                 return true;
             }
-            self.jest.console = None;
+            Some(true) if t.starts_with("at ") => return true,
+            Some(true) => self.jest.console = None,
+            None => {}
         }
         if t.is_empty() {
             return true;
@@ -2016,7 +2447,10 @@ impl Recognizers {
         parts.push(name);
         let key = TestKey::new(vec![file], parts.join(" > "));
         if outcome.is_failure() {
+            // Held for its `●` block, which has the message.
             self.jest.named = true;
+            self.jest.held.push((key, duration));
+            return true;
         }
         self.finished(key, outcome, duration, None, Level::Recognized, out);
         true
@@ -2039,8 +2473,14 @@ impl Recognizers {
         if !text.is_empty() {
             self.failure_output.push((key.clone(), text));
         }
-        let first = body.iter().find(|l| !l.is_empty()).cloned();
-        self.finished(key, Outcome::Failed, None, first, Level::Recognized, out);
+        let msg = jest_message(&body);
+        let duration = self
+            .jest
+            .held
+            .iter()
+            .position(|(k, _)| *k == key)
+            .and_then(|i| self.jest.held.remove(i).1);
+        self.finished(key, Outcome::Failed, duration, msg, Level::Recognized, out);
     }
 
     /// The file's section ended. A FAIL file without a failing test failed
@@ -2050,7 +2490,12 @@ impl Recognizers {
             return;
         };
         self.jest_close_block(&file, out);
-        if self.jest.failed && !self.jest.named {
+        for (key, duration) in std::mem::take(&mut self.jest.held) {
+            self.finished(key, Outcome::Failed, duration, None, Level::Recognized, out);
+        }
+        // A suite that failed to run is its own entry, with or without a
+        // failing test beside it (an `afterAll` that threw).
+        if self.jest.suite_failed_block || (self.jest.failed && !self.jest.named) {
             let body = std::mem::take(&mut self.jest.suite_error);
             let key = TestKey::new(vec![file.clone()], "(file)");
             let text = body.join("\n").trim().to_owned();
@@ -2301,6 +2746,7 @@ impl Recognizers {
             .map(|l| l.trim())
             .filter(|l| {
                 !l.is_empty()
+                    && !is_separator(l)
                     && !l.ends_with("───")
                     && !l.starts_with("running ")
                     && !l.starts_with("test ")
@@ -2333,6 +2779,9 @@ impl Recognizers {
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
+        self.go_confirm_tentative(&mut gts);
+        self.go_flush_tails();
+        self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
@@ -2355,6 +2804,7 @@ impl Recognizers {
         self.close_libtest_running();
         self.close_libtest_block();
         let mut held_pass = Vec::new();
+        self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
         self.flush_call_pass(&mut held_pass);
         if let Some((_, key)) = self.pytest_text_pass.take() {
@@ -3725,6 +4175,125 @@ mod tests {
         );
     }
 
+    /// Round 15: a stall in `pytest -v` named the test that had just
+    /// passed, not the one hanging (its line had no outcome yet).
+    #[test]
+    fn pytest_unfinished_line_starts_that_test_and_releases_the_held_pass() {
+        let mut r = Recognizers::default();
+        let mut ev = r.line("tests/t.py::test_slow PASSED   [ 50%]");
+        // The pass waits one line for a teardown error.
+        assert!(finished(&ev).is_empty());
+        ev.extend(r.partial("tests/t.py::test_"));
+        assert!(
+            ev.iter()
+                .all(|e| !matches!(e, EventKind::TestStarted { .. }))
+        );
+        ev.extend(r.partial("tests/t.py::test_hangs "));
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_slow".to_owned(), Outcome::Passed)]
+        );
+        let started: Vec<String> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestStarted { test } => Some(test.display()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["tests.t::test_hangs".to_owned()]);
+        // The same partial again does not start it twice.
+        assert!(r.partial("tests/t.py::test_hangs ").is_empty());
+    }
+
+    /// Round 15: pytest-xdist's verbose lines put the outcome first.
+    #[test]
+    fn pytest_xdist_verbose_lines_are_recognized() {
+        let (r, ev) = feed_all(
+            "[gw0] [ 33%] FAILED tests/test_a.py::test_q\n[gw1] [ 66%] PASSED tests/test_a.py::TestC::test_ok[a b]\n[gw0] [100%] SKIPPED tests/test_a.py::test_s\n=========================== short test summary info ============================\nFAILED tests/test_a.py::test_q - assert 2 == 1\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests.test_a::test_q".to_owned(), Outcome::Failed),
+                (
+                    "tests.test_a.TestC::test_ok[a b]".to_owned(),
+                    Outcome::Passed
+                ),
+                ("tests.test_a::test_s".to_owned(), Outcome::Skipped),
+            ]
+        );
+        assert_eq!(r.level, Some(Level::Recognized));
+    }
+
+    /// Round 15: -q names the failing test only in the short summary; the
+    /// FAILURES block above it becomes that test's output.
+    #[test]
+    fn pytest_q_failure_block_is_the_failing_tests_output() {
+        let (r, ev) = feed_all(concat!(
+            ".F.   [100%]\n",
+            "=================================== FAILURES ===================================\n",
+            "__________________________________ TestC.test_q ________________________________\n",
+            "\n",
+            ">       assert 2 == 1\n",
+            "E       assert 2 == 1\n",
+            "=========================== short test summary info ============================\n",
+            "FAILED tests/test_a.py::TestC::test_q - assert 2 == 1\n",
+            "1 failed, 2 passed in 0.03s\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.test_a.TestC::test_q".to_owned(), Outcome::Failed)]
+        );
+        assert_eq!(r.failure_output.len(), 1);
+        assert!(r.failure_output[0].1.contains("E       assert 2 == 1"));
+    }
+
+    /// Round 15: a pass and a teardown error is one errored test in the
+    /// verbose lines and in the `-rA` summary alike.
+    #[test]
+    fn pytest_teardown_error_is_one_errored_test_in_every_format() {
+        let (_, verbose) = feed_all(
+            "tests/t.py::test_x PASSED   [ 50%]\ntests/t.py::test_x ERROR   [ 50%]\ntests/t.py::test_y PASSED  [100%]\n",
+        );
+        let (_, summary) = feed_all(
+            "tests/t.py::test_x PASSED   [ 50%]\ntests/t.py::test_y PASSED  [100%]\n=========================== short test summary info ============================\nPASSED tests/t.py::test_x\nERROR tests/t.py::test_x - RuntimeError: teardown\n",
+        );
+        let last = |ev: &[EventKind]| {
+            let mut m: BTreeMap<String, Outcome> = BTreeMap::new();
+            for (n, o) in finished(ev) {
+                m.insert(n, o);
+            }
+            m
+        };
+        assert_eq!(last(&verbose), last(&summary));
+        assert_eq!(last(&summary)["tests.t::test_x"], Outcome::Errored);
+        assert!(
+            !finished(&summary)
+                .iter()
+                .any(|(n, _)| n.contains("second result"))
+        );
+    }
+
+    #[test]
+    fn pytest_parameter_ids_with_spaces_start_only_when_whole() {
+        let mut r = Recognizers::default();
+        assert!(r.partial("tests/t.py::test_r[negative 2/").is_empty());
+        assert!(r.partial("tests/t.py::test_r[negative ").is_empty());
+        let ev = r.partial("tests/t.py::test_r[negative 2/-4] ");
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn a_held_pass_is_released_when_output_goes_quiet() {
+        let mut r = Recognizers::default();
+        r.line("tests/t.py::test_a PASSED   [100%]");
+        let ev = r.release_held_pass();
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_a".to_owned(), Outcome::Passed)]
+        );
+    }
+
     #[test]
     fn pytest_summary_message_is_kept_for_a_verbose_failure() {
         let (r, ev) = feed(
@@ -4236,6 +4805,15 @@ fn strip_rerun(t: &str) -> (String, bool) {
     (t.to_owned(), false)
 }
 
+/// A line of a Go package's own output (not a test's) that says the test
+/// binary crashed: a panic outside the tests, a fatal runtime error, a kill.
+fn go_crash_line(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace)
+        && (line.starts_with("panic: ")
+            || line.starts_with("fatal error: ")
+            || line.starts_with("signal: killed"))
+}
+
 impl Recognizers {
     /// Every `go test` package that ran said `[no tests to run]` (a `-run`
     /// typo): `ok` packages with tests, or failures, say it was not so.
@@ -4252,6 +4830,22 @@ impl Recognizers {
     /// The full import path of a package printed short (gotestsum trims the
     /// module path), when a `ok`/`FAIL` line of the run gave it.
     fn go_pkg(&self, printed: &str) -> String {
+        // gotestsum prints the module's root package as `.`: the one the
+        // other packages are under.
+        if printed == "."
+            && let Some(m) = &self.go_module
+        {
+            return m.clone();
+        }
+        if printed == "."
+            && let Some(root) = self.go_full_pkgs.iter().min_by_key(|p| p.len())
+            && self
+                .go_full_pkgs
+                .iter()
+                .all(|p| p == root || p.starts_with(&format!("{root}/")))
+        {
+            return root.clone();
+        }
         self.go_full_pkgs
             .iter()
             .find(|f| f.as_str() == printed || f.ends_with(&format!("/{printed}")))
@@ -4270,9 +4864,11 @@ impl Recognizers {
     }
 
     /// One execution of a Go test whose key is final. The first is its
-    /// result; a later one is another attempt (`-count=N`, gotestsum's
-    /// `--rerun-fails`): the last decides, and a failure is kept in the
-    /// history whatever came after it. Equal passes change nothing.
+    /// result. A later one inside the same package run is an iteration
+    /// (`-count=N`): a failure sticks, a pass after it changes nothing. A
+    /// later one after the package's own result is a retry (gotestsum's
+    /// `--rerun-fails`, `retry`): the last decides, and a failure is kept in
+    /// the history whatever came after it. Equal passes change nothing.
     #[allow(clippy::too_many_arguments)]
     fn go_result(
         &mut self,
@@ -4282,6 +4878,7 @@ impl Recognizers {
         message: Option<String>,
         level: Level,
         subtest: bool,
+        retry: bool,
         out: &mut Vec<EventKind>,
     ) {
         let d = key.unique();
@@ -4301,6 +4898,10 @@ impl Recognizers {
             return;
         }
         if before.is_failure() && !outcome.is_failure() {
+            if !retry {
+                // A later iteration passing does not undo the failure.
+                return;
+            }
             self.go_recovered += 1;
         }
         if outcome.is_failure()
@@ -4311,6 +4912,7 @@ impl Recognizers {
         let n = self.go_attempts.entry(d.clone()).or_insert(1);
         *n += 1;
         let attempt = *n;
+        self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         out.push(EventKind::TestFinished {
             test: key,
@@ -4354,6 +4956,7 @@ impl Recognizers {
             message,
             Level::Recognized,
             sub,
+            false,
             out,
         );
     }
@@ -4381,10 +4984,15 @@ impl Recognizers {
         if run.execs.iter().any(|e| e.outcome.is_failure()) {
             self.go_failed_pkgs.insert(pkg.to_owned());
         }
-        // A stream (gotestsum's JSON) may have reported them already.
-        if !self.seen.contains_key(&qd) {
-            for e in run.execs {
+        // A stream (gotestsum's JSON) may have reported them already. The
+        // executions of a package that already had its result (gotestsum
+        // reruns the failed tests: a second `go test` of the package) are
+        // retries.
+        let retry = self.go_pkg_done.contains(pkg);
+        if !self.seen.contains_key(&qd) || retry {
+            for (i, e) in run.execs.into_iter().enumerate() {
                 let (q, level) = (q.clone(), Level::Recognized);
+                // Within one run: the first execution of a retry is one.
                 self.go_result(
                     q,
                     e.outcome,
@@ -4392,6 +5000,7 @@ impl Recognizers {
                     e.message,
                     level,
                     e.subtest,
+                    retry && i == 0,
                     out,
                 );
             }
@@ -4451,6 +5060,11 @@ impl Recognizers {
                 }
             }
         }
+        self.go_flush_tails();
+        self.go_open.clear();
+        self.go_after_fail = None;
+        self.go_panic_block = false;
+        let crashed = text.iter().any(|l| go_crash_line(l));
         let pending = std::mem::take(&mut self.go_pending);
         let failed_here = pending
             .iter()
@@ -4459,6 +5073,7 @@ impl Recognizers {
         for run in pending {
             self.go_requalify(run, &pkg, out);
         }
+        self.go_pkg_done.insert(pkg.clone());
         self.go_segment += 1;
         if status.trim() == "ok" {
             if tail.contains("[no tests to run]") {
@@ -4469,7 +5084,9 @@ impl Recognizers {
             return;
         }
         self.go_fail_pkgs += 1;
-        let mut explained = failed_here;
+        // A panic or a kill outside any test is the package's own failure,
+        // whatever a test did (round 15: a quarantined failure hid it).
+        let mut explained = failed_here && !crashed;
         for name in hung {
             explained = true;
             let message = timed_out(&name);
@@ -4498,10 +5115,111 @@ impl Recognizers {
         }
     }
 
+    /// The package line held while a test ran: more of that test's output
+    /// (its own result line, `=== NAME`) says it was a forgery of the test's
+    /// stdout; the next test, package or build line says it was real.
+    fn go_settle_tentative(&mut self, line: &str, out: &mut Vec<EventKind>) {
+        let Some((_, open)) = &self.go_tentative else {
+            return;
+        };
+        let t = line.trim_start();
+        let continues = [
+            "--- PASS: ",
+            "--- FAIL: ",
+            "--- SKIP: ",
+            "=== NAME",
+            "=== CONT",
+        ]
+        .iter()
+        .any(|p| {
+            t.strip_prefix(p).is_some_and(|rest| {
+                let name = rest.trim();
+                let name = name.rsplit_once(" (").map_or(name, |(n, _)| n).trim();
+                open.contains(name)
+            })
+        });
+        if continues {
+            self.go_tentative = None;
+        } else if t.starts_with("=== RUN")
+            || line.starts_with("ok  \t")
+            || line.starts_with("FAIL\t")
+            || line.starts_with("?   \t")
+            || line.starts_with("# ")
+        {
+            self.go_confirm_tentative(out);
+        }
+    }
+
+    fn go_confirm_tentative(&mut self, out: &mut Vec<EventKind>) {
+        if let Some((line, _)) = self.go_tentative.take() {
+            self.go_package_lines += 1;
+            self.go_package(&line, out);
+        }
+    }
+
+    /// What a failed test printed after its `--- FAIL` line (`go test`
+    /// without `-v`, a panic) is its output.
+    fn go_flush_tails(&mut self) {
+        let keys: Vec<String> = self
+            .go_output
+            .keys()
+            .filter(|k| k.starts_with("v\0"))
+            .cloned()
+            .collect();
+        for k in keys {
+            let name = &k[2..];
+            let key = self.go_key(name);
+            let failed = self
+                .go_pending
+                .iter()
+                .any(|r| r.key == key && r.execs.iter().any(|e| e.outcome.is_failure()));
+            let lines = self.go_output.remove(&k).unwrap_or_default();
+            if failed && !lines.is_empty() {
+                self.failure_output.push((key, lines.join("\n")));
+            }
+        }
+    }
+
+    /// Tests that passed because every subtest skipped: nothing ran.
+    fn go_note_all_skipped(&mut self, out: &mut Vec<EventKind>) {
+        let names = std::mem::take(&mut self.go_all_skipped);
+        if names.is_empty() {
+            return;
+        }
+        let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
+        out.push(EventKind::RunNote {
+            message: format!(
+                "{} test(s) passed with every subtest skipped, so nothing ran in them: {}{}",
+                names.len(),
+                shown.join(", "),
+                if names.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+
     /// Lines between packages: what a package failure explains itself with,
     /// and the tests a timeout panic names under `running tests:`.
     fn go_segment_line(&mut self, line: &str) {
         let t = line.trim();
+        // A panic right after a test's `--- FAIL` line, and what follows it
+        // until the package line, is that test's output, not the package's.
+        if self.go_panic_block || (line.starts_with("panic: ") && self.go_after_fail.is_some()) {
+            self.go_panic_block = true;
+            if let Some(owner) = self.go_after_fail.clone() {
+                let lines = self.go_output.entry(format!("v\0{owner}")).or_default();
+                if lines.len() < 200 {
+                    lines.push(line.trim_end().to_owned());
+                }
+            }
+            return;
+        }
+        if !t.is_empty() && !line.starts_with(char::is_whitespace) {
+            self.go_after_fail = None;
+        }
         if t == "running tests:" {
             self.go_reading_hung = true;
             return;
@@ -4618,8 +5336,10 @@ mod go_tests {
         );
     }
 
+    /// `go test -count=3`: iterations are not retries. A failure in any of
+    /// them is the test's failure, whatever the later ones did.
     #[test]
-    fn go_count_repeats_are_attempts_of_one_test() {
+    fn go_count_iterations_keep_the_failure() {
         let (_, ev) = feed_all(concat!(
             "=== RUN   TestRace\n--- PASS: TestRace (0.00s)\n",
             "=== RUN   TestRace\n    race_test.go:9: lost update\n--- FAIL: TestRace (0.00s)\n",
@@ -4629,9 +5349,173 @@ mod go_tests {
         let s = settled(&ev);
         assert_eq!(
             one(&s, "example.com/m/r::TestRace"),
-            vec![Outcome::Passed, Outcome::Failed, Outcome::Passed]
+            vec![Outcome::Passed, Outcome::Failed]
         );
         assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
+    }
+
+    #[test]
+    fn go_count_fail_then_pass_is_a_failure_text() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestF\n    f_test.go:5: boom\n--- FAIL: TestF (0.00s)\n",
+            "=== RUN   TestF\n--- PASS: TestF (0.00s)\n",
+            "FAIL\nFAIL\texample.com/f\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/f::TestF"), vec![Outcome::Failed]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(r.failed_reported(), 0, "no stale totals");
+    }
+
+    /// gotestsum `--rerun-fails` with `-v` text: the rerun is another
+    /// `go test` of the package, after its own result line: a retry.
+    #[test]
+    fn go_text_rerun_after_the_package_line_is_a_retry() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestFlaky\n    f_test.go:4: first\n--- FAIL: TestFlaky (0.00s)\nFAIL\nFAIL\texample.com/q\t0.01s\n",
+            "=== RUN   TestFlaky\n--- PASS: TestFlaky (0.00s)\nPASS\nok  \texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/q::TestFlaky"),
+            vec![Outcome::Failed, Outcome::Passed]
+        );
+        assert_eq!(r.failed_reported(), 0);
+    }
+
+    #[test]
+    fn go_count_fail_then_pass_is_a_failure_json() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Elapsed":0}"#,
+            "\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed]);
+        assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    /// A panic outside any test fails the package even when a test of it
+    /// failed too (round 15: a quarantined failure hid it).
+    #[test]
+    fn go_json_panic_in_package_output_is_a_package_error() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"q","Test":"TestQ"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"q","Test":"TestQ","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"run","Package":"q","Test":"TestQueue"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"q","Test":"TestQueue","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"output","Package":"q","Output":"panic: send on closed channel\n"}"#,
+            "\n",
+            r#"{"Action":"output","Package":"q","Output":"goroutine 12 [running]:\n"}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"q"}"#,
+            "\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "q::(package)"), vec![Outcome::Errored]);
+        assert_eq!(one(&s, "q::TestQ"), vec![Outcome::Failed]);
+    }
+
+    #[test]
+    fn go_text_panic_outside_a_test_is_a_package_error() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestQ\n    q_test.go:5: no\n--- FAIL: TestQ (0.00s)\n",
+            "=== RUN   TestQueue\n--- PASS: TestQueue (0.00s)\n",
+            "panic: send on closed channel\n\ngoroutine 12 [running]:\n",
+            "FAIL\texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/q::(package)"), vec![Outcome::Errored]);
+        assert_eq!(one(&s, "example.com/q::TestQ"), vec![Outcome::Failed]);
+    }
+
+    /// A test's own panic follows its `--- FAIL` line: it explains the
+    /// test, it is not another failure.
+    #[test]
+    fn go_text_panic_in_a_test_is_the_tests_output() {
+        let (r, ev) = feed_all(concat!(
+            "=== RUN   TestP\n--- FAIL: TestP (0.00s)\npanic: boom [recovered]\n\ngoroutine 7 [running]:\n",
+            "\tq_test.go:4 +0x25\nFAIL\texample.com/q\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(s.len(), 1, "{s:?}");
+        let (_, text) = r
+            .failure_output
+            .iter()
+            .find(|(k, _)| k.name == "TestP")
+            .expect("the panic is kept as the test's output");
+        assert!(text.starts_with("panic: boom"), "{text}");
+        assert_eq!(r.failure_output[0].0.path, vec!["example.com/q".to_owned()]);
+    }
+
+    /// Without `-v` the message follows the `--- FAIL` line.
+    #[test]
+    fn go_text_message_after_the_fail_line_is_kept() {
+        let (r, _) = feed_all(
+            "--- FAIL: TestX (0.00s)\n    x_test.go:9: boom\nFAIL\nFAIL\texample.com/x\t0.01s\n",
+        );
+        let (k, text) = &r.failure_output[0];
+        assert_eq!(
+            (k.display().as_str(), text.as_str()),
+            ("example.com/x::TestX", "    x_test.go:9: boom")
+        );
+    }
+
+    /// Round 15: a test printing a package line is not a package line.
+    #[test]
+    fn a_package_line_printed_by_a_running_test_is_its_output() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestA\n    a_test.go:3: no\n--- FAIL: TestA (0.00s)\n",
+            "=== RUN   TestSub\nok  \texample.com/fake\t0.010s\n--- PASS: TestSub (0.00s)\n",
+            "FAIL\nFAIL\texample.com/real\t0.02s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(one(&s, "example.com/real::TestA"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "example.com/real::TestSub"), vec![Outcome::Passed]);
+        assert_eq!(s.len(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn go_json_parent_with_every_subtest_skipped_is_noted() {
+        let (_, ev) = feed_all(concat!(
+            r#"{"Action":"run","Package":"p","Test":"TestS"}"#,
+            "\n",
+            r#"{"Action":"run","Package":"p","Test":"TestS/a"}"#,
+            "\n",
+            r#"{"Action":"skip","Package":"p","Test":"TestS/a","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Test":"TestS","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p","Elapsed":0}"#,
+            "\n",
+        ));
+        assert!(
+            ev.iter().any(|e| matches!(e, EventKind::RunNote { message } if message.contains("every subtest skipped") && message.contains("p::TestS"))),
+            "{ev:?}"
+        );
+    }
+
+    /// gotestsum `--rerun-fails` ends with `DONE 2 runs, 4 tests`: the first
+    /// DONE is the suite's count.
+    #[test]
+    fn gotestsum_rerun_totals_are_the_first_done() {
+        let (r, _) = feed_all(concat!(
+            "DONE 3 tests, 1 failure in 0.002s\n\n",
+            "PASS example.com/m/a.TestFlaky (re-run 1)\n",
+            "DONE 2 runs, 4 tests, 1 failure in 0.106s\n",
+        ));
+        assert_eq!(r.total(), 3);
     }
 
     #[test]
@@ -4669,6 +5553,8 @@ mod go_tests {
             r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
             "\n",
             r#"{"Action":"fail","Package":"p","Test":"TestF","Elapsed":0}"#,
+            "\n",
+            r#"{"Action":"fail","Package":"p","Elapsed":0}"#,
             "\n",
             r#"{"Action":"run","Package":"p","Test":"TestF"}"#,
             "\n",
@@ -4792,5 +5678,292 @@ mod go_tests {
             "ok  \texample.com/m/p\t0.001s [no tests to run]\n?   \texample.com/m/c\t[no test files]\n",
         );
         assert!(r.go_no_tests_only());
+    }
+}
+
+/// Round 15 (framework recognizers): probes with a hostile console, a suite
+/// error next to a failing test, and the Surefire rerun sections.
+#[cfg(test)]
+mod round15_fw_tests {
+    use super::*;
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let mut r = Recognizers::default();
+        let mut all = Vec::new();
+        for l in input.lines() {
+            all.extend(r.line(l));
+        }
+        all.extend(r.finish());
+        (r, all)
+    }
+
+    fn results(ev: &[EventKind]) -> Vec<(String, u32, Outcome)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    attempt,
+                    outcome,
+                    ..
+                } => Some((test.display(), *attempt, *outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn msgs(ev: &[EventKind]) -> Vec<(String, String)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Console output looked like tests: `✕ db migration (pending)` printed
+    /// by a `console.log` was recorded as a failed test (exit 0 became 1).
+    #[test]
+    fn jest_console_output_is_not_a_test() {
+        let (_, ev) = feed_all(concat!(
+            " PASS  src/deploy.test.js\n",
+            "  console.log\n",
+            "    Deploy plan:\n",
+            "      \u{2715} db migration (pending)\n",
+            "      \u{2713} web\n",
+            "      at log (src/deploy.test.js:3:11)\n",
+            "  deploy\n",
+            "    \u{2713} plans (4 ms)\n",
+            "Tests: 1 passed, 1 total\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![(
+                "src/deploy.test.js::deploy > plans".into(),
+                1,
+                Outcome::Passed
+            )]
+        );
+    }
+
+    #[test]
+    fn jest_console_after_the_tree_and_in_console_blocks_is_not_a_test() {
+        let (_, ev) = feed_all(concat!(
+            " PASS  src/a.test.js\n",
+            "  deploy\n",
+            "    \u{2713} plans (4 ms)\n",
+            "\n",
+            "  console.warn\n",
+            "    \u{2715} fake one\n",
+            "\n",
+            "      at warn (src/a.test.js:3:11)\n",
+            "\n",
+            " PASS  src/b.test.js\n",
+            "  \u{25cf} Console\n",
+            "\n",
+            "    console.error\n",
+            "      \u{2715} fake two\n",
+            "      \u{2713} fake three\n",
+            "\n",
+            "      at error (src/b.test.js:3:11)\n",
+            "\n",
+            "  other\n",
+            "    \u{2713} real\n",
+            "Tests: 2 passed, 2 total\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/a.test.js::deploy > plans".into(), 1, Outcome::Passed),
+                ("src/b.test.js::other > real".into(), 1, Outcome::Passed),
+            ]
+        );
+    }
+
+    /// A failing test and a suite that failed to run in one file: both.
+    #[test]
+    fn jest_suite_error_next_to_a_failing_test_is_recorded() {
+        let (_, ev) = feed_all(concat!(
+            " FAIL  src/db.test.js\n",
+            "  db\n",
+            "    \u{2715} writes (3 ms)\n",
+            "\n",
+            "  \u{25cf} db \u{203a} writes\n",
+            "\n",
+            "    expect(received).toBe(expected) // Object.is equality\n",
+            "\n",
+            "    Expected: 1\n",
+            "    Received: 2\n",
+            "\n",
+            "      4 |   expect(a).toBe(1);\n",
+            "\n",
+            "  \u{25cf} Test suite failed to run\n",
+            "\n",
+            "    afterAll: connection pool did not drain\n",
+            "\n",
+            "Tests: 1 failed, 1 total\n",
+        ));
+        let got = results(&ev);
+        assert!(
+            got.contains(&("src/db.test.js::db > writes".into(), 1, Outcome::Failed)),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&("src/db.test.js::(file)".into(), 1, Outcome::Errored)),
+            "{got:?}"
+        );
+        // The block's first assertion lines are the message.
+        assert!(
+            msgs(&ev).contains(&(
+                "src/db.test.js::db > writes".into(),
+                "expect(received).toBe(expected) // Object.is equality\nExpected: 1\nReceived: 2"
+                    .into()
+            )),
+            "{:?}",
+            msgs(&ev)
+        );
+        let file_msg = msgs(&ev)
+            .into_iter()
+            .find(|(t, _)| t == "src/db.test.js::(file)")
+            .unwrap();
+        assert!(file_msg.1.contains("connection pool"), "{file_msg:?}");
+    }
+
+    /// A passing verbose file with a bare suite error is the same entry.
+    #[test]
+    fn jest_suite_error_alone_is_the_file_entry() {
+        let (_, ev) = feed_all(concat!(
+            " FAIL  src/db.test.js\n",
+            "  \u{25cf} Test suite failed to run\n",
+            "\n",
+            "    boom\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![("src/db.test.js::(file)".into(), 1, Outcome::Errored)]
+        );
+    }
+
+    /// nextest's separator is not the failure's message.
+    #[test]
+    fn nextest_message_skips_separator_lines() {
+        let (_, ev) = feed_all(concat!(
+            "        FAIL [   0.004s] crate_a tests::it_works\n",
+            "\n",
+            "--- STDOUT:              crate_a tests::it_works ---\n",
+            "------------\n",
+            "thread 'tests::it_works' panicked at src/lib.rs:5:9:\n",
+            "assertion failed: false\n",
+            "------------\n",
+            "     Summary [   0.004s] 1 test run: 0 passed, 1 failed, 0 skipped\n",
+        ));
+        let m = msgs(&ev);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(!m[0].1.starts_with("---"), "{m:?}");
+        assert!(m[0].1.contains("assertion failed"), "{m:?}");
+    }
+
+    #[test]
+    fn nextest_text_keeps_the_binary_apart() {
+        let (_, ev) = feed_all(concat!(
+            "        FAIL [   0.004s] crate_a tests::it_works\n",
+            "        PASS [   0.003s] crate_b tests::it_works\n",
+        ));
+        let files: Vec<Option<String>> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, .. } => Some(test.file.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files, vec![Some("crate_a".into()), Some("crate_b".into())]);
+    }
+
+    #[test]
+    fn surefire_flakes_section_is_a_failed_then_a_passed_attempt() {
+        let (_, ev) = feed_all(concat!(
+            "[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1\n",
+            "[WARNING] Flakes: \n",
+            "[WARNING] com.acme.FlakyTest.sometimes\n",
+            "[ERROR]   Run 1: FlakyTest.sometimes:12 expected:<1> but was:<2>\n",
+            "[INFO]   Run 2: PASS\n",
+            "[INFO] \n",
+            "[INFO] BUILD SUCCESS\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("com.acme.FlakyTest::sometimes".into(), 1, Outcome::Failed),
+                ("com.acme.FlakyTest::sometimes".into(), 2, Outcome::Passed),
+            ]
+        );
+        assert!(
+            msgs(&ev)
+                .iter()
+                .any(|(_, m)| m.contains("expected:<1> but was:<2>"))
+        );
+    }
+
+    #[test]
+    fn surefire_rerun_that_fails_every_time_names_the_test() {
+        let (_, ev) = feed_all(concat!(
+            "[ERROR] Failures: \n",
+            "[ERROR] com.acme.FailTest.always\n",
+            "[ERROR]   Run 1: FailTest.always:5 expected:<1> but was:<2>\n",
+            "[ERROR]   Run 2: FailTest.always:5 expected:<1> but was:<2>\n",
+            "[INFO] \n",
+            "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n",
+        ));
+        let got = results(&ev);
+        assert_eq!(
+            got.last().unwrap().0,
+            "com.acme.FailTest::always",
+            "{got:?}"
+        );
+        assert!(got.iter().all(|(_, _, o)| *o == Outcome::Failed), "{got:?}");
+    }
+
+    #[test]
+    fn surefire_errors_section_entries_are_errored() {
+        let (_, ev) = feed_all(concat!(
+            "[ERROR] Errors: \n",
+            "[ERROR]   com.acme.CalcTest.io:12 IllegalState disk full\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   com.acme.CalcTest.adds:9 expected:<2> but was:<3>\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("com.acme.CalcTest::io".into(), 1, Outcome::Errored),
+                ("com.acme.CalcTest::adds".into(), 1, Outcome::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn vitest_unhandled_errors_block_is_an_errored_entry() {
+        let (_, ev) = feed_all(concat!(
+            " \u{2713} src/a.test.ts > adds 1ms\n",
+            "\n",
+            " \u{23af}\u{23af}\u{23af}\u{23af} Unhandled Errors \u{23af}\u{23af}\u{23af}\u{23af}\n",
+            "\n",
+            "Vitest caught 1 unhandled error during the test run.\n",
+            "\n",
+            "     Errors  1 error\n",
+        ));
+        assert!(
+            results(&ev).iter().any(|(_, _, o)| *o == Outcome::Errored),
+            "{:?}",
+            results(&ev)
+        );
+    }
+
+    #[test]
+    fn vitest_errors_count_is_remembered() {
+        let (r, _) = feed_all("     Errors  2 errors\n");
+        assert_eq!(r.unhandled_errors, 2);
     }
 }

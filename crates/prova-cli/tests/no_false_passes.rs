@@ -549,3 +549,27 @@ fn a_vitest_file_that_failed_to_load_fails_the_run() {
     );
     assert_eq!(failure_names(&s), vec!["src/b.test.ts::(file)"], "{s}");
 }
+
+/// Round 15: Surefire's console names a failure `CalcTest.flaky`, its
+/// report `calc.CalcTest`: the failure was recorded under the short name and
+/// passes under the long one, two tests whose history never met (a flaky
+/// test "failed every time", a regression "first time seen"). A
+/// parameterized case's console name lacks its arguments and index.
+#[test]
+fn surefire_console_failures_take_the_reports_name() {
+    let d = workspace("surefire_identity");
+    let junit = "<testsuite name=\"calc.CalcTest\" tests=\"3\" failures=\"2\"><testcase classname=\"calc.CalcTest\" name=\"adds\" time=\"0.1\"/><testcase classname=\"calc.CalcTest\" name=\"flaky\" time=\"0.1\"><failure message=\"tick\"/></testcase><testcase classname=\"calc.CalcTest\" name=\"many(int, int)[2]\" time=\"0.1\"><failure message=\"bad\"/></testcase></testsuite>";
+    std::fs::write(d.join("j.xml"), junit).unwrap();
+    let (code, s) = run_sh(
+        &d,
+        "mkdir -p target/surefire-reports; cp j.xml target/surefire-reports/TEST-calc.CalcTest.xml; printf '%s\\n' '[ERROR] Failures: ' '[ERROR]   CalcTest.flaky:23 tick' '[ERROR]   CalcTest.many:30 bad' '[ERROR] Tests run: 3, Failures: 2, Errors: 0, Skipped: 0'; exit 1",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    assert_eq!(
+        failure_names(&s),
+        vec!["calc.CalcTest::flaky", "calc.CalcTest::many(int, int)[2]"],
+        "{s}"
+    );
+    assert_eq!(s["counts"]["failed"], 2, "{s}");
+    assert_eq!(s["counts"]["passed"], 1, "{s}");
+}

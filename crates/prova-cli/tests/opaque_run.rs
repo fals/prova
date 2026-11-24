@@ -934,7 +934,7 @@ fn a_subtest_has_history() {
 /// no sampled test phase, so every size stayed "unknown" after 25 runs.
 /// The whole run is their phase. Medium: real processes, sampled over time.
 // Linux only: macOS samples through `ps` and `lsof`, which on CI runners
-// can take longer than this 2 s run allows for two samples (main 3c8473a);
+// can take longer than this 3 s run allows for two samples (main 3c8473a);
 // tests/sizes.rs covers macOS with longer runs.
 #[cfg(target_os = "linux")]
 #[test]
@@ -942,7 +942,7 @@ fn tests_known_only_from_result_files_get_a_size() {
     let d = workspace("file-sizes");
     let script = |extra: &str| {
         format!(
-            "echo building; end=$(($(date +%s) + 2)); while [ $(date +%s) -lt $end ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
+            "echo building; end=$(($(date +%s) + 3)); while [ $(date +%s) -lt $end ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
         )
     };
     prova(
@@ -1018,7 +1018,7 @@ fn a_wait_says_how_long_each_running_test_has_run() {
     let j = json(&prova(&d, &["status", &run, "--json"]));
     assert!(j["running_for_ms"][0].as_u64().unwrap() >= 1000, "{j}");
     prova(&d, &["cancel", &run]);
-    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 30);
+    assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 20);
 }
 
 /// Round 14: a stalled run said "no activity for 5.1s" half a minute after
@@ -1142,6 +1142,138 @@ fn skipped_subtests_are_counted_as_skipped() {
     let out = stdout(&o);
     assert!(
         out.contains("(and 2 subtests, 0 failed, 1 skipped)"),
+        "{out}"
+    );
+}
+
+/// Round 15: selecting one case of a parameterized test ran all of them,
+/// with no word of it (Surefire selects methods).
+#[test]
+fn selecting_one_parameterized_case_says_every_case_runs() {
+    let d = workspace("param-select");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.j]\nrun = \"echo all\"\nselect = \"echo mvn -q test -Dtest={filter}; i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test calc::x ... ok'\"\n",
+    )
+    .unwrap();
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "j",
+            "--json",
+            "--select",
+            "calc.CalcTest::many(int, int)[2]",
+        ],
+    );
+    let v = json(&o);
+    assert!(
+        v["notes"]
+            .to_string()
+            .contains("not one of its cases: every case of it runs"),
+        "{v}"
+    );
+}
+
+/// A fake `docker` on PATH: `run` prints a test line and hangs; `kill`
+/// records its arguments in `killed`.
+#[cfg(target_os = "linux")]
+fn fake_docker(d: &Path) -> (String, PathBuf) {
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let killed = d.join("killed");
+    let fake = bin.join("docker");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {}; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
+            killed.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (path, killed)
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_fake_docker(d: &Path, path: &str, args: &[&str]) -> serde_json::Value {
+    let mut a = vec!["run", "--detach", "--json", "--", "docker", "run", "--rm"];
+    a.extend_from_slice(args);
+    let o = Command::new(PROVA)
+        .args(a)
+        .current_dir(d)
+        .env("PROVA_HOME", home_of(d))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let id = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(d, id.clone());
+    assert!(prova(d, &["cancel", &id]).status.success());
+    json(&prova(
+        d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "done",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
+    ))
+}
+
+/// Round 15: cancelling a run through a container client left the
+/// container running. A named container is attributable to the run: prova
+/// kills it, and says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_stops_a_named_container_of_the_run() {
+    let d = workspace("cancel-container");
+    let (path, killed) = fake_docker(&d);
+    let s = cancel_fake_docker(&d, &path, &["--name", "pv-x", "img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
+        "kill pv-x",
+        "{s}"
+    );
+    assert!(s.to_string().contains("pv-x"), "{s}");
+}
+
+/// Without a name or cidfile the container cannot be attributed: prova
+/// does not guess, it says what to check.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_warns_when_the_container_cannot_be_attributed() {
+    let d = workspace("cancel-container-anon");
+    let (path, killed) = fake_docker(&d);
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(!killed.exists(), "{s}");
+    let text = s.to_string();
+    assert!(
+        text.contains("does not stop its container") && text.contains("docker ps"),
+        "{text}"
+    );
+}
+
+/// Round 15: a selected Vitest run listed another file's import error next
+/// to the selected test, with no word that it was outside the selection.
+#[test]
+fn a_failure_outside_the_selection_says_so() {
+    let d = workspace("outside-sel");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.v]\nrun = \"echo all\"\nselect = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\\\n' ' \u{2713} src/group.test.ts > group > bad two 1ms' ' FAIL  src/broken.test.ts [ src/broken.test.ts ]' 'Error: Cannot find module ./missing' ' Test Files  1 failed | 1 passed (2)' '      Tests  1 passed (1)'; exit 1\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "v", "--select", "group > bad two"]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("outside the selection \"group > bad two\": src/broken.test.ts::(file)"),
         "{out}"
     );
 }

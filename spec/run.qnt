@@ -17,6 +17,7 @@ module runLifecycle {
     | TestStarted(str)
     | TestFinished({ test: str, outcome: Outcome })
     | RunEnded(Status)
+    | Superseded(str)
 
   // Bounded model: two tests are enough to expose interleavings.
   pure val TESTS = Set("a", "b")
@@ -107,6 +108,8 @@ module runLifecycle {
     status == Running,
     not(open.contains(t)),
     not(outcomes.keys().contains(t)) or isFailure(outcomes.get(t)),
+    // A superseded name is gone: its test is the one that replaced it.
+    not(log.indices().exists(i => log[i] == Superseded(t))),
     log' = log.append(TestStarted(t)),
     open' = open.union(Set(t)),
     status' = status, outcomes' = outcomes,
@@ -137,6 +140,23 @@ module runLifecycle {
     log' = log.append(TestFinished({ test: t, outcome: o })),
     outcomes' = outcomes.put(t, o),
     open' = open, status' = status,
+    inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
+  }
+
+  // A result recorded under a provisional name is re-keyed: its test is
+  // `by`, whose own result is already recorded (a Go test once its package
+  // is known, a console name once the report names it). The provisional
+  // entry leaves the outcomes: one test, one result (round 15: its failure
+  // stayed in the verdict after a rerun passed).
+  action superseded(t: str, by: str): bool = all {
+    status == Running,
+    t != by,
+    not(open.contains(t)),
+    outcomes.keys().contains(t),
+    outcomes.keys().contains(by),
+    outcomes' = outcomes.keys().exclude(Set(t)).mapBy(k => outcomes.get(k)),
+    log' = log.append(Superseded(t)), open' = open, status' = status,
     inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
     exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
@@ -197,6 +217,7 @@ module runLifecycle {
 
   action step = {
     nondet t = TESTS.oneOf()
+    nondet b = TESTS.oneOf()
     nondet o = Set(Passed, Failed, Skipped, Errored).oneOf()
     nondet s = Set(Finished, Cancelled, Aborted).oneOf()
     nondet v = 1.to(3).oneOf()
@@ -209,6 +230,7 @@ module runLifecycle {
       testStarted(t),
       testFinished(t, o),
       testRepeated(t, o),
+      superseded(t, b),
       end(s),
       cancelCreated,
       late(t, o),
@@ -394,6 +416,16 @@ module runLifecycle {
         assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
         late("b", Failed),
       })
+
+  // Round 15: a provisional result re-keyed under its real name leaves the
+  // outcomes; a failure of it no longer counts once the test passed.
+  run supersededResultLeavesTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Failed))
+      .then(testStarted("b")).then(testFinished("b", Failed))
+      .then(testStarted("b")).then(testFinished("b", Passed))
+      .then(superseded("a", "b"))
+      .then(exited(0)).then(end(Finished))
+      .then(all { assert(verdict == Pass), assert(safety), late("a", Passed) })
 
   run cleanPassTest =
     init.then(start).then(testStarted("a")).then(testFinished("a", Passed))

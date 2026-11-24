@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::model::Outcome;
@@ -99,6 +99,13 @@ pub fn test_runs_with(
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+                -- a Go test seen before its package is known (`(package
+                -- pending) #N`) is the qualified test of that name that ran
+                -- most recently
+                OR (t1.file LIKE '(package pending) #%' AND t1.path = '[]' AND t2.id IN (
+                      SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
+                      WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
+                      ORDER BY qr.created_ms DESC LIMIT 1))
              WHERE t1.id = ?1),
          counted AS (
              SELECT r.id, r.created_ms FROM runs r
@@ -229,6 +236,13 @@ fn stats_with(
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+                -- a Go test seen before its package is known (`(package
+                -- pending) #N`) is the qualified test of that name that ran
+                -- most recently
+                OR (t1.file LIKE '(package pending) #%' AND t1.path = '[]' AND t2.id IN (
+                      SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
+                      WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
+                      ORDER BY qr.created_ms DESC LIMIT 1))
              WHERE t1.id = ?1 ORDER BY t2.suite",
         )?;
         stmt.query_map(params![test_id], |r| r.get(0))?
@@ -314,7 +328,11 @@ fn stats_with(
     };
     // Only a test history calls flaky can be "failing now" instead; one that
     // never passed has simply not passed yet (round 11).
-    let failing_now = streak >= needed && (retry > 0 || flips > 0);
+    // And on enough history for the rate to mean something: one earlier
+    // pass and three failures is a thin record (round 15: "failing now",
+    // then it passed again).
+    let failing_now =
+        streak >= needed && counted.len() >= FAILING_NOW_MIN_RUNS && (retry > 0 || flips > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -361,6 +379,10 @@ pub fn find_tests(
         "SELECT id, display, suite FROM tests
          WHERE instr(display, ?1) > 0 AND (?2 IS NULL OR suite = ?2)
            AND id NOT IN (SELECT test_id FROM superseded)
+           -- a Go test of a run still going, under its provisional name,
+           -- is listed once, under the package it ran in before
+           AND NOT (COALESCE(file, '') LIKE '(package pending) #%' AND EXISTS (
+                SELECT 1 FROM tests q WHERE q.suite = tests.suite AND q.name = tests.name AND q.path <> '[]'))
          ORDER BY (display = ?1) DESC, length(display) ASC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![query, suite], |r| {
@@ -457,6 +479,10 @@ pub struct SizeView {
     pub label: String,
 }
 
+/// Runs of history a test needs before a streak of failures overrides its
+/// flakiness.
+pub const FAILING_NOW_MIN_RUNS: usize = 5;
+
 /// Attributed runs that must all show one process and no socket before a
 /// test is called small (ADR 0025 §5): sampling can miss what is brief.
 pub const SMALL_AFTER: usize = 3;
@@ -542,6 +568,32 @@ pub fn observed_size(store: &Store, test_id: &str) -> Result<Option<SizeView>> {
             ),
         }));
     }
+    // Its runs went through a container client: what the tests use is out
+    // of sight, and no amount of sampling will change that (round 15).
+    let client: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT json_extract(e.payload, '$.message')
+               FROM events e JOIN runs r ON r.id = e.run_id
+              WHERE e.kind = 'run_note' AND r.status = 'finished'
+                AND json_extract(e.payload, '$.message') LIKE 'the tests ran through `%'
+                AND e.run_id IN (SELECT run_id FROM attempts WHERE test_id = ?1)
+                AND e.run_id NOT IN (SELECT run_id FROM forgotten)
+              LIMIT 1",
+            params![test_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(note) = client {
+        let name = note.split('`').nth(1).unwrap_or("a container client");
+        return Ok(Some(SizeView {
+            size: None,
+            at_most: None,
+            label: format!(
+                "unknown (ran through {name}: out of sight, so its size cannot be observed; declare it with `size` in prova.toml)"
+            ),
+        }));
+    }
     Ok(None)
 }
 
@@ -555,6 +607,9 @@ pub struct SizeReport {
     pub unknown: usize,
     /// Of the unknown, those seen small in fewer runs than needed.
     pub small_so_far: usize,
+    /// Of the unknown, those whose runs went through a container client:
+    /// their size cannot be observed, only declared.
+    pub out_of_sight: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     /// Medium and large tests with what made them so: (test, label).
@@ -598,6 +653,12 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
                 r.unknown += 1;
                 if view.as_ref().is_some_and(|v| v.label.starts_with("small?")) {
                     r.small_so_far += 1;
+                }
+                if view
+                    .as_ref()
+                    .is_some_and(|v| v.label.starts_with("unknown (ran through"))
+                {
+                    r.out_of_sight += 1;
                 }
             }
         }
@@ -843,6 +904,7 @@ pub fn slowest(
                FROM attempts a JOIN runs r ON r.id = a.run_id
               WHERE a.duration_ms IS NOT NULL AND a.outcome IN ('passed', 'failed')
                 AND r.status = 'finished'
+                AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
                 AND r.id NOT IN (SELECT run_id FROM forgotten)
                 AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
                                   AND w.payload LIKE '%; no evidence about the tests%')

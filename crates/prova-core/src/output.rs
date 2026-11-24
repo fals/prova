@@ -136,11 +136,54 @@ fn looks_like_error(line: &str) -> bool {
         "FAILED",
         "WARNING: DATA RACE",
         "signal: killed",
+        // Steps around the tests that failed (round 15: hidden behind a
+        // quarantined failure): type checkers, linters, coverage gates,
+        // make, interrupted or broken test runs.
+        ": error",
+        "error TS",
+        "\u{2716}",
+        "make: ***",
+        "not met",
+        "not reached",
+        "Interrupted",
+        "INTERNALERROR",
+        "Type Errors",
+        "Unhandled",
+        "fatal error",
+        "Fatal Python error",
+        "test timed out",
     ];
     STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
 }
 
+/// A line without terminal colour sequences (`ESC [ ... m`): kept output
+/// is read as text (round 15: `[32m- Expected[39m`).
+fn plain(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\u{1b}') {
+        return line.into();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.clone().next() == Some('[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if ('@'..='~').contains(&d) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
 fn clip(line: &str) -> String {
+    let line = plain(line);
+    let line = line.as_ref();
     match line.char_indices().nth(LINE_CHARS) {
         Some((i, _)) => format!("{}…", &line[..i]),
         None => line.to_owned(),
@@ -193,6 +236,75 @@ pub struct Distiller {
     error_bytes: usize,
     /// Lines of context still to add after the last error line.
     after: usize,
+    /// Every line that looks like an error, whatever the excerpt's budget,
+    /// up to `ERROR_LINES` (a quarantine must account for each, ADR 0029).
+    error_lines: Vec<ErrorLine>,
+    /// More error lines came than were kept.
+    error_overflow: bool,
+    /// The test whose section of the output is being read (pytest's
+    /// `____ test_x ____`, libtest's `---- x stdout ----`, Jest's `● a › b`,
+    /// Go's `=== RUN   TestX`): an error line there is that test's.
+    owner: Option<String>,
+}
+
+/// The test a line opens a section for, if it is such a header.
+fn section_owner(t: &str) -> Option<String> {
+    let t = t.trim();
+    if t.starts_with("___") && t.ends_with("___") {
+        let name = t.trim_matches('_').trim();
+        return (!name.is_empty()).then(|| name.to_owned());
+    }
+    if let Some(rest) = t.strip_prefix("---- ")
+        && let Some(name) = rest
+            .strip_suffix(" stdout ----")
+            .or(rest.strip_suffix(" stderr ----"))
+    {
+        return Some(name.to_owned());
+    }
+    if let Some(name) = t.strip_prefix("\u{25cf} ") {
+        return Some(name.trim().to_owned());
+    }
+    for p in ["=== RUN ", "=== CONT ", "=== NAME ", "--- FAIL: "] {
+        if let Some(rest) = t.strip_prefix(p) {
+            return rest.split_whitespace().next().map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// A line that ends any test's section: a summary banner or a runner's
+/// wrap-up.
+fn ends_section(t: &str) -> bool {
+    let t = t.trim();
+    (t.starts_with("====") && t.ends_with("===="))
+        || t.starts_with("test result:")
+        || t == "failures:"
+        || t.starts_with("Tests:")
+        || t.starts_with("Test Suites:")
+        || t == "FAIL"
+        || t == "PASS"
+        || t.starts_with("FAIL\t")
+        || t.starts_with("ok  \t")
+}
+
+/// An error-looking line: its number, its text, and the test whose section
+/// of the output it is in.
+pub type ErrorLine = (u64, String, Option<String>);
+
+/// Error-looking lines kept for the quarantine guard.
+const ERROR_LINES: usize = 2000;
+
+/// The text of a line: a `go test -json` output event's `Output`, or the
+/// line itself.
+fn text_of(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.starts_with('{')
+        && line.contains("\"Output\"")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+        && let Some(o) = v.get("Output").and_then(|o| o.as_str())
+    {
+        return o.trim_end().to_owned().into();
+    }
+    line.into()
 }
 
 impl Distiller {
@@ -203,6 +315,29 @@ impl Distiller {
         let line = clip(line.trim_end_matches(['\n', '\r']));
         if self.head.len() < HEAD {
             self.head.push(line.clone());
+        }
+        {
+            let t = text_of(&line);
+            if line.starts_with('{') && line.contains("\"Output\"") {
+                // `go test -json`: the event says whose output it is; a
+                // package's own output is no test's (round 15: a panic
+                // after the tests was the last test's).
+                self.owner = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("Test").and_then(|t| t.as_str()).map(str::to_owned));
+            } else if let Some(o) = section_owner(&t) {
+                self.owner = Some(o);
+            } else if ends_section(&t) {
+                self.owner = None;
+            }
+            if looks_like_error(&t) {
+                if self.error_lines.len() < ERROR_LINES {
+                    self.error_lines
+                        .push((n, t.into_owned(), self.owner.clone()));
+                } else {
+                    self.error_overflow = true;
+                }
+            }
         }
         let budget_left = self.error_bytes < EXCERPT_BYTES / 2;
         if budget_left && (looks_like_error(&line) || self.after > 0) {
@@ -264,6 +399,13 @@ impl Distiller {
                     .map(|(i, l)| (s.start + i as u64, l.clone()))
             })
             .collect()
+    }
+
+    /// Every line that looks like an error (a `go test -json` event's
+    /// output decoded), with the test whose section it is in, and whether
+    /// more came than were kept.
+    pub fn error_lines(&self) -> (&[ErrorLine], bool) {
+        (&self.error_lines, self.error_overflow)
     }
 
     /// First line that looks like an error, with its line number.
@@ -512,6 +654,39 @@ pub fn run_full(store: &Store, run: &str) -> Result<Option<String>> {
         .map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
+/// What a failing test printed, in a line or two, for a failure the
+/// framework gave no message for (Go prints a test's message after its
+/// `--- FAIL` line, or a panic after it): a panic and the test's own frame,
+/// else the first lines.
+pub fn test_output_summary(store: &Store, run: &str, test_id: &str) -> Option<String> {
+    let blob: Vec<u8> = store
+        .conn()
+        .query_row(
+            "SELECT output FROM test_output WHERE run_id = ?1 AND test_id = ?2 AND output IS NOT NULL",
+            params![run, test_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let text = String::from_utf8_lossy(&decompress(&blob)?).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let picked: Vec<&str> = match lines.iter().position(|l| l.starts_with("panic: ")) {
+        Some(p) => {
+            let mut v = vec![lines[p]];
+            v.extend(lines[p..].iter().find(|l| l.contains("_test.go:")));
+            v
+        }
+        None => lines.iter().take(3).copied().collect(),
+    };
+    let msg: String = picked.join("\n").chars().take(400).collect();
+    (!msg.is_empty()).then_some(msg)
+}
+
 /// Failing tests' own output in a run: (display name, text).
 pub fn test_outputs(store: &Store, run: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = store.conn().prepare(
@@ -735,5 +910,15 @@ mod tests {
         let b = bound_text(&t);
         assert!(b.len() < EXCERPT_BYTES + 64 && b.starts_with("[... "));
         assert!(b.ends_with("assert 16 == 4\n"));
+    }
+}
+
+#[cfg(test)]
+mod plain_tests {
+    /// Round 15: kept output showed `[32m- Expected[39m`.
+    #[test]
+    fn kept_lines_lose_their_colours() {
+        assert_eq!(super::clip("\u{1b}[32m- Expected\u{1b}[39m"), "- Expected");
+        assert_eq!(super::clip("plain"), "plain");
     }
 }

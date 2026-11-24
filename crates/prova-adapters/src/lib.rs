@@ -13,6 +13,9 @@ use prova_core::config::RunSpec;
 use prova_core::engine::{ExitReport, Observer};
 use prova_core::model::{EventKind, Level};
 
+/// How long output stays quiet before a held pytest pass is reported.
+const HELD_PASS_MS: u64 = 1000;
+
 /// Every run gets the whole ladder: recognizers on live output, then
 /// result files after exit. Nothing to configure.
 pub struct Ladder {
@@ -25,6 +28,8 @@ pub struct Ladder {
     streams: Vec<Stream>,
     /// "No test ran" is suspicious (ADR 0017), unless the suite says so.
     expect_tests: bool,
+    /// When the last output line arrived (ms), to release a held pass.
+    last_line_ms: u64,
 }
 
 /// A file read like output: from where the last read stopped, whole lines.
@@ -57,13 +62,27 @@ impl Stream {
 pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
     let mut files = results::ResultFiles::new(&spec.results);
     files.snapshot(root);
+    // gotestsum prints the module's root package as `.`; `go test` by its
+    // import path. go.mod names it, so both name a test alike (round 15).
+    let mut live = recognize::Recognizers::default();
+    live.go_module = std::fs::read_to_string(root.join("go.mod"))
+        .ok()
+        .and_then(|m| {
+            m.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("module ")
+                    .map(|p| p.trim().trim_matches('"').to_owned())
+            })
+        })
+        .filter(|p| !p.is_empty());
     Box::new(Ladder {
-        live: recognize::Recognizers::default(),
+        live,
         files,
         inject: spec.inject.clone(),
         inject_dir: None,
         streams: Vec::new(),
         expect_tests: spec.expects_tests(),
+        last_line_ms: 0,
     })
 }
 
@@ -100,12 +119,22 @@ impl Observer for Ladder {
         inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
 
-    fn on_line(&mut self, line: &str, _now_ms: u64) -> Vec<EventKind> {
+    fn on_line(&mut self, line: &str, now_ms: u64) -> Vec<EventKind> {
+        self.last_line_ms = now_ms;
         self.live.line(line)
     }
 
-    fn poll(&mut self, _now_ms: u64) -> Vec<EventKind> {
+    fn on_partial(&mut self, text: &str, _now_ms: u64) -> Vec<EventKind> {
+        self.live.partial(text)
+    }
+
+    fn poll(&mut self, now_ms: u64) -> Vec<EventKind> {
         let mut out = Vec::new();
+        // A pass held for a teardown error that no line followed: the
+        // output went quiet, so it stands (a stall report counts it).
+        if self.last_line_ms > 0 && now_ms.saturating_sub(self.last_line_ms) >= HELD_PASS_MS {
+            out.extend(self.live.release_held_pass());
+        }
         for i in 0..self.streams.len() {
             for line in self.streams[i].read_lines() {
                 out.extend(self.live.line(line.trim_end()));
@@ -129,6 +158,21 @@ impl Observer for Ladder {
         }
         held.extend(self.live.finish());
         let mut report = self.files.on_exit(root, started_ms);
+        // An injected recipe's stream that never appeared: the variable did
+        // not reach the test process (round 15: `./dev` did not forward
+        // PYTEST_ADDOPTS).
+        for stream in &self.streams {
+            if !stream.path.exists() {
+                let name = stream.path.file_name().and_then(|n| n.to_str());
+                let recipe = inject::RECIPES
+                    .iter()
+                    .find(|r| r.stream == name)
+                    .map_or("injected", |r| r.name);
+                report.warnings.push(format!(
+                    "the {recipe} report was never written: the variable did not reach the test process (a wrapper or container?)"
+                ));
+            }
+        }
         if let Some(dir) = &self.inject_dir {
             let injected = self.files.ingest(results::files_in(dir));
             report.events.extend(injected.events);
@@ -179,15 +223,19 @@ impl Observer for Ladder {
             .seen
             .iter()
             .map(|(unique, (d, _))| {
-                let file = unique
-                    .split_once('\u{1f}')
-                    .map(|(f, _)| f)
-                    .filter(|f| !f.is_empty());
-                prova_core::model::TestKey {
-                    file: file.map(str::to_owned),
-                    path: Vec::new(),
-                    name: d.clone(),
-                }
+                // The key it was stored under (round 15: rebuilt from the
+                // display, a `Class::method` key named no stored test).
+                self.live.seen_keys.get(unique).cloned().unwrap_or_else(|| {
+                    let file = unique
+                        .split_once('\u{1f}')
+                        .map(|(f, _)| f)
+                        .filter(|f| !f.is_empty());
+                    prova_core::model::TestKey {
+                        file: file.map(str::to_owned),
+                        path: Vec::new(),
+                        name: d.clone(),
+                    }
+                })
             })
             .collect();
         // A bare live name the file qualifies (VSTest's console `Divide`,
@@ -195,11 +243,26 @@ impl Observer for Ladder {
         // identity. Keeping the bare one made two classes' `Divide` swap
         // histories with the console's order, and a deterministic failure
         // read as flaky (round 13).
+        // A file name that qualifies the live one with a package (Surefire's
+        // console `CalcTest::flaky`, its report `calc.CalcTest::flaky`) is
+        // the identity too, whatever the live name holds (round 15: failures
+        // and passes of one Java test were two tests). A parameterized
+        // case's arguments and index are left out of the console name.
+        let base = |d: &str| -> String {
+            match d.find('(') {
+                Some(i) if d.ends_with(']') || d.ends_with(')') => d[..i].to_owned(),
+                _ => d.to_owned(),
+            }
+        };
         let qualifies =
-            |l: &str, d: &str| d != l && !l.contains("::") && d.ends_with(&format!(".{l}"));
+            |l: &str, d: &str| d != l && (base(d) == l || base(d).ends_with(&format!(".{l}")));
         let mut superseded: Vec<(usize, usize)> = Vec::new();
         let covers = |l: &str, d: &str| {
-            l == d || d.ends_with(&format!("::{l}")) || d.ends_with(&format!(".{l}"))
+            let b = base(d);
+            l == d
+                || d.ends_with(&format!("::{l}"))
+                || d.ends_with(&format!(".{l}"))
+                || (b != d && (b == l || b.ends_with(&format!(".{l}"))))
         };
         // Matched in passes over all file results (exact outcome, then
         // pass/fail, then any), not greedily: a passing `B.Same` must not
@@ -327,11 +390,21 @@ impl Observer for Ladder {
             });
         }
         // ADR 0017: evidence against a pass, and passes that verified little.
+        // Keyed by name; two tests of one name (nextest's `tests::it_works`
+        // in two binaries) keep their own identity, or a pass hides a
+        // failure (round 15).
+        let mut by_name: std::collections::BTreeMap<&String, usize> = Default::default();
+        for (d, _) in self.live.seen.values() {
+            *by_name.entry(d).or_default() += 1;
+        }
         let mut outcomes: std::collections::BTreeMap<String, prova_core::model::Outcome> = self
             .live
             .seen
-            .values()
-            .map(|(d, o)| (d.clone(), *o))
+            .iter()
+            .map(|(u, (d, o))| {
+                let shared = by_name.get(d).is_some_and(|n| *n > 1);
+                (if shared { u.clone() } else { d.clone() }, *o)
+            })
             .collect();
         outcomes.extend(finals.iter().map(|(k, o)| (k.clone(), *o)));
         let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64;
@@ -339,6 +412,25 @@ impl Observer for Ladder {
         if failed_reported > failed_seen {
             report.contradictions.push(format!(
                 "the framework reported {failed_reported} failed test(s) but prova recorded {failed_seen}: its summary is believed over its exit code"
+            ));
+        }
+        // Jest's own totals against what was recognized: console output or
+        // an odd layout can add or lose tests (round 15). A note, since the
+        // exit code and the totals still decide.
+        if self.live.jest_files > 0
+            && self.live.summary_seen
+            && (seen > self.live.total() && self.live.total() > 0 || failed_seen > failed_reported)
+        {
+            report.warnings.push(format!(
+                "Jest's totals say {} test(s), {failed_reported} failed, but prova recorded {seen}, {failed_seen} failed: some recognized lines may not be tests (console output?)",
+                self.live.total()
+            ));
+        }
+        // Errors no test owns (Vitest `Errors  1 error`): a pass may hide them.
+        if self.live.unhandled_errors > 0 && !self.live.unhandled_block {
+            report.warnings.push(format!(
+                "Vitest reported {} unhandled error(s) outside any test: this pass is unverified",
+                self.live.unhandled_errors
             ));
         }
         // A test file that fails to load fails no test: its framework counts
@@ -492,6 +584,7 @@ mod tests {
             inject_dir: None,
             streams: Vec::new(),
             expect_tests: true,
+            last_line_ms: 0,
         };
         // A pytest pass is held one line (a teardown error may follow).
         let mut live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
@@ -523,6 +616,74 @@ mod tests {
             report.contradictions.iter().any(|c| c.contains("test_a")),
             "{:?}",
             report.contradictions
+        );
+    }
+
+    fn run_lines(lines: &[&str]) -> (Vec<EventKind>, ExitReport) {
+        let mut ladder = Ladder {
+            live: recognize::Recognizers::default(),
+            files: results::ResultFiles::new(&[]),
+            inject: Vec::new(),
+            inject_dir: None,
+            streams: Vec::new(),
+            expect_tests: true,
+            last_line_ms: 0,
+        };
+        let mut live = Vec::new();
+        for l in lines {
+            live.extend(ladder.on_line(l, 0));
+        }
+        let root = std::env::temp_dir().join(format!("prova-r15fw-{}", std::process::id()));
+        let report = ladder.on_exit(&root, 0);
+        (live, report)
+    }
+
+    /// Two test binaries both with `tests::it_works`: one failing, one
+    /// passing. The framework's one failure is not lost behind the pass.
+    #[test]
+    fn nextest_text_failure_in_one_binary_is_recorded_not_contradicted() {
+        let (_, report) = run_lines(&[
+            "        FAIL [   0.004s] crate_a tests::it_works",
+            "        PASS [   0.003s] crate_b tests::it_works",
+            "------------",
+            "     Summary [   0.007s] 2 tests run: 1 passed, 1 failed, 0 skipped",
+        ]);
+        assert!(
+            report.contradictions.is_empty(),
+            "{:?}",
+            report.contradictions
+        );
+    }
+
+    /// Console output that Jest's own totals do not agree with is noted.
+    #[test]
+    fn jest_totals_that_disagree_with_the_recognized_tests_are_noted() {
+        let (_, report) = run_lines(&[
+            " PASS  src/a.test.js",
+            "  deploy",
+            "    \u{2713} plans (4 ms)",
+            "    \u{2713} extra (4 ms)",
+            "Tests: 1 passed, 1 total",
+        ]);
+        let all = [report.warnings.clone(), report.contradictions.clone()].concat();
+        assert!(
+            all.iter()
+                .any(|w| w.contains("Jest") && w.contains("recorded 2")),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn vitest_errors_line_without_a_block_is_a_warning() {
+        let (_, report) = run_lines(&[
+            " \u{2713} src/a.test.ts > adds 1ms",
+            "      Tests  1 passed (1)",
+            "     Errors  1 error",
+        ]);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("unhandled")),
+            "{:?}",
+            report.warnings
         );
     }
 }

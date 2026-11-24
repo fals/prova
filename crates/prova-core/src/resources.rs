@@ -119,10 +119,89 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
             .find(|c| exe == *c)
             .map(|c| (i, c))
     })?;
-    words[at + 1..]
+    let rest = &words[at + 1..];
+    // The subcommand: `docker compose run|exec`, `docker run|exec`,
+    // `kubectl exec|run|debug`; `logs`, `attach`, `cp` replay or copy
+    // output, they run nothing (round 15: `docker compose logs` passed as a
+    // container run, skipping the no-CPU check).
+    let sub = rest
         .iter()
-        .any(|w| matches!(*w, "run" | "exec" | "compose" | "debug"))
-        .then_some(client)
+        .copied()
+        .filter(|w| !w.starts_with('-'))
+        .find(|w| *w != "compose" && *w != "container")?;
+    if !matches!(sub, "run" | "exec" | "debug") {
+        return None;
+    }
+    // `docker exec box cat results.txt` prints a file: no test runs.
+    let viewer = rest.iter().any(|w| {
+        matches!(
+            w.rsplit('/').next().unwrap_or(w),
+            "cat" | "tail" | "head" | "less" | "more" | "tac"
+        )
+    });
+    (!viewer).then_some(client)
+}
+
+/// Whether the client's command line starts a container (`docker run`),
+/// the only kind whose container this run can name.
+pub fn container_client_runs(cmdline: &str) -> bool {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    words.iter().take(2).enumerate().any(|(i, w)| {
+        matches!(w.rsplit('/').next(), Some("docker" | "podman" | "nerdctl"))
+            && words.get(i + 1) == Some(&"run")
+    })
+}
+
+/// The container a `docker run` command line names: `--name X`, or the id
+/// in its `--cidfile`. None when it names neither (not attributable).
+pub fn container_of(cmdline: &str) -> Option<String> {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    let value = |flag: &str| {
+        words.iter().enumerate().find_map(|(i, w)| {
+            if *w == flag {
+                words.get(i + 1).map(|v| (*v).to_owned())
+            } else {
+                w.strip_prefix(&format!("{flag}=")).map(str::to_owned)
+            }
+        })
+    };
+    if let Some(name) = value("--name") {
+        return Some(name);
+    }
+    let file = value("--cidfile")?;
+    let id = std::fs::read_to_string(file).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// Kills a container by name or id with its client; true when it did.
+/// Bounded: a client that hangs is abandoned.
+pub fn kill_container(client: &str, target: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(client)
+        .args(["kill", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Whether a process is a test runner's process for a single test
@@ -624,6 +703,10 @@ mod container_tests {
         assert_eq!(c("kubectl exec pod -- go test ./..."), Some("kubectl"));
         assert_eq!(c("/bin/sh /w/bin/docker run img"), Some("docker"));
         assert_eq!(c("docker ps"), None);
+        // Round 15: replays and file viewers run nothing.
+        assert_eq!(c("docker compose logs app"), None);
+        assert_eq!(c("docker exec box cat /out/results.txt"), None);
+        assert_eq!(c("docker compose run --rm app pytest"), Some("docker"));
         assert_eq!(c("dockerd --host x"), None);
     }
 }

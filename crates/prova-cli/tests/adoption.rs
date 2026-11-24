@@ -388,3 +388,24 @@ fn init_says_created_for_a_new_agents_md() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(!out.contains("created AGENTS.md"), "{out}");
 }
+
+/// Round 15: after `adopt --write`, the next step said `--filter <test
+/// name>` though prova had seen the project's tests.
+#[test]
+fn adopt_write_suggests_a_test_it_has_seen() {
+    let d = workspace("example");
+    std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'test calc::adds ... ok'",
+        ],
+    );
+    let o = prova(&d, &["adopt", "--write"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("--filter calc::adds"), "{out}");
+}

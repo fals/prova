@@ -51,6 +51,11 @@ pub trait Observer {
     fn on_line(&mut self, _line: &str, _now_ms: u64) -> Vec<EventKind> {
         Vec::new()
     }
+    /// Called with the start of an output line not finished yet (a test
+    /// runner prints a test's name before its outcome).
+    fn on_partial(&mut self, _text: &str, _now_ms: u64) -> Vec<EventKind> {
+        Vec::new()
+    }
     /// Extra environment for the process under test (opt-in injection).
     /// `run_dir` is private to this run; files written there are the
     /// observer's to read in `on_exit`.
@@ -253,6 +258,12 @@ struct Supervisor<'a> {
     first_line_ms: Option<u64>,
     /// The container client the tests run through, if any.
     container: Option<&'static str>,
+    /// The client's command line, to find its container when the run is
+    /// stopped (round 15).
+    container_cmd: Option<String>,
+    /// Lifecycle keys of results re-keyed under another name (a Go test
+    /// once its package is known): their outcome is the new key's.
+    superseded: std::collections::BTreeSet<String>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
     /// From the first output line to the end: the phase of a run whose
@@ -468,6 +479,13 @@ impl Supervisor<'_> {
         {
             *d = Some(started.elapsed().as_millis() as u64);
         }
+        if let EventKind::TestSuperseded { test, by } = &kind {
+            self.superseded.insert(test.unique());
+            // One test, one result: the provisional entry leaves the
+            // verdict once its test's own result is recorded (spec/run.qnt
+            // `superseded`; round 15: a rerun's pass did not count).
+            let _ = self.lifecycle.supersede(&test.unique(), &by.unique());
+        }
         // Guard every test event with the lifecycle (spec/run.qnt).
         let ok = match &kind {
             EventKind::TestStarted { test } => {
@@ -635,6 +653,36 @@ impl Supervisor<'_> {
         });
     }
 
+    /// The run is being stopped: stopping a container client does not stop
+    /// its container. A container the run named (`--name`, `--cidfile`) is
+    /// killed; any other is not attributable, so the run says to check.
+    fn stop_container(&mut self) {
+        let Some(client) = self.container else {
+            return;
+        };
+        let cmd = self.container_cmd.clone().unwrap_or_default();
+        match crate::resources::container_of(&cmd) {
+            Some(target) if crate::resources::container_client_runs(&cmd) => {
+                let ok = crate::resources::kill_container(client, &target);
+                let message = if ok {
+                    format!("stopped the container `{target}` with `{client} kill {target}`: stopping the `{client}` client alone does not stop it")
+                } else {
+                    format!("could not stop the container `{target}` with `{client} kill {target}`: check `{client} ps` and stop it")
+                };
+                if ok {
+                    self.emit(EventKind::RunNote { message });
+                } else {
+                    self.emit(EventKind::RunWarning { message });
+                }
+            }
+            _ => self.emit(EventKind::RunWarning {
+                message: format!(
+                    "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
+                ),
+            }),
+        }
+    }
+
     /// A snapshot of the command's group, reused when under 50 ms old.
     fn usage_now(&mut self) -> crate::resources::Usage {
         if let Some((at, u)) = &self.last_usage
@@ -646,13 +694,19 @@ impl Supervisor<'_> {
         // A container client started before the tests printed anything is
         // how the command runs them: what they use is out of sight.
         if self.container.is_none() {
-            self.container = u.procs.iter().find_map(|(pid, (_, cmd))| {
+            let found = u.procs.iter().find_map(|(pid, (_, cmd))| {
                 let early = match (u.starts.get(pid), self.first_line_ms) {
                     (Some(start), Some(first)) => *start <= first,
                     _ => true,
                 };
-                crate::resources::container_client(cmd).filter(|_| early)
+                crate::resources::container_client(cmd)
+                    .filter(|_| early)
+                    .map(|c| (c, cmd.clone()))
             });
+            if let Some((client, cmd)) = found {
+                self.container = Some(client);
+                self.container_cmd = Some(cmd);
+            }
         }
         self.known_pids.extend(u.procs.keys().copied());
         self.known_sockets.extend(u.sockets.keys().copied());
@@ -726,12 +780,14 @@ impl Supervisor<'_> {
 
     /// The start of a line not finished yet: into the spool at once, so
     /// `prova output` and a stall summary show it.
-    fn partial(&mut self, stream: usize, text: &str) {
+    fn partial(&mut self, stream: usize, text: &str, observer: &mut dyn Observer) {
         let done = &mut self.partial[stream];
         let new = text.strip_prefix(done.as_str()).unwrap_or(text);
         let _ = self.output.write_all(new.as_bytes());
         let _ = self.output.flush();
         *done = text.to_owned();
+        let events = observer.on_partial(text, now_ms());
+        self.observed(events, observer);
     }
 
     fn line(&mut self, stream: usize, line: &str, observer: &mut dyn Observer) {
@@ -789,7 +845,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         default_slow: spec
             .size
             .map(crate::config::Size::slow_budget)
-            .unwrap_or(Duration::from_secs(60)),
+            .unwrap_or(crate::config::DEFAULT_SLOW),
         running: BTreeMap::new(),
         terminating: false,
         partial: Default::default(),
@@ -806,6 +862,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // The command itself may be the client (`docker run ... go test`):
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
+        container_cmd: Some(spec.command.display()),
+        superseded: Default::default(),
         phase: None,
         whole: None,
         one_test_procs: BTreeMap::new(),
@@ -865,6 +923,19 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     sup.pgid = pgid;
     sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
+    // A parameterized case's selection that the framework can only take as
+    // its whole method: all its cases run (round 15: no word of it).
+    if let Some(sel) = spec.selection.as_deref() {
+        let filter = crate::config::framework_filter(&spec.command.display(), sel);
+        if (sel.ends_with(']') || sel.ends_with(')')) && sel.contains('(') && !filter.contains('(')
+        {
+            sup.emit(EventKind::RunNote {
+                message: format!(
+                    "the framework selects {filter:?}, not one of its cases: every case of it runs"
+                ),
+            });
+        }
+    }
     if !injected.is_empty() {
         // Short: the temporary paths are noise in every summary (round 9).
         let vars: Vec<String> = injected
@@ -957,7 +1028,7 @@ fn observe_child(
                 }
                 Ok(Chunk::Partial(i, p, _)) => {
                     last_activity = Instant::now();
-                    sup.partial(i, &p);
+                    sup.partial(i, &p, observer);
                 }
                 Ok(Chunk::Eof) => open_streams -= 1,
                 Err(_) => break,
@@ -994,6 +1065,7 @@ fn observe_child(
             if terminating.is_none() && store.cancel_requested(run)? {
                 process::terminate_group(pgid);
                 sup.terminating = true;
+                sup.stop_container();
                 terminating = Some((now, Status::Cancelled, "cancelled".into()));
             }
         }
@@ -1011,6 +1083,7 @@ fn observe_child(
         if terminating.is_none() && now.duration_since(start) >= kill_after {
             process::terminate_group(pgid);
             sup.terminating = true;
+            sup.stop_container();
             let reason = format!(
                 "killed: exceeded kill_after {}",
                 crate::ids::format_duration(kill_after)
@@ -1071,7 +1144,7 @@ fn observe_child(
                     // when it arrived, like a line (round 12 CI: 388 of 400).
                     Chunk::Partial(_, _, a) if a.at > until => break,
                     Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                    Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                    Chunk::Partial(i, p, _) => sup.partial(i, &p, observer),
                     Chunk::Eof => *open -= 1,
                 }
             }
@@ -1087,6 +1160,7 @@ fn observe_child(
         // Cancelled while its output was still being recorded: what was not
         // recorded yet is dropped, and the run says it was cancelled.
         sup.terminating = true;
+        sup.stop_container();
         terminating = Some((Instant::now(), Status::Cancelled, "cancelled".into()));
     }
     // The test phase's size (ADR 0026 §2): what tests prova could not
@@ -1495,12 +1569,16 @@ fn observe_child(
             .flatten()
             .map(|v| v as u64)
     };
-    let set_aside = quarantined_only_failures(
-        sup.lifecycle.outcomes(),
-        &quarantine,
-        exit_code,
-        &first_seen,
-    );
+    // A re-keyed result counts once, under its new name (round 15: the
+    // provisional Go name failed the guard of a quarantined test).
+    let outcomes: BTreeMap<String, Outcome> = sup
+        .lifecycle
+        .outcomes()
+        .iter()
+        .filter(|(k, _)| !sup.superseded.contains(*k))
+        .map(|(k, o)| (k.clone(), *o))
+        .collect();
+    let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
     if let Some(names) = &set_aside {
         if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -1509,13 +1587,22 @@ fn observe_child(
                 "the framework counted {n} failure(s), more than the quarantined test(s) that failed ({}): something else failed too",
                 names.len()
             ));
-        } else if let Some((line, text)) =
-            unexplained_crash(store, run, &sup.distiller, names, &report.test_outputs)?
-        {
+        } else if exit_code.is_some_and(|c| c > 128) {
+            // Killed by a signal (exit 128 + n): cut short, whatever the
+            // tests said (round 15: exit 137 after a full summary passed).
             contradictions.push(format!(
-                "the output shows an error outside the quarantined test(s) (line {line}): {}",
-                text.trim().chars().take(160).collect::<String>()
+                "the command was killed (exit {}): a quarantine sets aside test failures, not a killed run",
+                exit_code.unwrap_or(0)
             ));
+        } else if let Some(why) = unaccounted_error(
+            store,
+            run,
+            &sup.distiller,
+            names,
+            &report.test_outputs,
+            &spec.command.display(),
+        )? {
+            contradictions.push(why);
         }
     }
     if let Some(code @ (126 | 127)) = exit_code {
@@ -1526,6 +1613,19 @@ fn observe_child(
             } else {
                 "not executable"
             }
+        ));
+    }
+    // pytest exits 4 (usage error: a selection that names nothing) without
+    // running a test: that is no test failing (round 15), like a command
+    // that could not start. Exit 5 (nothing collected) stays a failure: a
+    // suite that ran no test verified nothing (ADR 0017).
+    if let Some(code @ 4) = exit_code
+        && status == Status::Finished
+        && observed == 0
+        && sup.tail.iter().any(|l| pytest_ran_nothing(l))
+    {
+        reason = Some(format!(
+            "{PYTEST_NO_TEST} (exit {code}: usage error, e.g. a selection or option pytest rejected); no test failed"
         ));
     }
     if !contradictions.is_empty() {
@@ -1546,12 +1646,8 @@ fn observe_child(
         && closed.is_empty()
         && contradictions.is_empty()
         && sup.level >= Level::Recognized
-        && let Some(names) = quarantined_only_failures(
-            sup.lifecycle.outcomes(),
-            &quarantine,
-            exit_code,
-            &first_seen,
-        )
+        && let Some(names) =
+            quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
     {
         outcome = Outcome::Passed;
         sup.emit(EventKind::RunNote {
@@ -1560,6 +1656,13 @@ fn observe_child(
                 names.join(", ")
             ),
         });
+    }
+    if outcome == Outcome::Failed
+        && reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST))
+    {
+        outcome = Outcome::Errored;
     }
     if outcome == Outcome::Passed {
         // A quarantined test's own crash is set aside with it (round 14).
@@ -1606,6 +1709,63 @@ fn observe_child(
             format!(
                 "{} test(s) did not finish before the run ended",
                 closed.len()
+            )
+        });
+    }
+    // Only quarantined tests failed, and nothing else passed: the run fails
+    // (ADR 0028 §3), and says why (round 15: no detail at all).
+    let failing: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, o)| o.is_failure())
+        .map(|(k, _)| key_display(k))
+        .collect();
+    if outcome == Outcome::Failed
+        && reason.is_none()
+        && !failing.is_empty()
+        && failing
+            .iter()
+            .all(|d| crate::quarantine::covers(&quarantine, d).is_some())
+    {
+        // Which of ADR 0028's conditions did not hold (round 15: refused
+        // with no word of why).
+        let errored: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, o)| **o == Outcome::Errored)
+            .map(|(k, _)| key_display(k))
+            .collect();
+        let new_subtests: Vec<&str> = failing
+            .iter()
+            .copied()
+            .filter(|d| {
+                !quarantine.contains_key(*d)
+                    && crate::quarantine::covers(&quarantine, d)
+                        .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
+            })
+            .collect();
+        let verified_other = outcomes.iter().any(|(k, o)| {
+            *o == Outcome::Passed
+                && crate::quarantine::covers(&quarantine, key_display(k)).is_none()
+        });
+        reason = Some(if !errored.is_empty() {
+            format!(
+                "quarantined test(s) errored, not plainly failed ({}): a quarantine sets aside failures, not errors",
+                errored.join(", ")
+            )
+        } else if !new_subtests.is_empty() {
+            format!(
+                "subtest(s) first seen after their parent's quarantine failed ({}): a new subtest's failure is news",
+                new_subtests.join(", ")
+            )
+        } else if !verified_other {
+            format!(
+                "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
+                failing.join(", ")
+            )
+        } else {
+            format!(
+                "only quarantined test(s) failed ({}), but the run cannot be set aside (exit {}, or the run did not end on its own)",
+                failing.join(", "),
+                exit_code.map_or("none".to_owned(), |c| c.to_string())
             )
         });
     }
@@ -1687,6 +1847,40 @@ fn observe_child(
     let _ = std::fs::remove_dir_all(&dir);
     crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
     crate::output::sweep(store)
+}
+
+/// The reason prefix of a pytest run that ran no test (exit 4 or 5).
+pub const PYTEST_NO_TEST: &str = "pytest ran no test";
+
+/// A line pytest prints when it ran no test: usage errors and empty
+/// collections.
+fn pytest_ran_nothing(line: &str) -> bool {
+    let l = line.trim();
+    l.starts_with("ERROR: file or directory not found")
+        || l.starts_with("ERROR: not found:")
+        || l.starts_with("ERROR: usage:")
+        || l.starts_with("usage: pytest")
+        || l.starts_with("usage: __main__.py")
+        || l.contains("no tests ran")
+        || l.contains("collected 0 items")
+}
+
+/// The cause a failing test's kept output names: pytest's first `E` line,
+/// or the whole output when it is one line (a short summary's message).
+fn message_from_output(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(e) = lines.iter().find_map(|l| l.strip_prefix("E ")) {
+        let e = e.trim();
+        return (!e.is_empty()).then(|| e.to_owned());
+    }
+    match lines.as_slice() {
+        [one] => Some((*one).to_owned()),
+        _ => None,
+    }
 }
 
 /// Tests of the suite's last passing full run that this run did not record:
@@ -1845,6 +2039,166 @@ fn quarantined_only_failures(
     (!names.is_empty() && verified_other).then_some(names)
 }
 
+/// Whether `name` occurs in `line` as a whole name, not inside a longer one
+/// (round 15: `test_q` covered a crash of `test_queue`).
+fn names_word(line: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(name).any(|(i, _)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + name.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// The ways a framework prints a test's name: the whole display, without
+/// its file or binary part, its last part, and Jest's `›` for ` > `.
+fn printed_names(display: &str) -> Vec<String> {
+    let mut out = vec![display.to_owned()];
+    if let Some((_, rest)) = display.split_once("::") {
+        out.push(rest.to_owned());
+    }
+    let last = display
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(display)
+        .rsplit(" > ")
+        .next()
+        .unwrap_or(display);
+    out.push(last.to_owned());
+    let more: Vec<String> = out
+        .iter()
+        .filter(|n| n.contains(" > "))
+        .map(|n| n.replace(" > ", " \u{203a} "))
+        .collect();
+    out.extend(more);
+    out.retain(|n| n.len() >= 3);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A test runner's own summary of failing tests that says nothing more
+/// than the failures seen: counts of failures with no error, the bare
+/// `FAIL` lines, a package's result, Maven's and make's wrap-up of a
+/// failed test step.
+fn summary_of_failures(t: &str, command: &str) -> bool {
+    let lower = t.to_lowercase();
+    let no_errors =
+        !lower.contains("error") || lower.contains("errors: 0") || lower.contains(" 0 error");
+    if runner_failure_summary(t)
+        || matches!(
+            t,
+            "FAIL" | "FAILED" | "failures:" | "=== Failed" | "BUILD FAILURE"
+        )
+    {
+        return true;
+    }
+    // go: `FAIL\tpkg\t0.01s` (a package's result, not a build failure).
+    if (t.starts_with("FAIL\t") || t.starts_with("FAIL "))
+        && !t.contains('[')
+        && t.split_whitespace().count() <= 3
+    {
+        return true;
+    }
+    // Counts: pytest's `=== 1 failed, 2 passed in 0.1s ===`, libtest's
+    // `test result: FAILED. ...`, Jest's and Vitest's `Tests:`/`Test
+    // Suites:`/`Test Files`, gotestsum's `DONE`, Maven's `Tests run:`,
+    // dotnet's `Failed!  - Failed:`.
+    let counts = (t.starts_with('=')
+        && (lower.contains(" failed") || lower.contains("short test summary")))
+        || t.starts_with("test result: FAILED.")
+        || t.starts_with("Tests:")
+        || t.starts_with("Tests ")
+        || t.starts_with("Test Suites:")
+        || t.starts_with("Test Files")
+        || t.starts_with("DONE ")
+        || t.starts_with("[ERROR] Tests run:")
+        || t.starts_with("Failed!  - Failed:")
+        || t == "Test Run Failed.";
+    if counts {
+        return no_errors;
+    }
+    // Maven's wrap-up of a failed test step.
+    if let Some(rest) = t.strip_prefix("[ERROR]") {
+        let r = rest.trim();
+        return r.is_empty()
+            || r == "Failures:"
+            || r.starts_with("-> [Help")
+            || r.starts_with("[Help ")
+            || r.starts_with("To see the full stack trace")
+            || r.starts_with("Re-run Maven")
+            || r.starts_with("For more information")
+            || r.starts_with("Please refer to")
+            || (r.starts_with("Failed to execute goal")
+                && (r.contains("surefire") || r.contains("failsafe"))
+                && r.contains("There are test failures"));
+    }
+    // make's line for the target the suite runs (`make test`).
+    if let Some(rest) = t
+        .strip_prefix("make: *** [")
+        .or_else(|| t.split_once("]: *** [").map(|(_, r)| r))
+        && let Some((target, _)) = rest.split_once(']')
+    {
+        let target = target.rsplit(':').next().unwrap_or(target).trim();
+        return !target.is_empty() && command.split_whitespace().any(|w| w == target);
+    }
+    false
+}
+
+/// The first error-looking line of the output that the quarantined
+/// failing tests do not account for, as the reason a quarantine cannot
+/// set the run aside (ADR 0029): it names one of them (as a whole name),
+/// is part of one's own output or failure message, or is the runner's
+/// summary of failures. Too many error lines to check is a reason too.
+fn unaccounted_error(
+    store: &Store,
+    run: &str,
+    distiller: &crate::output::Distiller,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+    command: &str,
+) -> Result<Option<String>> {
+    let (lines, overflow) = distiller.error_lines();
+    if overflow {
+        return Ok(Some(
+            "the output has more error lines than prova can account for: a quarantine sets aside only failures it can explain".into(),
+        ));
+    }
+    let mut own: Vec<String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o.clone())
+        .collect();
+    let mut stmt = store.conn().prepare(
+        "SELECT a.message FROM attempts a JOIN tests t ON t.id = a.test_id
+          WHERE a.run_id = ?1 AND t.display = ?2 AND a.message IS NOT NULL",
+    )?;
+    for name in quarantined {
+        for m in stmt.query_map(rusqlite::params![run, name], |r| r.get::<_, String>(0))? {
+            own.push(m?);
+        }
+    }
+    let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
+    Ok(lines.iter().find_map(|(n, line, owner)| {
+        let t = line.trim();
+        // In a quarantined test's own section (its own section header
+        // names it as a whole name too).
+        let in_own_section = owner
+            .as_deref()
+            .is_some_and(|o| names.iter().any(|q| names_word(o, q)));
+        let accounted = in_own_section
+            || names.iter().any(|q| names_word(t, q))
+            || own.iter().any(|o| o.contains(t))
+            || summary_of_failures(t, command);
+        (!accounted).then(|| {
+            format!(
+                "the output shows an error outside the quarantined test(s) (line {n}): {}",
+                t.chars().take(160).collect::<String>()
+            )
+        })
+    }))
+}
+
 /// The first crash-like line of the output that no quarantined failing
 /// test accounts for: it names one of them, or it is part of one's own
 /// output or failure message. With no quarantined failure, the first crash.
@@ -1875,20 +2229,24 @@ fn unexplained_crash(
     }
     // A name as frameworks print it: the whole display, or without the
     // binary or file part before the first `::`.
-    let names: Vec<&str> = quarantined
-        .iter()
-        .flat_map(|n| {
-            [
-                n.as_str(),
-                n.split_once("::").map_or(n.as_str(), |(_, r)| r),
-            ]
-        })
-        .filter(|n| n.len() >= 4)
-        .collect();
+    let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
     Ok(crashes.into_iter().find(|(_, line)| {
         let t = line.trim();
-        !names.iter().any(|n| t.contains(n)) && !own.iter().any(|o| o.contains(t))
+        !names.iter().any(|n| names_word(t, n))
+            && !own.iter().any(|o| o.contains(t))
+            && !runner_failure_summary(t)
     }))
+}
+
+/// A test runner's own line saying that tests failed (nextest's `error: test
+/// run failed`, cargo's `error: test failed, to rerun pass ...`): it says
+/// nothing beyond the failures already seen (round 15: it failed every
+/// quarantined pass under nextest).
+fn runner_failure_summary(line: &str) -> bool {
+    line == "error: test run failed"
+        || line.starts_with("error: test failed, to rerun pass")
+        || (line.starts_with("error: ")
+            && (line.ends_with(" target failed:") || line.ends_with(" targets failed:")))
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite
@@ -1940,7 +2298,14 @@ fn left_out_flaky(
         {
             continue;
         }
-        if f.suites.iter().any(|s| s == suite) || overlaps(store, run, &f.suites)? {
+        // Another suite sharing tests with this one is evidence only when
+        // the flaky test's neighbours (its file, or its module) ran here: a
+        // suite that runs everything shares tests with a narrow one that
+        // never meant to run it (round 15: `small` warned about a flaky
+        // test of `medium`, because `spec` runs both).
+        if f.suites.iter().any(|s| s == suite)
+            || (overlaps(store, run, &f.suites)? && neighbour_ran(store, run, &f.display)?)
+        {
             left.push(f.display);
         }
     }
@@ -1954,6 +2319,21 @@ fn left_out_flaky(
         left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
         if left.len() > 5 { ", ..." } else { "" }
     )))
+}
+
+/// Whether this run recorded a test of the same file (or, with no file, the
+/// same module path) as the test named `display`.
+fn neighbour_ran(store: &Store, run: &str, display: &str) -> Result<bool> {
+    Ok(store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
+                         WHERE a.run_id = ?1
+                           AND EXISTS (SELECT 1 FROM tests f WHERE f.display = ?2
+                                         AND ((f.file IS NOT NULL AND f.file = t.file)
+                                           OR (f.file IS NULL AND t.file IS NULL
+                                               AND f.path = t.path AND f.path <> '[]'))))",
+        rusqlite::params![run, display],
+        |r| r.get(0),
+    )?)
 }
 
 // ------------------------------------------------------------------ wait
@@ -2520,12 +2900,27 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         })
     };
     let mut failures = Vec::new();
+    // A failure reported before its message (pytest -v prints the line
+    // first, the `-rfE` summary names the cause at the end): the message is
+    // in the test's kept output (round 15).
+    let kept: BTreeMap<String, String> =
+        if row.status.is_terminal() && failing.iter().take(20).any(|f| f.2.is_none()) {
+            crate::output::test_outputs(store, run)?
+                .into_iter()
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
     for (key, outcome, message, _, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
+        let message = message.clone().or_else(|| {
+            kept.get(&key.display())
+                .and_then(|t| message_from_output(t))
+        });
         failures.push(Failure {
             test: key.display(),
             outcome: *outcome,
-            message: message.clone(),
+            message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
                 c.suite_passed_on_same_code = suite_passed_on_same_code;
                 c
@@ -2560,7 +2955,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name)
                 .map(|f| f.1.as_str().to_owned())
                 .next();
-            if live && result.is_none() {
+            // A selection that did not include it says nothing of it
+            // (round 15: "not run" on every --select run).
+            if (live || selection.is_some()) && result.is_none() {
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
@@ -2600,7 +2997,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let slowest: Vec<SlowestTest> = if row.status.is_terminal() {
         let mut stmt = store.conn().prepare(
             "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
-              WHERE a.run_id = ?1 AND a.duration_ms >= ?2 GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
+              WHERE a.run_id = ?1 AND a.duration_ms >= ?2
+                AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+              GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
         )?;
         stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
             Ok(SlowestTest {
@@ -2622,6 +3021,30 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A selected run's failure outside the selection: a file-level entry
+    // the framework loads whatever the selection (Vitest imports every
+    // file for `-t`), or a test the filter did not name (round 15: read as
+    // the selection leaking).
+    if let Some(sel) = &selection {
+        let leaf = sel.rsplit("::").next().unwrap_or(sel).to_lowercase();
+        let outside: Vec<&str> = failures
+            .iter()
+            .map(|f| f.test.as_str())
+            .filter(|t| {
+                let tl = t.to_lowercase();
+                t.ends_with("::(file)")
+                    || t.ends_with("::(package)")
+                    || t.ends_with("::(suite)")
+                    || !(tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl)))
+            })
+            .collect();
+        if !outside.is_empty() {
+            notes.push(format!(
+                "outside the selection {sel:?}: {} (the framework loaded or ran more than the filter names)",
+                outside.join(", ")
+            ));
+        }
+    }
     // A failure before any test ran may be the environment's (a missing
     // SDK), not the code's; history would count it against the code
     // (round 14). Say how to keep it out.
@@ -2802,6 +3225,9 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .filter(|r| {
             r.status == Status::Finished
                 && r.outcome == Some(Outcome::Passed)
+                // A pass that set a quarantined failure aside is no "last
+                // green" (round 15).
+                && r.exit_code == Some(0)
                 && !thin.contains(&r.id)
         })
         .take(CHECKED_PASSES)

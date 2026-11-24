@@ -120,7 +120,7 @@ enum Cmd {
     #[command(after_help = "\
 Examples:
   prova run -- make test                     any command; history starts now
-  prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s)
+  prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s budget)
   prova run unit --until done                the result (waits up to 9m, then prints `next:`)
   prova run unit --select calc::divides      rerun one test (the suite's `select` template)
   prova run unit --repeat 10                 is it flaky? each test's pass/fail tally
@@ -148,8 +148,8 @@ Examples:
         #[arg(long, value_name = "N", conflicts_with = "detach")]
         repeat: Option<u32>,
         /// Report a stall after this long without activity (e.g. 30s).
-        /// Default: the suite's `stall_after`, else by size (small 30s,
-        /// medium 60s, large 5m), else 60s.
+        /// Default: the suite's `stall_after`, else by size (small 20s,
+        /// medium 60s, large 5m), else 20s.
         #[arg(long, value_name = "DURATION")]
         stall_after: Option<String>,
         /// Kill the run after this long in total (e.g. 30m).
@@ -1376,6 +1376,91 @@ fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
     }
 }
 
+/// The wrapper this project's earlier runs put in front of the test command
+/// (`./dev`, `nix develop -c`), from the newest run that had one.
+fn earlier_wrapper(store: &Store) -> Option<String> {
+    store.recent_runs(30).ok()?.into_iter().find_map(|r| {
+        let argv: Vec<String> = r.spec["command"]["argv"]
+            .as_array()?
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_owned))
+            .collect();
+        prova_adapters::adopt::wrapper_of(&argv)
+    })
+}
+
+/// What the framework named in a filter's syntax, for the framework the
+/// command runs.
+fn filter_syntax_advice(command: &str) -> &'static str {
+    let c = command;
+    if c.contains("pytest") {
+        "pytest selects with a `-k` expression (a substring of the test name) or a node id (tests/test_x.py::test_name)"
+    } else if c.contains("vitest") || c.contains("jest") {
+        "Vitest and Jest select with `-t <name pattern>`"
+    } else if c.contains("go test") || c.contains("gotestsum") {
+        "Go selects with `-run <regex>` (anchor it: ^TestName$)"
+    } else if c.contains("mvn") || c.contains("gradle") {
+        "Maven selects with `-Dtest=Class#method` (Gradle: `--tests Class.method`)"
+    } else if c.contains("dotnet") {
+        ".NET selects with `--filter FullyQualifiedName~Name`"
+    } else if c.contains("cargo") {
+        "cargo selects with a substring of the test path"
+    } else {
+        "use the framework's own filter syntax"
+    }
+}
+
+/// The part of a filter a framework's "not found" line names, when the
+/// filter has spaces and the line quotes only a piece of it: a wrapper or
+/// shell split it into words (round 15: `./dev` re-splits `$*`).
+fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
+    if !filter.contains(' ') {
+        return None;
+    }
+    lines.iter().find_map(|l| {
+        let (_, frag) = l.split_once("not found:")?;
+        let frag = frag.trim();
+        (!frag.is_empty() && frag != filter && filter.contains(frag)).then(|| frag.to_owned())
+    })
+}
+
+/// Why a run that ran no test failed on its own: the command could not
+/// start (126/127), or it exited nonzero and printed an error. None when it
+/// ran fine (exit 0), so the level is the issue.
+fn run_failure_cause(s: &Summary) -> Option<String> {
+    match s.exit_code {
+        Some(126 | 127) => s
+            .detail
+            .clone()
+            .or_else(|| Some(format!("exit {}", s.exit_code.unwrap_or_default()))),
+        Some(code) if code != 0 => {
+            let error = s.output_tail.iter().map(|l| l.trim()).find(|l| {
+                let l = l.to_lowercase();
+                [
+                    "error",
+                    "no module named",
+                    "not found",
+                    "no such file",
+                    "permission denied",
+                    "cannot",
+                ]
+                .iter()
+                .any(|w| l.contains(w))
+            });
+            let last = s
+                .output_tail
+                .iter()
+                .map(|l| l.trim())
+                .rfind(|l| !l.is_empty());
+            Some(match error.or(last) {
+                Some(line) => format!("exit {code}: {}", render::clean(line)),
+                None => format!("exit {code} with no output"),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool) -> Result<u8> {
     let (store, root, _) = open_here()?;
     if let (Some(suite), Some(filter)) = (verify, filter) {
@@ -1419,11 +1504,14 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         // The framework's own "nothing matched" beats a level diagnosis: an
         // opaque run with that message means the filter's syntax is wrong
         // for the framework, not the level (round 8: surefire with -q).
-        let nothing_matched = s
+        let lines: Vec<&String> = s
             .output_tail
             .iter()
             .chain(s.notes.iter())
             .chain(s.detail.iter())
+            .collect();
+        let nothing_matched = lines
+            .iter()
             .find(|l| {
                 let l = l.to_lowercase();
                 l.contains("no tests matching")
@@ -1431,13 +1519,33 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                     || l.contains("no tests ran")
                     || l.contains("no tests found")
                     || l.contains("no tests to run")
+                    || l.contains("file or directory not found")
             })
             .map(|l| render::clean(l.trim()));
         let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
+            let split = split_filter_fragment(&filter, &lines);
             (
                 false,
                 format!(
-                    "filter {filter:?} matched no test; the framework says: {line}. Use the framework's own filter syntax (Maven: Class#method, .NET: FullyQualifiedName~Name)"
+                    "filter {filter:?} matched no test; the framework says: {line}. {}{}",
+                    filter_syntax_advice(&s.command),
+                    split.map_or(String::new(), |f| format!(
+                        " The filter was split into words by a wrapper or the shell ({f:?} is only a part of it): use a filter without spaces (pytest: `-k` with a substring)"
+                    )),
+                ),
+            )
+        } else if let (true, Some(cause)) = (
+            tests.is_empty()
+                && (s.level == prova_core::model::Level::Opaque
+                    || matches!(s.exit_code, Some(126 | 127))),
+            run_failure_cause(&s),
+        ) {
+            // The command itself did not work: say why before anything about
+            // levels or templates (round 15: exit 127 was "level opaque").
+            (
+                false,
+                format!(
+                    "the command failed before any test ran: {cause}; fix it, then verify again"
                 ),
             )
         } else if s.level == prova_core::model::Level::Opaque {
@@ -1478,7 +1586,10 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         }
         return Ok(if ok { exit::PASSED } else { exit::FAILED });
     }
-    let p = prova_adapters::adopt::propose(&root);
+    let mut p = prova_adapters::adopt::propose(&root);
+    if let Some(wrapper) = earlier_wrapper(&store) {
+        prova_adapters::adopt::apply_wrapper(&mut p, &wrapper);
+    }
     let toml = prova_adapters::adopt::to_toml(&p);
     if json {
         println!("{}", serde_json::json!({ "proposal": p, "toml": toml }));
@@ -1500,9 +1611,24 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             for n in &p.notes {
                 println!("note: {n}");
             }
+            // A test prova has already seen, rather than a placeholder
+            // (round 15).
+            let example: Option<String> = store
+                .conn()
+                .query_row(
+                    "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                      WHERE a.outcome = 'passed' AND t.display NOT LIKE '%(%'
+                      ORDER BY a.ts_ms DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
             println!(
-                "next: prova adopt --verify {} --filter <test name>",
-                names[0]
+                "next: prova adopt --verify {} --filter {}",
+                names[0],
+                example
+                    .map(|e| shell_quote(&e))
+                    .unwrap_or_else(|| "<test name>".to_owned())
             );
         }
     }
@@ -2503,9 +2629,20 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     .into());
                 }
                 _ => {
-                    println!("{} tests match {test:?}; be more specific:", found.len());
-                    for (_, display, suite) in found.iter().take(20) {
-                        println!("  {display}  (suite {suite})");
+                    // One line per name, its suites together: a name listed
+                    // once per suite read as tests no name could tell apart
+                    // (round 15).
+                    let mut by_name: std::collections::BTreeMap<&str, Vec<&str>> =
+                        Default::default();
+                    for (_, display, suite) in &found {
+                        by_name.entry(display).or_default().push(suite);
+                    }
+                    println!("{} tests match {test:?}; be more specific:", by_name.len());
+                    for (display, suites) in by_name.iter().take(20) {
+                        println!("  {display}  (suite {})", suites.join(", "));
+                    }
+                    if by_name.len() > 20 {
+                        println!("  ... and {} more", by_name.len() - 20);
                     }
                     return Ok(exit::USAGE);
                 }
@@ -2582,7 +2719,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
-                if d.unknown > 0 {
+                if d.out_of_sight > 0 {
+                    println!(
+                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size` in prova.toml",
+                        d.out_of_sight
+                    );
+                }
+                if d.unknown > d.out_of_sight {
                     println!(
                         "unknown: {} seen small in fewer than {} runs so far; the others were never seen on their own (one test running, or its own process) and their runs were not sampled in time to tell (their output came all at once). Sizes are a lower bound: prova samples every 0.5 s and cannot see sleeps",
                         d.small_so_far,
@@ -2704,6 +2847,9 @@ fn repeat_runs(
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     let mut quarantined = std::collections::BTreeSet::new();
+    let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
+    // Runs in which each test had a result.
+    let mut seen_in: std::collections::BTreeMap<String, u32> = Default::default();
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2726,19 +2872,51 @@ fn repeat_runs(
         }
         any_failed |= s.outcome != Some(Outcome::Passed);
         let ran = s.counts.results();
-        if ran == 0 {
+        // Quiet output: the framework counted tests prova did not see one
+        // by one; that is not "no test ran" (round 15).
+        let counted = s.framework.is_some_and(|(t, _)| t > 0);
+        if ran == 0 && !counted {
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
             failed_otherwise += 1;
         }
+        if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
+            quiet += 1;
+        }
+        // A pass that proved little (cached results, warnings) is no
+        // evidence of a steady test (round 15: "every test passed every
+        // time" over replayed go test results).
+        if s.outcome == Some(Outcome::Passed)
+            && (!s.warnings.is_empty() || s.verified == Some(false))
+        {
+            unverified.push(id.clone());
+        }
+        // A result re-keyed under another name (a Go test once its package
+        // is known) counts under that name only (round 15: tallied twice).
+        // Every attempt counts (a retry's failure too).
+        let mut results: Vec<(String, String, Outcome)> = Vec::new();
+        let mut gone = std::collections::BTreeSet::new();
         for e in store.events_after(&id, 0)? {
-            if let prova_core::model::EventKind::TestFinished { test, outcome, .. } = e.kind {
-                let t = tally.entry(test.display()).or_default();
-                if outcome.is_failure() {
-                    t.1 += 1;
-                } else if outcome == Outcome::Passed {
-                    t.0 += 1;
+            match e.kind {
+                prova_core::model::EventKind::TestFinished { test, outcome, .. } => {
+                    results.push((test.unique(), test.display(), outcome));
                 }
+                prova_core::model::EventKind::TestSuperseded { test, .. } => {
+                    gone.insert(test.unique());
+                }
+                _ => {}
+            }
+        }
+        let mut this_run = std::collections::BTreeSet::new();
+        for (_, display, outcome) in results.into_iter().filter(|(u, _, _)| !gone.contains(u)) {
+            if this_run.insert(display.clone()) {
+                *seen_in.entry(display.clone()).or_default() += 1;
+            }
+            let t = tally.entry(display).or_default();
+            if outcome.is_failure() {
+                t.1 += 1;
+            } else if outcome == Outcome::Passed {
+                t.0 += 1;
             }
         }
         for q in &s.quarantined {
@@ -2808,11 +2986,34 @@ fn repeat_runs(
             } else {
                 ""
             };
-            println!("  FAIL {}{q}: failed every time", render::clean(t));
+            // Failing whenever seen is "every time" only if it was seen in
+            // every run (round 15: quiet output hid its passes).
+            let seen = seen_in.get(*t).copied().unwrap_or(0);
+            if seen < done {
+                println!(
+                    "  FAIL {}{q}: failed each of the {seen} time(s) it was seen; no result in the other {} run(s) (quiet output shows only failures)",
+                    render::clean(t),
+                    done - seen
+                );
+            } else {
+                println!("  FAIL {}{q}: failed every time", render::clean(t));
+            }
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
         if no_tests > 0 {
             println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
+        }
+        if quiet > 0 {
+            println!(
+                "  {quiet} of {done} run(s) showed only some tests one by one (quiet output): passes there were not seen"
+            );
+        }
+        if !unverified.is_empty() {
+            println!(
+                "  {} of {done} pass(es) verified little (warnings; e.g. cached results): {}",
+                unverified.len(),
+                unverified.join(", ")
+            );
         }
         if failed_otherwise > 0 {
             println!(
@@ -2821,7 +3022,13 @@ fn repeat_runs(
         }
         if tally.is_empty() {
             // Nothing to say about tests.
-        } else if mixed.is_empty() && always.is_empty() && no_tests == 0 && failed_otherwise == 0 {
+        } else if mixed.is_empty()
+            && always.is_empty()
+            && no_tests == 0
+            && failed_otherwise == 0
+            && quiet == 0
+            && unverified.is_empty()
+        {
             println!("  every test passed every time");
         } else if mixed.is_empty() && always.is_empty() {
             println!("  {steady} test(s) passed whenever they ran");
@@ -3003,6 +3210,16 @@ fn exit_code(s: &Summary) -> u8 {
             {
                 exit::INFRA
             }
+            // pytest found nothing to run (bad selection, empty collection):
+            // not a test failure either.
+            (Some(Outcome::Errored), Status::Finished)
+                if s.exit_code == Some(4)
+                    && s.detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with(engine::PYTEST_NO_TEST)) =>
+            {
+                exit::INFRA
+            }
             (_, Status::Cancelled) => exit::STALLED_OR_KILLED,
             (_, Status::Aborted)
                 if s.detail.as_deref().is_some_and(|d| d.starts_with("killed")) =>
@@ -3088,5 +3305,16 @@ mod help_tests {
         let mut missing = Vec::new();
         walk(&Cli::command(), "prova", &mut missing);
         assert!(missing.is_empty(), "{missing:#?}");
+    }
+}
+
+/// A word safe to paste into a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-./:@=".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }

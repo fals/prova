@@ -590,6 +590,11 @@ fn extra_metric_lines_void_the_comparison() {
         reason.contains("reported t 3x per trial, the baseline's 1x"),
         "{reason}"
     );
+    // Round 15: the trial output is kept, and the reason says how to read it.
+    assert!(reason.contains("prova exp log e "), "{reason}");
+    let log = prova(&d, &["exp", "log", "e"]);
+    let text = String::from_utf8_lossy(&log.stdout);
+    assert!(text.contains("== trial"), "{text}");
 }
 
 /// Round 8 red team: a process escaping the trial's group (setsid) kept
@@ -1214,9 +1219,11 @@ fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
 /// discard log name what they count and compare.
 #[test]
 fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
+    // Delays long against process start noise (macOS CI: a 20 ms arm
+    // measured 43 ms, then 92 ms, and the comparison was void).
     let d = repo("notbest", "0.3");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.02").unwrap();
+    std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "fast"])
             .status
@@ -1226,7 +1233,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
         "fast"
     );
-    std::fs::write(d.join("delay"), "0.1").unwrap();
+    std::fs::write(d.join("delay"), "0.2").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "mid"])
             .status
@@ -1245,7 +1252,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         "{t}"
     );
     // A discard names its reference.
-    std::fs::write(d.join("delay"), "0.5").unwrap();
+    std::fs::write(d.join("delay"), "0.6").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
@@ -1258,4 +1265,44 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         last["reason"].as_str().unwrap().contains("vs fast"),
         "{last}"
     );
+}
+
+/// Round 15: an experiment that failed before any trial measured nothing,
+/// so it does not count toward "other experiments on this baseline"; and
+/// the protocol line says which files are protected.
+#[test]
+fn unmeasured_experiments_do_not_count_as_other_experiments() {
+    let d = repo("caveat-count", "0.3");
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e0",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "mem_kb",
+            "--oracle",
+            "false",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let st = prova(&d, &["exp", "status", "e0"]);
+    let shown = String::from_utf8_lossy(&st.stdout).into_owned();
+    assert!(
+        shown.contains("Cargo.toml") && shown.contains("Makefile"),
+        "{shown}"
+    );
+    assert!(prova(&d, &["exp", "candidate", "e0"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e0", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    new_exp(&d, &["--metric", "mem_kb"]);
+    std::fs::write(d.join("delay"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let caveats = r["comparison"]["result"]["caveats"].to_string();
+    assert!(!caveats.contains("other experiment"), "{r}");
 }

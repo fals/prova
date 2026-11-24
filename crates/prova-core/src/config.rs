@@ -73,7 +73,7 @@ impl Size {
     /// Default idle budget before a stall is reported for a whole run.
     pub fn stall_after(self) -> Duration {
         match self {
-            Size::Small => Duration::from_secs(30),
+            Size::Small => Duration::from_secs(20),
             Size::Medium => Duration::from_secs(60),
             Size::Large => Duration::from_secs(300),
         }
@@ -181,9 +181,12 @@ impl RunSpec {
 }
 
 /// A quiet run of a suite with no declared size stalls after this long, as
-/// a small one does: `--until first-failure` (30 s) then catches a hang
-/// on its second wait at the latest (round 14: 60 s, two waits or more).
-pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(30);
+/// a small one does: inside the first `--until first-failure` wait (30 s),
+/// so a hang is named on the first call (rounds 14 and 15).
+pub const DEFAULT_STALL_AFTER: Duration = Duration::from_secs(20);
+/// A test with no history in a suite with no declared size is called slow
+/// after this long, inside the first 30 s wait (round 15: 60 s).
+pub const DEFAULT_SLOW: Duration = Duration::from_secs(20);
 pub const DEFAULT_KILL_AFTER: Duration = Duration::from_secs(3600);
 
 /// Workspace root: nearest ancestor with `prova.toml`, else with `.git`,
@@ -259,7 +262,13 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     // file) selects with spaces (round 14: it matched nothing).
     if command.contains(" -t ") || command.contains("--testNamePattern") {
         let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
-        return leaf.replace(" > ", " ");
+        let name = leaf.replace(" > ", " ");
+        // `-t` is a regular expression: a name with `(1, 2)` is a literal
+        // unless the user wrote a pattern (`^add`, `sub$`) (round 15).
+        if name.starts_with('^') || name.ends_with('$') {
+            return name;
+        }
+        return regex_escape(&name);
     }
     let Some((head, leaf)) = filter.rsplit_once("::") else {
         return filter.to_owned();
@@ -275,6 +284,18 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     } else {
         filter.to_owned()
     }
+}
+
+/// A name as a literal in a JavaScript regular expression.
+fn regex_escape(name: &str) -> String {
+    let mut p = String::with_capacity(name.len());
+    for c in name.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    p
 }
 
 /// `go test -run` takes one regular expression per subtest level, split
@@ -437,6 +458,22 @@ mod filter_tests {
         );
     }
 
+    /// Round 15: `-t` takes a regular expression; a test named
+    /// `add(1, 2) -> 3` selected nothing.
+    #[test]
+    fn a_vitest_or_jest_name_is_escaped_for_the_regex() {
+        use super::framework_filter as f;
+        let jest = "npx jest -t \"$PROVA_FILTER\"";
+        assert_eq!(f(jest, "add(1, 2) -> 3"), r"add\(1, 2\) -> 3");
+        assert_eq!(
+            f(jest, "src/x.test.ts::math > add(1, 2) -> 3"),
+            r"math add\(1, 2\) -> 3"
+        );
+        assert_eq!(f(jest, "a.b+c"), r"a\.b\+c");
+        // A pattern the user wrote is theirs.
+        assert_eq!(f(jest, "^add|sub$"), "^add|sub$");
+    }
+
     #[test]
     fn prova_names_become_framework_filters() {
         use super::framework_filter as f;
@@ -493,7 +530,7 @@ mod tests {
             c.run_spec("small", Some("-x")),
             Err(ConfigError::BadSelection(_))
         ));
-        assert_eq!(spec.stall_after_ms, 30_000);
+        assert_eq!(spec.stall_after_ms, 20_000);
         assert!(matches!(
             c.run_spec("nope", None),
             Err(ConfigError::UnknownSuite(..))
