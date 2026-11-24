@@ -2680,7 +2680,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 if let Some(w) = &d.warning {
                     println!("warning: {w}");
                 }
-                if d.unknown > 0 {
+                if d.out_of_sight > 0 {
+                    println!(
+                        "unknown: {} of them ran through a container client (docker, podman, ...): what tests use there is out of prova's sight and cannot be observed; declare their size with `size` in prova.toml",
+                        d.out_of_sight
+                    );
+                }
+                if d.unknown > d.out_of_sight {
                     println!(
                         "unknown: {} seen small in fewer than {} runs so far; the others were never seen on their own (one test running, or its own process) and their runs were not sampled in time to tell (their output came all at once). Sizes are a lower bound: prova samples every 0.5 s and cannot see sleeps",
                         d.small_so_far,

@@ -153,3 +153,34 @@ fn pytest_exit_4_with_no_test_is_not_a_test_failure() {
     );
     assert_eq!(o.status.code(), Some(1));
 }
+
+/// Round 15: tests that ran in docker were "unknown ... output came all at
+/// once", and `history` had no size line.
+#[cfg(target_os = "linux")]
+#[test]
+fn sizes_say_when_the_tests_ran_through_a_container_client() {
+    let d = workspace("sizes-docker");
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin,
+        "docker",
+        "i=0; while [ $i -lt 2000 ]; do i=$((i+1)); done\nprintf 'tests/test_a.py::test_one PASSED   [100%%]\\n'",
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = Command::new(PROVA)
+        .args(["run", "--", "docker", "run", "--rm", "img", "pytest", "-v"])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stdout(&o));
+    let out = stdout(&prova(&d, &["sizes"]));
+    assert!(
+        out.contains("ran through a container client") && !out.contains("came all at once"),
+        "{out}"
+    );
+    let h = stdout(&prova(&d, &["history", "test_one"]));
+    assert!(h.contains("size: unknown (ran through docker"), "{h}");
+}
