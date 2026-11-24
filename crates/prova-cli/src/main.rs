@@ -180,7 +180,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Proposed test sizes from observed durations.
+    /// Test sizes from what each test used (processes, network), with the reason (ADR 0025).
     Sizes {
         #[arg(long)]
         suite: Option<String>,
