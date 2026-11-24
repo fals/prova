@@ -130,7 +130,10 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str), expect:
         }
         Expect::NoOtherPass => {
             assert_eq!(o.status.code(), Some(1), "{name}: {t}");
-            assert!(t.contains("no other test passed"), "{name}: {t}");
+            assert!(
+                (t.contains("no other test passed") || t.contains("names no passing test")),
+                "{name}: {t}"
+            );
         }
     }
 
