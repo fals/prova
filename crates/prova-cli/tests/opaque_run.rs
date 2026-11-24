@@ -1259,3 +1259,21 @@ fn cancel_warns_when_the_container_cannot_be_attributed() {
         "{text}"
     );
 }
+
+/// Round 15: a selected Vitest run listed another file's import error next
+/// to the selected test, with no word that it was outside the selection.
+#[test]
+fn a_failure_outside_the_selection_says_so() {
+    let d = workspace("outside-sel");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.v]\nrun = \"echo all\"\nselect = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\\\n' ' \u{2713} src/group.test.ts > group > bad two 1ms' ' FAIL  src/broken.test.ts [ src/broken.test.ts ]' 'Error: Cannot find module ./missing' ' Test Files  1 failed | 1 passed (2)' '      Tests  1 passed (1)'; exit 1\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "v", "--select", "group > bad two"]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("outside the selection \"group > bad two\": src/broken.test.ts::(file)"),
+        "{out}"
+    );
+}

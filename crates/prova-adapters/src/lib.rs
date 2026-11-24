@@ -614,6 +614,7 @@ mod tests {
             inject_dir: None,
             streams: Vec::new(),
             expect_tests: true,
+            last_line_ms: 0,
         };
         let mut live = Vec::new();
         for l in lines {

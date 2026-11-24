@@ -2995,6 +2995,30 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let command = serde_json::from_value::<RunSpec>(row.spec.clone())
         .map(|s| s.command.display())
         .unwrap_or_default();
+    // A selected run's failure outside the selection: a file-level entry
+    // the framework loads whatever the selection (Vitest imports every
+    // file for `-t`), or a test the filter did not name (round 15: read as
+    // the selection leaking).
+    if let Some(sel) = &selection {
+        let leaf = sel.rsplit("::").next().unwrap_or(sel).to_lowercase();
+        let outside: Vec<&str> = failures
+            .iter()
+            .map(|f| f.test.as_str())
+            .filter(|t| {
+                let tl = t.to_lowercase();
+                t.ends_with("::(file)")
+                    || t.ends_with("::(package)")
+                    || t.ends_with("::(suite)")
+                    || !(tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl)))
+            })
+            .collect();
+        if !outside.is_empty() {
+            notes.push(format!(
+                "outside the selection {sel:?}: {} (the framework loaded or ran more than the filter names)",
+                outside.join(", ")
+            ));
+        }
+    }
     // A failure before any test ran may be the environment's (a missing
     // SDK), not the code's; history would count it against the code
     // (round 14). Say how to keep it out.
