@@ -3076,6 +3076,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     if row.status == Status::Finished
         && matches!(row.outcome, Some(Outcome::Failed | Outcome::Errored))
         && counts.results() == 0
+        // Quiet output: the framework counted tests, so tests ran and the
+        // failure came after them (round 16: a lint step's failure got a
+        // `forget` hint).
+        && framework.is_none_or(|(t, _)| t == 0)
     {
         notes.push(format!(
             "no test result was seen: if this failed for the environment (a missing tool or SDK), not the code, `prova forget {run} --reason \"...\"` keeps it out of history"

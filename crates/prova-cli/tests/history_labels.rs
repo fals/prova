@@ -862,3 +862,27 @@ fn a_thin_history_is_not_failing_now() {
     let out = run(&d, "make", "fail");
     assert!(!out.contains("failing now"), "{out}");
 }
+
+/// Round 16: quiet tests that all passed, then a failing lint step: "no
+/// test result was seen" with a hint to forget a real code failure.
+#[test]
+fn a_step_failing_after_quiet_tests_is_not_called_testless() {
+    let d = workspace("quietlint");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}echo '.......'; echo '7 passed in 0.10s'; echo \"*** Error compiling './broken.py'...\"; echo 'SyntaxError: invalid syntax'; exit 1"
+            )
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make"]));
+    assert!(
+        out.contains("FAILED") && !out.contains("prova forget"),
+        "{out}"
+    );
+    let out = text(&prova(&d, &["run", "make", "--repeat", "2"]));
+    assert!(!out.contains("(no test ran)"), "{out}");
+}

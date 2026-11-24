@@ -2848,6 +2848,8 @@ fn repeat_runs(
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     let mut quarantined = std::collections::BTreeSet::new();
     let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
+    let mut unverified_why: Option<String> = None;
+    let mut failed_why: Option<String> = None;
     // Runs in which each test had a result.
     let mut seen_in: std::collections::BTreeMap<String, u32> = Default::default();
     for i in 1..=n {
@@ -2879,6 +2881,7 @@ fn repeat_runs(
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
             failed_otherwise += 1;
+            failed_why = failed_why.or_else(|| s.detail.clone());
         }
         if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
             quiet += 1;
@@ -2889,6 +2892,13 @@ fn repeat_runs(
         if s.outcome == Some(Outcome::Passed)
             && (!s.warnings.is_empty() || s.verified == Some(false))
         {
+            // The reason itself, not a generic one (round 16: "e.g. cached
+            // results" for a known flaky test's pass).
+            unverified_why.get_or_insert_with(|| {
+                s.warnings.first().cloned().unwrap_or_else(|| {
+                    format!("known flaky test(s) passed: {}", s.flaky_passed.join(", "))
+                })
+            });
             unverified.push(id.clone());
         }
         // A result re-keyed under another name (a Go test once its package
@@ -2933,7 +2943,7 @@ fn repeat_runs(
                 .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
-            } else if ran == 0 {
+            } else if ran == 0 && !counted {
                 " (no test ran)".to_owned()
             } else if let (Some(Outcome::Failed | Outcome::Errored), Some(d)) =
                 (s.outcome, &s.detail)
@@ -3010,14 +3020,16 @@ fn repeat_runs(
         }
         if !unverified.is_empty() {
             println!(
-                "  {} of {done} pass(es) verified little (warnings; e.g. cached results): {}",
+                "  {} of {done} pass(es) verified little: {} (e.g. {})",
                 unverified.len(),
-                unverified.join(", ")
+                unverified.join(", "),
+                render::clean(unverified_why.as_deref().unwrap_or("see each run's status"))
             );
         }
         if failed_otherwise > 0 {
             println!(
-                "  {failed_otherwise} of {done} run(s) failed with no failing test (see each run's status)"
+                "  {failed_otherwise} of {done} run(s) failed with no failing test shown: {}",
+                render::clean(failed_why.as_deref().unwrap_or("see each run's status"))
             );
         }
         if tally.is_empty() {
