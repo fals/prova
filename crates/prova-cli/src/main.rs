@@ -1611,9 +1611,24 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             for n in &p.notes {
                 println!("note: {n}");
             }
+            // A test prova has already seen, rather than a placeholder
+            // (round 15).
+            let example: Option<String> = store
+                .conn()
+                .query_row(
+                    "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+                      WHERE a.outcome = 'passed' AND t.display NOT LIKE '%(%'
+                      ORDER BY a.ts_ms DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
             println!(
-                "next: prova adopt --verify {} --filter <test name>",
-                names[0]
+                "next: prova adopt --verify {} --filter {}",
+                names[0],
+                example
+                    .map(|e| shell_quote(&e))
+                    .unwrap_or_else(|| "<test name>".to_owned())
             );
         }
     }
@@ -3290,5 +3305,16 @@ mod help_tests {
         let mut missing = Vec::new();
         walk(&Cli::command(), "prova", &mut missing);
         assert!(missing.is_empty(), "{missing:#?}");
+    }
+}
+
+/// A word safe to paste into a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-./:@=".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
