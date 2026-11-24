@@ -814,3 +814,33 @@ fn the_verdict_comes_after_the_output_excerpt() {
         "{out}"
     );
 }
+
+/// Round 12 count audit: a name-based subtest rule took JUnit's `x/y`
+/// (a display or parameterized name) for a subtest of `x` and hid its
+/// failure among "subtests". Only recognizers flag subtests. Medium: a
+/// result file found after the run.
+#[test]
+fn a_slash_in_a_junit_name_is_not_a_subtest() {
+    let d = workspace("junit-slash");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"x\"/><testcase classname=\"C\" name=\"x/y\"><failure message=\"boom\"/></testcase></testsuite>' > junit.xml; exit 1",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let c = &v["counts"];
+    assert_eq!(
+        (c["passed"].as_u64(), c["failed"].as_u64()),
+        (Some(1), Some(1)),
+        "{v}"
+    );
+    assert!(c["subtests"].is_null(), "{v}");
+}
