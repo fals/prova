@@ -62,8 +62,18 @@ impl Stream {
 pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
     let mut files = results::ResultFiles::new(&spec.results);
     files.snapshot(root);
+    // gotestsum prints the module's root package as `.`; `go test` by its
+    // import path. go.mod names it, so both name a test alike (round 15).
+    let mut live = recognize::Recognizers::default();
+    live.go_module = std::fs::read_to_string(root.join("go.mod"))
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find_map(|l| l.trim().strip_prefix("module ").map(|p| p.trim().trim_matches('"').to_owned()))
+        })
+        .filter(|p| !p.is_empty());
     Box::new(Ladder {
-        live: recognize::Recognizers::default(),
+        live,
         files,
         inject: spec.inject.clone(),
         inject_dir: None,

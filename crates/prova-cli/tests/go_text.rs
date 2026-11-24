@@ -636,6 +636,8 @@ fn a_go_verbose_rerun_that_passes_is_flaky_not_failed() {
 #[test]
 fn gotestsum_testname_root_package_tests_are_tests() {
     let d = workspace("gts-root");
+    // go.mod names the root package as `go test` prints it.
+    std::fs::write(d.join("go.mod"), "module example.com/calc\n\ngo 1.22\n").unwrap();
     let (code, s) = run_sh(
         &d,
         "printf '%s\\n' 'EMPTY cmd/conform' 'PASS TestAdd (0.00s)' '=== RUN   TestDiv' \
@@ -646,7 +648,7 @@ fn gotestsum_testname_root_package_tests_are_tests() {
          'DONE 5 tests, 1 skipped, 1 failure in 1.503s'; exit 1",
     );
     assert_eq!(code, Some(1), "{s}");
-    assert_eq!(failing(&s), vec![".::TestDiv"], "{s}");
+    assert_eq!(failing(&s), vec!["example.com/calc::TestDiv"], "{s}");
     assert_eq!(
         (
             s["counts"]["passed"].as_u64(),

@@ -21,6 +21,9 @@ pub struct Recognizers {
     /// Final outcome of every test reported so far:
     /// unique key -> (display name, outcome).
     pub seen: BTreeMap<String, (String, Outcome)>,
+    /// The Go module of the run's directory (go.mod), for packages printed
+    /// as `.`.
+    pub go_module: Option<String>,
     /// The key each `seen` entry was reported under (unique key -> key):
     /// a result superseded later names the test it was stored as.
     pub seen_keys: BTreeMap<String, TestKey>,
@@ -4829,6 +4832,11 @@ impl Recognizers {
     fn go_pkg(&self, printed: &str) -> String {
         // gotestsum prints the module's root package as `.`: the one the
         // other packages are under.
+        if printed == "."
+            && let Some(m) = &self.go_module
+        {
+            return m.clone();
+        }
         if printed == "."
             && let Some(root) = self.go_full_pkgs.iter().min_by_key(|p| p.len())
             && self
