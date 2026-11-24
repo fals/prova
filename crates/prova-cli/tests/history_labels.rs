@@ -976,3 +976,29 @@ fn a_failed_run_names_tests_that_did_not_run() {
         "{out}"
     );
 }
+
+/// Round 16: `--select tests.test_q::test_flaky` became `-k test_flaky`,
+/// which ran only `test_flaky_slow`; the run passed.
+#[test]
+fn a_named_selection_must_run_the_test_it_names() {
+    let d = workspace("selnamed");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.py]\nrun = \"true\"\nselect = {:?}\n",
+            format!(
+                "{WORK_SH}: pytest -k {{filter}}; echo 'collected 4 items / 3 deselected / 1 selected'; echo 'tests/test_q.py::test_flaky_slow PASSED'; echo '1 passed, 3 deselected in 0.01s'"
+            )
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "py", "--select", "tests.test_q::test_flaky"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(
+            "that test did not run; the filter matched other tests (tests.test_q::test_flaky_slow)"
+        ),
+        "{out}"
+    );
+}

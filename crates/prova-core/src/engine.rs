@@ -1342,6 +1342,30 @@ fn observe_child(
             contradictions.push(format!(
                 "selection {sel:?} matched no test: nothing was verified"
             ));
+        } else if let Some(sel) = &spec.selection
+            && sel.contains("::")
+            && sup.level > Level::Opaque
+        {
+            // A test named in full must itself run: a framework filter by
+            // substring or by bare name can match only others (round 16:
+            // `-k test_flaky` ran `test_flaky_slow`, `-run ^TestParse$`
+            // ran another package's TestParse, and the run passed).
+            let ran_names: Vec<String> = sup
+                .lifecycle
+                .outcomes()
+                .keys()
+                .filter(|k| !sup.superseded.contains(*k))
+                .map(|k| key_display(k).to_owned())
+                .collect();
+            if !ran_names.iter().any(|d| names_the_selection(d, sel)) {
+                let mut others = ran_names.clone();
+                others.sort();
+                others.truncate(5);
+                contradictions.push(format!(
+                    "selection {sel:?}: that test did not run; the filter matched other tests ({}): nothing selected was verified",
+                    others.join(", ")
+                ));
+            }
         }
         if spec.selection.is_none() {
             sup.flush()?; // this run's results must be in the store to compare
@@ -2171,6 +2195,20 @@ fn quarantined_only_failures(
         *o == Outcome::Passed && crate::quarantine::covers(quarantine, key_display(k)).is_none()
     });
     (!names.is_empty() && verified_other).then_some(names)
+}
+
+/// Whether a test's display name is the selected test, one of its
+/// subtests, or one of its parameterized cases.
+fn names_the_selection(display: &str, sel: &str) -> bool {
+    display == sel
+        || [
+            sel.to_owned() + "/",
+            sel.to_owned() + "[",
+            sel.to_owned() + "(",
+        ]
+        .iter()
+        .any(|p| display.starts_with(p.as_str()))
+        || sel.starts_with(&format!("{display}/"))
 }
 
 /// Whether `name` occurs in `line` as a whole name, not inside a longer one
