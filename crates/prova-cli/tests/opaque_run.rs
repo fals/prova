@@ -930,6 +930,10 @@ fn a_subtest_has_history() {
 /// Round 13 (Java, C#): tests known only from result files at the end had
 /// no sampled test phase, so every size stayed "unknown" after 25 runs.
 /// The whole run is their phase. Medium: real processes, sampled over time.
+// Linux only: macOS samples through `ps` and `lsof`, which on CI runners
+// can take longer than this 2 s run allows for two samples (main 3c8473a);
+// tests/sizes.rs covers macOS with longer runs.
+#[cfg(target_os = "linux")]
 #[test]
 fn tests_known_only_from_result_files_get_a_size() {
     let d = workspace("file-sizes");
