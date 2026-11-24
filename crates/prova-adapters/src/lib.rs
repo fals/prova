@@ -190,6 +190,9 @@ impl Observer for Ladder {
             })
             .collect();
         let mut covered = vec![false; report.events.len()];
+        // A failure on either side wins (round 13: live pass, file fail
+        // recorded as passed while the framework said 1 failed).
+        let mut disagreed: Vec<(usize, String)> = Vec::new();
         type Same = fn(prova_core::model::Outcome, prova_core::model::Outcome) -> bool;
         let passes: [Same; 3] = [
             |a, b| a == b,
@@ -206,8 +209,20 @@ impl Observer for Ladder {
                     .find(|(l, lo, used)| !*used && same(*lo, *o) && covers(l, d))
                 {
                     l.2 = true;
-                    covered[*i] = true;
+                    if o.is_failure() && !l.1.is_failure() {
+                        // The file's failure stays as an event.
+                        disagreed.push((*i, d.clone()));
+                    } else {
+                        covered[*i] = true;
+                    }
                 }
+            }
+        }
+        // The engine drops a second result for a test already finished as
+        // passed, so the file's failure is recorded under its own name.
+        for (i, _) in &disagreed {
+            if let EventKind::TestFinished { test, .. } = &mut report.events[*i] {
+                test.name = format!("{} (result file)", test.name);
             }
         }
         let mut i = 0;
@@ -215,6 +230,11 @@ impl Observer for Ladder {
             i += 1;
             !covered[i - 1]
         });
+        for (_, d) in disagreed {
+            report.contradictions.push(format!(
+                "{d}: the live output said it passed but the result file says it failed (the failure is recorded)"
+            ));
+        }
         // `go test` without -v or -json prints failures only (round 5).
         // (Not with -v: its `=== RUN` lines show it; round 9 noted it anyway.)
         if self.live.go_package_lines > 0
@@ -361,5 +381,62 @@ impl Observer for Ladder {
             (a, b) => a.or(b),
         };
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prova_core::model::Outcome;
+
+    /// Live pass, file failure: the failure is recorded (round 13: pytest
+    /// said 1 failed, prova recorded a pass). Temp dir: the file is the point.
+    #[test]
+    fn a_failure_in_the_result_file_beats_a_live_pass() {
+        let root = std::env::temp_dir().join(format!("prova-ladder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("junit.xml"),
+            r#"<testsuite><testcase classname="tests.t" name="test_a"><failure message="boom"/></testcase></testsuite>"#,
+        )
+        .unwrap();
+        let mut ladder = Ladder {
+            live: recognize::Recognizers::default(),
+            files: results::ResultFiles::new(&[]),
+            inject: Vec::new(),
+            inject_dir: None,
+            streams: Vec::new(),
+            expect_tests: true,
+        };
+        let live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);
+        assert!(matches!(
+            live.last(),
+            Some(EventKind::TestFinished {
+                outcome: Outcome::Passed,
+                ..
+            })
+        ));
+        let report = ladder.on_exit(&root, 0);
+        let _ = std::fs::remove_dir_all(&root);
+        let failed: Vec<_> = report
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EventKind::TestFinished {
+                        outcome: Outcome::Failed,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", report.events);
+        assert!(
+            report.contradictions.iter().any(|c| c.contains("test_a")),
+            "{:?}",
+            report.contradictions
+        );
     }
 }
