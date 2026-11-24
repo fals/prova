@@ -2386,7 +2386,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     entry.budget_from = *budget_from;
                 }
             }
-            EventKind::RunStalled { idle_ms, .. } => stalled_ms = Some(*idle_ms),
+            // Idle for as long as the stall said plus the time since, while
+            // nothing else happened (round 14: "no activity for 5.1s" half
+            // a minute later).
+            EventKind::RunStalled { idle_ms, .. } => {
+                stalled_ms = Some(if row.status.is_terminal() {
+                    *idle_ms
+                } else {
+                    idle_ms + now_ms().saturating_sub(e.ts_ms)
+                })
+            }
             EventKind::TestStarted { test } => {
                 stalled_ms = None;
                 started_at.entry(test.unique()).or_insert(e.ts_ms);

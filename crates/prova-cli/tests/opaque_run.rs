@@ -1020,3 +1020,30 @@ fn a_wait_says_how_long_each_running_test_has_run() {
     prova(&d, &["cancel", &run]);
     assert_eq!(prova_core::config::DEFAULT_STALL_AFTER.as_secs(), 30);
 }
+
+/// Round 14: a stalled run said "no activity for 5.1s" half a minute after
+/// the stall, the idle time at the moment it was declared.
+#[test]
+fn a_stall_reports_the_idle_time_so_far() {
+    let d = workspace("idle-now");
+    let run = detach(&d, &["--stall-after", "1s"], "sleep 20");
+    let w = json(&prova(
+        &d,
+        &[
+            "wait",
+            &run,
+            "--until",
+            "stall",
+            "--max-wait",
+            "10s",
+            "--json",
+        ],
+    ));
+    assert_eq!(w["reason"], "stall", "{w}");
+    let seq = w["last_seq"].as_u64().unwrap().to_string();
+    // Nothing else happens: this wait ends on its budget.
+    prova(&d, &["wait", &run, "--after", &seq, "--max-wait", "2s"]);
+    let s = json(&prova(&d, &["status", &run, "--json"]));
+    assert!(s["stalled_ms"].as_u64().unwrap() >= 3000, "{s}");
+    prova(&d, &["cancel", &run]);
+}
