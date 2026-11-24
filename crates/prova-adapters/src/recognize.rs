@@ -73,6 +73,10 @@ pub struct Recognizers {
     pub harness_stopped: Vec<String>,
     /// Text results held while an injected stream is expected.
     held_text_events: Vec<EventKind>,
+    /// Parsing into `held_text_events`: a held result is a fallback, not a
+    /// report, so it must not mark its test seen or started, or the
+    /// stream's own result is dropped as a duplicate (round 12).
+    holding: bool,
     /// The longest time one of the framework's own summaries says its tests
     /// took (libtest `finished in`, go `ok pkg 1.5s`, pytest `in 1.50s`;
     /// packages may run in parallel, so not a sum): more than the
@@ -120,6 +124,10 @@ fn message(lines: &[String]) -> Option<String> {
 impl Recognizers {
     fn started(&mut self, key: TestKey, out: &mut Vec<EventKind>) {
         let d = key.unique();
+        if self.holding {
+            out.push(EventKind::TestStarted { test: key });
+            return;
+        }
         // A stream can report a start after another source reported the end
         // (pytest -v text before its reportlog line): never restart a test.
         if self.seen.contains_key(&d) {
@@ -170,6 +178,17 @@ impl Recognizers {
         out: &mut Vec<EventKind>,
     ) {
         let d = key.unique();
+        if self.holding {
+            out.push(EventKind::TestFinished {
+                test: key,
+                attempt: 1,
+                outcome,
+                duration_ms,
+                message,
+                source: level,
+            });
+            return;
+        }
         if self.seen.contains_key(&d) {
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
@@ -478,15 +497,22 @@ impl Recognizers {
             let mut held = std::mem::take(&mut self.held_text_events);
             let _ = self.libtest(line, &mut out)
                 || self.go_verbose(line, &mut out)
-                || (self.pytest_stream && !streamed && self.pytest(line, &mut held))
+                || (self.pytest_stream && !streamed && self.hold(|r| r.pytest(line, &mut held)))
                 || (!self.pytest_stream && self.pytest(line, &mut out))
                 || self.dotnet(line, &mut out)
-                || (self.vitest_stream && !streamed && self.vitest(line, &mut held))
+                || (self.vitest_stream && !streamed && self.hold(|r| r.vitest(line, &mut held)))
                 || (!self.vitest_stream && self.vitest(line, &mut out))
                 || self.tap(line, &mut out);
             self.held_text_events = held;
         }
         out
+    }
+
+    fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        self.holding = true;
+        let r = f(self);
+        self.holding = false;
+        r
     }
 
     // ------------------------------------------------------------- go json
@@ -1773,6 +1799,38 @@ mod tests {
                 .line("tests/test_calc.py::test_add PASSED")
                 .is_empty(),
             "the stream decides"
+        );
+    }
+
+    /// Round 12 (blocker): with an injected stream, pytest -v and Vitest
+    /// print a test's result before the stream file is read. The held text
+    /// result marked the test as seen, so the stream's result was dropped as
+    /// a duplicate and the held one discarded: fast tests, failures among
+    /// them, vanished from the run and from history.
+    #[test]
+    fn a_held_text_result_never_hides_the_streams_result() {
+        let mut r = Recognizers {
+            pytest_stream: true,
+            ..Recognizers::default()
+        };
+        assert!(r.line("tests/test_calc.py::test_div FAILED").is_empty());
+        let ev = r.line(r#"{"nodeid": "tests/test_calc.py::test_div", "when": "call", "outcome": "failed", "duration": 0.0, "longrepr": {"reprcrash": {"message": "assert 16 == 4"}}, "$report_type": "TestReport"}"#);
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.test_calc::test_div".into(), Outcome::Failed)],
+            "{ev:?}"
+        );
+        let mut v = Recognizers {
+            vitest_stream: true,
+            ..Recognizers::default()
+        };
+        v.line(" ❯ src/calc.test.ts (5 tests | 1 failed) 6ms");
+        v.line("   × calc > divides 4ms");
+        let ev = v.line(r#"{"type":"test","name":"calc > divides","file":"src/calc.test.ts","event":"failed","exec_time":0.004,"message":"expected 16 to be 4"}"#);
+        let f = finished(&ev);
+        assert!(
+            f.len() == 1 && f[0].0.contains("divides") && f[0].1 == Outcome::Failed,
+            "{ev:?}"
         );
     }
 
