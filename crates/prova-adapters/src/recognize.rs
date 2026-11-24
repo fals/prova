@@ -899,6 +899,61 @@ impl Recognizers {
         out
     }
 
+    /// The start of an unfinished output line. A pytest `-v` line shows the
+    /// test's id, then its outcome once it ends: an id followed by a space
+    /// and nothing else is a test running now (round 15: a stall named the
+    /// test that had just passed). The previous test's held pass is
+    /// reported first, as the next line would have.
+    pub fn partial(&mut self, text: &str) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if self.pytest_stream
+            || !text.ends_with(' ')
+            || self.holding
+            || !text.contains(".py::")
+            || text.starts_with(' ')
+        {
+            return out;
+        }
+        let id = text.trim_end();
+        // Whole parameters only: a read boundary can cut the id short, and
+        // spaces are part of an id only inside its brackets.
+        let outside = {
+            let mut depth = 0i32;
+            let mut s = String::new();
+            for c in id.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ if depth == 0 => s.push(c),
+                    _ => {}
+                }
+            }
+            (depth == 0).then_some(s)
+        };
+        if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
+            return out;
+        }
+        let key = pytest_key(id);
+        if self
+            .pytest_text_pass
+            .as_ref()
+            .is_some_and(|(held, _)| held != id)
+        {
+            out.extend(self.release_held_pass());
+        }
+        self.started(key, &mut out);
+        out
+    }
+
+    /// A pytest pass held for a teardown error, when nothing followed it.
+    pub fn release_held_pass(&mut self) -> Vec<EventKind> {
+        let mut out = Vec::new();
+        if let Some((_, key)) = self.pytest_text_pass.take() {
+            self.finished(key, Outcome::Passed, None, None, Level::Recognized, &mut out);
+        }
+        out
+    }
+
     fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
         self.holding = true;
         let r = f(self);
@@ -3752,6 +3807,53 @@ mod tests {
         assert_eq!(
             msg_of(&ev, "tests.t::test_p[a - b]"),
             Some("AssertionError: assert 'a - b' == 'c'")
+        );
+    }
+
+    /// Round 15: a stall in `pytest -v` named the test that had just
+    /// passed, not the one hanging (its line had no outcome yet).
+    #[test]
+    fn pytest_unfinished_line_starts_that_test_and_releases_the_held_pass() {
+        let mut r = Recognizers::default();
+        let mut ev = r.line("tests/t.py::test_slow PASSED   [ 50%]");
+        // The pass waits one line for a teardown error.
+        assert!(finished(&ev).is_empty());
+        ev.extend(r.partial("tests/t.py::test_"));
+        assert!(ev.iter().all(|e| !matches!(e, EventKind::TestStarted { .. })));
+        ev.extend(r.partial("tests/t.py::test_hangs "));
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_slow".to_owned(), Outcome::Passed)]
+        );
+        let started: Vec<String> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestStarted { test } => Some(test.display()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["tests.t::test_hangs".to_owned()]);
+        // The same partial again does not start it twice.
+        assert!(r.partial("tests/t.py::test_hangs ").is_empty());
+    }
+
+    #[test]
+    fn pytest_parameter_ids_with_spaces_start_only_when_whole() {
+        let mut r = Recognizers::default();
+        assert!(r.partial("tests/t.py::test_r[negative 2/").is_empty());
+        assert!(r.partial("tests/t.py::test_r[negative ").is_empty());
+        let ev = r.partial("tests/t.py::test_r[negative 2/-4] ");
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn a_held_pass_is_released_when_output_goes_quiet() {
+        let mut r = Recognizers::default();
+        r.line("tests/t.py::test_a PASSED   [100%]");
+        let ev = r.release_held_pass();
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_a".to_owned(), Outcome::Passed)]
         );
     }
 

@@ -13,6 +13,9 @@ use prova_core::config::RunSpec;
 use prova_core::engine::{ExitReport, Observer};
 use prova_core::model::{EventKind, Level};
 
+/// How long output stays quiet before a held pytest pass is reported.
+const HELD_PASS_MS: u64 = 1000;
+
 /// Every run gets the whole ladder: recognizers on live output, then
 /// result files after exit. Nothing to configure.
 pub struct Ladder {
@@ -25,6 +28,8 @@ pub struct Ladder {
     streams: Vec<Stream>,
     /// "No test ran" is suspicious (ADR 0017), unless the suite says so.
     expect_tests: bool,
+    /// When the last output line arrived (ms), to release a held pass.
+    last_line_ms: u64,
 }
 
 /// A file read like output: from where the last read stopped, whole lines.
@@ -64,6 +69,7 @@ pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
         inject_dir: None,
         streams: Vec::new(),
         expect_tests: spec.expects_tests(),
+        last_line_ms: 0,
     })
 }
 
@@ -100,12 +106,22 @@ impl Observer for Ladder {
         inject::env(&self.inject, &dir, |k| std::env::var(k).ok())
     }
 
-    fn on_line(&mut self, line: &str, _now_ms: u64) -> Vec<EventKind> {
+    fn on_line(&mut self, line: &str, now_ms: u64) -> Vec<EventKind> {
+        self.last_line_ms = now_ms;
         self.live.line(line)
     }
 
-    fn poll(&mut self, _now_ms: u64) -> Vec<EventKind> {
+    fn on_partial(&mut self, text: &str, _now_ms: u64) -> Vec<EventKind> {
+        self.live.partial(text)
+    }
+
+    fn poll(&mut self, now_ms: u64) -> Vec<EventKind> {
         let mut out = Vec::new();
+        // A pass held for a teardown error that no line followed: the
+        // output went quiet, so it stands (a stall report counts it).
+        if self.last_line_ms > 0 && now_ms.saturating_sub(self.last_line_ms) >= HELD_PASS_MS {
+            out.extend(self.live.release_held_pass());
+        }
         for i in 0..self.streams.len() {
             for line in self.streams[i].read_lines() {
                 out.extend(self.live.line(line.trim_end()));
@@ -526,6 +542,7 @@ mod tests {
             inject_dir: None,
             streams: Vec::new(),
             expect_tests: true,
+            last_line_ms: 0,
         };
         // A pytest pass is held one line (a teardown error may follow).
         let mut live = ladder.on_line("tests/t.py::test_a PASSED   [100%]", 0);

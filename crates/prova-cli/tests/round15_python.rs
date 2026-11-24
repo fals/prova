@@ -210,3 +210,33 @@ fn an_injected_report_that_never_appears_is_warned_about() {
         "{v}"
     );
 }
+
+/// Round 15: at a stall, `pytest -v` had printed `test_slow PASSED` and the
+/// name of the test that hangs, without its outcome. The pass counts at
+/// once and `running now` names the hanging test.
+#[test]
+fn a_pytest_stall_names_the_running_test_and_counts_the_pass() {
+    let d = workspace("stall-partial");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--detach",
+            "--json",
+            "--stall-after",
+            "1s",
+            "--",
+            "sh",
+            "-c",
+            "echo 'tests/t.py::test_slow PASSED   [ 50%]'; printf 'tests/t.py::test_hangs '; exec sleep 60",
+        ],
+    );
+    let id = json(&o)["run"].as_str().unwrap().to_owned();
+    let w = prova(&d, &["wait", &id, "--max-wait", "20s", "--json"]);
+    let s = json(&w);
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
+    assert_eq!(s["reason"], "stall", "{s}");
+    assert_eq!(s["counts"]["passed"], 1, "{s}");
+    assert_eq!(s["running"][0], "tests.t::test_hangs", "{s}");
+}

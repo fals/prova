@@ -51,6 +51,11 @@ pub trait Observer {
     fn on_line(&mut self, _line: &str, _now_ms: u64) -> Vec<EventKind> {
         Vec::new()
     }
+    /// Called with the start of an output line not finished yet (a test
+    /// runner prints a test's name before its outcome).
+    fn on_partial(&mut self, _text: &str, _now_ms: u64) -> Vec<EventKind> {
+        Vec::new()
+    }
     /// Extra environment for the process under test (opt-in injection).
     /// `run_dir` is private to this run; files written there are the
     /// observer's to read in `on_exit`.
@@ -771,12 +776,14 @@ impl Supervisor<'_> {
 
     /// The start of a line not finished yet: into the spool at once, so
     /// `prova output` and a stall summary show it.
-    fn partial(&mut self, stream: usize, text: &str) {
+    fn partial(&mut self, stream: usize, text: &str, observer: &mut dyn Observer) {
         let done = &mut self.partial[stream];
         let new = text.strip_prefix(done.as_str()).unwrap_or(text);
         let _ = self.output.write_all(new.as_bytes());
         let _ = self.output.flush();
         *done = text.to_owned();
+        let events = observer.on_partial(text, now_ms());
+        self.observed(events, observer);
     }
 
     fn line(&mut self, stream: usize, line: &str, observer: &mut dyn Observer) {
@@ -1004,7 +1011,7 @@ fn observe_child(
                 }
                 Ok(Chunk::Partial(i, p, _)) => {
                     last_activity = Instant::now();
-                    sup.partial(i, &p);
+                    sup.partial(i, &p, observer);
                 }
                 Ok(Chunk::Eof) => open_streams -= 1,
                 Err(_) => break,
@@ -1120,7 +1127,7 @@ fn observe_child(
                     // when it arrived, like a line (round 12 CI: 388 of 400).
                     Chunk::Partial(_, _, a) if a.at > until => break,
                     Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                    Chunk::Partial(i, p, _) => sup.partial(i, &p),
+                    Chunk::Partial(i, p, _) => sup.partial(i, &p, observer),
                     Chunk::Eof => *open -= 1,
                 }
             }
