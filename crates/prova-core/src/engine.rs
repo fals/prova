@@ -3039,14 +3039,20 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             "SELECT t.display, MAX(a.duration_ms) AS d FROM attempts a JOIN tests t ON t.id = a.test_id
               WHERE a.run_id = ?1 AND a.duration_ms >= ?2
                 AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+                -- A test the cancel cut off took as long as the cancel let it
+                -- (round 16: a hung test listed as slow).
+                AND NOT (a.outcome = 'errored' AND ?3)
               GROUP BY t.display ORDER BY d DESC, t.display LIMIT 3",
         )?;
-        stmt.query_map(rusqlite::params![run, SLOWEST_MIN_MS], |r| {
-            Ok(SlowestTest {
-                test: r.get(0)?,
-                duration_ms: r.get::<_, i64>(1)? as u64,
-            })
-        })?
+        stmt.query_map(
+            rusqlite::params![run, SLOWEST_MIN_MS, row.status != Status::Finished],
+            |r| {
+                Ok(SlowestTest {
+                    test: r.get(0)?,
+                    duration_ms: r.get::<_, i64>(1)? as u64,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<_>>()?
     } else {
         Vec::new()

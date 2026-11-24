@@ -1277,3 +1277,18 @@ fn a_failure_outside_the_selection_says_so() {
         "{out}"
     );
 }
+
+/// Round 16: a cancelled run listed its hung test among the slow tests,
+/// with the time the cancel let it run.
+#[test]
+fn a_cancelled_hang_is_not_a_slow_test() {
+    let d = workspace("cancel-slow");
+    let run = detach(&d, &[], "printf '=== RUN   TestHang\\n'; sleep 20");
+    prova(&d, &["wait", &run, "--max-wait", "1500ms"]);
+    let o = prova(&d, &["cancel", &run]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("CANCELLED") && !out.contains("slow tests:"),
+        "{out}"
+    );
+}
