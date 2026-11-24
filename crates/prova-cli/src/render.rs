@@ -39,6 +39,9 @@ fn headline(s: &Summary) -> String {
     }
 }
 
+/// What a candidate may not change without `--change` (`HARNESS_FILES`).
+const PROTECTED: &str = "tests, benchmarks or build files (test and bench files and directories, Makefile and *.sh, Cargo.toml, go.mod, package.json, pyproject.toml, pom.xml, build.gradle*, *.csproj, runner configs)";
+
 /// Strips terminal control sequences from text that came from the process
 /// under test before it reaches a terminal.
 pub fn clean(s: &str) -> String {
@@ -1085,10 +1088,10 @@ pub fn protocol_line(p: &prova_core::experiment::Protocol) -> String {
             p.scope.join(", ")
         ));
     } else if p.scope.is_empty() {
-        s.push_str("; candidates may not change tests, benchmarks or build files");
+        s.push_str(&format!("; candidates may not change {PROTECTED}"));
     } else {
         s.push_str(&format!(
-            "; candidates may not change tests, benchmarks or build files, except {}",
+            "; candidates may not change {PROTECTED}, except {}",
             p.scope.join(", ")
         ));
     }

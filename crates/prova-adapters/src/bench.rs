@@ -25,6 +25,7 @@ pub type Metric = (String, f64, Option<String>);
 /// Nanoseconds per unit of a time unit as tools print it.
 fn ns_per(unit: &str) -> Option<f64> {
     Some(match unit.trim() {
+        "ps" => 1e-3,
         "ns" => 1.0,
         "us" | "µs" | "μs" => 1e3,
         "ms" => 1e6,
@@ -387,6 +388,27 @@ mod tests {
         // A faster candidate prints microseconds: same metric, same unit.
         let fast = parse("count_primes            time:   [630.55 µs 633.21 µs 636.09 µs]");
         assert!((get(&fast, "count_primes.time_ns") - 633_210.0).abs() < 1.0);
+    }
+
+    /// Round 15: a very fast candidate prints picoseconds.
+    #[test]
+    fn criterion_reads_every_unit() {
+        for (unit, ns) in [
+            ("ps", 0.3801),
+            ("ns", 380.1),
+            ("µs", 380_100.0),
+            ("us", 380_100.0),
+            ("ms", 380_100_000.0),
+            ("s", 380_100_000_000.0),
+        ] {
+            let m = parse(&format!(
+                "count_primes   time:   [378.04 {unit} 380.1 {unit} 382.2 {unit}]"
+            ));
+            assert!(
+                (get(&m, "count_primes.time_ns") - ns).abs() < ns * 1e-9,
+                "{unit}"
+            );
+        }
     }
 
     #[test]
