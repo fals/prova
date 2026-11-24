@@ -1,6 +1,6 @@
 # 0026: Sizes from process start times and from the whole run
 
-Status: Proposed (2026-11-24). Amends [0025](0025-sizes-by-resources.md) §3–§5.
+Status: Accepted (2026-11-24). Amends [0025](0025-sizes-by-resources.md) §3–§5.
 
 ## Context
 
