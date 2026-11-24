@@ -407,6 +407,9 @@ enum ExpCmd {
         against: Option<String>,
         #[arg(long)]
         detach: bool,
+        /// Longest foreground wait (default 9m), then `exp wait` continues.
+        #[arg(long)]
+        max_wait: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -415,6 +418,9 @@ enum ExpCmd {
         name: String,
         #[arg(long)]
         detach: bool,
+        /// Longest foreground wait (default 9m), then `exp wait` continues.
+        #[arg(long)]
+        max_wait: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -566,14 +572,34 @@ fn exp_exit(r: &experiment::Report) -> u8 {
     }
 }
 
+/// `exp status` exit: the experiment's state. A REJECT after an accepted best
+/// is not a failure of the experiment; a running comparison stays 5.
+fn exp_status_exit(r: &experiment::Report) -> u8 {
+    let code = exp_exit(r);
+    let rejected = r
+        .comparison
+        .as_ref()
+        .is_some_and(|c| c.status == "decided" && c.verdict.as_deref() == Some("reject"));
+    if rejected && r.best != "baseline" {
+        exit::PASSED
+    } else {
+        code
+    }
+}
+
 fn exp_start(
     store: &Store,
     name: &str,
     candidate: &str,
     against: Option<&str>,
     detach: bool,
+    max_wait: Option<&str>,
     json: bool,
 ) -> Result<u8> {
+    let budget = match max_wait {
+        Some(m) => parse_duration(m).ok_or_else(|| anyhow!("invalid --max-wait {m:?}"))?,
+        None => Duration::from_secs(9 * 60),
+    };
     let id = experiment::start(store, name, candidate, against)?;
     let best = experiment::get(store, name)?.best;
     let live = experiment::live_tree_variants(store, name, &[candidate, against.unwrap_or(&best)]);
@@ -620,9 +646,10 @@ fn exp_start(
     // Bounded like `prova run --until done` (round 11: a foreground
     // comparison blocked with no limit): 9 minutes, then the command to
     // continue; the comparison goes on in the background.
-    let deadline = std::time::Instant::now() + Duration::from_secs(9 * 60);
+    let deadline = std::time::Instant::now() + budget;
     loop {
-        let r = experiment::wait(store, name, Duration::from_secs(30))?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let r = experiment::wait(store, name, left.min(Duration::from_secs(30)))?;
         if exp_exit(&r) != exit::RUNNING {
             let _ = child.wait();
             render::experiment(&r, json);
@@ -631,7 +658,10 @@ fn exp_start(
         if std::time::Instant::now() >= deadline {
             render::experiment(&r, json);
             if !json {
-                println!("next: prova exp wait {name} --max-wait 9m");
+                println!(
+                    "next: prova exp wait {name} --max-wait {}",
+                    max_wait.unwrap_or("9m")
+                );
             }
             return Ok(exit::RUNNING);
         }
@@ -1061,6 +1091,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             candidate,
             against,
             detach,
+            max_wait,
             json,
         } => {
             let candidate = match candidate {
@@ -1071,14 +1102,35 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     .map(|v| v.name.clone())
                     .ok_or_else(|| anyhow!("no candidate yet: prova exp candidate {name}"))?,
             };
-            exp_start(&store, &name, &candidate, against.as_deref(), detach, json)
+            exp_start(
+                &store,
+                &name,
+                &candidate,
+                against.as_deref(),
+                detach,
+                max_wait.as_deref(),
+                json,
+            )
         }
-        ExpCmd::Revalidate { name, detach, json } => {
+        ExpCmd::Revalidate {
+            name,
+            detach,
+            max_wait,
+            json,
+        } => {
             let e = experiment::get(&store, &name)?;
             if e.best == "baseline" {
                 bail!("nothing to revalidate: no candidate has been kept");
             }
-            exp_start(&store, &name, &e.best, Some("baseline"), detach, json)
+            exp_start(
+                &store,
+                &name,
+                &e.best,
+                Some("baseline"),
+                detach,
+                max_wait.as_deref(),
+                json,
+            )
         }
         ExpCmd::Wait {
             name,
@@ -1093,7 +1145,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
         ExpCmd::Status { name, json } => {
             let r = experiment::report(&store, &name)?;
             render::experiment(&r, json);
-            Ok(exp_exit(&r))
+            Ok(exp_status_exit(&r))
         }
         ExpCmd::Best {
             name,

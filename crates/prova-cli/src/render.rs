@@ -646,6 +646,28 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
     );
     println!("hypothesis: {}", clean(&r.hypothesis));
     println!("{}", protocol_line(&r.protocol));
+    // The current best leads, with how it became best, before the latest
+    // comparison (which may be a later REJECT).
+    if r.best != "baseline" {
+        let how = r
+            .decisions
+            .iter()
+            .rev()
+            .find(|d| d["candidate"] == r.best.as_str() && d["decision"] != "discard")
+            .map(|d| {
+                let why = clean(d["reason"].as_str().unwrap_or(""));
+                if d["decision"] == "reset" {
+                    format!("set by hand: {why}")
+                } else {
+                    format!(
+                        "ACCEPT, comparison {}: {why}",
+                        d["comparison"].as_str().unwrap_or("")
+                    )
+                }
+            })
+            .unwrap_or_else(|| "accepted".to_owned());
+        println!("best: {} ({how})", r.best);
+    }
     if let Some(c) = &r.comparison {
         let head = match (c.status.as_str(), c.verdict.as_deref()) {
             ("decided", Some(v)) => v.to_uppercase(),
@@ -677,7 +699,7 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment, Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) on this baseline and metric (revalidations count), Holm)",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
                     num("baseline_median"),
