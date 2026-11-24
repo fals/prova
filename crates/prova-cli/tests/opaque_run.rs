@@ -1129,3 +1129,17 @@ fn tests_run_through_a_container_client_get_no_size() {
         "{ev}"
     );
 }
+
+/// Round 14: a skipped Go subtest was counted as a subtest like one that
+/// ran.
+#[test]
+fn skipped_subtests_are_counted_as_skipped() {
+    let d = workspace("go-subtest-skip");
+    let script = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '%s\\n' '=== RUN   TestP' '=== RUN   TestP/a' '=== RUN   TestP/b' '    p_test.go:9: not here' '--- PASS: TestP (0.00s)' '    --- PASS: TestP/a (0.00s)' '    --- SKIP: TestP/b (0.00s)' 'PASS' 'ok  \texample.com/m\t0.01s'";
+    let o = prova(&d, &["run", "--", "sh", "-c", script]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("(and 2 subtests, 0 failed, 1 skipped)"),
+        "{out}"
+    );
+}

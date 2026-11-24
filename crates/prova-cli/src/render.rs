@@ -148,8 +148,14 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
             c.skipped,
             if c.subtests > 0 {
                 format!(
-                    " (and {} subtests, {} failed)",
-                    c.subtests, c.subtests_failed
+                    " (and {} subtests, {} failed{})",
+                    c.subtests,
+                    c.subtests_failed,
+                    if c.subtests_skipped > 0 {
+                        format!(", {} skipped", c.subtests_skipped)
+                    } else {
+                        String::new()
+                    }
                 )
             } else {
                 String::new()

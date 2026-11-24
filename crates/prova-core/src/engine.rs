@@ -2009,6 +2009,9 @@ pub struct Counts {
     /// Of them, failed or errored.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub subtests_failed: u64,
+    /// Of them, skipped (round 14: a skipped subtest read as one that ran).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests_skipped: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -2475,6 +2478,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         if f.4 {
             counts.subtests += 1;
             counts.subtests_failed += u64::from(f.1.is_failure());
+            counts.subtests_skipped += u64::from(f.1 == Outcome::Skipped);
             if f.1.is_failure() {
                 failing.push(f);
             }
