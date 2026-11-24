@@ -869,3 +869,45 @@ fn console_and_trx_results_are_each_test_once() {
         "{v}"
     );
 }
+
+/// Round 13 (Java, C#): a result file the previous run wrote moments before
+/// counted for the next run (a 2 s mtime slack): a test that never ran was
+/// recorded, a selection that matched nothing passed, a real failure was
+/// overridden by an old pass. Only files this run created or changed count.
+/// Medium: result files on disk across two runs.
+#[test]
+fn a_previous_runs_result_file_is_not_this_runs() {
+    let d = workspace("stale-results");
+    let busy = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done";
+    let first = format!(
+        "{busy}; printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"old\"><failure message=\"boom\"/></testcase></testsuite>' > junit.xml; exit 1"
+    );
+    prova(
+        &d,
+        &["run", "--json", "--until", "done", "--", "sh", "-c", &first],
+    );
+    let second = format!("{busy}; echo 'test m::new ... ok'; exit 0");
+    let o = prova(
+        &d,
+        &[
+            "run", "--json", "--until", "done", "--", "sh", "-c", &second,
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let c = &v["counts"];
+    assert_eq!(
+        (c["passed"].as_u64(), c["failed"].as_u64()),
+        (Some(1), Some(0)),
+        "{v}"
+    );
+    // The same file rewritten by this run does count.
+    let third = format!(
+        "{busy}; printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"old\"/></testsuite>' > junit.xml; exit 0"
+    );
+    let o = prova(
+        &d,
+        &["run", "--json", "--until", "done", "--", "sh", "-c", &third],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["counts"]["passed"], 1, "{v}");
+}

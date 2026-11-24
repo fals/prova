@@ -1,8 +1,9 @@
 //! Level 1: result files written during the run (ADR 0013 section 2).
 //!
 //! After the process exits, the workspace is searched for JUnit XML and TRX
-//! files modified since the run started. No configuration needed for the
-//! usual locations; `results` globs in `prova.toml` add more.
+//! files this run created or changed: the files present when it started are
+//! remembered with their size and modification time. No configuration
+//! needed for the usual locations; `results` globs in `prova.toml` add more.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -48,23 +49,50 @@ const TARGET_RESULT_DIRS: &[&str] = &[
 ];
 const MAX_DEPTH: usize = 12;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
-/// Clock slack between run start and file mtime.
+/// Clock slack between run start and file mtime, when no snapshot was taken.
 const SLACK_MS: u64 = 2000;
+
+/// A file's modification time (ns) and size.
+type Stamp = (u128, u64);
 
 pub struct ResultFiles {
     globs: Vec<String>,
+    /// Result files present when the run started.
+    before: Option<std::collections::HashMap<PathBuf, Stamp>>,
+}
+
+fn stamp(meta: &std::fs::Metadata) -> Stamp {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    (mtime, meta.len())
 }
 
 impl ResultFiles {
     pub fn new(extra: &[String]) -> ResultFiles {
         let mut globs: Vec<String> = DEFAULT_GLOBS.iter().map(|s| s.to_string()).collect();
         globs.extend(extra.iter().cloned());
-        ResultFiles { globs }
+        ResultFiles {
+            globs,
+            before: None,
+        }
     }
 
-    /// Files under `root` matching the globs, modified at or after `since_ms`.
-    pub fn find(&self, root: &Path, since_ms: u64) -> Vec<PathBuf> {
-        let mut out = Vec::new();
+    /// Remembers the result files present before the run starts: a file the
+    /// previous run wrote a moment ago is not this run's (round 13: a 2 s
+    /// mtime slack counted it, so a test that never ran was recorded and a
+    /// selection that matched nothing passed).
+    pub fn snapshot(&mut self, root: &Path) {
+        let mut before = std::collections::HashMap::new();
+        self.each(root, &mut |path, meta| {
+            before.insert(path.to_path_buf(), stamp(meta));
+        });
+        self.before = Some(before);
+    }
+
+    fn each(&self, root: &Path, f: &mut dyn FnMut(&Path, &std::fs::Metadata)) {
         walk(root, root, 0, &mut |rel, path| {
             if !self.globs.iter().any(|g| glob_match(g, rel)) {
                 return;
@@ -72,16 +100,24 @@ impl ResultFiles {
             let Ok(meta) = std::fs::metadata(path) else {
                 return;
             };
-            if !meta.is_file() || meta.len() > MAX_FILE {
-                return;
+            if meta.is_file() && meta.len() <= MAX_FILE {
+                f(path, &meta);
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if mtime + SLACK_MS >= since_ms {
+        });
+    }
+
+    /// Result files this run wrote: created, or changed since the snapshot.
+    /// Without a snapshot, files modified at or after `since_ms` (less a
+    /// clock slack).
+    pub fn find(&self, root: &Path, since_ms: u64) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.each(root, &mut |path, meta| {
+            let now = stamp(meta);
+            let fresh = match &self.before {
+                Some(before) => before.get(path) != Some(&now),
+                None => (now.0 / 1_000_000) as u64 + SLACK_MS >= since_ms,
+            };
+            if fresh {
                 out.push(path.to_path_buf());
             }
         });

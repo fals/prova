@@ -52,10 +52,14 @@ impl Stream {
     }
 }
 
-pub fn observer_for(spec: &RunSpec, _root: &Path) -> Box<dyn Observer> {
+/// Built before the process starts: the result files already on disk are
+/// remembered, so only the ones this run writes are read at the end.
+pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
+    let mut files = results::ResultFiles::new(&spec.results);
+    files.snapshot(root);
     Box::new(Ladder {
         live: recognize::Recognizers::default(),
-        files: results::ResultFiles::new(&spec.results),
+        files,
         inject: spec.inject.clone(),
         inject_dir: None,
         streams: Vec::new(),
