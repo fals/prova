@@ -85,6 +85,8 @@ Release tarballs with checksums are on the
 [releases page](https://github.com/fals/prova/releases); from source:
 `cargo install --git https://github.com/fals/prova prova-cli`. All options in
 [Getting started](docs/getting-started.md#install).
+Shell completion (commands, options, suite names, run ids):
+`source <(prova completions bash)` ([zsh, fish](docs/getting-started.md#shell-completion)).
 
 ## Quickstart
 

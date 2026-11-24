@@ -55,6 +55,21 @@ prova under you.
 cargo install --git https://github.com/fals/prova --tag v0.1.2 prova-cli
 ```
 
+### Shell completion
+
+TAB completes commands, options, suite names from `prova.toml`, recent run
+ids and experiment names:
+
+```sh
+echo 'source <(prova completions bash)' >> ~/.bashrc          # bash
+echo 'source <(prova completions zsh)' >> ~/.zshrc            # zsh
+echo 'prova completions fish | source' >> ~/.config/fish/config.fish
+```
+
+Every command's `--help` ends with examples (`prova output --help`).
+Commands that read a run (`output`, `events`, `wait`) default to the
+latest one, so `prova output` shows what the last run printed.
+
 ### Platform notes
 
 On macOS, prova watches test processes through `ps` instead of `/proc`,

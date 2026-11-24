@@ -116,6 +116,17 @@ pub struct Location {
     pub fallback: bool,
 }
 
+/// The data directory of `root` if it already holds a store; creates
+/// nothing (shell completion asks on every TAB).
+pub fn existing(root: &Path) -> Option<PathBuf> {
+    let repo = identify(root);
+    let central = prova_home().map(|h| h.join("repos").join(&repo.id));
+    [central, Some(root.join(".prova"))]
+        .into_iter()
+        .flatten()
+        .find(|d| d.join("prova.db").exists())
+}
+
 pub fn locate(root: &Path) -> Location {
     let repo = identify(root);
     if let Some(home) = prova_home() {
