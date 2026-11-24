@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0009_test_sizes.sql"),
     include_str!("migrations/0010_quarantine.sql"),
     include_str!("migrations/0011_superseded.sql"),
+    include_str!("migrations/0012_recording_indexes.sql"),
 ];
 
 pub struct Store {
