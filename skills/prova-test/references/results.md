@@ -44,8 +44,11 @@ Contents: [Failure history](#failure-history) ·
   `quarantined: <test> <result> (<reason>; expires in Nd)` (`not reported`
   when the run gave no per-test results or was cut short);
   `prova quarantine list` and `remove` manage it. It sets aside nothing
-  else: another failure, an error, a crash line or a framework count above
-  its failures fails the run; a parent's quarantine does not cover a
+  else: every error line of the output must be its own (in its section,
+  naming it, or the runner's summary of failures), so another failure, an
+  error, a lint, type-check or coverage step, a framework count above its
+  failures, or a run killed by a signal fails the run, and `detail:` says
+  which; a parent's quarantine does not cover a
   subtest first seen after it; a run where only quarantined tests ran and
   failed fails. A quarantine lives in this machine's prova store, not in
   the repository: CI and teammates do not see it. Do not quarantine a test
