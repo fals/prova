@@ -138,11 +138,31 @@ use std::os::unix::process::CommandExt;
 enum Chunk {
     /// A complete line from stream 0 (stdout) or 1 (stderr), with when its
     /// bytes arrived (ADR 0026: test windows are timed by arrival).
-    Line(usize, String, Instant),
+    Line(usize, String, Arrived),
     /// The start of a line not finished yet (pytest's progress dots before
     /// a hang): shown in the live output at once (round 8).
-    Partial(usize, String, Instant),
+    Partial(usize, String, Arrived),
     Eof,
+}
+
+/// When a chunk's bytes arrived: on the monotonic clock (timers) and on
+/// the boot clock process start times use (Linux). The boot clock is read
+/// here, not derived from the monotonic one: a paused VM advances one and
+/// not the other (round 12, arm64 CI: the runner's own bash looked started
+/// inside a test).
+#[derive(Clone, Copy)]
+struct Arrived {
+    at: Instant,
+    boot_ms: Option<u64>,
+}
+
+impl Arrived {
+    fn now() -> Arrived {
+        Arrived {
+            at: Instant::now(),
+            boot_ms: crate::process::uptime_ms(),
+        }
+    }
 }
 
 fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Chunk>) {
@@ -157,13 +177,13 @@ fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Ch
                     while let Some(i) = pending.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = pending.drain(..=i).collect();
                         let line = String::from_utf8_lossy(&line).into_owned();
-                        if tx.send(Chunk::Line(id, line, Instant::now())).is_err() {
+                        if tx.send(Chunk::Line(id, line, Arrived::now())).is_err() {
                             return;
                         }
                     }
                     if !pending.is_empty() {
                         let part = String::from_utf8_lossy(&pending).into_owned();
-                        if tx.send(Chunk::Partial(id, part, Instant::now())).is_err() {
+                        if tx.send(Chunk::Partial(id, part, Arrived::now())).is_err() {
                             return;
                         }
                     }
@@ -174,7 +194,7 @@ fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Ch
             let _ = tx.send(Chunk::Line(
                 id,
                 String::from_utf8_lossy(&pending).into_owned(),
-                Instant::now(),
+                Arrived::now(),
             ));
         }
         let _ = tx.send(Chunk::Eof);
@@ -226,12 +246,9 @@ struct Supervisor<'a> {
     /// The suite's declared size, checked against what tests use.
     declared: Option<crate::config::Size>,
     /// When the line being handled arrived (None for stream files).
-    line_at: Option<Instant>,
+    line_at: Option<Arrived>,
     /// When the run's first output line arrived, in ms since boot.
     first_line_ms: Option<u64>,
-    /// This supervisor's start, as an Instant and in ms since boot (Linux):
-    /// converts arrival times to compare with process start times.
-    boot: Option<(Instant, u64)>,
     /// The run's test phase, from its first test event (ADR 0026 §2).
     phase: Option<Phase>,
 }
@@ -285,11 +302,12 @@ impl Supervisor<'_> {
             EventKind::TestStarted { .. } | EventKind::TestFinished { .. }
         ) && self.pgid != 0
         {
-            let at = self.line_at.unwrap_or_else(Instant::now);
+            let arrived = self.line_at.unwrap_or_else(Arrived::now);
+            let at = arrived.at;
             if self.phase.is_none() {
                 let _ = self.usage_now();
                 self.phase = Some(Phase {
-                    start_ms: self.boot_ms(at),
+                    start_ms: arrived.boot_ms,
                     base_pids: self.known_pids.clone(),
                     base_sockets: self.known_sockets.clone(),
                     last_event: at,
@@ -322,8 +340,8 @@ impl Supervisor<'_> {
                         solo: alone,
                         own: None,
                         seen: Default::default(),
-                        started: self.line_at.unwrap_or_else(Instant::now),
-                        start_ms: self.boot_ms(self.line_at.unwrap_or_else(Instant::now)),
+                        started: self.line_at.map_or_else(Instant::now, |a| a.at),
+                        start_ms: self.line_at.unwrap_or_else(Arrived::now).boot_ms,
                         pending: None,
                     },
                 );
@@ -377,7 +395,7 @@ impl Supervisor<'_> {
             {
                 // Not observed now: the program may already be in the next
                 // test. Only a sample taken well before this line counts.
-                let read = self.line_at.unwrap_or_else(Instant::now);
+                let read = self.line_at.map_or_else(Instant::now, |a| a.at);
                 if let Some(t) = self.sizes.get_mut(&test.unique())
                     && let Some((at, seen)) = t.pending.take()
                     && read.saturating_duration_since(at) >= SIZE_GUARD
@@ -533,16 +551,6 @@ impl Supervisor<'_> {
         }
     }
 
-    /// An instant in ms since boot, where the OS says (Linux).
-    fn boot_ms(&self, at: Instant) -> Option<u64> {
-        let (i0, ms0) = self.boot?;
-        Some(if at >= i0 {
-            ms0 + at.duration_since(i0).as_millis() as u64
-        } else {
-            ms0.saturating_sub(i0.duration_since(at).as_millis() as u64)
-        })
-    }
-
     /// The run's test phase as one observation: samples taken before its
     /// last test event, at least two of them, or nothing (ADR 0026 §2).
     fn phase_seen(&self) -> Option<crate::resources::Seen> {
@@ -583,7 +591,7 @@ impl Supervisor<'_> {
     /// subtree of a process that names it, or, while it runs alone,
     /// whatever appeared in the group since it started.
     fn observe_sizes(&mut self, now: &crate::resources::Usage) {
-        let now_boot = self.boot_ms(Instant::now());
+        let now_boot = crate::process::uptime_ms();
         // The run's test phase: what started inside it, beyond the runner.
         if let Some(p) = &mut self.phase {
             let mut s = crate::resources::seen_new(&p.base_pids, &p.base_sockets, now);
@@ -732,7 +740,6 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         known_sockets: Default::default(),
         line_at: None,
         first_line_ms: None,
-        boot: crate::process::uptime_ms().map(|ms| (Instant::now(), ms)),
         phase: None,
         one_test_procs: BTreeMap::new(),
         declared: spec.size,
@@ -869,7 +876,7 @@ fn observe_child(
                     last_activity = Instant::now();
                     sup.line_at = Some(at);
                     if sup.first_line_ms.is_none() {
-                        sup.first_line_ms = sup.boot_ms(at);
+                        sup.first_line_ms = at.boot_ms;
                     }
                     sup.line(i, &l, observer);
                     sup.line_at = None;
@@ -969,10 +976,10 @@ fn observe_child(
             match chunk {
                 // A leaked process still writing: what came after the
                 // deadline is not waited for.
-                Chunk::Line(_, _, at) if at > until => break,
+                Chunk::Line(_, _, a) if a.at > until => break,
                 // A read boundary mid-line sends a partial too: judged by
                 // when it arrived, like a line (round 12 CI: 388 of 400).
-                Chunk::Partial(_, _, at) if at > until => break,
+                Chunk::Partial(_, _, a) if a.at > until => break,
                 Chunk::Line(i, l, _) => sup.line(i, &l, observer),
                 Chunk::Partial(i, p, _) => sup.partial(i, &p),
                 Chunk::Eof => *open -= 1,
