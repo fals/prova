@@ -858,7 +858,16 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
         );
         if let Some(res) = &c.result {
             if let Some(reason) = res["reason"].as_str() {
-                println!("reason: {}", clean(reason));
+                // A warning gets its own line, not the end of a long reason
+                // (round 16: a 527288x "improvement" from special-casing the
+                // benchmark's input was kept as the best).
+                match reason.split_once("; warning: ") {
+                    Some((r, w)) => {
+                        println!("reason: {}", clean(r));
+                        println!("warning: {}", clean(w));
+                    }
+                    None => println!("reason: {}", clean(reason)),
+                }
             }
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
@@ -921,6 +930,18 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
                 format!(
                     "accepted against {}, not against the best: the best is still {}; compare with it: prova exp run {} --against {}",
                     c.baseline, r.best, r.experiment, r.best
+                )
+            }
+            ("decided", Some("accept"))
+                if c.result.as_ref().is_some_and(|res| {
+                    res["reason"]
+                        .as_str()
+                        .is_some_and(|x| x.contains("a change this large is rarely real"))
+                }) =>
+            {
+                format!(
+                    "read the candidate's diff before trusting this: a change this large usually means the code special-cases the benchmark or the workload changed; if so, put the best back: prova exp best {} <label> --reason \"...\"",
+                    r.experiment
                 )
             }
             ("decided", Some("accept"))

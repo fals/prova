@@ -1327,3 +1327,25 @@ fn an_oracle_out_of_room_is_not_a_specification_violation() {
         "{reason}"
     );
 }
+
+/// Round 16: a 527288x "improvement" (the candidate special-cased the
+/// benchmark's input) ended its long reason with the warning, and `next:`
+/// said keep it.
+#[test]
+fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
+    let d = spec_repo_with("huge", "test \"$(cat answer)\" = 42");
+    std::fs::write(d.join("steps"), "0.05").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "run", "e"]);
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(t.contains("ACCEPT"), "{t}");
+    assert!(
+        t.lines()
+            .any(|l| l.starts_with("warning: a change this large is rarely real")),
+        "{t}"
+    );
+    assert!(
+        t.contains("next: read the candidate's diff before trusting this"),
+        "{t}"
+    );
+}
