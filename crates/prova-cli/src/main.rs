@@ -1361,6 +1361,18 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
     }
 }
 
+/// A mistake in how prova was asked: exit 2.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 fn main() -> ExitCode {
     // `prova ... | head` closes stdout early; exit quietly like other tools.
     let default_hook = std::panic::take_hook();
@@ -1380,7 +1392,12 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("prova: error: {e:#}");
-            ExitCode::from(exit::INFRA)
+            // A mistake in how prova was asked is exit 2, not an
+            // infrastructure failure (round 12).
+            let usage = e.downcast_ref::<UsageError>().is_some()
+                || e.downcast_ref::<config::ConfigError>()
+                    .is_some_and(config::ConfigError::is_usage);
+            ExitCode::from(if usage { exit::USAGE } else { exit::INFRA })
         }
     }
 }
@@ -1588,12 +1605,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                         .map(|(n, _)| n)
                         .collect();
                     match with.first() {
-                        Some(n) => bail!(
+                        Some(n) => return Err(UsageError(format!(
                             "--select runs one test through a suite's select template, not a command after --: prova run {n} --select <test>"
-                        ),
-                        None => bail!(
-                            "--select runs one test through a suite's select template; there is none yet: `prova adopt --write` proposes one"
-                        ),
+                        )).into()),
+                        None => return Err(UsageError(
+                            "--select runs one test through a suite's select template; there is none yet: `prova adopt --write` proposes one".into()
+                        ).into()),
                     }
                 }
                 let rel = cwd
@@ -1879,7 +1896,10 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     analysis::most_recent(&store, &found)?
                 }
                 (_, []) => {
-                    bail!("no test matching {test:?}; tests are recorded from level 1 runs on")
+                    return Err(UsageError(format!(
+                        "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                    ))
+                    .into());
                 }
                 _ => {
                     println!("{} tests match {test:?}; be more specific:", found.len());

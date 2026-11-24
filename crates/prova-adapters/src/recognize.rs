@@ -189,7 +189,15 @@ impl Recognizers {
             });
             return;
         }
-        if self.seen.contains_key(&d) {
+        if let Some((_, before)) = self.seen.get(&d) {
+            // A different result under the same name is another test (two
+            // test binaries both with `tests::it_works`, round 12): keep it,
+            // or a failure hides behind a pass.
+            if before.is_failure() != outcome.is_failure() {
+                let mut other = key.clone();
+                other.name = format!("{} (second result)", key.name);
+                return self.finished(other, outcome, duration_ms, message, level, out);
+            }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
             if self.libtest_binary.is_some() && key.file == self.libtest_binary {
@@ -1832,6 +1840,33 @@ mod tests {
             f.len() == 1 && f[0].0.contains("divides") && f[0].1 == Outcome::Failed,
             "{ev:?}"
         );
+    }
+
+    /// Round 12 (false pass): two test binaries with the same test name
+    /// (`tests::it_works` in lib.rs and main.rs); the second, failing,
+    /// result was dropped as a duplicate of the first, passing one.
+    #[test]
+    fn a_second_result_under_the_same_name_is_kept() {
+        let (_, events) = feed(concat!(
+            "test tests::it_works ... ok\n",
+            "test tests::it_works ... FAILED\n",
+        ));
+        let f = finished(&events);
+        assert!(
+            f.iter().any(|(_, o)| *o == Outcome::Failed),
+            "the failure must not be dropped: {f:?}"
+        );
+        let (_, events) = feed(concat!(
+            r#"{"type":"test","event":"started","name":"m::a"}"#,
+            "\n",
+            r#"{"type":"test","name":"m::a","event":"ok"}"#,
+            "\n",
+            r#"{"type":"test","event":"started","name":"m::a"}"#,
+            "\n",
+            r#"{"type":"test","name":"m::a","event":"failed"}"#,
+            "\n",
+        ));
+        assert!(finished(&events).iter().any(|(_, o)| *o == Outcome::Failed));
     }
 
     #[test]

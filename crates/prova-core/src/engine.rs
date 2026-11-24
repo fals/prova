@@ -1034,7 +1034,12 @@ fn observe_child(
             });
         }
     } else {
-        contradictions.retain(|c| !c.contains("never reported a result"));
+        // prova stopped it: a harness that never finished, or a test
+        // binary cut off before its summary, is the cancel, not a test
+        // that exits early (round 12).
+        contradictions.retain(|c| {
+            !c.contains("never reported a result") && !c.contains("the tests after it never ran")
+        });
     }
     let mut warnings = report.warnings;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
@@ -1998,10 +2003,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         },
         leaked,
         notes,
-        verified: row
-            .status
-            .is_terminal()
-            .then(|| row.outcome == Some(Outcome::Passed) && warnings.is_empty()),
+        // A pass that rests on a known flaky test passing proves little
+        // (round 12: `verified: true` next to `flaky_passed`).
+        verified: row.status.is_terminal().then(|| {
+            row.outcome == Some(Outcome::Passed) && warnings.is_empty() && flaky_passed.is_empty()
+        }),
         warnings,
         flaky_passed,
         output_tail: if want_tail {
@@ -2032,6 +2038,14 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
     let last_passed = prev
         .iter()
         .find(|r| r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id));
+    let unverified_passes = prev
+        .iter()
+        .filter(|r| {
+            r.status == Status::Finished
+                && r.outcome == Some(Outcome::Passed)
+                && thin.contains(&r.id)
+        })
+        .count();
     // Only finished runs are evidence of "the same failure" (round 8: a
     // cancelled hang was counted as seen before).
     let same = row
@@ -2062,7 +2076,18 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         "previous_runs": finished,
         "cut_short_runs": prev.len() - finished,
         "selection": selection,
-        "last": { "run": last.id, "outcome": last.outcome, "code": last.code },
+        // A cut-short run is named by its status (round 12: JSON said
+        // "errored" where the text said "cancelled").
+        "last": {
+            "run": last.id,
+            "outcome": if last.status == Status::Finished {
+                last.outcome.map(|o| o.as_str().to_owned())
+            } else {
+                Some(last.status.as_str().to_owned())
+            },
+            "code": last.code,
+        },
+        "unverified_passes": unverified_passes,
         "last_passed": last_passed.map(|r| serde_json::json!({ "run": r.id, "code": r.code })),
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
@@ -2073,8 +2098,9 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             store
                 .conn()
                 .query_row(
-                    "SELECT id, suite FROM runs r WHERE code = ?1 AND suite <> ?2 AND status = 'finished'
-                       AND outcome = 'passed'
+                    "SELECT id, suite FROM runs r WHERE code = ?1 AND code <> 'nogit' AND suite <> ?2
+                       AND status = 'finished' AND outcome = 'passed'
+                       AND json_extract(spec, '$.selection') IS NULL
                        AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
                      ORDER BY created_ms DESC LIMIT 1",
                     rusqlite::params![row.code, row.suite],

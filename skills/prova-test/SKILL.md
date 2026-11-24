@@ -94,8 +94,10 @@ needs attention.
 - `prova flaky` known flaky tests. `prova sizes` how many tests of each size,
   and what made each medium or large one so ("started postgres", "1 local
   socket"). `prova history <test>` shows its `size:` and why; `small?`
-  means seen small in fewer than 3 runs, `medium or less` that prova never
-  saw it alone. Sizes come from what tests use, never from duration.
+  means nothing more seen in fewer than 3 runs, `medium or less` that prova
+  could not isolate it and its run used that much (named). Sizes come from
+  what tests use, never from duration; small is "nothing more seen", and
+  sleeps and timers are invisible to prova.
 
 ## Writing tests
 

@@ -22,7 +22,9 @@ fn headline(s: &Summary) -> String {
         WaitReason::Slow => "SLOW TEST (run still going)".into(),
         WaitReason::Failure => "FAILING (run still going)".into(),
         WaitReason::Done => match (s.status, s.outcome) {
-            (Status::Finished, Some(Outcome::Passed)) if !s.warnings.is_empty() => {
+            (Status::Finished, Some(Outcome::Passed))
+                if !s.warnings.is_empty() || !s.flaky_passed.is_empty() =>
+            {
                 "PASSED (unverified: see warnings)".into()
             }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
@@ -169,7 +171,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     if !s.flaky_passed.is_empty() {
         println!(
-            "note: {} known flaky test(s) passed this time, which proves little: {}",
+            "warning: {} known flaky test(s) passed this time, which proves little (not verified): {}",
             s.flaky_passed.len(),
             s.flaky_passed
                 .iter()
@@ -219,7 +221,12 @@ fn context(f: &prova_core::engine::Failure) -> String {
     } else if c.failed_before > 0 {
         parts.push(format!("failed {}x before", c.failed_before));
     } else if c.passed_before && !c.flaky {
-        parts.push("new failure".to_owned());
+        // Thin evidence is said (round 12: "new failure" after one pass
+        // sent the agent after its own fix).
+        parts.push(match c.passes_before {
+            0 | 1 => "new failure (it passed only once before)".to_owned(),
+            _ => "new failure".to_owned(),
+        });
     } else if !c.flaky {
         parts.push("has not passed yet".to_owned());
     }
@@ -357,7 +364,11 @@ fn history_line(h: &serde_json::Value) -> String {
                 o["suite"].as_str().unwrap_or("?"),
                 o["run"].as_str().unwrap_or("?")
             ),
-            None => "none of them passed".into(),
+            None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+                0 => "none of them passed".into(),
+                // (round 12: "none of them passed; on this exact code: passed?")
+                u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
+            },
         }),
         None => {}
     }
@@ -538,7 +549,21 @@ pub fn heartbeat(s: &Summary) {
         c.skipped
     );
     if !s.running.is_empty() {
-        let names: Vec<String> = s.running.iter().take(3).map(|t| clean(t)).collect();
+        // Logs are read too: a 3000-character test name made a 3000-character
+        // line (round 12).
+        let names: Vec<String> = s
+            .running
+            .iter()
+            .take(3)
+            .map(|t| {
+                let c = clean(t);
+                if c.chars().count() > 100 {
+                    c.chars().take(99).collect::<String>() + "…"
+                } else {
+                    c
+                }
+            })
+            .collect();
         line.push_str(&format!("; running now: {}", names.join(", ")));
     }
     eprintln!("{line}");
@@ -808,6 +833,10 @@ mod label_tests {
     use prova_core::engine::Failure;
 
     fn label(seen_before: usize, flaky: bool) -> String {
+        label_after(seen_before, flaky, 5)
+    }
+
+    fn label_after(seen_before: usize, flaky: bool, passes_before: usize) -> String {
         super::context(&Failure {
             test: "t".into(),
             outcome: prova_core::model::Outcome::Failed,
@@ -817,6 +846,7 @@ mod label_tests {
                 seen_before,
                 failed_before: seen_before,
                 passed_before: true,
+                passes_before,
                 run_cut_short: false,
                 flaky,
                 last_passed_code: None,
@@ -832,6 +862,11 @@ mod label_tests {
     fn a_flaky_test_is_not_a_new_failure() {
         assert_eq!(label(0, true), " [FLAKY]");
         assert_eq!(label(0, false), " [new failure]");
+        // Round 12: one earlier pass is thin evidence, and is said.
+        assert_eq!(
+            label_after(0, false, 1),
+            " [new failure (it passed only once before)]"
+        );
         assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
             test: "t".into(),
@@ -840,6 +875,7 @@ mod label_tests {
             context: Some(FailureContext {
                 failed_before: 0,
                 passed_before: false,
+                passes_before: 0,
                 run_cut_short: false,
                 first_seen: true,
                 seen_before: 0,
@@ -861,6 +897,7 @@ mod label_tests {
                 seen_before: 0,
                 failed_before: 0,
                 passed_before: false,
+                passes_before: 0,
                 run_cut_short: false,
                 flaky: false,
                 last_passed_code: None,

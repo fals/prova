@@ -222,7 +222,9 @@ fn overlapping_tests_are_bounded_by_what_their_run_used() {
     let port = listener.local_addr().unwrap().port();
     suite(
         &d,
-        "S m::a\nS m::b\nspin 1\nexec 3<>/dev/tcp/127.0.0.1/$PORT\nspin 2\nexec 3>&-\nOK m::a\nOK m::b\n",
+        // Waits in whole seconds (bash 3.2): the socket is held at least
+        // 2 s, so the phase is sampled several times.
+        "S m::a\nS m::b\nspin 2\nexec 3<>/dev/tcp/127.0.0.1/$PORT\nspin 3\nexec 3>&-\nOK m::a\nOK m::b\n",
         Some("small"),
     );
     let run = runs(&d, port, 1);

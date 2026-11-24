@@ -353,8 +353,9 @@ fn suite_from_prova_toml_with_selection() {
     assert_eq!(o.status.code(), Some(0));
     let out = prova(&d, &["output", "last"]);
     assert_eq!(stdout(&out).trim(), "only parser");
+    // A usage mistake: exit 2 (round 12; it was 4, "infrastructure").
     let none = prova(&d, &["run", "nope"]);
-    assert_eq!(none.status.code(), Some(4));
+    assert_eq!(none.status.code(), Some(2));
 }
 
 #[test]
@@ -377,7 +378,7 @@ fn selection_cannot_inject_shell_commands() {
         "selected x; touch PWNED $(touch PWNED2)"
     );
     let leading_dash = prova(&d, &["run", "t", "--select=-rf"]);
-    assert_eq!(leading_dash.status.code(), Some(4));
+    assert_eq!(leading_dash.status.code(), Some(2));
 }
 
 #[test]
@@ -729,6 +730,6 @@ fn a_dead_supervisor_does_not_leave_the_command_running() {
 fn select_with_a_command_says_what_it_needs() {
     let d = workspace("selcmd");
     let o = prova(&d, &["run", "--select", "x", "--", "true"]);
-    assert_eq!(o.status.code(), Some(4));
+    assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("prova adopt --write"));
 }
