@@ -1605,6 +1605,14 @@ fn observe_child(
             contradictions.push(why);
         }
     }
+    // Maven prints `BUILD FAILURE` whenever a test failed. With the quarantined
+    // failures set aside it says nothing more: the goal's own error lines
+    // (`Failed to execute goal ...`) are what `unaccounted_error` checks.
+    if set_aside.is_some() {
+        contradictions.retain(|c| {
+            !(c.starts_with("the build says it failed: \"") && c.ends_with("BUILD FAILURE\""))
+        });
+    }
     if let Some(code @ (126 | 127)) = exit_code {
         reason = Some(format!(
             "the command could not start (exit {code}: {}); no test ran",
@@ -2148,6 +2156,8 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
             || r.starts_with("-> [Help")
             || r.starts_with("[Help ")
             || r.starts_with("To see the full stack trace")
+            || (r.starts_with("See ") && r.ends_with(" for the individual test results."))
+            || r.starts_with("See dump files (if any exist)")
             || r.starts_with("Re-run Maven")
             || r.starts_with("For more information")
             || r.starts_with("Please refer to")
@@ -2162,10 +2172,29 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
         && let Some((target, _)) = rest.split_once(']')
     {
         let target = target.rsplit(':').next().unwrap_or(target).trim();
-        return !target.is_empty()
-            && command
-                .split_whitespace()
-                .any(|w| w.trim_matches([';', '&', '|', '"', '\'', '(', ')']) == target);
+        return !target.is_empty() && make_names_target(command, target);
+    }
+    false
+}
+
+/// Whether `command` runs `make` with `target` among its goals: a word
+/// after a `make` word, up to the end of that command (`;`, `&&`, `|`).
+/// A word of a script that merely spells the target (a `case` pattern
+/// `lint)`) is not the suite running it.
+fn make_names_target(command: &str, target: &str) -> bool {
+    let mut in_make = false;
+    for word in command.split_whitespace() {
+        let w = word.trim_matches(['"', '\'', '(', ')']);
+        let ends = w.ends_with([';', '&', '|']) || matches!(w, "&&" | "||" | "|");
+        let w = w.trim_matches([';', '&', '|']);
+        if in_make && !w.starts_with('-') && w == target {
+            return true;
+        }
+        if w == "make" || w.ends_with("/make") {
+            in_make = true;
+        } else if ends {
+            in_make = false;
+        }
     }
     false
 }
@@ -3364,6 +3393,42 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
 mod quarantine_tests {
     use super::*;
     use crate::quarantine::Entry;
+
+    /// Round 16: make's line for a target is the runner's own only when the
+    /// suite's command runs that target, not when a script spells the word.
+    #[test]
+    fn make_failing_a_target_the_command_runs_is_a_summary_and_no_other_is() {
+        let line = "make: *** [Makefile:2: test] Error 2";
+        let lint = "make: *** [Makefile:5: lint] Error 1";
+        let script = "sh -c : make test; case $s in lint) echo x ;; esac";
+        assert!(summary_of_failures(line, script));
+        assert!(!summary_of_failures(lint, script));
+        assert!(summary_of_failures(lint, "make test lint"));
+        assert!(summary_of_failures(line, "make -C sub test && echo done"));
+        assert!(!summary_of_failures(lint, "make test && lint"));
+        assert!(!summary_of_failures(lint, "make test; lint"));
+    }
+
+    /// Round 16: Maven's wrap-up of a failed test step, as captured from
+    /// `mvn test`; a line that merely starts the same way is not one.
+    #[test]
+    fn maven_wrap_up_lines_of_a_failed_test_step_are_the_runners_summary() {
+        for t in [
+            "[ERROR] See /w/target/surefire-reports for the individual test results.",
+            "[ERROR] See dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.",
+            "[ERROR] Failures: ",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0",
+        ] {
+            assert!(summary_of_failures(t, "mvn test"), "{t}");
+        }
+        for t in [
+            "[ERROR] See you at /w/src/Other.java:[3,5] ';' expected",
+            "[ERROR] COMPILATION ERROR :",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 0",
+        ] {
+            assert!(!summary_of_failures(t, "mvn test"), "{t}");
+        }
+    }
 
     fn q(names: &[&str]) -> BTreeMap<String, Entry> {
         names

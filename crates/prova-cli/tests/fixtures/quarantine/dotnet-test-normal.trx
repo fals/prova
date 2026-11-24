@@ -1,0 +1,77 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="88a6e431-b286-48c1-854d-20d791a14dc7" name="@cf66704503e6 2026-11-24 19:41:45" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-11-24T19:41:45.8695801+00:00" queuing="2026-11-24T19:41:45.8695802+00:00" start="2026-11-24T19:41:45.5066182+00:00" finish="2026-11-24T19:41:45.8787512+00:00" />
+  <TestSettings name="default" id="8f19f577-2b36-4c9a-b24c-48fe1dcd866e">
+    <Deployment runDeploymentRoot="_cf66704503e6_2026-11-24_19_41_45" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="087e643b-5697-4bb2-a7ee-def65991edc5" testId="550226e2-c91a-ecc4-269b-36556d3be00a" testName="Calc.CalcTests.HangsWhenAsked" computerName="cf66704503e6" duration="00:00:00.0000407" startTime="2026-11-24T19:41:45.8124949+00:00" endTime="2026-11-24T19:41:45.8124949+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="087e643b-5697-4bb2-a7ee-def65991edc5" />
+    <UnitTestResult executionId="cb8a323b-d6e3-4b5f-893c-0925fccc6e3d" testId="5753774b-b813-e174-c951-031629f535a8" testName="Calc.CalcTests.FlakyClock" computerName="cf66704503e6" duration="00:00:00.0005815" startTime="2026-11-24T19:41:45.8123901+00:00" endTime="2026-11-24T19:41:45.8123901+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="cb8a323b-d6e3-4b5f-893c-0925fccc6e3d">
+      <Output>
+        <ErrorInfo>
+          <Message>clock tick landed on a bad boundary</Message>
+          <StackTrace>   at Calc.CalcTests.FlakyClock() in /w/CalcTests.cs:line 17
+   at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="52bcaa13-4777-438c-bedd-bc96bfa73ae4" testId="86a63504-ea19-cdc3-e385-754581ef16de" testName="Calc.CalcTests.Divides" computerName="cf66704503e6" duration="00:00:00.0019934" startTime="2026-11-24T19:41:45.8060351+00:00" endTime="2026-11-24T19:41:45.8060351+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="52bcaa13-4777-438c-bedd-bc96bfa73ae4" />
+    <UnitTestResult executionId="a301b36c-f7d5-4726-89af-d65a5200c134" testId="72500225-31e4-8bee-57de-ae3f1137bc47" testName="Calc.CalcTests.SlowIntegration" computerName="cf66704503e6" duration="00:00:00.0114816" startTime="2026-11-24T19:41:45.8043710+00:00" endTime="2026-11-24T19:41:45.8043796+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a301b36c-f7d5-4726-89af-d65a5200c134" />
+    <UnitTestResult executionId="43de5852-660b-4d78-809e-af102f0a73ac" testId="6664e65f-ba73-26d9-daac-6c6161092a71" testName="Calc.CalcTests.Adds" computerName="cf66704503e6" duration="00:00:00.0001809" startTime="2026-11-24T19:41:45.8125172+00:00" endTime="2026-11-24T19:41:45.8125172+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="43de5852-660b-4d78-809e-af102f0a73ac" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="Calc.CalcTests.Divides" storage="/w/bin/debug/net9.0/calc.tests.dll" id="86a63504-ea19-cdc3-e385-754581ef16de">
+      <Execution id="52bcaa13-4777-438c-bedd-bc96bfa73ae4" />
+      <TestMethod codeBase="/w/bin/Debug/net9.0/Calc.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Calc.CalcTests" name="Divides" />
+    </UnitTest>
+    <UnitTest name="Calc.CalcTests.HangsWhenAsked" storage="/w/bin/debug/net9.0/calc.tests.dll" id="550226e2-c91a-ecc4-269b-36556d3be00a">
+      <Execution id="087e643b-5697-4bb2-a7ee-def65991edc5" />
+      <TestMethod codeBase="/w/bin/Debug/net9.0/Calc.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Calc.CalcTests" name="HangsWhenAsked" />
+    </UnitTest>
+    <UnitTest name="Calc.CalcTests.Adds" storage="/w/bin/debug/net9.0/calc.tests.dll" id="6664e65f-ba73-26d9-daac-6c6161092a71">
+      <Execution id="43de5852-660b-4d78-809e-af102f0a73ac" />
+      <TestMethod codeBase="/w/bin/Debug/net9.0/Calc.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Calc.CalcTests" name="Adds" />
+    </UnitTest>
+    <UnitTest name="Calc.CalcTests.FlakyClock" storage="/w/bin/debug/net9.0/calc.tests.dll" id="5753774b-b813-e174-c951-031629f535a8">
+      <Execution id="cb8a323b-d6e3-4b5f-893c-0925fccc6e3d" />
+      <TestMethod codeBase="/w/bin/Debug/net9.0/Calc.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Calc.CalcTests" name="FlakyClock" />
+    </UnitTest>
+    <UnitTest name="Calc.CalcTests.SlowIntegration" storage="/w/bin/debug/net9.0/calc.tests.dll" id="72500225-31e4-8bee-57de-ae3f1137bc47">
+      <Execution id="a301b36c-f7d5-4726-89af-d65a5200c134" />
+      <TestMethod codeBase="/w/bin/Debug/net9.0/Calc.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Calc.CalcTests" name="SlowIntegration" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="550226e2-c91a-ecc4-269b-36556d3be00a" executionId="087e643b-5697-4bb2-a7ee-def65991edc5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5753774b-b813-e174-c951-031629f535a8" executionId="cb8a323b-d6e3-4b5f-893c-0925fccc6e3d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="86a63504-ea19-cdc3-e385-754581ef16de" executionId="52bcaa13-4777-438c-bedd-bc96bfa73ae4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="72500225-31e4-8bee-57de-ae3f1137bc47" executionId="a301b36c-f7d5-4726-89af-d65a5200c134" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6664e65f-ba73-26d9-daac-6c6161092a71" executionId="43de5852-660b-4d78-809e-af102f0a73ac" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="5" executed="5" passed="4" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 9.0.23)
+[xUnit.net 00:00:00.03]   Discovering: Calc.Tests
+[xUnit.net 00:00:00.05]   Discovered:  Calc.Tests
+[xUnit.net 00:00:00.05]   Starting:    Calc.Tests
+[xUnit.net 00:00:00.09]       clock tick landed on a bad boundary
+[xUnit.net 00:00:00.09]       Stack Trace:
+[xUnit.net 00:00:00.09]         /w/CalcTests.cs(17,0): at Calc.CalcTests.FlakyClock()
+[xUnit.net 00:00:00.09]            at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+[xUnit.net 00:00:00.09]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.09]   Finished:    Calc.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="cf66704503e6" outcome="Error" timestamp="2026-11-24T19:41:45.8116888+00:00">
+        <Text>[xUnit.net 00:00:00.09]     Calc.CalcTests.FlakyClock [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

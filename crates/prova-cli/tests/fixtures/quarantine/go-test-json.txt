@@ -1,0 +1,29 @@
+{"Time":"2026-11-24T20:40:17.693011202+01:00","Action":"start","Package":"example.com/calc"}
+{"Time":"2026-11-24T20:40:17.693181582+01:00","Action":"start","Package":"example.com/calc/cmd/conform"}
+{"Time":"2026-11-24T20:40:17.693238693+01:00","Action":"output","Package":"example.com/calc/cmd/conform","Output":"?   \texample.com/calc/cmd/conform\t[no test files]\n"}
+{"Time":"2026-11-24T20:40:17.693267699+01:00","Action":"skip","Package":"example.com/calc/cmd/conform","Elapsed":0}
+{"Time":"2026-11-24T20:40:17.694639918+01:00","Action":"run","Package":"example.com/calc","Test":"TestAdd"}
+{"Time":"2026-11-24T20:40:17.69467685+01:00","Action":"output","Package":"example.com/calc","Test":"TestAdd","Output":"=== RUN   TestAdd\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.694689705+01:00","Action":"output","Package":"example.com/calc","Test":"TestAdd","Output":"--- PASS: TestAdd (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.694696939+01:00","Action":"pass","Package":"example.com/calc","Test":"TestAdd","Elapsed":0}
+{"Time":"2026-11-24T20:40:17.694702269+01:00","Action":"run","Package":"example.com/calc","Test":"TestDiv"}
+{"Time":"2026-11-24T20:40:17.694705706+01:00","Action":"output","Package":"example.com/calc","Test":"TestDiv","Output":"=== RUN   TestDiv\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.694710996+01:00","Action":"output","Package":"example.com/calc","Test":"TestDiv","Output":"--- PASS: TestDiv (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.694715825+01:00","Action":"pass","Package":"example.com/calc","Test":"TestDiv","Elapsed":0}
+{"Time":"2026-11-24T20:40:17.694720735+01:00","Action":"run","Package":"example.com/calc","Test":"TestFlakyClock"}
+{"Time":"2026-11-24T20:40:17.694725324+01:00","Action":"output","Package":"example.com/calc","Test":"TestFlakyClock","Output":"=== RUN   TestFlakyClock\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.694730183+01:00","Action":"output","Package":"example.com/calc","Test":"TestFlakyClock","Output":"    calc_test.go:23: clock tick landed on a bad boundary\n","OutputType":"error"}
+{"Time":"2026-11-24T20:40:17.694742437+01:00","Action":"output","Package":"example.com/calc","Test":"TestFlakyClock","Output":"--- FAIL: TestFlakyClock (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.69475956+01:00","Action":"fail","Package":"example.com/calc","Test":"TestFlakyClock","Elapsed":0}
+{"Time":"2026-11-24T20:40:17.694768267+01:00","Action":"run","Package":"example.com/calc","Test":"TestSlowIntegration"}
+{"Time":"2026-11-24T20:40:17.694772154+01:00","Action":"output","Package":"example.com/calc","Test":"TestSlowIntegration","Output":"=== RUN   TestSlowIntegration\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.704874039+01:00","Action":"output","Package":"example.com/calc","Test":"TestSlowIntegration","Output":"--- PASS: TestSlowIntegration (0.01s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.704914227+01:00","Action":"pass","Package":"example.com/calc","Test":"TestSlowIntegration","Elapsed":0.01}
+{"Time":"2026-11-24T20:40:17.704930919+01:00","Action":"run","Package":"example.com/calc","Test":"TestHang"}
+{"Time":"2026-11-24T20:40:17.704937662+01:00","Action":"output","Package":"example.com/calc","Test":"TestHang","Output":"=== RUN   TestHang\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.704951058+01:00","Action":"output","Package":"example.com/calc","Test":"TestHang","Output":"    calc_test.go:33: set HANG=1 to hang\n"}
+{"Time":"2026-11-24T20:40:17.704958963+01:00","Action":"output","Package":"example.com/calc","Test":"TestHang","Output":"--- SKIP: TestHang (0.00s)\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.704965095+01:00","Action":"skip","Package":"example.com/calc","Test":"TestHang","Elapsed":0}
+{"Time":"2026-11-24T20:40:17.704971818+01:00","Action":"output","Package":"example.com/calc","Output":"FAIL\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.705232072+01:00","Action":"output","Package":"example.com/calc","Output":"FAIL\texample.com/calc\t0.012s\n","OutputType":"frame"}
+{"Time":"2026-11-24T20:40:17.705257141+01:00","Action":"fail","Package":"example.com/calc","Elapsed":0.012}

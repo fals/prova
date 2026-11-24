@@ -264,12 +264,46 @@ fn section_owner(t: &str) -> Option<String> {
     if let Some(name) = t.strip_prefix("\u{25cf} ") {
         return Some(name.trim().to_owned());
     }
-    for p in ["=== RUN ", "=== CONT ", "=== NAME ", "--- FAIL: "] {
+    for p in [
+        "=== RUN ",
+        "=== CONT ",
+        "=== NAME ",
+        "--- FAIL: ",
+        "=== FAIL: ",
+    ] {
         if let Some(rest) = t.strip_prefix(p) {
-            return rest.split_whitespace().next().map(str::to_owned);
+            // gotestsum's `=== FAIL: pkg Test (0.00s)` names the package first.
+            let mut words = rest.split_whitespace();
+            let first = words.next()?;
+            return match (p, words.next()) {
+                ("=== FAIL: ", Some(test)) => Some(format!("{first}::{test}")),
+                _ => Some(first.to_owned()),
+            };
         }
     }
-    None
+    vitest_header(t).or_else(|| vstest_header(t))
+}
+
+/// Vitest's `FAIL  src/a.test.ts > describe > test`: the block of a failed
+/// test, as the `file::describe > test` name the adapter gives it.
+fn vitest_header(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("FAIL ")?.trim_start();
+    let (file, test) = rest.split_once(" > ")?;
+    (!file.contains(char::is_whitespace) && file.contains('.') && !test.trim().is_empty())
+        .then(|| format!("{file}::{}", test.trim()))
+}
+
+/// VSTest's `  Failed Calc.CalcTests.FlakyClock [12 ms]` (also `Passed` and
+/// `Skipped`): the block of one test, with its `Error Message:` and `Stack
+/// Trace:` after a failed one.
+fn vstest_header(t: &str) -> Option<String> {
+    let rest = ["Failed ", "Passed ", "Skipped "]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))?;
+    let (name, time) = rest.trim().split_once(" [")?;
+    let time = time.strip_suffix(']')?;
+    let timed = time.ends_with("s") && time.starts_with(|c: char| c.is_ascii_digit() || c == '<');
+    (timed && !name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_owned())
 }
 
 /// A line that ends any test's section: a summary banner or a runner's
@@ -281,6 +315,14 @@ fn ends_section(t: &str) -> bool {
         || t == "failures:"
         || t.starts_with("Tests:")
         || t.starts_with("Test Suites:")
+        || t.starts_with("Test Files ")
+        || t.starts_with("Tests ")
+        || t.starts_with("Total tests:")
+        || t.starts_with("Failed!  ")
+        || t.starts_with("Passed!  ")
+        || t.starts_with("Test Run ")
+        || t.starts_with("DONE ")
+        || t.starts_with('\u{23af}')
         || t == "FAIL"
         || t == "PASS"
         || t.starts_with("FAIL\t")
@@ -910,6 +952,77 @@ mod tests {
         let b = bound_text(&t);
         assert!(b.len() < EXCERPT_BYTES + 64 && b.starts_with("[... "));
         assert!(b.ends_with("assert 16 == 4\n"));
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    /// The owner of each error-looking line of `text`.
+    fn owners(text: &str) -> Vec<(String, Option<String>)> {
+        let mut d = Distiller::default();
+        for l in text.lines() {
+            d.push(l);
+        }
+        d.error_lines()
+            .0
+            .iter()
+            .map(|(_, l, o)| (l.trim().to_owned(), o.clone()))
+            .collect()
+    }
+
+    /// Round 16: headers as the real frameworks print them.
+    #[test]
+    fn real_framework_headers_open_a_tests_section() {
+        for (header, owner) in [
+            (
+                "  Failed Calc.CalcTests.FlakyClock [< 1 ms]",
+                "Calc.CalcTests.FlakyClock",
+            ),
+            (
+                "  Failed Calc.CalcTests.FlakyClock [12 ms]",
+                "Calc.CalcTests.FlakyClock",
+            ),
+            (
+                "  Passed Calc.CalcTests.Divides [1 s]",
+                "Calc.CalcTests.Divides",
+            ),
+            (
+                " FAIL  src/calc.test.ts > calc > flaky clock",
+                "src/calc.test.ts::calc > flaky clock",
+            ),
+            ("=== FAIL: . TestFlakyClock (0.00s)", ".::TestFlakyClock"),
+        ] {
+            assert_eq!(section_owner(header).as_deref(), Some(owner), "{header}");
+        }
+        for not_header in [
+            "Failed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5",
+            "Failed to execute goal x [ERROR] boom",
+            "FAIL\texample.com/calc\t0.012s",
+            "FAIL  src/lib.rs",
+            "Failed some test [not a time]",
+        ] {
+            assert_eq!(section_owner(not_header), None, "{not_header}");
+        }
+    }
+
+    /// Strict: another test's header, or a runner's wrap-up, ends the
+    /// section of the one before; the error after it is not that test's.
+    #[test]
+    fn an_error_after_another_header_or_the_wrap_up_is_not_the_earlier_tests() {
+        let o = owners(
+            "  Failed Calc.A [1 ms]\n  Error Message:\n  Passed Calc.B [1 ms]\n  Error Message:\nFailed!  - Failed: 1, Passed: 1\nError: build broke",
+        );
+        let by = |i: usize| (o[i].0.as_str(), o[i].1.as_deref());
+        assert_eq!(by(0), ("Error Message:", Some("Calc.A")));
+        assert_eq!(by(1), ("Error Message:", Some("Calc.B")));
+        assert_eq!(by(2), ("Error: build broke", None));
+        let v = owners(
+            " FAIL  src/a.test.ts > a > x\nAssertionError: no\n⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯\n\nError: later",
+        );
+        assert_eq!(v[1].1.as_deref(), Some("src/a.test.ts::a > x"), "{v:?}");
+        assert_eq!(v[2].1, None, "{v:?}");
     }
 }
 
