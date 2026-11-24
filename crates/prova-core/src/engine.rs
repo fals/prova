@@ -1759,9 +1759,15 @@ fn observe_child(
         sup.flush()?;
         let rerun: Vec<String> = {
             let mut stmt = store.conn().prepare(
+                // A retry: a failed attempt, then a pass of the same test.
+                // A result re-keyed under another name is no attempt (round
+                // 16: a quarantined Go failure read as "passed on a retry").
                 "SELECT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-                  WHERE a.run_id = ?1 GROUP BY a.test_id
-                 HAVING SUM(a.outcome IN ('failed','errored')) > 0",
+                  WHERE a.run_id = ?1
+                    AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+                  GROUP BY a.test_id
+                 HAVING SUM(a.outcome IN ('failed','errored')) > 0
+                    AND SUM(a.outcome = 'passed') > 0",
             )?;
             stmt.query_map(rusqlite::params![run], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?

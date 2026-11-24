@@ -728,3 +728,28 @@ fn a_parent_of_failing_subtests_has_no_framing_message() {
     let msg = parent["message"].as_str().unwrap_or("");
     assert!(!msg.contains("=== RUN") && !msg.contains("--- FAIL"), "{s}");
 }
+
+/// Round 16: a quarantined `go test -v` failure made the pass "unverified":
+/// "1 test(s) failed, then passed on a retry: TestFlaky", with no retry.
+#[test]
+fn a_quarantined_go_failure_is_no_retry() {
+    let d = workspace("q-noretry");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &script]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "passed", "{s}");
+    assert!(!s.to_string().contains("passed on a retry"), "{s}");
+}
