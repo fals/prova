@@ -24,6 +24,13 @@ pub struct Recognizers {
     /// The Go module of the run's directory (go.mod), for packages printed
     /// as `.`.
     pub go_module: Option<String>,
+    /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
+    /// failures it listed, and how many runs `--rerun-fails` made. A
+    /// package green on its last run after failures means its failed tests
+    /// passed on a rerun (round 16: reported as failures, exit 0).
+    gts_pkg_last: BTreeMap<String, bool>,
+    gts_failed: Vec<TestKey>,
+    gts_runs: u64,
     /// The key each `seen` entry was reported under (unique key -> key):
     /// a result superseded later names the test it was stored as.
     pub seen_keys: BTreeMap<String, TestKey>,
@@ -565,6 +572,13 @@ impl Recognizers {
                 // `--rerun-fails` ends with `DONE 2 runs, 4 tests, ...`: the
                 // tests of every run, reruns again. The first DONE is the
                 // suite's count.
+                if counts.contains(" runs")
+                    && let Some(n) = counts
+                        .split(", ")
+                        .find_map(|p| p.strip_suffix(" runs")?.trim().parse::<u64>().ok())
+                {
+                    self.gts_runs = self.gts_runs.max(n);
+                }
                 if self.gts_done_seen && counts.contains(" runs") {
                     return;
                 }
@@ -1145,6 +1159,18 @@ impl Recognizers {
     /// none of it). Names match `go test -v`'s (the package is relative).
     fn gotestsum(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_end();
+        // `pkgname`'s package status lines: `✓  pkg (2ms)`, `✖  pkg (1.5s)`.
+        for (mark, passed) in [('\u{2713}', true), ('\u{2716}', false)] {
+            if let Some(rest) = t.strip_prefix(mark)
+                && let Some(pkg) = rest.split_whitespace().next()
+                && rest.starts_with("  ")
+            {
+                let pkg = self.go_pkg(pkg);
+                self.gts_pkg_last.insert(pkg, passed);
+                self.gotestsum_seen = true;
+                return true;
+            }
+        }
         // A failing `testname` line is followed by what the test printed.
         if self.gts_inline && self.gts_pending.is_some() {
             if line.starts_with([' ', '\t']) {
@@ -1307,7 +1333,39 @@ impl Recognizers {
                     self.failure_fallback.push((key, m));
                 }
             } else {
+                if outcome.is_failure() {
+                    self.gts_failed.push(key.clone());
+                }
                 self.result(key, outcome, dur, msg, Level::Recognized, sub, out);
+            }
+        }
+    }
+
+    /// gotestsum reran its failures and the last run of their package was
+    /// green: each passed on a rerun (it exits non-zero if any still fails).
+    fn gotestsum_reruns_passed(&mut self, out: &mut Vec<EventKind>) {
+        if self.gts_runs < 2 {
+            return;
+        }
+        for key in std::mem::take(&mut self.gts_failed) {
+            let green = key
+                .path
+                .first()
+                .and_then(|p| self.gts_pkg_last.get(p))
+                .copied()
+                .unwrap_or(false);
+            if green {
+                let sub = key.name.contains('/');
+                self.go_result(
+                    key,
+                    Outcome::Passed,
+                    None,
+                    None,
+                    Level::Recognized,
+                    sub,
+                    true,
+                    out,
+                );
             }
         }
     }
@@ -2835,6 +2893,7 @@ impl Recognizers {
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
+        self.gotestsum_reruns_passed(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
                 if !self.gts_pkg_with_failure.contains(&pkg)

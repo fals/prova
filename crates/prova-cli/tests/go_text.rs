@@ -766,3 +766,20 @@ fn gotestsum_subpackages_are_named_by_import_path() {
     );
     assert_eq!(failing(&s), vec!["example.com/m/calc::TestFlaky"], "{s}");
 }
+
+/// Round 16: gotestsum `--format pkgname --rerun-fails` whose rerun passed
+/// (real capture: the failures are listed, the package's last line is
+/// green, exit 0) was reported as a failure.
+#[test]
+fn a_gotestsum_pkgname_rerun_that_passed_is_flaky() {
+    let d = workspace("gts-pkg-rerun");
+    std::fs::write(d.join("go.mod"), "module example.com/calc\n").unwrap();
+    let capture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/quarantine/gotestsum-pkgname-rerun.txt"
+    );
+    let (code, s) = run_sh(&d, &format!("cat {capture}; exit 0"));
+    assert_eq!(code, Some(0), "{s}");
+    assert_eq!(s["outcome"], "passed", "{s}");
+    assert!(s.to_string().contains("passed on a retry"), "{s}");
+}
