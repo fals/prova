@@ -533,3 +533,48 @@ fn a_package_panic_in_go_json_is_not_a_quarantined_tests() {
     let o = prova(&d, &["run", "panic"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
 }
+
+/// Round 15: a quarantine refused for a new subtest said nothing of why.
+#[test]
+fn a_refused_quarantine_says_why() {
+    let d = workspace("why");
+    let go = |sub: bool| {
+        let subtest = if sub {
+            "'=== RUN   TestQ/new' '    q_test.go:9: real regression' '    --- FAIL: TestQ/new (0.00s)'"
+        } else {
+            "'    q_test.go:3: flake'"
+        };
+        format!(
+            "{BUSY} printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestQ' {subtest} '--- FAIL: TestQ (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.old]\nrun = {:?}\n\n[suite.new]\nrun = {:?}\n",
+            go(false),
+            go(true)
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "old"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m::TestQ",
+            "--reason",
+            "flake",
+        ],
+    );
+    let o = prova(&d, &["run", "new"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(
+            "first seen after their parent's quarantine failed (example.com/m::TestQ/new)"
+        ),
+        "{out}"
+    );
+}

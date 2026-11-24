@@ -1652,10 +1652,48 @@ fn observe_child(
             .iter()
             .all(|d| crate::quarantine::covers(&quarantine, d).is_some())
     {
-        reason = Some(format!(
-            "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
-            failing.join(", ")
-        ));
+        // Which of ADR 0028's conditions did not hold (round 15: refused
+        // with no word of why).
+        let errored: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, o)| **o == Outcome::Errored)
+            .map(|(k, _)| key_display(k))
+            .collect();
+        let new_subtests: Vec<&str> = failing
+            .iter()
+            .copied()
+            .filter(|d| {
+                !quarantine.contains_key(*d)
+                    && crate::quarantine::covers(&quarantine, d)
+                        .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
+            })
+            .collect();
+        let verified_other = outcomes.iter().any(|(k, o)| {
+            *o == Outcome::Passed
+                && crate::quarantine::covers(&quarantine, key_display(k)).is_none()
+        });
+        reason = Some(if !errored.is_empty() {
+            format!(
+                "quarantined test(s) errored, not plainly failed ({}): a quarantine sets aside failures, not errors",
+                errored.join(", ")
+            )
+        } else if !new_subtests.is_empty() {
+            format!(
+                "subtest(s) first seen after their parent's quarantine failed ({}): a new subtest's failure is news",
+                new_subtests.join(", ")
+            )
+        } else if !verified_other {
+            format!(
+                "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
+                failing.join(", ")
+            )
+        } else {
+            format!(
+                "only quarantined test(s) failed ({}), but the run cannot be set aside (exit {}, or the run did not end on its own)",
+                failing.join(", "),
+                exit_code.map_or("none".to_owned(), |c| c.to_string())
+            )
+        });
     }
     let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
