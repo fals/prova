@@ -92,10 +92,10 @@ fn go_verbose_same_test_in_two_packages_has_no_phantom() {
     assert!(!s.to_string().contains("second result"), "{s}");
 }
 
-/// `go test -count=3`: pass, fail, pass of one test is one test with three
-/// attempts, flaky, and its history keeps the failure.
+/// `go test -count=3`: pass, fail, pass of one test in one package run is a
+/// failure: iterations are not retries (round 15).
 #[test]
-fn go_count_repeats_keep_the_failure_in_the_history() {
+fn go_count_iterations_keep_the_failure() {
     let d = workspace("count");
     let (code, s) = run_sh(
         &d,
@@ -105,15 +105,188 @@ fn go_count_repeats_keep_the_failure_in_the_history() {
     );
     assert_eq!(code, Some(1), "the command failed: {s}");
     assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(failing(&s), vec!["example.com/m/r::TestRace"], "{s}");
     assert!(!s.to_string().contains("second result"), "{s}");
-    let h = text(&prova(&d, &["history", "TestRace"]));
-    assert!(
-        h.contains("example.com/m/r::TestRace")
-            && h.contains("3 attempts")
-            && h.contains("lost update")
-            && h.contains("FLAKY"),
-        "{h}"
+}
+
+/// The same with `go test -count=2 -json`: fail, then pass, exit 1.
+#[test]
+fn go_json_count_iterations_keep_the_failure() {
+    let d = workspace("count-json");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' \
+         '{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestF\"}' \
+         '{\"Action\":\"output\",\"Package\":\"p\",\"Test\":\"TestF\",\"Output\":\"    f_test.go:4: boom\\n\"}' \
+         '{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestF\",\"Elapsed\":0}' \
+         '{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestF\"}' \
+         '{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestF\",\"Elapsed\":0}' \
+         '{\"Action\":\"fail\",\"Package\":\"p\",\"Elapsed\":0}'; exit 1",
     );
+    assert_eq!(code, Some(1), "{s}");
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(failing(&s), vec!["p::TestF"], "{s}");
+}
+
+/// A quarantined test failing in one iteration next to another test that
+/// failed then passed: the second fails the run, named.
+#[test]
+fn go_count_failure_next_to_a_quarantined_one_fails_the_run() {
+    let d = workspace("count-quar");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestQ' '--- PASS: TestQ (0.00s)' '=== RUN   TestQueue' \
+         '    q_test.go:3: no' '--- FAIL: TestQueue (0.00s)' '=== RUN   TestQ' '    q_test.go:9: x' \
+         '--- FAIL: TestQ (0.00s)' '=== RUN   TestQueue' '--- PASS: TestQueue (0.00s)' 'FAIL' \
+         'FAIL\texample.com/q\t0.01s'; exit 1"
+    );
+    // History for TestQ, then the quarantine.
+    let first = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestQ' '--- FAIL: TestQ (0.00s)' 'FAIL' 'FAIL\texample.com/q\t0.01s'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &first]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/q::TestQ",
+            "--reason",
+            "known",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(o.status.code(), Some(1), "{s}");
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(failing(&s), vec!["example.com/q::TestQueue"], "{s}");
+}
+
+/// Round 15: a panic in the package's own output, outside any test, next to
+/// a quarantined failing test must not pass.
+#[test]
+fn a_go_panic_outside_a_test_fails_next_to_a_quarantined_failure() {
+    let d = workspace("panic-quar");
+    let first = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestQ' '--- FAIL: TestQ (0.00s)' 'FAIL' 'FAIL\texample.com/q\t0.01s'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &first]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/q::TestQ",
+            "--reason",
+            "known",
+        ],
+    );
+    // go test -v text
+    let text_run = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestQ' '    q_test.go:5: no' '--- FAIL: TestQ (0.00s)' \
+         '=== RUN   TestQueue' '--- PASS: TestQueue (0.00s)' 'panic: send on closed channel' '' \
+         'goroutine 12 [running]:' 'FAIL\texample.com/q\t0.01s'; exit 2"
+    );
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &text_run]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert!(
+        failing(&s).contains(&"example.com/q::(package)".to_owned()),
+        "{s}"
+    );
+    // go test -json
+    let json_run = format!(
+        "{WORK}printf '%s\\n' \
+         '{{\"Action\":\"run\",\"Package\":\"example.com/q\",\"Test\":\"TestQ\"}}' \
+         '{{\"Action\":\"fail\",\"Package\":\"example.com/q\",\"Test\":\"TestQ\",\"Elapsed\":0}}' \
+         '{{\"Action\":\"run\",\"Package\":\"example.com/q\",\"Test\":\"TestQueue\"}}' \
+         '{{\"Action\":\"pass\",\"Package\":\"example.com/q\",\"Test\":\"TestQueue\",\"Elapsed\":0}}' \
+         '{{\"Action\":\"output\",\"Package\":\"example.com/q\",\"Output\":\"panic: send on closed channel\\n\"}}' \
+         '{{\"Action\":\"output\",\"Package\":\"example.com/q\",\"Output\":\"goroutine 12 [running]:\\n\"}}' \
+         '{{\"Action\":\"fail\",\"Package\":\"example.com/q\"}}'; exit 2"
+    );
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &json_run]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert!(
+        failing(&s).contains(&"example.com/q::(package)".to_owned()),
+        "{s}"
+    );
+}
+
+/// Round 15: a package line printed by a running test is its output.
+#[test]
+fn a_package_line_forged_by_a_test_does_not_rekey_earlier_tests() {
+    let d = workspace("forged");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' '=== RUN   TestA' '    a_test.go:3: no' '--- FAIL: TestA (0.00s)' '=== RUN   TestSub' \
+         'ok  \texample.com/fake\t0.010s' '--- PASS: TestSub (0.00s)' 'FAIL' 'FAIL\texample.com/real\t0.02s'; exit 1",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    assert_eq!(failing(&s), vec!["example.com/real::TestA"], "{s}");
+    assert_eq!(s["counts"]["passed"], 1, "{s}");
+    assert_eq!(s["counts"]["errored"], 0, "{s}");
+}
+
+/// Round 15: `go test` without -v prints the message after the FAIL line;
+/// a panic in a test follows it too.
+#[test]
+fn go_failure_messages_that_follow_the_fail_line_are_shown() {
+    let d = workspace("tailmsg");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "{WORK}printf '%s\\n' '--- FAIL: TestX (0.00s)' '    x_test.go:9: boom' 'FAIL' 'FAIL\texample.com/x\t0.01s'; exit 1"
+            ),
+        ],
+    );
+    assert!(
+        text(&o).contains("TestX [first time seen: no history yet]: x_test.go:9: boom"),
+        "{}",
+        text(&o)
+    );
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "{WORK}printf '%s\\n' '=== RUN   TestP' '--- FAIL: TestP (0.00s)' 'panic: boom [recovered]' '' 'goroutine 7 [running]:' \
+                 '\tp_test.go:4 +0x25' 'FAIL\texample.com/x\t0.01s'; exit 2"
+            ),
+        ],
+    );
+    let out = text(&o);
+    assert!(out.contains("panic: boom"), "{out}");
+    assert!(!out.contains("example.com/x::(package)"), "{out}");
+}
+
+/// Round 15: the live report of a Go failure seen under its provisional
+/// name (the package line comes later) knows the test failed before.
+#[test]
+fn a_live_go_failure_under_its_provisional_name_has_its_history() {
+    let d = workspace("provisional");
+    // The same command twice: one suite, the second run comes after the first.
+    let script = format!(
+        "{WORK}echo '=== RUN   TestFF'; echo '--- FAIL: TestFF (0.00s)'; sleep 2; echo 'FAIL\texample.com/ff\t2s'; exit 1"
+    );
+    let o = prova(&d, &["run", "--", "sh", "-c", &script]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    let o = prova(
+        &d,
+        &["run", "--until", "first-failure", "--", "sh", "-c", &script],
+    );
+    let out = text(&o);
+    assert!(out.contains("TestFF"), "{out}");
+    assert!(!out.contains("first time seen"), "{out}");
 }
 
 /// gotestsum `--rerun-fails`: the rerun passed, the command exited 0: flaky.
@@ -146,6 +319,7 @@ fn a_gotestsum_json_rerun_that_passes_is_flaky() {
          '{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestF\"}' \
          '{\"Action\":\"output\",\"Package\":\"p\",\"Test\":\"TestF\",\"Output\":\"    f_test.go:4: flake\\n\"}' \
          '{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestF\",\"Elapsed\":0}' \
+         '{\"Action\":\"fail\",\"Package\":\"p\",\"Elapsed\":0}' \
          '{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestF\"}' \
          '{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestF\",\"Elapsed\":0}' \
          '{\"Action\":\"pass\",\"Package\":\"p\",\"Elapsed\":0}'; exit 0",

@@ -99,6 +99,13 @@ pub fn test_runs_with(
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+                -- a Go test seen before its package is known (`(package
+                -- pending) #N`) is the qualified test of that name that ran
+                -- most recently
+                OR (t1.file LIKE '(package pending) #%' AND t1.path = '[]' AND t2.id IN (
+                      SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
+                      WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
+                      ORDER BY qr.created_ms DESC LIMIT 1))
              WHERE t1.id = ?1),
          counted AS (
              SELECT r.id, r.created_ms FROM runs r
@@ -229,6 +236,13 @@ fn stats_with(
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+                -- a Go test seen before its package is known (`(package
+                -- pending) #N`) is the qualified test of that name that ran
+                -- most recently
+                OR (t1.file LIKE '(package pending) #%' AND t1.path = '[]' AND t2.id IN (
+                      SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
+                      WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
+                      ORDER BY qr.created_ms DESC LIMIT 1))
              WHERE t1.id = ?1 ORDER BY t2.suite",
         )?;
         stmt.query_map(params![test_id], |r| r.get(0))?
@@ -365,6 +379,10 @@ pub fn find_tests(
         "SELECT id, display, suite FROM tests
          WHERE instr(display, ?1) > 0 AND (?2 IS NULL OR suite = ?2)
            AND id NOT IN (SELECT test_id FROM superseded)
+           -- a Go test of a run still going, under its provisional name,
+           -- is listed once, under the package it ran in before
+           AND NOT (COALESCE(file, '') LIKE '(package pending) #%' AND EXISTS (
+                SELECT 1 FROM tests q WHERE q.suite = tests.suite AND q.name = tests.name AND q.path <> '[]'))
          ORDER BY (display = ?1) DESC, length(display) ASC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![query, suite], |r| {
