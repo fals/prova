@@ -104,6 +104,12 @@ pub struct Recognizers {
     /// binary executed twice); they count toward `reported_total`.
     pub repeats: u64,
     cache_noted: bool,
+    /// pytest subtests reported without a label, per parent test.
+    subtest_counts: BTreeMap<String, u32>,
+    /// Quint: the module whose tests are being listed, and a failure whose
+    /// detail block is being read.
+    quint_module: Option<String>,
+    quint_detail: Option<String>,
 }
 
 fn lift(level: &mut Option<Level>, l: Level) {
@@ -226,6 +232,14 @@ impl Recognizers {
             // Recognized with a binary known) the same binary run again.
             if self.libtest_binary.is_some() && key.file == self.libtest_binary {
                 self.repeats += 1;
+            }
+            // The pytest summary line carries the message the verbose line
+            // did not: keep it as the test's output.
+            if before.is_failure()
+                && outcome.is_failure()
+                && let Some(m) = message
+            {
+                self.failure_fallback.push((key, m));
             }
             return;
         }
@@ -624,7 +638,8 @@ impl Recognizers {
                 || self.dotnet(line, &mut out)
                 || (self.vitest_stream && !streamed && self.hold(|r| r.vitest(line, &mut held)))
                 || (!self.vitest_stream && self.vitest(line, &mut out))
-                || self.tap(line, &mut out);
+                || self.tap(line, &mut out)
+                || self.quint(line, &mut out);
             self.held_text_events = held;
         }
         out
@@ -825,7 +840,9 @@ impl Recognizers {
     /// teardown). Setup starts the test (or ends it when it fails or skips),
     /// call ends it.
     fn reportlog(&mut self, v: &serde_json::Value, out: &mut Vec<EventKind>) {
-        if v["$report_type"] == "SubTestReport" {
+        // pytest 9 names the class `SubtestReport`; reportlog plugins and
+        // older previews wrote `SubTestReport`.
+        if v["$report_type"] == "SubTestReport" || v["$report_type"] == "SubtestReport" {
             return self.reportlog_subtest(v, out);
         }
         if v["$report_type"] != "TestReport" {
@@ -895,7 +912,17 @@ impl Recognizers {
             "skipped" => Outcome::Skipped,
             _ => return,
         };
-        let key = pytest_subtest(pytest_key(id), label.trim());
+        let parent = pytest_key(id);
+        let label = if label.trim().is_empty() {
+            // No context to tell subtests apart: by order within the
+            // parent, so none is merged into another or into the parent.
+            let n = self.subtest_counts.entry(parent.unique()).or_insert(0);
+            *n += 1;
+            format!("(subtest {n})")
+        } else {
+            label
+        };
+        let key = pytest_subtest(parent, label.trim());
         let longrepr = &v["longrepr"];
         let msg = if outcome.is_failure() {
             let text = reportlog_text(longrepr);
@@ -916,6 +943,18 @@ impl Recognizers {
 
     fn go_verbose(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let t = line.trim_start();
+        // Parallel tests interleave: `=== NAME` / `=== CONT` say whose
+        // output follows.
+        for word in ["=== NAME", "=== CONT", "=== PAUSE"] {
+            if let Some(name) = t.strip_prefix(word)
+                && name.starts_with(' ')
+            {
+                if word != "=== PAUSE" && !name.trim().is_empty() {
+                    self.go_current = Some(name.trim().to_owned());
+                }
+                return true;
+            }
+        }
         if let Some(name) = t.strip_prefix("=== RUN") {
             self.go_run_lines += 1;
             let name = name.trim().to_owned();
@@ -1084,7 +1123,7 @@ impl Recognizers {
             if !sub && !rest.starts_with(' ') {
                 continue;
             }
-            let (left, msg) = match rest.split_once(" - ") {
+            let (left, msg) = match split_summary(rest) {
                 Some((i, m)) => (i, Some(m.trim().to_owned())),
                 None => (rest, None),
             };
@@ -1478,6 +1517,64 @@ impl Recognizers {
         out
     }
 
+    // ------------------------------------------------------------- Quint
+
+    /// `quint test`: a module header, then `    ok NAME passed N test(s)` and
+    /// `    1) NAME failed after N test(s)`; the failures' details follow in
+    /// `  1) NAME:` blocks, and the totals as `  N passing` / `  N failed`.
+    fn quint(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        if indent == 2 && !t.contains(' ') && !t.ends_with(':') && !t.ends_with(')') {
+            // Candidate module header; only used if quint lines follow.
+            self.quint_module = Some(t.to_owned());
+            return false;
+        }
+        let key = |this: &Self, name: &str| {
+            TestKey::new(this.quint_module.iter().cloned().collect(), name)
+        };
+        if indent >= 2
+            && let Some(rest) = t.strip_prefix("ok ")
+            && let Some((name, tail)) = rest.split_once(" passed ")
+            && tail.ends_with(" test(s)")
+            && !name.contains(' ')
+        {
+            let key = key(self, name);
+            self.finished(key, Outcome::Passed, None, None, Level::Recognized, out);
+            return true;
+        }
+        // "1) badTest failed after 1 test(s)" and its detail block "1) badTest:".
+        if let Some((n, rest)) = t.split_once(") ")
+            && n.chars().all(|c| c.is_ascii_digit())
+            && !n.is_empty()
+        {
+            if let Some((name, tail)) = rest.split_once(" failed after ")
+                && tail.ends_with(" test(s)")
+                && !name.contains(' ')
+            {
+                let key = key(self, name);
+                self.finished(key, Outcome::Failed, None, None, Level::Recognized, out);
+                return true;
+            }
+            if let Some(name) = rest.strip_suffix(':')
+                && !name.contains(' ')
+                && self.seen.contains_key(&key(self, name).unique())
+            {
+                self.quint_detail = Some(name.to_owned());
+                return true;
+            }
+        }
+        if let Some(name) = self.quint_detail.clone()
+            && !t.is_empty()
+        {
+            self.quint_detail = None;
+            let key = key(self, &name);
+            self.failure_fallback.push((key, t.to_owned()));
+            return true;
+        }
+        false
+    }
+
     // ------------------------------------------------------------- TAP
 
     fn tap(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
@@ -1634,6 +1731,24 @@ fn split_rust_path(name: &str) -> (Vec<String>, String) {
 
 /// A pytest subtest: the parent's key, named as pytest prints it
 /// ("test_b [case] (i=2)", "test_b (i=1)").
+/// Splits "id - message" at the first ` - ` outside brackets: a parameter
+/// id may contain it (`test_p[a - b] - AssertionError`).
+fn split_summary(rest: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = (depth - 1).max(0),
+            ' ' if depth == 0 && rest[i..].starts_with(" - ") => {
+                return Some((&rest[..i], &rest[i + 3..]));
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced brackets: fall back to the first separator.
+    rest.split_once(" - ")
+}
+
 fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
     if !label.is_empty() {
         parent.name = format!("{} {label}", parent.name);
@@ -2501,6 +2616,117 @@ mod tests {
         );
         assert!(ev.is_empty(), "{ev:?}");
         assert_eq!(r.level, None);
+    }
+
+    fn msg_of<'a>(ev: &'a [EventKind], name: &str) -> Option<&'a str> {
+        ev.iter().find_map(|e| match e {
+            EventKind::TestFinished { test, message, .. } if test.display() == name => {
+                message.as_deref()
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn quint_test_results_and_failure_message() {
+        let (_, ev) = feed(
+            "  t\n    ok okTest passed 1 test(s)\n    1) badTest failed after 1 test(s)\n\n  1 passing (13ms)\n  1 failed\n\n  1) badTest:\n       Error [QNT508]: Expect condition does not hold true\n        at t.qnt:6:17\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("t::okTest".into(), Outcome::Passed),
+                ("t::badTest".into(), Outcome::Failed)
+            ]
+        );
+    }
+
+    #[test]
+    fn quint_failure_detail_becomes_the_tests_output() {
+        let (r, _) = feed(
+            "  t\n    1) badTest failed after 1 test(s)\n\n  1) badTest:\n       Error [QNT508]: Expect condition does not hold true\n",
+        );
+        assert_eq!(r.failure_fallback.len(), 1);
+        assert_eq!(
+            r.failure_fallback[0].1,
+            "Error [QNT508]: Expect condition does not hold true"
+        );
+    }
+
+    #[test]
+    fn pytest9_subtest_report_class_name_is_accepted() {
+        let (_, ev) = feed(
+            r#"{"nodeid": "tests/t.py::test_a", "when": "call", "outcome": "failed", "_subtest.context": {"msg": "m", "kwargs": {}}, "$report_type": "SubtestReport"}"#,
+        );
+        assert_eq!(
+            subtests(&ev),
+            vec![("tests.t::test_a [m]".into(), Outcome::Failed)]
+        );
+    }
+
+    #[test]
+    fn pytest_subtests_without_context_stay_distinct() {
+        let (_, ev) = feed(concat!(
+            r#"{"nodeid": "tests/t.py::test_a", "when": "call", "outcome": "passed", "$report_type": "SubtestReport"}"#,
+            "\n",
+            r#"{"nodeid": "tests/t.py::test_a", "when": "call", "outcome": "failed", "$report_type": "SubtestReport"}"#,
+            "\n",
+            r#"{"nodeid": "tests/t.py::test_a", "when": "call", "outcome": "passed", "$report_type": "TestReport"}"#,
+        ));
+        let f = finished(&ev);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert_eq!(
+            f[0],
+            ("tests.t::test_a (subtest 1)".into(), Outcome::Passed)
+        );
+        assert_eq!(
+            f[1],
+            ("tests.t::test_a (subtest 2)".into(), Outcome::Failed)
+        );
+        assert_eq!(f[2], ("tests.t::test_a".into(), Outcome::Passed));
+    }
+
+    #[test]
+    fn pytest_summary_splits_id_at_separator_outside_brackets() {
+        let (_, ev) =
+            feed("FAILED tests/t.py::test_p[a - b] - AssertionError: assert 'a - b' == 'c'");
+        assert_eq!(
+            finished(&ev),
+            vec![("tests.t::test_p[a - b]".into(), Outcome::Failed)]
+        );
+        assert_eq!(
+            msg_of(&ev, "tests.t::test_p[a - b]"),
+            Some("AssertionError: assert 'a - b' == 'c'")
+        );
+    }
+
+    #[test]
+    fn pytest_summary_message_is_kept_for_a_verbose_failure() {
+        let (r, ev) = feed(
+            "tests/t.py::test_a FAILED   [100%]\nFAILED tests/t.py::test_a - AssertionError: boom",
+        );
+        assert_eq!(finished(&ev).len(), 1);
+        assert_eq!(r.failure_fallback.len(), 1);
+        assert_eq!(r.failure_fallback[0].1, "AssertionError: boom");
+    }
+
+    #[test]
+    fn go_parallel_output_follows_name_and_cont_lines() {
+        let (_, ev) = feed(
+            "=== RUN   TestA\n=== RUN   TestA/one\n=== PAUSE TestA/one\n=== RUN   TestA/two\n=== PAUSE TestA/two\n=== CONT  TestA/one\n=== CONT  TestA/two\n    a_test.go:20: two failed here\n=== NAME  TestA/one\n    a_test.go:15: one says: bad\n=== NAME  TestA\n    a_test.go:30: parent cleanup failed\n--- FAIL: TestA (0.01s)\n    --- FAIL: TestA/one (0.00s)\n    --- FAIL: TestA/two (0.00s)",
+        );
+        assert_eq!(
+            msg_of(&ev, "TestA/two"),
+            Some("a_test.go:20: two failed here")
+        );
+        assert_eq!(
+            msg_of(&ev, "TestA/one"),
+            Some("a_test.go:15: one says: bad")
+        );
+        assert_eq!(
+            msg_of(&ev, "TestA"),
+            Some("a_test.go:30: parent cleanup failed")
+        );
     }
 }
 
