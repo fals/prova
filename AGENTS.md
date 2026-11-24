@@ -79,9 +79,10 @@ prova history <test>       # before calling a failure new or flaky
 ```
 
 - Use the **stable** prova binary to test the **development** prova. The stable binary is built from the last green `main` and installed with `cargo install --path crates/prova-cli --root .prova/stable` (path ignored by git). Never test prova with the binary you are changing: a bug would hide itself. Tests isolate themselves with `PROVA_HOME`; never run the development binary against your real home.
-- Never run raw test commands in Stage B, except to debug prova itself, and say so in your report. A Claude Code hook (`.claude/hooks/require-prova.sh`) blocks direct `cargo test` / `cargo nextest`; other harnesses must follow the rule by hand.
+- Never run raw test commands in Stage B, except to debug prova itself, and say so in your report. A Claude Code hook (`.claude/hooks/require-prova.sh`) blocks direct `cargo test` / `cargo nextest`, and prova output piped into filters; other harnesses must follow the rules by hand.
 - Every performance claim (faster, smaller, fewer allocations) requires a prova experiment with a frozen protocol and an `accept` verdict ([0007](docs/adr/0007-experiments.md)). Link the experiment id in the PR. "It looked faster once" is not evidence.
 - One command per intent ([0019](docs/adr/0019-one-command-per-intent.md)): no shell loops, pipes or output parsing around prova. If you are about to write one, that is a prova bug: open a `dogfood` issue with the loop.
+- Read prova's output whole. Never pipe it through `grep`, `head`, `tail` or `cut`: it is already short, and filtering drops the warnings, notes and `next:` line that say whether a pass is verified and what to run next. The hook blocks it here; ask prova for detail instead (`status`, `output --tail N`, `history`).
 - If prova gets in the way, that is a prova bug: open an issue labelled `dogfood` with the exact command and run id, then work around it.
 
 ## Testing rules
