@@ -1211,6 +1211,15 @@ fn cancel_fake_docker(d: &Path, path: &str, args: &[&str]) -> serde_json::Value 
         .unwrap();
     let id = json(&o)["run"].as_str().unwrap().to_owned();
     let _guard = CancelOnDrop(d, id.clone());
+    // The command must be running (its container client started) before
+    // the cancel: under load a cancel came "before start" (round 16 CI).
+    // Bounded: each wait returns within 500 ms.
+    for _ in 0..40 {
+        let w = json(&prova(d, &["wait", &id, "--max-wait", "500ms", "--json"]));
+        if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+    }
     assert!(prova(d, &["cancel", &id]).status.success());
     json(&prova(
         d,
