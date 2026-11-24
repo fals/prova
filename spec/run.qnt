@@ -122,6 +122,22 @@ module runLifecycle {
     exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
   }
 
+  // A test that already has a result is executed again and fails (Go's
+  // `-count=N` repeats executions, it does not retry them). The failure is
+  // recorded: it must never hide behind an earlier pass. A repeated pass
+  // changes nothing and is not an event.
+  action testRepeated(t: str, o: Outcome): bool = all {
+    status == Running,
+    not(open.contains(t)),
+    outcomes.keys().contains(t),
+    isFailure(o),
+    log' = log.append(TestFinished({ test: t, outcome: o })),
+    outcomes' = outcomes.put(t, o),
+    open' = open, status' = status,
+    inputs' = inputs, frozenInputs' = frozenInputs, dropped' = dropped,
+    exitCode' = exitCode, contradiction' = contradiction, verdict' = verdict,
+  }
+
   // The process exits (before the run is recorded as ended).
   action exited(code: int): bool = all {
     status == Running,
@@ -189,6 +205,7 @@ module runLifecycle {
       start,
       testStarted(t),
       testFinished(t, o),
+      testRepeated(t, o),
       end(s),
       cancelCreated,
       late(t, o),
@@ -321,6 +338,20 @@ module runLifecycle {
       .then(testStarted("a")).then(testFinished("a", Passed))
       .then(exited(0)).then(end(Finished))
       .then(all { assert(verdict == Pass), assert(safety), late("a", Passed) })
+
+  // Go -count=3: pass, fail, pass of one test. The failure is recorded after
+  // the pass, and the last execution is what the test ends as.
+  run repeatedFailureTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(testRepeated("a", Failed))
+      .then(all { assert(outcomes.get("a") == Failed), exited(1) })
+      .then(end(Finished))
+      .then(all { assert(verdict == Fail), assert(safety), late("a", Passed) })
+
+  // A repeated pass is not an event.
+  run repeatedPassIsNotAnEventTest =
+    init.then(start).then(testStarted("a")).then(testFinished("a", Passed))
+      .then(testRepeated("a", Passed)).fail()
 
   // A passed test does not start again.
   run noRestartAfterPassTest =

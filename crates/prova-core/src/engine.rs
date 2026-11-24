@@ -482,11 +482,18 @@ impl Supervisor<'_> {
                 ..
             } => {
                 self.running.remove(&test.unique());
-                let _ = attempt;
-                let ok = self
+                // A test executed again after a pass and failing (Go's
+                // `-count=N`) is a later attempt: the failure is recorded.
+                let mut ok = self
                     .lifecycle
                     .test_finished(&test.unique(), *outcome)
                     .is_ok();
+                if !ok && *attempt > 1 {
+                    ok = self
+                        .lifecycle
+                        .test_repeated(&test.unique(), *outcome)
+                        .is_ok();
+                }
                 if ok && outcome.is_failure() {
                     self.any_test_failed = true;
                 }
@@ -1651,7 +1658,9 @@ fn missing_since(
     let Some(prev) = prev else { return Ok(None) };
     let mut stmt = store.conn().prepare(
         "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.run_id = ?1 AND a.outcome <> 'skipped' GROUP BY a.test_id ORDER BY t.display",
+         WHERE a.run_id = ?1 AND a.outcome <> 'skipped'
+           AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+         GROUP BY a.test_id ORDER BY t.display",
     )?;
     let earlier: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![prev], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1659,12 +1668,35 @@ fn missing_since(
     if earlier.is_empty() {
         return Ok(None);
     }
+    // What this run has, by name: a test recorded bare before and qualified
+    // now (or the reverse) did run.
+    let mut now: Vec<String> = Vec::new();
+    for id in current {
+        let d: Option<String> = store
+            .conn()
+            .query_row("SELECT display FROM tests WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        now.extend(d);
+    }
     let missing = earlier
         .iter()
-        .filter(|(id, _)| !current.contains(id))
+        .filter(|(id, d)| !current.contains(id) && !now.iter().any(|n| same_test_name(n, d)))
         .map(|(_, d)| d.clone())
         .collect();
     Ok(Some((prev, missing, earlier.len())))
+}
+
+/// A name recorded bare (`TestX`, from text output that named no package)
+/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
+/// test: the same name, or one is the other behind a `::` or `/`.
+fn same_test_name(a: &str, b: &str) -> bool {
+    let tail = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
+    };
+    a == b || tail(a, b) || tail(b, a)
 }
 
 /// The display name of a lifecycle key (`file<US>name`).
@@ -1738,7 +1770,10 @@ fn left_out_flaky(
     }
     let mut left: Vec<String> = Vec::new();
     for f in crate::analysis::flaky(store, None, 50)? {
+        // A name recorded bare (`TestX`, text output before Go results were
+        // qualified by package) is the test `pkg::TestX` this run has.
         if ran.contains(&f.display)
+            || ran.iter().any(|r| same_test_name(r, &f.display))
             || left.contains(&f.display)
             || crate::quarantine::covers(quarantine, &f.display).is_some()
         {
