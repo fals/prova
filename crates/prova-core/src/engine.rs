@@ -220,6 +220,8 @@ struct Supervisor<'a> {
     cpu_start: Option<u64>,
     /// The framework's own test count, when it printed one.
     framework_total: Option<u64>,
+    /// The framework's own count of failures, when it printed one.
+    framework_failed: Option<u64>,
     /// Text of an unfinished line already written to the spool, per stream.
     partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
@@ -330,8 +332,9 @@ const SIZE_GUARD: Duration = Duration::from_millis(50);
 
 impl Supervisor<'_> {
     fn emit(&mut self, mut kind: EventKind) {
-        if let EventKind::RunTotals { tests, .. } = &kind {
+        if let EventKind::RunTotals { tests, failed } = &kind {
             self.framework_total = Some(*tests);
+            self.framework_failed = Some(*failed);
         }
         // The run's test phase starts at its first test event (ADR 0026).
         if matches!(
@@ -770,6 +773,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         terminating: false,
         partial: Default::default(),
         framework_total: None,
+        framework_failed: None,
         cpu_start: None,
         pgid: 0,
         sizes: BTreeMap::new(),
@@ -1436,6 +1440,28 @@ fn observe_child(
             sup.emit(EventKind::RunNote { message });
         }
     }
+    // Only quarantined tests failed, as far as the tests go: the run may
+    // pass without them only if they explain everything that went wrong
+    // (round 14: a build failure, a panic or a data race elsewhere hid
+    // behind a quarantined failure).
+    let set_aside = quarantined_only_failures(sup.lifecycle.outcomes(), &quarantine, exit_code);
+    if let Some(names) = &set_aside {
+        if let Some(n) = sup.framework_failed
+            && n > names.len() as u64
+        {
+            contradictions.push(format!(
+                "the framework counted {n} failure(s), more than the quarantined test(s) that failed ({}): something else failed too",
+                names.len()
+            ));
+        } else if let Some((line, text)) =
+            unexplained_crash(store, run, &sup.distiller, names, &report.test_outputs)?
+        {
+            contradictions.push(format!(
+                "the output shows an error outside the quarantined test(s) (line {line}): {}",
+                text.trim().chars().take(160).collect::<String>()
+            ));
+        }
+    }
     if let Some(code @ (126 | 127)) = exit_code {
         reason = Some(format!(
             "the command could not start (exit {code}: {}); no test ran",
@@ -1476,7 +1502,14 @@ fn observe_child(
         });
     }
     if outcome == Outcome::Passed {
-        if let Some((line, text)) = sup.distiller.first_crash() {
+        // A quarantined test's own crash is set aside with it (round 14).
+        if let Some((line, text)) = unexplained_crash(
+            store,
+            run,
+            &sup.distiller,
+            set_aside.as_deref().unwrap_or_default(),
+            &report.test_outputs,
+        )? {
             warnings.push(format!(
                 "the output shows an error outside any failing test (line {line}): {}",
                 text.trim().chars().take(160).collect::<String>()
@@ -1696,6 +1729,52 @@ fn quarantined_only_failures(
         names.push(display.to_owned());
     }
     (!names.is_empty()).then_some(names)
+}
+
+/// The first crash-like line of the output that no quarantined failing
+/// test accounts for: it names one of them, or it is part of one's own
+/// output or failure message. With no quarantined failure, the first crash.
+fn unexplained_crash(
+    store: &Store,
+    run: &str,
+    distiller: &crate::output::Distiller,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+) -> Result<Option<(u64, String)>> {
+    let crashes = distiller.crashes();
+    if quarantined.is_empty() || crashes.is_empty() {
+        return Ok(crashes.into_iter().next());
+    }
+    let mut own: Vec<String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o.clone())
+        .collect();
+    let mut stmt = store.conn().prepare(
+        "SELECT a.message FROM attempts a JOIN tests t ON t.id = a.test_id
+          WHERE a.run_id = ?1 AND t.display = ?2 AND a.message IS NOT NULL",
+    )?;
+    for name in quarantined {
+        for m in stmt.query_map(rusqlite::params![run, name], |r| r.get::<_, String>(0))? {
+            own.push(m?);
+        }
+    }
+    // A name as frameworks print it: the whole display, or without the
+    // binary or file part before the first `::`.
+    let names: Vec<&str> = quarantined
+        .iter()
+        .flat_map(|n| {
+            [
+                n.as_str(),
+                n.split_once("::").map_or(n.as_str(), |(_, r)| r),
+            ]
+        })
+        .filter(|n| n.len() >= 4)
+        .collect();
+    Ok(crashes.into_iter().find(|(_, line)| {
+        let t = line.trim();
+        !names.iter().any(|n| t.contains(n)) && !own.iter().any(|o| o.contains(t))
+    }))
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite

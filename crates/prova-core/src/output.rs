@@ -134,6 +134,8 @@ fn looks_like_error(line: &str) -> bool {
         "Segmentation fault",
         "core dumped",
         "FAILED",
+        "WARNING: DATA RACE",
+        "signal: killed",
     ];
     STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
 }
@@ -169,6 +171,12 @@ fn looks_like_crash(line: &str) -> bool {
         "Crashed tests:",
         "The forked VM terminated",
         "COMPILATION ERROR",
+        // Go: the race detector, a killed test binary, a package that did
+        // not build or set up (round 14: hidden behind a quarantine).
+        "WARNING: DATA RACE",
+        "signal: killed",
+        "[build failed]",
+        "[setup failed]",
     ];
     STARTS.iter().any(|p| t.starts_with(p)) || CONTAINS.iter().any(|p| t.contains(p))
 }
@@ -242,6 +250,20 @@ impl Distiller {
     /// First line that looks like a crash, with its line number.
     pub fn first_crash(&self) -> Option<(u64, String)> {
         self.first_matching(looks_like_crash)
+    }
+
+    /// Every kept line that looks like a crash, with its line number.
+    pub fn crashes(&self) -> Vec<(u64, String)> {
+        self.errors
+            .iter()
+            .flat_map(|s| {
+                s.lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| looks_like_crash(l))
+                    .map(|(i, l)| (s.start + i as u64, l.clone()))
+            })
+            .collect()
     }
 
     /// First line that looks like an error, with its line number.
