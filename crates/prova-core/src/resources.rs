@@ -119,10 +119,27 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
             .find(|c| exe == *c)
             .map(|c| (i, c))
     })?;
-    words[at + 1..]
+    let rest = &words[at + 1..];
+    // The subcommand: `docker compose run|exec`, `docker run|exec`,
+    // `kubectl exec|run|debug`; `logs`, `attach`, `cp` replay or copy
+    // output, they run nothing (round 15: `docker compose logs` passed as a
+    // container run, skipping the no-CPU check).
+    let sub = rest
         .iter()
-        .any(|w| matches!(*w, "run" | "exec" | "compose" | "debug"))
-        .then_some(client)
+        .copied()
+        .filter(|w| !w.starts_with('-'))
+        .find(|w| *w != "compose" && *w != "container")?;
+    if !matches!(sub, "run" | "exec" | "debug") {
+        return None;
+    }
+    // `docker exec box cat results.txt` prints a file: no test runs.
+    let viewer = rest.iter().any(|w| {
+        matches!(
+            w.rsplit('/').next().unwrap_or(w),
+            "cat" | "tail" | "head" | "less" | "more" | "tac"
+        )
+    });
+    (!viewer).then_some(client)
 }
 
 /// Whether a process is a test runner's process for a single test
@@ -624,6 +641,10 @@ mod container_tests {
         assert_eq!(c("kubectl exec pod -- go test ./..."), Some("kubectl"));
         assert_eq!(c("/bin/sh /w/bin/docker run img"), Some("docker"));
         assert_eq!(c("docker ps"), None);
+        // Round 15: replays and file viewers run nothing.
+        assert_eq!(c("docker compose logs app"), None);
+        assert_eq!(c("docker exec box cat /out/results.txt"), None);
+        assert_eq!(c("docker compose run --rm app pytest"), Some("docker"));
         assert_eq!(c("dockerd --host x"), None);
     }
 }
