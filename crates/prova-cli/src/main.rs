@@ -2449,6 +2449,10 @@ fn repeat_runs(
     let mut tally: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
     let mut runs = Vec::new();
     let mut any_failed = false;
+    // Runs that ran no test, and runs that failed with no failing test:
+    // never "every test passed" (round 13: five runs whose selection matched
+    // nothing were tallied as all green).
+    let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2470,6 +2474,12 @@ fn repeat_runs(
             return Ok(exit::RUNNING);
         }
         any_failed |= s.outcome != Some(Outcome::Passed);
+        let ran = s.counts.results();
+        if ran == 0 {
+            no_tests += 1;
+        } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
+            failed_otherwise += 1;
+        }
         for e in store.events_after(&id, 0)? {
             if let prova_core::model::EventKind::TestFinished { test, outcome, .. } = e.kind {
                 let t = tally.entry(test.display()).or_default();
@@ -2482,14 +2492,20 @@ fn repeat_runs(
         }
         if !json {
             let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            let why = if !failing.is_empty() {
+                format!(" ({})", failing.join(", "))
+            } else if ran == 0 {
+                " (no test ran)".to_owned()
+            } else if let (Some(Outcome::Failed | Outcome::Errored), Some(d)) =
+                (s.outcome, &s.detail)
+            {
+                format!(" ({})", render::clean(d))
+            } else {
+                String::new()
+            };
             eprintln!(
-                "run {i}/{n} {id}: {}{}",
+                "run {i}/{n} {id}: {}{why}",
                 s.outcome.map(|o| o.as_str()).unwrap_or("?"),
-                if failing.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", failing.join(", "))
-                }
             );
         }
         runs.push(serde_json::json!({ "run": id, "outcome": s.outcome }));
@@ -2522,8 +2538,20 @@ fn repeat_runs(
             println!("  FAIL {}: failed every time", render::clean(t));
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
-        if mixed.is_empty() && always.is_empty() {
+        if no_tests > 0 {
+            println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
+        }
+        if failed_otherwise > 0 {
+            println!(
+                "  {failed_otherwise} of {done} run(s) failed with no failing test (see each run's status)"
+            );
+        }
+        if tally.is_empty() {
+            // Nothing to say about tests.
+        } else if mixed.is_empty() && always.is_empty() && no_tests == 0 && failed_otherwise == 0 {
             println!("  every test passed every time");
+        } else if mixed.is_empty() && always.is_empty() {
+            println!("  {steady} test(s) passed whenever they ran");
         } else if steady > 0 {
             println!("  {steady} other test(s) passed every time");
         }

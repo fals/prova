@@ -660,3 +660,21 @@ fn a_runs_labels_are_as_of_that_run() {
         "{list}"
     );
 }
+
+/// Round 13 (Java): five runs whose selection matched nothing (each run
+/// failed, no test ran) were tallied as "every test passed every time".
+#[test]
+fn repeat_never_calls_runs_without_tests_green() {
+    let d = workspace("repeat-empty");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo 'No tests matching pattern'; exit 1\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "t", "--repeat", "2"]);
+    let out = text(&o);
+    assert!(!out.contains("every test passed"), "{out}");
+    assert!(out.contains("2 of 2 run(s) ran no test"), "{out}");
+    let progress = String::from_utf8_lossy(&o.stderr);
+    assert!(progress.contains("(no test ran)"), "{progress}");
+}
