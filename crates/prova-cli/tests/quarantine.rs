@@ -788,3 +788,23 @@ fn flaky_names_its_columns_and_quarantines() {
         "{out}"
     );
 }
+
+/// Round 16: `--repeat --json` tallied a quarantined test's failures with
+/// nothing marking it quarantined.
+#[test]
+fn repeat_json_marks_quarantined_tests() {
+    let d = workspace("repeatjson");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let o = prova(&d, &["run", "make", "--repeat", "2", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let x = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["test"] == "calc::x")
+        .cloned()
+        .unwrap();
+    assert_eq!(x["quarantined"], true, "{v}");
+}

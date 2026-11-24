@@ -825,14 +825,24 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
 
 pub fn exp_progress(r: &prova_core::experiment::Report) {
     if let Some(c) = &r.comparison {
+        // Extended past its target, the count is out of the maximum (round
+        // 16: "7/5 baseline").
+        let target = if c.baseline_trials.max(c.candidate_trials) > c.target_trials {
+            c.max_trials
+        } else {
+            c.target_trials
+        };
         eprintln!(
-            "{} vs {}: {}/{} baseline, {}/{} candidate trials",
+            "{} vs {}: {}/{target} baseline, {}/{target} candidate trials{}",
             c.candidate,
             c.baseline,
             c.baseline_trials,
-            c.target_trials,
             c.candidate_trials,
-            c.target_trials
+            if target != c.target_trials {
+                " (extended)"
+            } else {
+                ""
+            }
         );
     }
 }

@@ -3040,7 +3040,16 @@ fn repeat_runs(
     if json {
         let tests: Vec<_> = tally
             .iter()
-            .map(|(t, (p, f))| serde_json::json!({ "test": t, "passed": p, "failed": f }))
+            .map(|(t, (p, f))| {
+                serde_json::json!({
+                    "test": t,
+                    "passed": p,
+                    "failed": f,
+                    // (round 16: a quarantined test's failures looked like
+                    // any other's in --json)
+                    "quarantined": quarantined.contains(t),
+                })
+            })
             .collect();
         println!(
             "{}",
