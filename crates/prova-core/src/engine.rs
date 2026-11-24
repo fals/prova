@@ -1589,21 +1589,17 @@ fn observe_child(
             }
         ));
     }
-    // pytest exits 4 (usage error: a selection that names nothing) or 5
-    // (nothing collected) without running a test: that is no test failing
-    // (round 15), like a command that could not start.
-    if let Some(code @ (4 | 5)) = exit_code
+    // pytest exits 4 (usage error: a selection that names nothing) without
+    // running a test: that is no test failing (round 15), like a command
+    // that could not start. Exit 5 (nothing collected) stays a failure: a
+    // suite that ran no test verified nothing (ADR 0017).
+    if let Some(code @ 4) = exit_code
         && status == Status::Finished
         && observed == 0
         && sup.tail.iter().any(|l| pytest_ran_nothing(l))
     {
         reason = Some(format!(
-            "{PYTEST_NO_TEST} (exit {code}: {}); no test failed",
-            if code == 4 {
-                "usage error, e.g. a selection or option pytest rejected"
-            } else {
-                "nothing collected"
-            }
+            "{PYTEST_NO_TEST} (exit {code}: usage error, e.g. a selection or option pytest rejected); no test failed"
         ));
     }
     if !contradictions.is_empty() {

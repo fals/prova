@@ -41,6 +41,5 @@ Then:
   sight: their size is "unknown (ran through docker)", declare it with
   `size`, and `prova cancel` only stops a container the command named
   (`--name` or `--cidfile`): otherwise check `docker ps`.
-- pytest exit 4 or 5 with no test result (a selection that names nothing, an
-  empty collection) is not a test failure: prova reports it as errored and
-  exits 4. `pytest-xdist` verbose lines (`[gw0] [ 33%] FAILED ...`) are read.
+- pytest exit 4 with no test result (a selection or option it rejected) is
+  not a test failure: prova reports it as errored and exits 4. `pytest-xdist` verbose lines (`[gw0] [ 33%] FAILED ...`) are read.

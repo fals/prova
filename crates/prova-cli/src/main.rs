@@ -3137,7 +3137,7 @@ fn exit_code(s: &Summary) -> u8 {
             // pytest found nothing to run (bad selection, empty collection):
             // not a test failure either.
             (Some(Outcome::Errored), Status::Finished)
-                if matches!(s.exit_code, Some(4 | 5))
+                if s.exit_code == Some(4)
                     && s.detail
                         .as_deref()
                         .is_some_and(|d| d.starts_with(engine::PYTEST_NO_TEST)) =>
