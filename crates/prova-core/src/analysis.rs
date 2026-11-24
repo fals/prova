@@ -314,7 +314,11 @@ fn stats_with(
     };
     // Only a test history calls flaky can be "failing now" instead; one that
     // never passed has simply not passed yet (round 11).
-    let failing_now = streak >= needed && (retry > 0 || flips > 0);
+    // And on enough history for the rate to mean something: one earlier
+    // pass and three failures is a thin record (round 15: "failing now",
+    // then it passed again).
+    let failing_now =
+        streak >= needed && counted.len() >= FAILING_NOW_MIN_RUNS && (retry > 0 || flips > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -456,6 +460,10 @@ pub struct SizeView {
     /// What the agent reads: the size and why.
     pub label: String,
 }
+
+/// Runs of history a test needs before a streak of failures overrides its
+/// flakiness.
+pub const FAILING_NOW_MIN_RUNS: usize = 5;
 
 /// Attributed runs that must all show one process and no socket before a
 /// test is called small (ADR 0025 §5): sampling can miss what is brief.

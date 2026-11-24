@@ -828,3 +828,17 @@ fn a_failure_with_no_test_is_named_and_can_be_forgotten() {
     let out = run(&d, "make", "fail");
     assert!(out.contains("failed (no test seen)"), "{out}");
 }
+
+/// Round 15: one earlier pass and three failures was "failing now: more
+/// failures in a row than its flakiness explains", then it passed again.
+/// A streak needs enough history behind it to be called a break.
+#[test]
+fn a_thin_history_is_not_failing_now() {
+    let d = workspace("thinfailingnow");
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    let out = run(&d, "make", "fail");
+    assert!(!out.contains("failing now"), "{out}");
+}
