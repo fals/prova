@@ -201,6 +201,19 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
             format_duration(std::time::Duration::from_millis(ms))
         );
     }
+    if !s.skipped_tests.is_empty() {
+        let names: Vec<String> = s.skipped_tests.iter().map(|t| clean(t)).collect();
+        let more = (s.counts.skipped as usize).saturating_sub(names.len());
+        println!(
+            "skipped: {}{}",
+            names.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        );
+    }
     if !s.running.is_empty() && s.reason != WaitReason::Failure {
         let names: Vec<String> = s
             .running
@@ -1169,6 +1182,7 @@ mod live_tests {
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
+            skipped_tests: vec![],
             framework: None,
             failures: vec![],
             stalled_ms: None,

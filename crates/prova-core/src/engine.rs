@@ -2466,6 +2466,10 @@ pub struct Summary {
     /// How long each test of `running` has been running, in order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub running_for_ms: Vec<u64>,
+    /// Tests skipped in a full run, by name (at most 10): a count alone
+    /// hides which (round 16).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_tests: Vec<String>,
     /// The framework's own count (tests, failed), when it printed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<(u64, u64)>,
@@ -3205,6 +3209,18 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         // How long each has been running: a test running for 30 s that
         // usually takes milliseconds is the hang, before any budget says so
         // (round 14).
+        skipped_tests: if selection.is_none() {
+            let mut v: Vec<String> = finals
+                .values()
+                .filter(|f| f.1 == Outcome::Skipped && !f.4)
+                .map(|f| f.0.display())
+                .collect();
+            v.sort();
+            v.truncate(10);
+            v
+        } else {
+            Vec::new()
+        },
         running_for_ms: if row.status.is_terminal() {
             Vec::new()
         } else {

@@ -886,3 +886,19 @@ fn a_step_failing_after_quiet_tests_is_not_called_testless() {
     let out = text(&prova(&d, &["run", "make", "--repeat", "2"]));
     assert!(!out.contains("(no test ran)"), "{out}");
 }
+
+/// Round 16: skipped tests were counted but never named.
+#[test]
+fn skipped_tests_are_named() {
+    let d = workspace("skipnames");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::later ... ignored'")
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make"]));
+    assert!(out.contains("skipped: calc::later"), "{out}");
+}
