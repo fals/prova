@@ -92,3 +92,8 @@ A run fails, even with exit 0, when:
   passing tests). Take them seriously: flaky detection depends on it.
 - `framework counted N` gives the framework's own count when its output
   hid individual tests.
+- `(and N subtests, M failed)`: results nested under a test that reports
+  its own (Go's `TestX/case` under `TestX`). The counts before it are
+  tests; each subtest still has its own history and failure line.
+- The run's output excerpt, when shown, comes first; prova's verdict
+  (counts, failures, history, `next:`) always comes last.

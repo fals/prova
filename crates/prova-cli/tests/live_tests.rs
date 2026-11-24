@@ -65,8 +65,10 @@ fn go_json_stream_reaches_native_level() {
         &["run", "--json", "--", "sh", "-c", "cat out.txt; exit 1"],
     ));
     assert_eq!(s["level"], "native");
-    assert_eq!(s["counts"]["passed"], 3);
+    // TestSub/a and TestSub/b are subtests of TestSub (round 12).
+    assert_eq!(s["counts"]["passed"], 2);
     assert_eq!(s["counts"]["failed"], 1);
+    assert_eq!(s["counts"]["subtests"], 2);
     assert_eq!(s["failures"][0]["message"], "x_test.go:6: want 2 got 3");
     assert!(
         s["output_tail"].as_array().is_none_or(|a| a.is_empty()),

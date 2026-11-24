@@ -945,18 +945,35 @@ fn observe_child(
     };
 
     // Collect remaining output; leaked processes may hold the pipes open,
-    // so never wait on EOF without a bound.
+    // so never wait on EOF without a bound. The bound is on waiting for
+    // output, not on recording it: every line that arrived before the
+    // deadline is recorded however long that takes (round 12: with history,
+    // recording 723 Go results took over 1 s and two thirds were dropped
+    // from a run that still passed).
     let drain = |sup: &mut Supervisor<'_>, open: &mut i32, observer: &mut dyn Observer| {
         let until = Instant::now() + DRAIN_AFTER_EXIT;
         while *open > 0 {
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
-                break;
+            let chunk = match rx.try_recv() {
+                Ok(c) => c,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let Some(left) = until.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match rx.recv_timeout(left) {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    }
+                }
             };
-            match rx.recv_timeout(left) {
-                Ok(Chunk::Line(i, l, _)) => sup.line(i, &l, observer),
-                Ok(Chunk::Partial(i, p)) => sup.partial(i, &p),
-                Ok(Chunk::Eof) => *open -= 1,
-                Err(_) => break,
+            match chunk {
+                // A leaked process still writing: what came after the
+                // deadline is not waited for.
+                Chunk::Line(_, _, at) if at > until => break,
+                Chunk::Partial(..) if Instant::now() > until => break,
+                Chunk::Line(i, l, _) => sup.line(i, &l, observer),
+                Chunk::Partial(i, p) => sup.partial(i, &p),
+                Chunk::Eof => *open -= 1,
             }
         }
     };
@@ -1568,10 +1585,38 @@ pub struct SlowTest {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Counts {
+    /// Tests, not counting subtests: a Go `t.Run` inside a test that reports
+    /// its own result is counted once, under `subtests`.
     pub passed: u64,
     pub failed: u64,
     pub skipped: u64,
     pub errored: u64,
+    /// Results nested under another test of this run (`TestX/case`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests: u64,
+    /// Of them, failed or errored.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subtests_failed: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Counts {
+    /// Every result seen, subtests included.
+    pub fn results(&self) -> u64 {
+        self.passed + self.failed + self.skipped + self.errored + self.subtests
+    }
+}
+
+/// A result nested under another test that reported its own (Go subtests:
+/// `TestX/case` under `TestX`). Counted apart, or a test with 10 cases
+/// counts 11 (a 53-test Go suite showed 723).
+fn is_subtest(t: &TestKey, names: &std::collections::HashSet<(Option<&str>, String)>) -> bool {
+    let d = t.display();
+    d.match_indices('/')
+        .any(|(i, _)| i > 0 && names.contains(&(t.file.as_deref(), d[..i].to_owned())))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1853,7 +1898,19 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     }
     let mut counts = Counts::default();
     let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64)> = Vec::new();
+    let names: std::collections::HashSet<(Option<&str>, String)> = finals
+        .values()
+        .map(|f| (f.0.file.as_deref(), f.0.display()))
+        .collect();
     for f in finals.values() {
+        if is_subtest(&f.0, &names) {
+            counts.subtests += 1;
+            counts.subtests_failed += u64::from(f.1.is_failure());
+            if f.1.is_failure() {
+                failing.push(f);
+            }
+            continue;
+        }
         match f.1 {
             Outcome::Passed => counts.passed += 1,
             Outcome::Failed => counts.failed += 1,
@@ -1959,7 +2016,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     // A selection that ran nothing must not look like a pass.
-    let ran = counts.passed + counts.failed + counts.skipped + counts.errored;
+    let ran = counts.results();
     // (A selection that matched nothing at level 1+ fails the run, with
     // its own note; at level 0 prova cannot tell.)
     if let Some(sel) = &selection

@@ -78,6 +78,14 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         return;
     }
     let dur = format_duration(std::time::Duration::from_millis(s.elapsed_ms));
+    // The command's own output first, prova's verdict last: what is read
+    // last is what prova concluded (passed, failed, history, next).
+    if !s.output_tail.is_empty() {
+        println!("output (last {} lines):", s.output_tail.len());
+        for l in &s.output_tail {
+            println!("  | {}", clean(l));
+        }
+    }
     println!("run {}  suite {}  `{}`", s.run, s.suite, s.command);
     let mut line = format!("{}  {dur}", headline(s));
     if let Some(c) = s.exit_code {
@@ -97,7 +105,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     ));
     println!("{line}");
     let c = &s.counts;
-    let seen = c.passed + c.failed + c.skipped + c.errored;
+    let seen = c.results();
     // When the framework counted more than prova saw, say both (ADR 0018).
     let counted = match s.framework {
         Some((n, f)) if n > seen => {
@@ -125,8 +133,18 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {errored}, {} skipped{counted}",
-            c.passed, c.failed, c.skipped
+            "tests: {} passed, {} failed, {errored}, {} skipped{}{counted}",
+            c.passed,
+            c.failed,
+            c.skipped,
+            if c.subtests > 0 {
+                format!(
+                    " (and {} subtests, {} failed)",
+                    c.subtests, c.subtests_failed
+                )
+            } else {
+                String::new()
+            }
         );
     }
     for f in &s.failures {
@@ -189,12 +207,6 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     }
     if !s.leaked.is_empty() {
         println!("leaked processes (killed): {:?}", s.leaked);
-    }
-    if !s.output_tail.is_empty() {
-        println!("output (last {} lines):", s.output_tail.len());
-        for l in &s.output_tail {
-            println!("  | {}", clean(l));
-        }
     }
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
@@ -443,7 +455,8 @@ fn all_known_flaky(s: &Summary) -> bool {
     // Not when the run failed for another reason too (a crash, round 10).
     s.detail.is_none()
         && !s.failures.is_empty()
-        && s.failures.len() == s.counts.failed as usize + s.counts.errored as usize
+        && s.failures.len()
+            == (s.counts.failed + s.counts.errored + s.counts.subtests_failed) as usize
         && s.failures.iter().all(|f| {
             f.context
                 .as_ref()
@@ -970,8 +983,7 @@ mod live_tests {
             counts: Counts {
                 passed,
                 failed,
-                skipped: 0,
-                errored: 0,
+                ..Counts::default()
             },
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             framework: None,

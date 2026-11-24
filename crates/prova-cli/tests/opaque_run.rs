@@ -137,6 +137,10 @@ impl Drop for CancelOnDrop<'_> {
 /// shell's reaped-children time (the release smoke test saw it stall).
 /// (It once froze the arm64 runner: not itself, but by pushing pids past
 /// 10000, where another test's `kill -9 -<pgid>` became `kill -1`.)
+// Linux only: macOS's `ps` gives no CPU time of exited children, so a loop
+// of millisecond commands can look idle there (getting started, platform
+// notes).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_loop_of_short_commands_is_not_a_stall() {
     let d = workspace("short-cmds");
@@ -732,4 +736,81 @@ fn select_with_a_command_says_what_it_needs() {
     let o = prova(&d, &["run", "--select", "x", "--", "true"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("prova adopt --write"));
+}
+
+/// Usability round 12 (a 53-test Go suite with 670 subtests): output that
+/// had already arrived when the command exited was dropped once recording
+/// it took longer than the 1 s drain, which history makes likely. Medium:
+/// needs prova's store and a real command.
+#[test]
+fn every_line_that_arrived_is_recorded_however_long_recording_takes() {
+    let d = workspace("drain-all");
+    let script = "i=0; while [ $i -lt 400 ]; do echo \"=== RUN   TestT$i\"; echo \"--- PASS: TestT$i (0.00s)\"; i=$((i+1)); done";
+    for _ in 0..2 {
+        let o = prova(
+            &d,
+            &["run", "--json", "--until", "done", "--", "sh", "-c", script],
+        );
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["counts"]["passed"], 400, "{v}");
+    }
+}
+
+/// Usability round 12: a Go test with subtests was counted once per subtest
+/// plus once itself (a 53-test suite reported 723). Subtests are counted
+/// apart, in Go's text and JSON forms alike. Medium: prova's store.
+#[test]
+fn go_subtests_are_counted_apart_from_tests() {
+    let d = workspace("go-subtests");
+    let text = "printf '=== RUN   TestA\\n=== RUN   TestA/one\\n=== RUN   TestA/one/deep\\n=== RUN   TestA/two\\n    --- PASS: TestA/one/deep (0.00s)\\n    --- PASS: TestA/one (0.00s)\\n    --- FAIL: TestA/two (0.00s)\\n--- FAIL: TestA (0.00s)\\n=== RUN   TestB\\n--- PASS: TestB (0.00s)\\nFAIL\\n'; exit 1";
+    let json = "for e in 'run\",\"Test\":\"TestA' 'run\",\"Test\":\"TestA/one' 'pass\",\"Test\":\"TestA/one' 'fail\",\"Test\":\"TestA' 'run\",\"Test\":\"TestB' 'pass\",\"Test\":\"TestB'; do echo \"{\\\"Package\\\":\\\"p\\\",\\\"Action\\\":\\\"$e\\\"}\"; done; exit 1";
+    for (script, subtests, failed) in [(text, 3, 1), (json, 1, 0)] {
+        let o = prova(
+            &d,
+            &["run", "--json", "--until", "done", "--", "sh", "-c", script],
+        );
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        let c = &v["counts"];
+        assert_eq!(
+            (c["passed"].as_u64(), c["failed"].as_u64()),
+            (Some(1), Some(1)),
+            "{v}"
+        );
+        assert_eq!(c["subtests"], subtests, "{v}");
+        assert_eq!(c["subtests_failed"].as_u64().unwrap_or(0), failed, "{v}");
+    }
+    let o = prova(&d, &["run", "--until", "done", "--", "sh", "-c", text]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("tests: 1 passed, 1 failed, 0 errored, 0 skipped (and 3 subtests, 1 failed)"),
+        "{out}"
+    );
+}
+
+/// The command's output excerpt comes first and prova's verdict last: what
+/// is read last is what prova concluded (owner, round 12). Medium: a real
+/// command.
+#[test]
+fn the_verdict_comes_after_the_output_excerpt() {
+    let d = workspace("verdict-last");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            "echo 'error: linker failed'; exit 2",
+        ],
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let excerpt = out.find("output (last").expect(&out);
+    let header = out.find("\nrun ").expect(&out);
+    assert!(excerpt < header, "{out}");
+    assert!(
+        out.trim_end().lines().last().unwrap().starts_with("next: "),
+        "{out}"
+    );
 }

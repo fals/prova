@@ -60,9 +60,11 @@ cargo install --git https://github.com/fals/prova --tag v0.1.2 prova-cli
 On macOS, prova watches test processes through `ps` instead of `/proc`,
 and a test's sockets through `lsof` (installed with macOS; without it, sizes
 see processes only).
-Two checks need counters macOS does not give: a pass whose command used
-no CPU at all is not flagged there, and experiments run without a
-sandbox or CPU counters (every verdict says which checks did not run).
+Some checks need counters macOS does not give: a pass whose command used
+no CPU at all is not flagged there; a quiet loop of commands that each
+last milliseconds can look idle and be reported as a stall; sizes have no
+process start times there; and experiments run without a sandbox or CPU
+counters (every verdict says which checks did not run).
 
 Experiments isolate each arm in a sandbox when
 [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
