@@ -424,6 +424,10 @@ struct ProtocolChange {
     /// Adds a specification file (repeatable).
     #[arg(long = "spec")]
     specs: Vec<PathBuf>,
+    /// Removes a specification file from the protocol, before the first
+    /// trial (repeatable), e.g. `--no-spec spec/old.lean`.
+    #[arg(long = "no-spec")]
+    no_specs: Vec<PathBuf>,
     /// Command that must succeed for a variant to satisfy the specification.
     #[arg(long)]
     oracle: Option<String>,
@@ -770,6 +774,47 @@ fn spec_files(files: &[PathBuf], root: &Path) -> Result<Vec<experiment::SpecFile
             })
         })
         .collect()
+}
+
+/// Paths the oracle command names (existing files or directories of the
+/// repository) that no `--spec` covers: the oracle's own files are part of
+/// the specification, and a candidate may edit them unless they are frozen
+/// (usability round 13).
+fn unfrozen_oracle_paths(p: &experiment::Protocol, root: &Path) -> Vec<String> {
+    let Some(oracle) = &p.oracle else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tok in oracle.split_whitespace() {
+        let t = tok.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')' | '&' | '|'));
+        let t = t.strip_prefix("./").unwrap_or(t);
+        if t.is_empty() || t.starts_with('-') || t.starts_with('/') || t.contains("..") || t == "." {
+            continue;
+        }
+        let t = t.trim_end_matches('/');
+        let path = root.join(t);
+        let covered = p
+            .specs
+            .iter()
+            .any(|s| s.path == t || (path.is_dir() && s.path.starts_with(&format!("{t}/"))));
+        if path.exists() && !covered && !out.iter().any(|o| o == t) {
+            out.push(t.to_owned());
+        }
+    }
+    out
+}
+
+fn warn_unfrozen_oracle_paths(p: &experiment::Protocol, root: &Path) {
+    let paths = unfrozen_oracle_paths(p, root);
+    if paths.is_empty() {
+        return;
+    }
+    let flags: Vec<String> = paths.iter().map(|x| format!("--spec {x}")).collect();
+    eprintln!(
+        "warning: the oracle names {} that no --spec freezes, so a candidate can change what judges it; add {} (files only: name the files inside a directory; remove one with `prova exp protocol <name> --no-spec <file>`)",
+        paths.join(", "),
+        flags.join(" ")
+    );
 }
 
 fn parse_guardrails(list: &[String]) -> Result<Vec<experiment::Guardrail>> {
@@ -1360,6 +1405,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     p.min_effect * 100.0
                 );
             }
+            warn_unfrozen_oracle_paths(&p, &root);
             experiment::create(&store, &name, &hypothesis, &p, &cwd, base)?;
             // The baseline as a commit, not only a ref name (round 9).
             let sha = experiment::variant(&store, &name, "baseline")?
@@ -1415,10 +1461,31 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             if c.setup.is_some() {
                 p.setup = c.setup;
             }
+            for f in &c.no_specs {
+                // The file may be gone from the tree: match the path as
+                // given when it cannot be resolved.
+                let rel = spec_files(std::slice::from_ref(f), &root)
+                    .ok()
+                    .and_then(|v| v.into_iter().next().map(|s| s.path))
+                    .unwrap_or_else(|| f.to_string_lossy().into_owned());
+                let before = p.specs.len();
+                p.specs.retain(|s| s.path != rel);
+                if p.specs.len() == before {
+                    bail!(
+                        "{rel} is not a specification file of {name} (registered: {})",
+                        p.specs
+                            .iter()
+                            .map(|s| s.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
             for f in spec_files(&c.specs, &root)? {
                 p.specs.retain(|s| s.path != f.path);
                 p.specs.push(f);
             }
+            warn_unfrozen_oracle_paths(&p, &root);
             if c.oracle.is_some() {
                 p.oracle = c.oracle;
             }
@@ -1620,7 +1687,7 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     println!("{n:40} {v:>16.3} {}", u.as_deref().unwrap_or(""));
                 }
                 println!(
-                    "next: prova exp new <name> --metric <one of these> --better lower|higher -- {}",
+                    "next: prova exp new <name> --hypothesis \"<FILL IN: what you expect and why>\" --metric <one of these> --better lower|higher -- {}",
                     sh_quote(&command)
                 );
             }
