@@ -165,6 +165,7 @@ impl Recognizers {
             duration_ms,
             message,
             source: Level::Native,
+            subtest: false,
         });
     }
 
@@ -177,6 +178,24 @@ impl Recognizers {
         level: Level,
         out: &mut Vec<EventKind>,
     ) {
+        self.result(key, outcome, duration_ms, message, level, false, out);
+    }
+
+    /// A test's or a subtest's result. Only the recognizer knows what is a
+    /// subtest (Go: a `/` in the name; pytest: a subtest report): a name
+    /// rule applied to every framework took JUnit and xUnit display names
+    /// for subtests (round 12 audit).
+    #[allow(clippy::too_many_arguments)]
+    fn result(
+        &mut self,
+        key: TestKey,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        level: Level,
+        subtest: bool,
+        out: &mut Vec<EventKind>,
+    ) {
         let d = key.unique();
         if self.holding {
             out.push(EventKind::TestFinished {
@@ -186,6 +205,7 @@ impl Recognizers {
                 duration_ms,
                 message,
                 source: level,
+                subtest,
             });
             return;
         }
@@ -196,7 +216,7 @@ impl Recognizers {
             if before.is_failure() != outcome.is_failure() {
                 let mut other = key.clone();
                 other.name = format!("{} (second result)", key.name);
-                return self.finished(other, outcome, duration_ms, message, level, out);
+                return self.result(other, outcome, duration_ms, message, level, subtest, out);
             }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
@@ -219,6 +239,7 @@ impl Recognizers {
             duration_ms,
             message,
             source: level,
+            subtest,
         });
     }
 
@@ -565,7 +586,9 @@ impl Recognizers {
                 } else {
                     None
                 };
-                self.finished(key(t), outcome, elapsed, msg, Level::Native, out);
+                // Go test names cannot contain '/': one that does is a
+                // subtest (`t.Run`).
+                self.result(key(t), outcome, elapsed, msg, Level::Native, t.contains('/'), out);
             }
             ("fail", None) => {
                 // Package failed without any failing test: build error or crash.
@@ -777,12 +800,13 @@ impl Recognizers {
                 } else {
                     None
                 };
-                self.finished(
+                self.result(
                     TestKey::new(Vec::new(), name),
                     outcome,
                     dur.map(|s| (s * 1000.0).round() as u64),
                     msg,
                     Level::Recognized,
+                    name.contains('/'),
                     out,
                 );
                 return true;

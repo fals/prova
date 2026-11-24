@@ -191,6 +191,7 @@ impl ResultFiles {
                         duration_ms: a.duration_ms,
                         message: a.message,
                         source: Level::ResultFiles,
+                        subtest: false,
                     });
                 }
             }

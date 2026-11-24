@@ -141,7 +141,7 @@ enum Chunk {
     Line(usize, String, Instant),
     /// The start of a line not finished yet (pytest's progress dots before
     /// a hang): shown in the live output at once (round 8).
-    Partial(usize, String),
+    Partial(usize, String, Instant),
     Eof,
 }
 
@@ -163,7 +163,7 @@ fn reader(id: usize, mut stream: impl Read + Send + 'static, tx: mpsc::Sender<Ch
                     }
                     if !pending.is_empty() {
                         let part = String::from_utf8_lossy(&pending).into_owned();
-                        if tx.send(Chunk::Partial(id, part)).is_err() {
+                        if tx.send(Chunk::Partial(id, part, Instant::now())).is_err() {
                             return;
                         }
                     }
@@ -874,7 +874,7 @@ fn observe_child(
                     sup.line(i, &l, observer);
                     sup.line_at = None;
                 }
-                Ok(Chunk::Partial(i, p)) => {
+                Ok(Chunk::Partial(i, p, _)) => {
                     last_activity = Instant::now();
                     sup.partial(i, &p);
                 }
@@ -970,9 +970,11 @@ fn observe_child(
                 // A leaked process still writing: what came after the
                 // deadline is not waited for.
                 Chunk::Line(_, _, at) if at > until => break,
-                Chunk::Partial(..) if Instant::now() > until => break,
+                // A read boundary mid-line sends a partial too: judged by
+                // when it arrived, like a line (round 12 CI: 388 of 400).
+                Chunk::Partial(_, _, at) if at > until => break,
                 Chunk::Line(i, l, _) => sup.line(i, &l, observer),
-                Chunk::Partial(i, p) => sup.partial(i, &p),
+                Chunk::Partial(i, p, _) => sup.partial(i, &p),
                 Chunk::Eof => *open -= 1,
             }
         }
@@ -1424,6 +1426,7 @@ fn observe_child(
             duration_ms,
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
+            subtest: false,
         };
         sup.pending.push(Event {
             v: EVENT_VERSION,
@@ -1610,14 +1613,6 @@ impl Counts {
     }
 }
 
-/// A result nested under another test that reported its own (Go subtests:
-/// `TestX/case` under `TestX`). Counted apart, or a test with 10 cases
-/// counts 11 (a 53-test Go suite showed 723).
-fn is_subtest(t: &TestKey, names: &std::collections::HashSet<(Option<&str>, String)>) -> bool {
-    let d = t.display();
-    d.match_indices('/')
-        .any(|(i, _)| i > 0 && names.contains(&(t.file.as_deref(), d[..i].to_owned())))
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
@@ -1826,7 +1821,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     };
     let events = store.events_after(run, 0)?;
     // Final outcome per test: the last attempt counts, retries do not.
-    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64)> = BTreeMap::new();
+    // (test, outcome, message, seq, subtest)
+    let mut finals: BTreeMap<String, (TestKey, Outcome, Option<String>, u64, bool)> =
+        BTreeMap::new();
     let mut stalled_ms = None;
     let mut leaked = Vec::new();
     let mut slow: BTreeMap<String, SlowTest> = BTreeMap::new();
@@ -1843,13 +1840,14 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 test,
                 outcome,
                 message,
+                subtest,
                 ..
             } => {
                 running.retain(|(u, _)| *u != test.unique());
                 slow.remove(&test.unique());
                 finals.insert(
                     test.unique(),
-                    (test.clone(), *outcome, message.clone(), e.seq),
+                    (test.clone(), *outcome, message.clone(), e.seq, *subtest),
                 );
             }
             EventKind::TestSlow {
@@ -1897,13 +1895,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     let mut counts = Counts::default();
-    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64)> = Vec::new();
-    let names: std::collections::HashSet<(Option<&str>, String)> = finals
-        .values()
-        .map(|f| (f.0.file.as_deref(), f.0.display()))
-        .collect();
+    let mut failing: Vec<&(TestKey, Outcome, Option<String>, u64, bool)> = Vec::new();
     for f in finals.values() {
-        if is_subtest(&f.0, &names) {
+        if f.4 {
             counts.subtests += 1;
             counts.subtests_failed += u64::from(f.1.is_failure());
             if f.1.is_failure() {
@@ -1939,7 +1933,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         })
     };
     let mut failures = Vec::new();
-    for (key, outcome, message, _) in failing.iter().take(20).copied() {
+    for (key, outcome, message, _, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
         failures.push(Failure {
             test: key.display(),
@@ -1958,8 +1952,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     if row.status == Status::Finished {
         let passed: std::collections::BTreeSet<String> = finals
             .values()
-            .filter(|(_, o, _, _)| *o == Outcome::Passed)
-            .map(|(k, _, _, _)| k.display())
+            .filter(|(_, o, _, _, _)| *o == Outcome::Passed)
+            .map(|(k, _, _, _, _)| k.display())
             .collect();
         if !passed.is_empty() {
             for f in crate::analysis::flaky(store, None, 50)? {
