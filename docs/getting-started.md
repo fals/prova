@@ -107,7 +107,7 @@ prova output <run>              # the kept excerpt; --test <name> for one failin
 prova run default --repeat 5    # is it flaky? each test's tally over 5 runs
 prova sizes                     # small / medium / large by what each test used
 prova slowest                   # the slowest tests, p50 and p95 from history
-prova quarantine add <test> --reason "..."   # set a known-flaky test aside, in the open
+prova quarantine add <test> --reason "..."   # set a known-flaky test aside, in the open (this machine's store)
 ```
 
 While a run goes, failures print as they happen. On a terminal a live line
@@ -189,8 +189,10 @@ What prova does for you, on every run, with no configuration:
   loop.
 - **Bounds time by size.** Until history exists, a small test is called
   slow after 1 s (medium 30 s, large 5 min), a quiet run stalls after 30 s
-  (60 s, 5 min), and a test is killed at 60 s (300 s, 900 s). A hung test
-  costs seconds, not a CI timeout.
+  (60 s, 5 min; 30 s with no size declared), and a test is killed at 60 s
+  (300 s, 900 s). A hung test costs seconds, not a CI timeout. Tests run
+  through a container client (`docker run`, `kubectl exec`) are out of
+  sight: prova records no size for them.
 
 What prova cannot see: a socket opened and closed between two samples
 (every 0.5 s), and sleeps or timers. So small means "no other process or

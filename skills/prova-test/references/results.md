@@ -39,9 +39,16 @@ Contents: [Failure history](#failure-history) ·
   pass of it, and the run is unverified. To set a flaky test aside in the
   open instead, `prova quarantine add <test> --reason "..."` (expires in 14
   days, `--days N` up to 90): it still runs and keeps its history; if it is
-  the only failure the run passes, verified for the rest. Every summary
-  lists it as `quarantined: <test> <result> (<reason>; expires in Nd)`;
-  `prova quarantine list` and `remove` manage it. Do not quarantine a test
+  the only failure the run passes, verified for the rest, with the header
+  `PASSED (quarantined failures set aside)`. Every summary lists it as
+  `quarantined: <test> <result> (<reason>; expires in Nd)` (`not reported`
+  when the run gave no per-test results or was cut short);
+  `prova quarantine list` and `remove` manage it. It sets aside nothing
+  else: another failure, an error, a crash line or a framework count above
+  its failures fails the run; a parent's quarantine does not cover a
+  subtest first seen after it; a run where only quarantined tests ran and
+  failed fails. A quarantine lives in this machine's prova store, not in
+  the repository: CI and teammates do not see it. Do not quarantine a test
   that fails every time now; that is a real failure.
 - `slow tests: a 1.5s, b 1.1s (prova slowest)`: the slowest tests of this run
   (1 s or more). `prova slowest [--suite S] [-n N]` lists p50 and p95 from
@@ -60,8 +67,10 @@ Contents: [Failure history](#failure-history) ·
 - `SLOW`: over the test's budget; the line says where it came from (3x its
   usual time, the suite's default, or the test runner's own warning).
 - A stall ends any wait, including a plain `prova run -- ...`: cancel it.
-- `running now:` names the tests still running when a run stalls or a test
-  is slow.
+- `running now:` names the tests still running, with how long each has
+  run (`TestHang (for 28.4s)`): one running far longer than it usually
+  takes is the likely hang, before any budget says so. A suite with no
+  declared size stalls after 30 s of no activity.
 
 ## Unverified passes
 
@@ -82,12 +91,15 @@ A warning that ends with "no evidence about the tests" (impossible or
 identical durations, no CPU, shared result files, replayed output) keeps
 the run out of every test's history.
 
-`prova status` lists an unverified run as `passed?`. In `--json`,
+`prova status` lists an unverified run as `passed?`, and a run that passed
+with quarantined failures set aside as `passed*`. In `--json`,
 `verified` is `true` only for a clean pass. Do not report "tests pass" on
 an unverified run; read the warnings and make the suite run its tests.
 
 `prova forget <run> --reason "..."` takes a run whose results were not real
-out of every test's history (and the flaky labels it caused).
+out of every test's history (and the flaky labels it caused). A run that
+failed before any test ran (a missing tool or SDK) says so and suggests it;
+history lists such runs as `failed (no test seen)`.
 
 ## Failed runs
 
