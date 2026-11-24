@@ -1613,7 +1613,6 @@ impl Counts {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub run: String,

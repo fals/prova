@@ -26,6 +26,10 @@ pub struct Recognizers {
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
+    /// VSTest `Total tests:` block seen: its `Failed:` line follows.
+    vstest_totals: bool,
+    /// nextest `SKIP` lines named individually.
+    nextest_skip_lines: u64,
     /// libtest: the test binary currently running ("Running tests/x.rs (...)").
     libtest_binary: Option<String>,
     started: BTreeSet<String>,
@@ -268,6 +272,85 @@ impl Recognizers {
                 self.reported_total += total;
             }
             self.reported_failed += field("Failed:").unwrap_or(0);
+            return;
+        }
+        // VSTest console at normal verbosity: "Total tests: 14", then
+        // "     Failed: 4" (Passed and Skipped lines add nothing).
+        if let Some(n) = t.strip_prefix("Total tests:") {
+            if let Ok(v) = n.trim().parse::<u64>() {
+                self.summary_seen = true;
+                self.reported_total += v;
+                self.vstest_totals = true;
+            }
+            return;
+        }
+        if self.vstest_totals {
+            if let Some(n) = t.strip_prefix("Failed:") {
+                if let Ok(v) = n.trim().parse::<u64>() {
+                    self.reported_failed += v;
+                }
+                self.vstest_totals = false;
+            } else if t.starts_with("Total time:") {
+                self.vstest_totals = false;
+            }
+            return;
+        }
+        // nextest "Summary [ 0.2s] 11 tests run: 8 passed, 3 failed, 2 skipped".
+        // Its skipped count also covers tests a filter left out, which no
+        // framework counts as tests: only those it named with SKIP lines
+        // are added.
+        if t.starts_with("Summary [")
+            && let Some((_, rest)) = t.split_once("] ")
+            && let Some((head, counts)) = rest.split_once(" run: ")
+            && let Some(n) = head
+                .split_whitespace()
+                .next()
+                .map(|w| w.rsplit('/').next().unwrap_or(w))
+                .and_then(|w| w.parse::<u64>().ok())
+            && (head.ends_with(" tests") || head.ends_with(" test"))
+        {
+            let mut skipped = 0;
+            let mut failed = 0;
+            for part in counts.split(',') {
+                let mut w = part.split_whitespace();
+                if let (Some(num), Some(word)) = (w.next(), w.next())
+                    && let Ok(v) = num.parse::<u64>()
+                {
+                    match word {
+                        "failed" | "timed" => failed += v,
+                        "skipped" => skipped += v,
+                        _ => {}
+                    }
+                }
+            }
+            self.summary_seen = true;
+            self.reported_total += n + skipped.min(self.nextest_skip_lines);
+            self.reported_failed += failed;
+            return;
+        }
+        // Maven Surefire's aggregate "Tests run: 22, Failures: 4, Errors: 1,
+        // Skipped: 2": the per-class lines also say "Time elapsed".
+        if let Some(rest) = t
+            .strip_prefix("[INFO] ")
+            .or_else(|| t.strip_prefix("[ERROR] "))
+            .or_else(|| t.strip_prefix("[WARNING] "))
+            .unwrap_or(t)
+            .strip_prefix("Tests run:")
+            && !rest.contains("Time elapsed")
+        {
+            let field = |name: &str| {
+                rest.split(',').find_map(|p| {
+                    p.trim()
+                        .strip_prefix(name)
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                })
+            };
+            if let Some(n) = field("") {
+                self.summary_seen = true;
+                self.reported_total += n;
+                self.reported_failed +=
+                    field("Failures:").unwrap_or(0) + field("Errors:").unwrap_or(0);
+            }
             return;
         }
         // Jest "Tests:       1 failed, 4 passed, 5 total"; Vitest
@@ -588,7 +671,15 @@ impl Recognizers {
                 };
                 // Go test names cannot contain '/': one that does is a
                 // subtest (`t.Run`).
-                self.result(key(t), outcome, elapsed, msg, Level::Native, t.contains('/'), out);
+                self.result(
+                    key(t),
+                    outcome,
+                    elapsed,
+                    msg,
+                    Level::Native,
+                    t.contains('/'),
+                    out,
+                );
             }
             ("fail", None) => {
                 // Package failed without any failing test: build error or crash.
@@ -894,7 +985,11 @@ impl Recognizers {
                 s if s.starts_with("ignored") => Outcome::Skipped,
                 _ => return false,
             };
-            let key = self.libtest_key(name.trim());
+            // Text says `name - should panic`, JSON and nextest say `name`:
+            // one test, one history.
+            let name = name.trim();
+            let name = name.strip_suffix(" - should panic").unwrap_or(name);
+            let key = self.libtest_key(name);
             self.finished(key, outcome, None, None, Level::Recognized, out);
             return true;
         }
@@ -1051,7 +1146,13 @@ impl Recognizers {
         else {
             return false;
         };
-        if name.contains(char::is_whitespace) || name.is_empty() {
+        // A name with spaces (a theory's `Slash(s: "x/y")`, MSTest's
+        // `Slash ("x/y")`) only counts on VSTest's own two-space indent:
+        // prose that starts with "Failed " is not a result.
+        if name.is_empty()
+            || (name.contains(char::is_whitespace)
+                && (!line.starts_with("  ") || line.starts_with("   ")))
+        {
             return false;
         }
         let ms = dur
@@ -1098,6 +1199,8 @@ impl Recognizers {
             || t == "Stack Trace:"
             || t.starts_with("Failed ")
             || t.starts_with("Passed ")
+            || t.starts_with("Skipped ")
+            || t.starts_with("Total tests:")
             || t.starts_with("Failed!")
         {
             let msg = lines.join("\n");
@@ -1178,7 +1281,10 @@ impl Recognizers {
                 self.nextest_pass_output = Some((key.display(), false, false));
                 self.finished(key, Outcome::Passed, ms, None, Level::Recognized, out)
             }
-            "SKIP" => self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out),
+            "SKIP" => {
+                self.nextest_skip_lines += 1;
+                self.finished(key, Outcome::Skipped, None, None, Level::Recognized, out)
+            }
             _ => {
                 // FAIL, TIMEOUT, SIGSEGV, ABORT, LEAK-FAIL: hold for the output.
                 self.flush_nextest(out);
@@ -2053,6 +2159,63 @@ mod tests {
         let (_, ev) = feed("ok  \texample.com/calc\t(cached)\nok  \texample.com/other\t(cached)");
         assert_eq!(ev.len(), 1);
         assert!(matches!(&ev[0], EventKind::RunNote { message } if message.contains("-count=1")));
+    }
+
+    #[test]
+    fn vstest_names_with_spaces_and_console_totals() {
+        let (r, ev) = feed(
+            "  Passed Xu.CalcTests.Adds [1 ms]\n  Failed Xu.CalcTests.Slash(s: \"x/y\") [1 ms]\n  Error Message:\n   boom\n  Stack Trace:\n  Failed Slash (\"x/y\") [< 1 ms]\n  Skipped Unsure [< 1 ms]\nTotal tests: 14\n     Passed: 9\n     Failed: 4\n    Skipped: 1\n Total time: 0.3 Seconds\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("Xu.CalcTests.Adds".into(), Outcome::Passed),
+                ("Xu.CalcTests.Slash(s: \"x/y\")".into(), Outcome::Failed),
+                ("Slash (\"x/y\")".into(), Outcome::Failed),
+                ("Unsure".into(), Outcome::Skipped),
+            ]
+        );
+        assert_eq!(r.total(), 14);
+        assert_eq!(r.failed_reported(), 4);
+        let (_, ev) = feed("Failed all the tests we could [1 ms]\n");
+        assert!(finished(&ev).is_empty(), "prose is not a result");
+    }
+
+    #[test]
+    fn nextest_summary_is_the_total_and_named_skips_count() {
+        let (r, _) = feed(
+            "        PASS [   0.005s] ( 1/3) rc tests::a\n        FAIL [   0.005s] ( 2/3) rc tests::b\n     Summary [   0.206s] 3 tests run: 2 passed, 1 failed, 2 skipped\n",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (3, 1));
+        let (r, ev) = feed(
+            "        SKIP [         ] rc tests::ig\n        PASS [   0.005s] ( 1/1) rc tests::a\n     Summary [   0.006s] 1 test run: 1 passed, 1 skipped\n",
+        );
+        assert_eq!(finished(&ev).len(), 2);
+        assert_eq!(r.total(), 2, "the skipped test seen by name counts");
+    }
+
+    #[test]
+    fn surefire_aggregate_line_is_the_total() {
+        let (r, _) = feed(
+            "[ERROR] Tests run: 19, Failures: 4, Errors: 0, Skipped: 2, Time elapsed: 0.001 s <<< FAILURE! -- in ex.CalcTest\n[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.019 s -- in ex.OtherTest\n[ERROR] Tests run: 22, Failures: 4, Errors: 1, Skipped: 2\n",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (22, 5));
+        let (r, _) = feed("Tests run: 3, Failures: 0, Errors: 0, Skipped: 1\n");
+        assert_eq!(r.total(), 3);
+    }
+
+    #[test]
+    fn libtest_text_should_panic_has_the_json_name() {
+        let (_, ev) = feed(
+            "test tests::panics - should panic ... ok\ntest tests::bad - should panic ... FAILED\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests::panics".into(), Outcome::Passed),
+                ("tests::bad".into(), Outcome::Failed),
+            ]
+        );
     }
 
     #[test]
