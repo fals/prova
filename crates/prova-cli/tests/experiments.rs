@@ -1306,3 +1306,24 @@ fn unmeasured_experiments_do_not_count_as_other_experiments() {
     let caveats = r["comparison"]["result"]["caveats"].to_string();
     assert!(!caveats.contains("other experiment"), "{r}");
 }
+
+/// Round 16: the oracle's build ran out of disk quota in the candidate's
+/// checkout; the correct candidate was REJECTed as violating the spec.
+#[test]
+fn an_oracle_out_of_room_is_not_a_specification_violation() {
+    let d = spec_repo_with(
+        "oracle-quota",
+        "[ -f broken ] && { echo 'error: failed to write target/deps/x.rmeta: Disk quota exceeded (os error 122)'; exit 101; }; test \"$(cat answer)\" = 42",
+    );
+    std::fs::write(d.join("steps"), "10").unwrap();
+    std::fs::write(d.join("broken"), "").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    assert_ne!(r["comparison"]["verdict"], "reject", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("ran out of room") && reason.contains("Disk quota"),
+        "{reason}"
+    );
+}
