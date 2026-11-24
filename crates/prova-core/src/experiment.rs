@@ -2339,7 +2339,9 @@ fn is_generic_trailer(l: &str) -> bool {
 /// `CountPrimes(2) = 1, specification says 0`). Falls back to the last line.
 fn decisive_line(text: &str) -> Option<&str> {
     let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines().rfind(|l| !is_generic_trailer(l)).or_else(|| lines().last())
+    lines()
+        .rfind(|l| !is_generic_trailer(l))
+        .or_else(|| lines().last())
 }
 
 /// Why a variant does not satisfy the specification: it does not, or the
@@ -2881,7 +2883,10 @@ mod tests {
     #[test]
     fn the_decisive_oracle_line_skips_generic_trailers() {
         let t = "CountPrimes(2) = 1, specification says 0\nexit status 1\nFAIL\nmake: *** [Makefile:3: conform] Error 1\nError: Process completed with exit code 2.\n";
-        assert_eq!(decisive_line(t), Some("CountPrimes(2) = 1, specification says 0"));
+        assert_eq!(
+            decisive_line(t),
+            Some("CountPrimes(2) = 1, specification says 0")
+        );
         assert_eq!(decisive_line("only\nexit status 1\n"), Some("only"));
         assert_eq!(decisive_line("exit status 1\n"), Some("exit status 1"));
         assert_eq!(decisive_line("\n\n"), None);

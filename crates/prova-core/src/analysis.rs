@@ -111,7 +111,11 @@ pub fn test_runs_with(
                    -- bug look flaky)
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
                                                   AND w.payload LIKE '%; no evidence about the tests%'))
-                   AND r3.id NOT IN (SELECT run_id FROM forgotten)))
+                   AND r3.id NOT IN (SELECT run_id FROM forgotten)
+                   -- labels of a run are as of that run: later runs do not
+                   -- rewrite them (round 13: 'failed 8x before' on a run
+                   -- that followed 3 failures)
+                   AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
@@ -373,6 +377,17 @@ pub fn most_recent(store: &Store, candidates: &[(String, String, String)]) -> Re
 
 /// Flaky tests among those seen in the last `runs` runs of any suite.
 pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<TestStats>> {
+    flaky_as_of(store, suite, window, None)
+}
+
+/// Tests flaky as of run `as_of` (its history up to it, its own result
+/// included): a run's labels do not change when later runs come in.
+pub fn flaky_as_of(
+    store: &Store,
+    suite: Option<&str>,
+    window: usize,
+    as_of: Option<&str>,
+) -> Result<Vec<TestStats>> {
     let mut stmt = store.conn().prepare(
         // Any test that failed somewhere: its history is shared across
         // suites (ADR 0018), so a flip between suites counts (round 6).
@@ -384,7 +399,7 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
         .collect::<rusqlite::Result<_>>()?;
     let mut out: Vec<TestStats> = Vec::new();
     for id in ids {
-        if let Some(s) = stats(store, &id, window)?
+        if let Some(s) = stats_with(store, &id, window, as_of)?
             && s.flaky
             && !out.iter().any(|o| {
                 o.display == s.display

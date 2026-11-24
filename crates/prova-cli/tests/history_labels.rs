@@ -632,3 +632,31 @@ fn a_cancelled_run_is_cancelled_in_json_too() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["history"]["last"]["outcome"], "cancelled", "{v}");
 }
+
+/// Round 13 (Rust): an old run's labels were recomputed from today's
+/// history ("failed 8x before" on a run that followed 3 failures; a test
+/// called known-flaky before it ever flaked), and the run list showed
+/// unverified passes as plain "passed".
+#[test]
+fn a_runs_labels_are_as_of_that_run() {
+    let d = workspace("as-of");
+    suites(&d);
+    run(&d, "make", "fail");
+    run(&d, "make", "fail");
+    let second: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["status", "last", "--json"]))).unwrap();
+    let second = second["run"].as_str().unwrap().to_owned();
+    run(&d, "make", "fail");
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let then = text(&prova(&d, &["status", &second]));
+    assert!(then.contains("FAIL calc::x [failed 1x before]"), "{then}");
+    assert!(!then.contains("FLAKY"), "{then}");
+    // The latest pass is of a now-flaky test: unverified in the list too.
+    run(&d, "make", "pass");
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        list.lines().next().is_some_and(|l| l.contains("passed?")),
+        "{list}"
+    );
+}

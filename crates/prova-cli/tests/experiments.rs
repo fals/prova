@@ -1116,12 +1116,24 @@ fn status_leads_with_the_best_after_a_later_reject() {
 /// a git repository and the binary).
 #[test]
 fn exp_new_warns_about_oracle_files_that_are_not_frozen() {
-    let d = spec_repo_with("oracle-unfrozen", "test -f work.sh && test \"$(cat answer)\" = 42");
+    let d = spec_repo_with(
+        "oracle-unfrozen",
+        "test -f work.sh && test \"$(cat answer)\" = 42",
+    );
     let o = prova(
         &d,
         &[
-            "exp", "new", "e2", "--hypothesis", "h", "--spec", "spec.txt", "--oracle",
-            "test -f work.sh && test -f spec.txt", "--", "./work.sh",
+            "exp",
+            "new",
+            "e2",
+            "--hypothesis",
+            "h",
+            "--spec",
+            "spec.txt",
+            "--oracle",
+            "test -f work.sh && test -f spec.txt",
+            "--",
+            "./work.sh",
         ],
     );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1164,5 +1176,8 @@ fn exp_metrics_next_line_names_the_hypothesis() {
     let d = spec_repo("metrics-next");
     let o = prova(&d, &["exp", "metrics", "--", "./work.sh"]);
     let out = String::from_utf8_lossy(&o.stdout);
-    assert!(out.contains("next: prova exp new <name> --hypothesis"), "{out}");
+    assert!(
+        out.contains("next: prova exp new <name> --hypothesis"),
+        "{out}"
+    );
 }

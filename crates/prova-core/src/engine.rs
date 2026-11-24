@@ -1812,6 +1812,25 @@ pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(n)..].to_vec()
 }
 
+/// Runs whose pass verified little: a warning (ADR 0017), or a known flaky
+/// test that passed. The run list marks them `passed?`.
+pub fn unverified_runs(
+    store: &Store,
+    runs: &[RunRow],
+) -> Result<std::collections::BTreeSet<String>> {
+    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+    let mut out = store.unverified(&ids)?;
+    for r in runs {
+        if r.outcome == Some(Outcome::Passed) && !out.contains(&r.id) {
+            let s = summarize(store, &r.id, WaitReason::Done, 0)?;
+            if !s.flaky_passed.is_empty() {
+                out.insert(r.id.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) -> Result<Summary> {
     // A run whose supervisor is gone is recorded as aborted before it is
     // described: no summary may show a dead run as running.
@@ -1962,7 +1981,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             .map(|(k, _, _, _, _)| k.display())
             .collect();
         if !passed.is_empty() {
-            for f in crate::analysis::flaky(store, None, 50)? {
+            for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
                 if passed.contains(&f.display) && !flaky_passed.contains(&f.display) {
                     flaky_passed.push(f.display);
                 }

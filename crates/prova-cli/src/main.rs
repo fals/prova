@@ -788,7 +788,8 @@ fn unfrozen_oracle_paths(p: &experiment::Protocol, root: &Path) -> Vec<String> {
     for tok in oracle.split_whitespace() {
         let t = tok.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')' | '&' | '|'));
         let t = t.strip_prefix("./").unwrap_or(t);
-        if t.is_empty() || t.starts_with('-') || t.starts_with('/') || t.contains("..") || t == "." {
+        if t.is_empty() || t.starts_with('-') || t.starts_with('/') || t.contains("..") || t == "."
+        {
             continue;
         }
         let t = t.trim_end_matches('/');
@@ -2163,8 +2164,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     out.push(serde_json::json!({ "repo": k, "runs": runs }));
                 } else if !runs.is_empty() {
                     println!("== {}  ({})", k.name, k.workspace);
-                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-                    render::runs(&runs, &store.unverified(&ids)?, false);
+                    render::runs(&runs, &engine::unverified_runs(&store, &runs)?, false);
                 }
             }
             if json {
@@ -2193,8 +2193,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     if engine::reap_orphans(&store, &runs)? {
                         runs = store.recent_runs(20)?;
                     }
-                    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-                    render::runs(&runs, &store.unverified(&ids)?, json);
+                    render::runs(&runs, &engine::unverified_runs(&store, &runs)?, json);
                     Ok(exit::PASSED)
                 }
             }
