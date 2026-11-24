@@ -215,6 +215,10 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         );
     }
     for n in &s.notes {
+        // The detail line says it already (round 13: printed twice).
+        if s.detail.as_deref() == Some(n.as_str()) {
+            continue;
+        }
         println!("note: {}", clean(n));
     }
     if !s.slowest.is_empty() {
@@ -235,7 +239,11 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         println!("detail: {d}");
     }
     if !s.leaked.is_empty() {
-        println!("leaked processes (killed): {:?}", s.leaked);
+        // Say what it means (round 13: a bare list of pids, unexplained).
+        println!(
+            "leaked processes (killed): {:?}: still alive when the command ended (a server or build daemon it started, such as the MSBuild server); prova stopped them",
+            s.leaked
+        );
     }
     if let Some(h) = &s.history {
         println!("history: {}", history_line(h));
@@ -693,6 +701,9 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
         // A thin pass is not a plain "passed" in the list either (round 9).
         let outcome = match r.outcome {
             Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
+            // A cancelled or killed run has no test outcome of its own:
+            // "cancelled errored" read as a test error (round 13).
+            _ if matches!(r.status, prova_core::model::Status::Cancelled) => "-",
             o => o.map(Outcome::as_str).unwrap_or("-"),
         };
         let dur = match (r.started_ms, r.ended_ms) {

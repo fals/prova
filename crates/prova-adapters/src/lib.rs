@@ -409,7 +409,7 @@ impl Observer for Ladder {
                 message: format!(
                     "the framework reported {} tests but prova saw {seen} individually (condensed or quiet output): \
                      passing tests are not recorded, so flaky detection and durations are incomplete. \
-                     Run the framework with verbose output or a JUnit report (`prova adopt --write` sets it up).",
+                     Run the framework with verbose output or a JUnit report (`prova adopt` proposes a suite that does).",
                     self.live.total()
                 ),
             });

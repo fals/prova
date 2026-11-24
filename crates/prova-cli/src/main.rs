@@ -310,7 +310,7 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// Test sizes from what each test used (processes, network), with the reason (ADR 0025).
+    /// Test sizes from what each test used (processes, network), with the reason.
     #[command(after_help = "\
 Examples:
   prova sizes                  counts, and each medium or large test with what it used
@@ -323,7 +323,7 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// The slowest tests from history: p50 and p95, worst first (ADR 0027).
+    /// The slowest tests from history: p50 and p95, worst first.
     #[command(after_help = "\
 Examples:
   prova slowest                 the 10 slowest tests of this repository
@@ -340,7 +340,7 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// Set known-flaky tests aside from the verdict, in the open (ADR 0027).
+    /// Set known-flaky tests aside from the verdict, in the open.
     #[command(after_help = "\
 Examples:
   prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"
@@ -2024,7 +2024,11 @@ fn print_output(
     let spool = store.run_dir(id).join("output.log");
     if !store.run(id)?.status.is_terminal() && spool.exists() {
         let mut f = std::fs::File::open(&spool).with_context(|| format!("{}", spool.display()))?;
-        std::io::copy(&mut f, &mut std::io::stdout())?;
+        let n = std::io::copy(&mut f, &mut std::io::stdout())?;
+        if n == 0 {
+            // Silence is not an answer (round 13: nothing, exit 0).
+            println!("(run {id} has printed nothing yet)");
+        }
         return Ok(exit::PASSED);
     }
     if let Some(full) = output::run_full(store, id)? {
@@ -2353,7 +2357,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     } else {
                         WaitReason::Running
                     };
-                    let s = engine::summarize(&store, &id, reason, seq)?;
+                    let mut s = engine::summarize(&store, &id, reason, seq)?;
+                    // A stalled run is STALLED here as in `wait` (round 13:
+                    // status said RUNNING seconds after wait said STALLED).
+                    if s.reason == WaitReason::Running && s.stalled_ms.is_some() {
+                        s = engine::summarize(&store, &id, WaitReason::Stall, seq)?;
+                    }
                     render::summary(&s, json);
                     Ok(exit_code(&s))
                 }

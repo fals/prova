@@ -302,7 +302,7 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                     name: "make".into(),
                     run: "make test".into(),
                     select: None,
-                    why: "the project's own command, exactly as CI runs it".into(),
+                    why: "the project's own command, as developers and CI run it".into(),
                 });
             } else {
                 // The project's own command, plus prova's Vitest reporter when

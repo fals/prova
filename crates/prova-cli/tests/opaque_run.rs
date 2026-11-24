@@ -963,3 +963,37 @@ fn tests_known_only_from_result_files_get_a_size() {
         "{h}"
     );
 }
+
+/// Round 13 (C#): a cancelled run was listed as "cancelled errored", read
+/// as a test error. Medium: a real run cancelled.
+#[test]
+fn a_cancelled_run_has_no_test_outcome_in_the_list() {
+    let d = workspace("cancel-list");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--detach",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exec sleep 30",
+        ],
+    );
+    let id = serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["run"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
+    let list = stdout(&prova(&d, &["status"]));
+    let line = list
+        .lines()
+        .find(|l| l.starts_with(&id[..8]))
+        .unwrap_or_default();
+    assert!(
+        line.contains("cancelled") && !line.contains("errored"),
+        "{list}"
+    );
+}

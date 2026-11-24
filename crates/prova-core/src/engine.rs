@@ -2060,6 +2060,28 @@ fn narrow_by_running<'a>(
     (missing.iter().collect(), None)
 }
 
+/// The excerpt as a person reads it: `go test -json` lines become their
+/// own output text (round 13: 30 lines of raw JSON under a failure prova
+/// had already decoded).
+fn readable(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            if !t.starts_with('{') {
+                return Some(l);
+            }
+            match serde_json::from_str::<serde_json::Value>(t) {
+                Ok(v) if v.get("Action").is_some() => v["Output"]
+                    .as_str()
+                    .map(|o| o.trim_end().to_owned())
+                    .filter(|o| !o.trim().is_empty()),
+                _ => Some(l),
+            }
+        })
+        .collect()
+}
+
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
     if let Ok(crate::output::Kept::Excerpt(e)) = crate::output::run_excerpt(store, run) {
         return e.tail(n);
@@ -2390,6 +2412,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && row.level == Level::Opaque
         && row.status == Status::Finished
         && ran == 0
+        // The framework already said no test ran: one statement, not a
+        // second that contradicts it (round 13, Rust).
+        && !notes.iter().any(|n| n.contains("no test ran"))
     {
         notes.push(format!(
             "selection {sel:?}: no per-test results seen, so prova cannot tell whether any test matched"
@@ -2444,7 +2469,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         quarantined,
         slowest,
         output_tail: if want_tail {
-            output_tail(store, run, 30)
+            readable(output_tail(store, run, 30))
         } else {
             Vec::new()
         },
@@ -2629,5 +2654,22 @@ mod narrow_tests {
         assert_eq!(s, vec!["calc.CalcTest::hangs", "calc.CalcTest::adds"]);
         let (s, c) = super::narrow_by_running(&missing, &["building".to_owned()]);
         assert_eq!((s.len(), c), (3, None));
+    }
+}
+
+#[cfg(test)]
+mod readable_tests {
+    /// Round 13 (Go): the excerpt under a failure was raw test2json.
+    #[test]
+    fn go_json_lines_read_as_their_output() {
+        let lines = vec![
+            r#"{"Action":"run","Test":"TestA"}"#.to_owned(),
+            r#"{"Action":"output","Test":"TestA","Output":"    a_test.go:9: boom\n"}"#.to_owned(),
+            "plain line".to_owned(),
+        ];
+        assert_eq!(
+            super::readable(lines),
+            vec!["    a_test.go:9: boom".to_owned(), "plain line".to_owned()]
+        );
     }
 }
