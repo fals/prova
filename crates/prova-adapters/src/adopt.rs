@@ -244,9 +244,30 @@ pub fn propose(root: &Path) -> Proposal {
 
 /// Test runners and entry points a wrapper puts in front of.
 const RUNNERS: &[&str] = &[
-    "make", "pytest", "python", "python3", "py.test", "mvn", "mvnw", "gradle", "gradlew", "npm",
-    "npx", "yarn", "pnpm", "bun", "cargo", "go", "gotestsum", "dotnet", "vitest", "jest", "rake",
-    "bundle", "tox", "nox",
+    "make",
+    "pytest",
+    "python",
+    "python3",
+    "py.test",
+    "mvn",
+    "mvnw",
+    "gradle",
+    "gradlew",
+    "npm",
+    "npx",
+    "yarn",
+    "pnpm",
+    "bun",
+    "cargo",
+    "go",
+    "gotestsum",
+    "dotnet",
+    "vitest",
+    "jest",
+    "rake",
+    "bundle",
+    "tox",
+    "nox",
 ];
 
 /// The wrapper in front of a test command an earlier run used (`./dev`,
@@ -255,7 +276,9 @@ const RUNNERS: &[&str] = &[
 /// runner, or with a shell, whose arguments are not a prefix.
 pub fn wrapper_of(argv: &[String]) -> Option<String> {
     let name = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
-    let at = argv.iter().position(|w| RUNNERS.contains(&name(w).as_str()))?;
+    let at = argv
+        .iter()
+        .position(|w| RUNNERS.contains(&name(w).as_str()))?;
     let prefix = &argv[..at];
     let shell = |w: &String| matches!(name(w).as_str(), "sh" | "bash" | "zsh" | "dash");
     if prefix.is_empty()
@@ -525,7 +548,10 @@ mod tests {
     fn a_wrapper_goes_in_front_of_run_and_select() {
         let d = dir(
             "wrapped-py",
-            &[("pyproject.toml", "[tool.pytest.ini_options]\n"), ("t.py", "")],
+            &[
+                ("pyproject.toml", "[tool.pytest.ini_options]\n"),
+                ("t.py", ""),
+            ],
         );
         let mut p = propose(&d);
         apply_wrapper(&mut p, "./dev");

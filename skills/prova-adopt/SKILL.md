@@ -64,3 +64,10 @@ project's test scripts, Makefile or CI config to adopt prova.
    belongs in version control; commit it when the user's workflow allows.
 
 Then use the `prova-test` skill for the fix loop.
+
+If the project's tests run through a wrapper (`./dev make test`,
+`docker compose run app pytest`), run it once with `prova run -- <wrapper
+command>` before `prova adopt`: the proposal keeps that wrapper in `run` and
+`select`. `prova adopt --verify` says first why a command could not run
+(exit 127, `No module named pytest`) and gives the filter syntax of the
+framework it found; a filter with spaces may be split by the wrapper.

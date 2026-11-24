@@ -130,10 +130,8 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
 pub fn container_client_runs(cmdline: &str) -> bool {
     let words: Vec<&str> = cmdline.split(' ').collect();
     words.iter().take(2).enumerate().any(|(i, w)| {
-        matches!(
-            w.rsplit('/').next(),
-            Some("docker" | "podman" | "nerdctl")
-        ) && words.get(i + 1) == Some(&"run")
+        matches!(w.rsplit('/').next(), Some("docker" | "podman" | "nerdctl"))
+            && words.get(i + 1) == Some(&"run")
     })
 }
 

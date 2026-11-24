@@ -53,7 +53,10 @@ fn a_verbose_failure_takes_its_message_from_the_short_summary() {
         "tests/test_x.py::test_a PASSED   [ 50%]\ntests/test_x.py::test_y FAILED   [100%]\n=========================== short test summary info ============================\nFAILED tests/test_x.py::test_y - AssertionError: 16 != 4\n========================= 1 failed, 1 passed in 0.03s ==========================\n",
     )
     .unwrap();
-    let o = prova(&d, &["run", "--json", "--", "sh", "-c", "cat out.txt; exit 1"]);
+    let o = prova(
+        &d,
+        &["run", "--json", "--", "sh", "-c", "cat out.txt; exit 1"],
+    );
     let v = json(&o);
     assert_eq!(
         v["failures"][0]["message"], "AssertionError: 16 != 4",

@@ -1429,20 +1429,29 @@ fn split_filter_fragment(filter: &str, lines: &[&String]) -> Option<String> {
 /// ran fine (exit 0), so the level is the issue.
 fn run_failure_cause(s: &Summary) -> Option<String> {
     match s.exit_code {
-        Some(126 | 127) => s.detail.clone().or_else(|| {
-            Some(format!(
-                "exit {}",
-                s.exit_code.unwrap_or_default()
-            ))
-        }),
+        Some(126 | 127) => s
+            .detail
+            .clone()
+            .or_else(|| Some(format!("exit {}", s.exit_code.unwrap_or_default()))),
         Some(code) if code != 0 => {
             let error = s.output_tail.iter().map(|l| l.trim()).find(|l| {
                 let l = l.to_lowercase();
-                ["error", "no module named", "not found", "no such file", "permission denied", "cannot"]
-                    .iter()
-                    .any(|w| l.contains(w))
+                [
+                    "error",
+                    "no module named",
+                    "not found",
+                    "no such file",
+                    "permission denied",
+                    "cannot",
+                ]
+                .iter()
+                .any(|w| l.contains(w))
             });
-            let last = s.output_tail.iter().map(|l| l.trim()).rfind(|l| !l.is_empty());
+            let last = s
+                .output_tail
+                .iter()
+                .map(|l| l.trim())
+                .rfind(|l| !l.is_empty());
             Some(match error.or(last) {
                 Some(line) => format!("exit {code}: {}", render::clean(line)),
                 None => format!("exit {code} with no output"),
@@ -1526,14 +1535,18 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 ),
             )
         } else if let (true, Some(cause)) = (
-            tests.is_empty() && (s.level == prova_core::model::Level::Opaque || matches!(s.exit_code, Some(126 | 127))),
+            tests.is_empty()
+                && (s.level == prova_core::model::Level::Opaque
+                    || matches!(s.exit_code, Some(126 | 127))),
             run_failure_cause(&s),
         ) {
             // The command itself did not work: say why before anything about
             // levels or templates (round 15: exit 127 was "level opaque").
             (
                 false,
-                format!("the command failed before any test ran: {cause}; fix it, then verify again"),
+                format!(
+                    "the command failed before any test ran: {cause}; fix it, then verify again"
+                ),
             )
         } else if s.level == prova_core::model::Level::Opaque {
             (false, "cannot verify: run is at level opaque (no per-test results); see the prova-<language> skill to raise the level".to_owned())

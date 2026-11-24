@@ -1789,7 +1789,11 @@ fn pytest_ran_nothing(line: &str) -> bool {
 /// The cause a failing test's kept output names: pytest's first `E` line,
 /// or the whole output when it is one line (a short summary's message).
 fn message_from_output(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if let Some(e) = lines.iter().find_map(|l| l.strip_prefix("E ")) {
         let e = e.trim();
         return (!e.is_empty()).then(|| e.to_owned());
@@ -2634,18 +2638,20 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // A failure reported before its message (pytest -v prints the line
     // first, the `-rfE` summary names the cause at the end): the message is
     // in the test's kept output (round 15).
-    let kept: BTreeMap<String, String> = if row.status.is_terminal()
-        && failing.iter().take(20).any(|f| f.2.is_none())
-    {
-        crate::output::test_outputs(store, run)?.into_iter().collect()
-    } else {
-        BTreeMap::new()
-    };
+    let kept: BTreeMap<String, String> =
+        if row.status.is_terminal() && failing.iter().take(20).any(|f| f.2.is_none()) {
+            crate::output::test_outputs(store, run)?
+                .into_iter()
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
     for (key, outcome, message, _, _) in failing.iter().take(20).copied() {
         let id = crate::store::test_id(&row.suite, key);
-        let message = message
-            .clone()
-            .or_else(|| kept.get(&key.display()).and_then(|t| message_from_output(t)));
+        let message = message.clone().or_else(|| {
+            kept.get(&key.display())
+                .and_then(|t| message_from_output(t))
+        });
         failures.push(Failure {
             test: key.display(),
             outcome: *outcome,

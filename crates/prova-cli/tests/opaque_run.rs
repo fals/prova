@@ -1184,7 +1184,15 @@ fn cancel_fake_docker(d: &Path, path: &str, args: &[&str]) -> serde_json::Value 
     assert!(prova(d, &["cancel", &id]).status.success());
     json(&prova(
         d,
-        &["wait", &id, "--until", "done", "--max-wait", "20s", "--json"],
+        &[
+            "wait",
+            &id,
+            "--until",
+            "done",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
     ))
 }
 

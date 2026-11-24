@@ -954,7 +954,14 @@ impl Recognizers {
     pub fn release_held_pass(&mut self) -> Vec<EventKind> {
         let mut out = Vec::new();
         if let Some((_, key)) = self.pytest_text_pass.take() {
-            self.finished(key, Outcome::Passed, None, None, Level::Recognized, &mut out);
+            self.finished(
+                key,
+                Outcome::Passed,
+                None,
+                None,
+                Level::Recognized,
+                &mut out,
+            );
         }
         out
     }
@@ -1892,9 +1899,11 @@ impl Recognizers {
 
     /// The failure block pytest printed for this test, kept as its output.
     fn claim_pytest_block(&mut self, key: &TestKey) {
-        let Some(at) = self.pytest_blocks.iter().position(|(h, _)| {
-            h == &key.name || h.ends_with(&format!(".{}", key.name))
-        }) else {
+        let Some(at) = self
+            .pytest_blocks
+            .iter()
+            .position(|(h, _)| h == &key.name || h.ends_with(&format!(".{}", key.name)))
+        else {
             return;
         };
         let (_, lines) = self.pytest_blocks.remove(at);
@@ -3900,7 +3909,10 @@ mod tests {
         // The pass waits one line for a teardown error.
         assert!(finished(&ev).is_empty());
         ev.extend(r.partial("tests/t.py::test_"));
-        assert!(ev.iter().all(|e| !matches!(e, EventKind::TestStarted { .. })));
+        assert!(
+            ev.iter()
+                .all(|e| !matches!(e, EventKind::TestStarted { .. }))
+        );
         ev.extend(r.partial("tests/t.py::test_hangs "));
         assert_eq!(
             finished(&ev),
@@ -3928,7 +3940,10 @@ mod tests {
             finished(&ev),
             vec![
                 ("tests.test_a::test_q".to_owned(), Outcome::Failed),
-                ("tests.test_a.TestC::test_ok[a b]".to_owned(), Outcome::Passed),
+                (
+                    "tests.test_a.TestC::test_ok[a b]".to_owned(),
+                    Outcome::Passed
+                ),
                 ("tests.test_a::test_s".to_owned(), Outcome::Skipped),
             ]
         );
