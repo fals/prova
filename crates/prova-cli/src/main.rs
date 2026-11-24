@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use prova_core::analysis;
 use prova_core::config::{self, CommandSpec, DEFAULT_KILL_AFTER, DEFAULT_STALL_AFTER, RunSpec};
 use prova_core::engine::{self, NewRunRequest, Summary, Until, WaitReason};
@@ -28,11 +29,26 @@ pub mod exit {
     pub const RUNNING: u8 = 5;
 }
 
+const ROOT_EXAMPLES: &str = "\
+Examples:
+  prova run -- make test                   any test command, no config
+  prova run unit --until first-failure     a suite from prova.toml; back at the first failure
+  prova output                             what the last run printed
+  prova history calc::divides              new failure, pre-existing, or flaky?
+  prova exp new speed --hypothesis \"...\" -- go test -bench .
+
+Shell completion (commands, options, suite names, run ids):
+  bash  echo 'source <(COMPLETE=bash prova)' >> ~/.bashrc
+  zsh   echo 'source <(COMPLETE=zsh prova)' >> ~/.zshrc
+  fish  echo 'COMPLETE=fish prova | source' >> ~/.config/fish/config.fish
+  (or `prova completions <shell>` prints the script)";
+
 #[derive(Parser)]
 #[command(
     name = "prova",
     version,
-    about = "prova: tests with memory, experiments with proof"
+    about = "prova: tests with memory, experiments with proof",
+    after_help = ROOT_EXAMPLES
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,11 +75,20 @@ impl From<UntilArg> for Until {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run a suite from prova.toml, or any command after `--`.
+    #[command(after_help = "\
+Examples:
+  prova run -- make test                     any command; history starts now
+  prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s)
+  prova run unit --until done                the result (waits up to 9m, then prints `next:`)
+  prova run unit --select calc::divides      rerun one test (the suite's `select` template)
+  prova run unit --repeat 10                 is it flaky? each test's pass/fail tally
+  prova run unit --detach                    start, print the run id, return; then `prova wait`")]
     Run {
-        /// Suite name from prova.toml.
+        /// Suite name from prova.toml (omit it and give a command after `--`).
+        #[arg(add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
         /// Run only tests matching this filter (uses the suite's `select`).
-        #[arg(long)]
+        #[arg(long, value_name = "TEST")]
         select: Option<String>,
         /// Return the run id immediately; follow with `prova wait`.
         #[arg(long, conflicts_with = "until")]
@@ -74,27 +99,28 @@ enum Cmd {
         until: Option<UntilArg>,
         /// With --until: wait at most this long (default 9m for `done`,
         /// 30s otherwise); then exit 5 with the command to continue.
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         max_wait: Option<String>,
         /// Run it N times in a row and report each test's tally (is it
         /// flaky?), within one --max-wait budget (default 9m).
-        #[arg(long, conflicts_with = "detach")]
+        #[arg(long, value_name = "N", conflicts_with = "detach")]
         repeat: Option<u32>,
         /// Report a stall after this long without activity (e.g. 30s).
         /// Default: the suite's `stall_after`, else by size (small 30s,
         /// medium 60s, large 5m), else 60s.
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         stall_after: Option<String>,
         /// Kill the run after this long in total (e.g. 30m).
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         kill_after: Option<String>,
         /// Opt-in environment injection recipe (repeatable), e.g. pytest-junit.
-        #[arg(long = "inject")]
+        #[arg(long = "inject", value_name = "RECIPE")]
         inject: Vec<String>,
         /// Keep the whole output (compressed), not only the excerpt: for
         /// debugging prova's recognizers.
         #[arg(long)]
         keep_output: bool,
+        /// One JSON object instead of text (same fields).
         #[arg(long)]
         json: bool,
         /// Command to run, after `--`.
@@ -102,43 +128,81 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Wait for the next significant event of a run, at most --max-wait.
+    #[command(after_help = "\
+Examples:
+  prova wait                         the latest run: first failure, slow test, stall or end
+  prova wait 3fa9 --until done       its result (up to 9m)
+  prova wait 3fa9 --after 14         only events after #14 (the `next:` line gives it)")]
     Wait {
-        /// Run id, unique prefix, or `last`.
+        /// Run id, a unique prefix of it, or `last`.
+        #[arg(default_value = "last", add = ArgValueCompleter::new(complete_runs))]
         run: String,
+        /// What to wait for.
         #[arg(long, value_enum, default_value = "first-failure")]
         until: UntilArg,
         /// Default: 9m for `--until done` (under the usual 10-minute limit of
         /// one tool call), 30s otherwise.
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         max_wait: Option<String>,
         /// Only consider events after this sequence number.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, value_name = "SEQ", default_value_t = 0)]
         after: u64,
+        /// One JSON object instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Cancel a run (process group: SIGTERM, grace, SIGKILL).
-    Cancel { run: String },
+    #[command(after_help = "\
+Examples:
+  prova cancel 3fa9c1d2
+  prova cancel last")]
+    Cancel {
+        /// Run id, a unique prefix of it, or `last`.
+        #[arg(add = ArgValueCompleter::new(complete_runs))]
+        run: String,
+    },
     /// Take a run out of every test's history (a run whose results were
     /// not real), with the reason; flaky labels it caused go away.
+    #[command(after_help = "\
+Example:
+  prova forget 3fa9 --reason \"ran against a stale build\"")]
     Forget {
+        /// Run id, a unique prefix of it, or `last`.
+        #[arg(add = ArgValueCompleter::new(complete_runs))]
         run: String,
+        /// Why its results were not real (kept with the run).
         #[arg(long)]
         reason: String,
     },
     /// Show one run, or recent runs.
+    #[command(after_help = "\
+Examples:
+  prova status              recent runs of this repository
+  prova status last         the latest run: result, warnings, failures
+  prova status --all        recent runs of every repository")]
     Status {
+        /// Run id, a unique prefix of it, or `last`; omit for recent runs.
+        #[arg(add = ArgValueCompleter::new(complete_runs))]
         run: Option<String>,
         /// Recent runs of every repository known to this prova home.
         #[arg(long, conflicts_with = "run")]
         all: bool,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Print a run's events as JSON Lines.
+    #[command(after_help = "\
+Examples:
+  prova events                    the latest run's events
+  prova events 3fa9 --follow      keep printing until the run ends
+  prova events 3fa9 --after 14    only events after #14")]
     Events {
+        /// Run id, a unique prefix of it, or `last`.
+        #[arg(default_value = "last", add = ArgValueCompleter::new(complete_runs))]
         run: String,
-        #[arg(long, default_value_t = 0)]
+        /// Only events after this sequence number.
+        #[arg(long, value_name = "SEQ", default_value_t = 0)]
         after: u64,
         /// Keep printing new events until the run ends.
         #[arg(long)]
@@ -146,76 +210,140 @@ enum Cmd {
     },
     /// Print a run's output: live while it runs; once it ended, the kept
     /// excerpt (head, error blocks, tail) and failing tests' own output.
+    #[command(after_help = "\
+Examples:
+  prova output                          the latest run's kept output
+  prova output 3fa9                     a run by id (or a unique prefix)
+  prova output last --tail 50           only its last 50 lines
+  prova output last --test divides      one failing test's own output
+  prova output 3fa9 --json              the same, as JSON")]
     Output {
+        /// Run id, a unique prefix of it, or `last`.
+        #[arg(default_value = "last", add = ArgValueCompleter::new(complete_runs))]
         run: String,
         /// Last lines only.
-        #[arg(long)]
+        #[arg(long, value_name = "N")]
         tail: Option<usize>,
         /// One failing test's own output (substring of its name).
-        #[arg(long)]
+        #[arg(long, value_name = "TEST")]
         test: Option<String>,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// History and flake statistics of tests matching a name.
+    #[command(after_help = "\
+Examples:
+  prova history calc::divides           one test: outcomes, code versions, size, flakiness
+  prova history divides --suite unit    only runs of one suite
+  prova history \"\"                      every test prova knows")]
     History {
         /// Substring of the test's full name.
         test: String,
-        #[arg(long)]
+        /// Only runs of this suite.
+        #[arg(long, add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        /// How many of the latest runs to look at.
+        #[arg(long, value_name = "RUNS", default_value_t = 50)]
         window: usize,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Tests with flaky evidence: passed on retry, or both passed and failed on the same code.
+    #[command(after_help = "\
+Examples:
+  prova flaky                  this repository
+  prova flaky --suite unit     one suite
+  prova flaky --all            every repository")]
     Flaky {
-        #[arg(long)]
+        /// Only runs of this suite.
+        #[arg(long, add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
         /// Across every repository known to this prova home.
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value_t = 100)]
+        /// How many of the latest runs to look at.
+        #[arg(long, value_name = "RUNS", default_value_t = 100)]
         window: usize,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Test sizes from what each test used (processes, network), with the reason (ADR 0025).
+    #[command(after_help = "\
+Examples:
+  prova sizes                  counts, and each medium or large test with what it used
+  prova sizes --suite unit     one suite")]
     Sizes {
-        #[arg(long)]
+        /// Only runs of this suite.
+        #[arg(long, add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
+        /// JSON instead of text (every test).
         #[arg(long)]
         json: bool,
     },
     /// Compare per-test results of two runs.
+    #[command(after_help = "\
+Example:
+  prova diff 3fa9 last         fixed, broken and new tests between two runs")]
     Diff {
+        /// The earlier run: id, unique prefix, or `last`.
+        #[arg(add = ArgValueCompleter::new(complete_runs))]
         base: String,
+        /// The later run: id, unique prefix, or `last`.
+        #[arg(add = ArgValueCompleter::new(complete_runs))]
         head: String,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Install prova skills for agents and add a short section to AGENTS.md.
+    #[command(after_help = "\
+Example:
+  prova init       in the repository root; safe to run again")]
     Init {
         /// Kept for compatibility: skills now always go to .claude/skills too.
         #[arg(long, hide = true)]
         claude: bool,
     },
     /// Detect the test setup and propose prova.toml; verify single-test selection.
+    #[command(after_help = "\
+Examples:
+  prova adopt                                    print the proposal
+  prova adopt --write                            write prova.toml (only if none exists)
+  prova adopt --verify unit --filter divides     check that `select` runs only that test")]
     Adopt {
         /// Write the proposal to prova.toml (only if none exists).
         #[arg(long)]
         write: bool,
         /// Verify the `select` template of this suite.
-        #[arg(long, requires = "filter")]
+        #[arg(long, value_name = "SUITE", requires = "filter", add = ArgValueCompleter::new(complete_suites))]
         verify: Option<String>,
         /// A real test name to select when verifying.
-        #[arg(long)]
+        #[arg(long, value_name = "TEST")]
         filter: Option<String>,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Serve the MCP facade on stdio (tools mirror the CLI).
+    #[command(after_help = "\
+Example:
+  claude mcp add prova -- prova mcp")]
     Mcp,
+    /// Print the shell completion script (commands, options, suite names,
+    /// run ids, experiments).
+    #[command(after_help = "\
+Examples:
+  echo 'source <(prova completions bash)' >> ~/.bashrc
+  echo 'source <(prova completions zsh)' >> ~/.zshrc
+  echo 'prova completions fish | source' >> ~/.config/fish/config.fish")]
+    Completions {
+        /// The shell.
+        #[arg(value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
+        shell: String,
+    },
     /// Experiments: frozen protocol, interleaved trials, statistical verdict.
     #[command(subcommand)]
     Exp(ExpCmd),
@@ -257,34 +385,46 @@ impl From<BetterArg> for experiment::Better {
 /// the oracle).
 #[derive(clap::Args)]
 struct ProtocolChange {
+    /// Primary metric (see `prova exp metrics`).
     #[arg(long)]
     metric: Option<String>,
+    /// Whether lower or higher is better.
     #[arg(long, value_enum)]
     better: Option<BetterArg>,
+    /// Unit of the metric, for reports.
     #[arg(long)]
     unit: Option<String>,
+    /// Smallest change that matters, e.g. 2% or 0.02.
     #[arg(long)]
     min_effect: Option<String>,
+    /// Significance level.
     #[arg(long)]
     alpha: Option<f64>,
+    /// Trials per arm before the first verdict.
     #[arg(long)]
     trials: Option<u32>,
+    /// Fewest trials per arm for any verdict.
     #[arg(long)]
     min_trials: Option<u32>,
+    /// Inconclusive results extend up to this many trials per arm.
     #[arg(long)]
     max_trials: Option<u32>,
+    /// Unmeasured runs per arm first.
     #[arg(long)]
     warmup: Option<u32>,
     /// Replaces the guardrails (NAME or NAME:higher), repeatable.
     #[arg(long = "guardrail")]
     guardrails: Vec<String>,
+    /// Kill a single trial after this long.
     #[arg(long)]
     kill_after: Option<String>,
+    /// Shell command run once in each variant's directory before trials.
     #[arg(long)]
     setup: Option<String>,
     /// Adds a specification file (repeatable).
     #[arg(long = "spec")]
     specs: Vec<PathBuf>,
+    /// Command that must succeed for a variant to satisfy the specification.
     #[arg(long)]
     oracle: Option<String>,
     /// Replaces the extra paths a candidate may change (glob, repeatable).
@@ -300,23 +440,28 @@ struct ProtocolArgs {
     /// lists them; `wall_ms` is always recorded.
     #[arg(long, default_value = "wall_ms")]
     metric: String,
+    /// Whether lower or higher is better.
     #[arg(long, value_enum, default_value = "lower")]
     better: BetterArg,
+    /// Unit of the metric, for reports.
     #[arg(long)]
     unit: Option<String>,
     /// Smallest change that matters, e.g. 2% or 0.02.
     #[arg(long, default_value = "2%")]
     min_effect: String,
+    /// Significance level.
     #[arg(long, default_value_t = 0.05)]
     alpha: f64,
     /// Trials per arm before the first verdict.
     #[arg(long, default_value_t = 10)]
     trials: u32,
+    /// Fewest trials per arm for any verdict.
     #[arg(long, default_value_t = 5)]
     min_trials: u32,
     /// Inconclusive results extend up to this many trials per arm.
     #[arg(long, default_value_t = 20)]
     max_trials: u32,
+    /// Unmeasured runs per arm first.
     #[arg(long, default_value_t = 1)]
     warmup: u32,
     /// Metric that must not get worse: NAME or NAME:higher (higher is better).
@@ -357,15 +502,29 @@ struct ProtocolArgs {
 enum ExpCmd {
     /// Set the best variant by hand, e.g. back to `baseline` after an
     /// ACCEPT that turned out wrong; recorded in the decision log.
+    #[command(after_help = "\
+Example:
+  prova exp best speed baseline --reason \"c2's win did not replicate\"")]
     Best {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
+        /// Variant to make the best: `baseline` or a candidate (c1, ...).
         variant: String,
+        /// Why (kept in the decision log).
         #[arg(long)]
         reason: String,
     },
     /// Create an experiment; the baseline is a git ref (default HEAD).
+    #[command(after_help = "\
+Examples:
+  prova exp new speed --hypothesis \"sieve beats trial division\" \\
+    --metric BenchmarkPrimes.ns_per_op --min-effect 5% -- go test -run '^$' -bench . -count 3
+  prova exp new p95 --hypothesis \"...\" --metric latency_ms --guardrail rss_mb -- ./bench.sh")]
     New {
+        /// A short name for the experiment, e.g. `speed`.
         name: String,
+        /// What you expect and why, fixed before any trial.
         #[arg(long)]
         hypothesis: String,
         /// Baseline git ref; `.` means the working tree as it is now.
@@ -379,25 +538,44 @@ enum ExpCmd {
     },
     /// Change the protocol (refused after the first trial). Only the options
     /// given change; `--spec` adds files; the result is printed.
+    #[command(after_help = "\
+Example:
+  prova exp protocol speed --trials 20 --min-effect 3%")]
     Protocol {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
         #[command(flatten)]
         change: ProtocolChange,
     },
     /// Record a candidate: the working tree now (default) or a git ref.
+    #[command(after_help = "\
+Examples:
+  prova exp candidate speed                      the working tree as it is now
+  prova exp candidate speed --ref feature/sieve
+  prova exp candidate speed --param THREADS=8")]
     Candidate {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
         /// Candidate name (default c1, c2, ...).
         #[arg(long)]
         label: Option<String>,
+        /// Record this git ref instead of the working tree.
         #[arg(long = "ref")]
         git_ref: Option<String>,
-        /// Parameter passed to the workload as PROVA_PARAM_<KEY>.
-        #[arg(long = "param")]
+        /// Parameter passed to the workload as PROVA_PARAM_<KEY> (KEY=VALUE).
+        #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
     /// Run trials of a candidate against the current best and decide.
+    #[command(after_help = "\
+Examples:
+  prova exp run speed                        the latest candidate against the best
+  prova exp run speed --candidate c2 --detach")]
     Run {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
         /// Candidate (default: the latest recorded).
         #[arg(long)]
@@ -405,46 +583,85 @@ enum ExpCmd {
         /// Compare against this variant instead of the current best.
         #[arg(long)]
         against: Option<String>,
+        /// Start the trials, print and return; then `prova exp wait`.
         #[arg(long)]
         detach: bool,
         /// Longest foreground wait (default 9m), then `exp wait` continues.
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         max_wait: Option<String>,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Re-measure the current best against the original baseline.
+    #[command(after_help = "\
+Example:
+  prova exp revalidate speed")]
     Revalidate {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
+        /// Start the trials, print and return; then `prova exp wait`.
         #[arg(long)]
         detach: bool,
         /// Longest foreground wait (default 9m), then `exp wait` continues.
-        #[arg(long)]
+        #[arg(long, value_name = "DURATION")]
         max_wait: Option<String>,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Wait for the running comparison, at most --max-wait.
+    #[command(after_help = "\
+Example:
+  prova exp wait speed --max-wait 5m")]
     Wait {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
-        #[arg(long, default_value = "30s")]
+        /// Wait at most this long.
+        #[arg(long, value_name = "DURATION", default_value = "30s")]
         max_wait: String,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Show the experiment, latest comparison and decision log.
+    #[command(after_help = "\
+Example:
+  prova exp status speed")]
     Status {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// Cancel the running comparison.
-    Cancel { name: String },
+    #[command(after_help = "\
+Example:
+  prova exp cancel speed")]
+    Cancel {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
+        name: String,
+    },
     /// List experiments.
+    #[command(after_help = "\
+Example:
+  prova exp list        name, best variant, protocol hash, hypothesis")]
     List,
     /// Kept logs of what failed in the latest comparison (a trial, the
     /// setup, the oracle).
+    #[command(after_help = "\
+Examples:
+  prova exp log speed                    every kept log
+  prova exp log speed oracle-candidate   one of them
+  prova exp log speed 3 --tail 20        trial 3, last 20 lines")]
     Log {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
         /// One log: a trial number, setup-baseline, oracle-candidate, ...
         entry: Option<String>,
@@ -454,12 +671,79 @@ enum ExpCmd {
     },
     /// Run a workload once and show the metrics prova reads from it
     /// (benchmark tools and JSON metric lines), to choose --metric.
+    #[command(after_help = "\
+Example:
+  prova exp metrics -- go test -run '^$' -bench . -count 1")]
     Metrics {
+        /// JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Workload command, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+}
+
+// ---------------------------------------------------------------- completion
+//
+// `COMPLETE=<shell> prova` prints the shell's completion script; the shell
+// then calls prova back for candidates. Completers only read: a TAB press
+// never creates a store.
+
+fn complete_suites(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(cfg) = config::load(&config::find_root(&cwd)) else {
+        return Vec::new();
+    };
+    let prefix = current.to_string_lossy();
+    cfg.suite
+        .iter()
+        .filter(|(n, _)| n.starts_with(prefix.as_ref()))
+        .map(|(n, s)| CompletionCandidate::new(n).help(Some(s.run.clone().into())))
+        .collect()
+}
+
+/// The store of this repository, if one exists (opened read-mostly: no
+/// store is created for a completion).
+fn existing_store() -> Option<Store> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = config::find_root(&cwd);
+    let dir = prova_core::home::existing(&root)?;
+    Store::open_dir(&root, &dir).ok()
+}
+
+fn complete_runs(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let mut out = vec![CompletionCandidate::new("last").help(Some("the latest run".into()))];
+    if let Some(store) = existing_store()
+        && let Ok(runs) = store.recent_runs(20)
+    {
+        out.extend(runs.into_iter().map(|r| {
+            let outcome = r
+                .outcome
+                .map_or_else(|| format!("{:?}", r.status), |o| format!("{o:?}"));
+            CompletionCandidate::new(r.id).help(Some(
+                format!("{} {}", r.suite, outcome.to_lowercase()).into(),
+            ))
+        }));
+    }
+    out.retain(|c| c.get_value().to_string_lossy().starts_with(prefix.as_ref()));
+    out
+}
+
+fn complete_experiments(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let Some(store) = existing_store() else {
+        return Vec::new();
+    };
+    experiment::list(&store)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.name.starts_with(prefix.as_ref()))
+        .map(|e| CompletionCandidate::new(e.name).help(Some(e.hypothesis.into())))
+        .collect()
 }
 
 fn parse_effect(s: &str) -> Result<f64> {
@@ -1387,6 +1671,8 @@ fn main() -> ExitCode {
         }
         default_hook(info);
     }));
+    // `COMPLETE=<shell> prova ...`: the shell asking for completions.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     match dispatch(cli.cmd) {
         Ok(code) => ExitCode::from(code),
@@ -1551,6 +1837,17 @@ fn duration_arg(v: &Option<String>, name: &str) -> Result<Option<u64>> {
 
 fn dispatch(cmd: Cmd) -> Result<u8> {
     match cmd {
+        Cmd::Completions { shell } => {
+            // The script is what `COMPLETE=<shell> prova` prints.
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .env("COMPLETE", &shell)
+                .status()?;
+            Ok(if status.success() {
+                exit::PASSED
+            } else {
+                exit::INFRA
+            })
+        }
         Cmd::Run {
             suite,
             select,
@@ -2388,5 +2685,41 @@ mod tests {
     #[test]
     fn usage_exit_code_matches_clap() {
         assert_eq!(super::exit::USAGE, 2);
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// Every visible option and argument says what it is, and every
+    /// visible command shows examples (owner: "`prova output` is super
+    /// hard, idk what are the options").
+    #[test]
+    fn every_option_is_described_and_every_command_has_examples() {
+        fn walk(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for a in cmd.get_arguments() {
+                let id = a.get_id().as_str();
+                if a.is_hide_set() || id == "help" || id == "version" {
+                    continue;
+                }
+                if a.get_help().is_none() {
+                    missing.push(format!("{path} {id}: no description"));
+                }
+            }
+            if cmd.get_after_help().is_none() && cmd.get_subcommands().next().is_none() {
+                missing.push(format!("{path}: no examples"));
+            }
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() || sub.get_name() == "help" {
+                    continue;
+                }
+                walk(sub, &format!("{path} {}", sub.get_name()), missing);
+            }
+        }
+        let mut missing = Vec::new();
+        walk(&Cli::command(), "prova", &mut missing);
+        assert!(missing.is_empty(), "{missing:#?}");
     }
 }

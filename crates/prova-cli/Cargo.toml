@@ -16,6 +16,7 @@ ctrlc = "3.5.3"
 serde_json = "1.0.154"
 prova-adapters = { version = "0.1.0", path = "../prova-adapters" }
 prova-core = { version = "0.1.0", path = "../prova-core" }
+clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 
 [lints]
 workspace = true
