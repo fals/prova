@@ -679,9 +679,13 @@ fn init() -> Result<u8> {
             dirs.push(skills);
         }
     }
+    let mut failures: Vec<String> = Vec::new();
     let mut files = 0;
     for dir in &dirs {
-        files = write_skills(&root.join(dir), &names)?;
+        match write_skills(&root.join(dir), &names) {
+            Ok(n) => files = n,
+            Err(e) => failures.push(format!("{dir}: {e}")),
+        }
     }
     println!(
         "installed {} skills ({files} files) into {}: {}",
@@ -694,10 +698,9 @@ fn init() -> Result<u8> {
     // harness from reading it: CLAUDE.md (Claude Code then ignores
     // AGENTS.md), GEMINI.md (Gemini CLI's default), and the files Zed reads
     // first. None of those is created: a new one would hide AGENTS.md.
+    // Every target is processed; failures are reported with their path.
     let mut updated = Vec::new();
-    if upsert_section(&root.join("AGENTS.md"), true)? {
-        updated.push("AGENTS.md");
-    }
+    let mut targets: Vec<(&str, bool)> = vec![("AGENTS.md", true)];
     for f in [
         "CLAUDE.md",
         ".claude/CLAUDE.md",
@@ -709,8 +712,16 @@ fn init() -> Result<u8> {
         ".github/copilot-instructions.md",
     ] {
         let path = root.join(f);
-        if path.is_file() && upsert_section(&path, false)? {
-            updated.push(f);
+        if path.is_file() || path.is_symlink() {
+            targets.push((f, false));
+        }
+    }
+    for (f, create) in targets {
+        match upsert_section(&root, &root.join(f), create) {
+            Ok(Section::Changed) => updated.push(f),
+            Ok(Section::Unchanged) => {}
+            Ok(Section::Skipped(why)) => eprintln!("skipped {f}: {why}"),
+            Err(e) => failures.push(format!("{f}: {e}")),
         }
     }
     if !updated.is_empty() {
@@ -727,43 +738,116 @@ fn init() -> Result<u8> {
         } else {
             "\n"
         };
-        std::fs::write(&gi, format!("{ignore}{sep}.prova/\n"))?;
-        println!("added .prova/ to .gitignore");
+        match std::fs::write(&gi, format!("{ignore}{sep}.prova/\n")) {
+            Ok(()) => println!("added .prova/ to .gitignore"),
+            Err(e) => failures.push(format!(".gitignore: {e}")),
+        }
     }
     if !root.join("prova.toml").exists() {
         println!("next: prova adopt   (proposes prova.toml for this project)");
     }
-    Ok(exit::PASSED)
+    if failures.is_empty() {
+        return Ok(exit::PASSED);
+    }
+    for f in &failures {
+        eprintln!("error: {f}");
+    }
+    eprintln!(
+        "init finished with {} failure(s); every other file was done",
+        failures.len()
+    );
+    Ok(exit::INFRA)
+}
+
+/// What `upsert_section` did to one instruction file.
+enum Section {
+    Changed,
+    Unchanged,
+    /// Left alone on purpose, with the reason.
+    Skipped(String),
 }
 
 /// Puts the prova section into an instruction file: replaces it between
 /// its markers, or appends it. A file that imports AGENTS.md (`@AGENTS.md`)
 /// already has it. Returns whether the file changed.
-fn upsert_section(path: &Path, create: bool) -> Result<bool> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+///
+/// Only a well-formed file (one begin, one end, begin first) is updated in
+/// place; any other marker state is an error and the file stays untouched.
+/// A symlink resolving outside `root` is never written through. The file's
+/// line ending (LF or CRLF) is kept.
+fn upsert_section(root: &Path, path: &Path, create: bool) -> Result<Section> {
+    const BEGIN: &str = "<!-- prova:begin -->";
+    const END: &str = "<!-- prova:end -->";
+    let name = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if path.is_symlink() {
+        let root_real = root.canonicalize()?;
+        match path.canonicalize() {
+            Ok(real) if real.starts_with(&root_real) => {}
+            Ok(real) => {
+                return Ok(Section::Skipped(format!(
+                    "symlink points outside the repository ({})",
+                    real.display()
+                )));
+            }
+            Err(_) => return Ok(Section::Skipped("dangling symlink".to_owned())),
+        }
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
     if text.is_empty() && !create {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
     if text.lines().any(|l| l.trim() == "@AGENTS.md") {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
-    let section = skills::AGENTS_SECTION;
-    let new = match (
-        text.find("<!-- prova:begin -->"),
-        text.find("<!-- prova:end -->"),
-    ) {
-        (Some(a), Some(b)) if b > a => {
-            let end = b + "<!-- prova:end -->".len();
-            format!("{}{}{}", &text[..a], section.trim_end(), &text[end..])
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let section = if crlf {
+        skills::AGENTS_SECTION.replace('\n', "\r\n")
+    } else {
+        skills::AGENTS_SECTION.to_owned()
+    };
+    let broken = |what: &str| {
+        anyhow::anyhow!("{name}: prova section markers are broken ({what}); fix them by hand")
+    };
+    let new = match (text.matches(BEGIN).count(), text.matches(END).count()) {
+        (0, 0) if text.is_empty() => section,
+        (0, 0) => {
+            let mut t = text.clone();
+            if !t.ends_with('\n') {
+                t.push_str(eol);
+            }
+            t.push_str(eol);
+            t.push_str(&section);
+            t
         }
-        _ if text.is_empty() => section.to_owned(),
-        _ => format!("{}\n\n{}", text.trim_end(), section),
+        (1, 1) => match (text.find(BEGIN), text.find(END)) {
+            (Some(a), Some(b)) if a < b => {
+                format!(
+                    "{}{}{}",
+                    &text[..a],
+                    section.trim_end(),
+                    &text[b + END.len()..]
+                )
+            }
+            _ => return Err(broken("end before begin")),
+        },
+        (_, 0) => return Err(broken("begin without end")),
+        (0, _) => return Err(broken("end without begin")),
+        _ => return Err(broken("duplicate markers")),
     };
     if new == text {
-        return Ok(false);
+        return Ok(Section::Unchanged);
     }
     std::fs::write(path, new)?;
-    Ok(true)
+    Ok(Section::Changed)
 }
 
 /// Whether a test prova names `calc.CalcTest::divides` is one a framework
