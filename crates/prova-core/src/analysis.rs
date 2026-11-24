@@ -116,7 +116,8 @@ pub fn test_runs_with(
                    -- rewrite them (round 13: 'failed 8x before' on a run
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
-         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env
+         SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
+                json_extract(r.spec, '$.selection')
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -135,11 +136,30 @@ pub fn test_runs_with(
             r.get::<_, Option<String>>(6)?,
             r.get::<_, Option<String>>(7)?,
             r.get::<_, String>(8)?,
+            r.get::<_, Option<String>>(9)?,
         ))
     })?;
+    // A parent run only because its subtest was selected (Go runs the
+    // parent of `-run TestX/case`) says nothing about the parent: its pass
+    // there made a parent that fails in full runs FLAKY (round 13, Go).
+    let leaf = |n: &str| n.rsplit("::").next().unwrap_or(n).to_owned();
+    let this: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT display FROM tests WHERE id = ?1",
+            params![test_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .map(|d| leaf(&d));
     let mut out: Vec<TestRun> = Vec::new();
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env) = row?;
+        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection) = row?;
+        if let (Some(sel), Some(this)) = (&selection, &this)
+            && leaf(sel).starts_with(&format!("{this}/"))
+        {
+            continue;
+        }
         let env: BTreeMap<String, String> = serde_json::from_str::<serde_json::Value>(&env)
             .ok()
             .and_then(|v| {

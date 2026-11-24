@@ -707,3 +707,24 @@ fn bare_console_names_take_the_result_files_identity() {
     let h = text(&prova(&d, &["history", "P.CalcTests.Divide"]));
     assert!(h.contains("3 runs with a result, 3 failed"), "{h}");
 }
+
+/// Round 13 (Go): selecting a subtest ran its parent, which passed there;
+/// with the full runs' failures on the same code the parent became FLAKY
+/// and every later green run "proved little".
+#[test]
+fn a_parent_run_for_its_selected_subtest_is_not_evidence() {
+    let d = workspace("subtest-parent");
+    let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.t]\nrun = \"{busy}; printf '=== RUN   TestX\\\\n=== RUN   TestX/bad\\\\n    --- FAIL: TestX/bad (0.00s)\\\\n=== RUN   TestX/ok\\\\n    --- PASS: TestX/ok (0.00s)\\\\n--- FAIL: TestX (0.00s)\\\\n'; exit 1\"\nselect = \"{busy}; printf '=== RUN   TestX\\\\n=== RUN   TestX/ok\\\\n    --- PASS: TestX/ok (0.00s)\\\\n--- PASS: TestX (0.00s)\\\\n'\"\n"
+        ),
+    )
+    .unwrap();
+    text(&prova(&d, &["run", "t"]));
+    text(&prova(&d, &["run", "t", "--select", "TestX/ok"]));
+    let out = text(&prova(&d, &["run", "t"]));
+    assert!(!out.contains("FLAKY"), "{out}");
+    assert!(out.contains("FAIL TestX [failed 1x before]"), "{out}");
+}

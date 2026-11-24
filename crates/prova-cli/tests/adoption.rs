@@ -358,3 +358,18 @@ fn init_section_names_the_prova_home() {
     let agents = std::fs::read_to_string(d.join("AGENTS.md")).unwrap();
     assert!(agents.contains("`PROVA_HOME`"), "{agents}");
 }
+
+/// Round 13 (Go): `go test -run TestX/case` runs the parent `TestX` too;
+/// verify called a correct subtest template "not selective".
+#[test]
+fn verify_accepts_the_parent_of_a_selected_subtest() {
+    let d = workspace("verify-subtest");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.t]\nrun = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '=== RUN   TestB\\\\n--- PASS: TestB (0.00s)\\\\n=== RUN   TestX\\\\n=== RUN   TestX/case\\\\n    --- PASS: TestX/case (0.00s)\\\\n--- PASS: TestX (0.00s)\\\\n'\"\nselect = \"i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; printf '=== RUN   TestX\\\\n=== RUN   TestX/case\\\\n    --- PASS: TestX/case (0.00s)\\\\n--- PASS: TestX (0.00s)\\\\n'\"\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["adopt", "--verify", "t", "--filter", "TestX/case"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.starts_with("VERIFIED"), "{out}");
+}

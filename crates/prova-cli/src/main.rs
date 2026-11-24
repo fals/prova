@@ -1289,7 +1289,14 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         // The filter is the framework's own syntax: a Go regex (`^TestAdd$`)
         // is anchored to the test name, not to prova's full name (round 6).
         let matches = |t: &str| filter_matches(&filter, t);
-        let unrelated: Vec<&String> = tests.iter().filter(|t| !matches(t)).collect();
+        // The parent of a selected subtest runs too (Go runs `TestX` for
+        // `-run TestX/case`): it is not unrelated (round 13, Go).
+        let leaf = |n: &str| n.rsplit("::").next().unwrap_or(n).to_owned();
+        let parent_of_selected = |t: &str| leaf(&filter).starts_with(&format!("{}/", leaf(t)));
+        let unrelated: Vec<&String> = tests
+            .iter()
+            .filter(|t| !matches(t) && !parent_of_selected(t))
+            .collect();
         // The framework's own "nothing matched" beats a level diagnosis: an
         // opaque run with that message means the filter's syntax is wrong
         // for the framework, not the level (round 8: surefire with -q).
