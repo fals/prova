@@ -1408,15 +1408,32 @@ fn observe_child(
         if let Some((prev, missing, _)) = missing_since_last_run(store, run, &sup.suite, &current)?
             && !missing.is_empty()
         {
-            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
-            sup.emit(EventKind::RunNote {
-                message: format!(
+            let lines: Vec<String> = sup.tail.iter().cloned().collect();
+            let (suspects, class) = narrow_by_running(&missing, &lines);
+            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            let message = match class {
+                Some(c) => format!(
+                    "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {}{}",
+                    suspects.len(),
+                    names.join(", "),
+                    if suspects.len() > names.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                ),
+                None => format!(
                     "{} test(s) of the last finished run {prev} never reported before the run was cut short (a hung test is among them): {}{}",
                     missing.len(),
                     names.join(", "),
-                    if missing.len() > names.len() { ", ..." } else { "" }
+                    if missing.len() > names.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
                 ),
-            });
+            };
+            sup.emit(EventKind::RunNote { message });
         }
     }
     if let Some(code @ (126 | 127)) = exit_code {
@@ -2018,6 +2035,31 @@ pub fn wait(
 
 /// Last `n` lines of a run's output: from the live spool, or from the
 /// excerpt kept once the run ended.
+/// The suspects of a hang narrowed by the framework's own last `Running
+/// <class>` line (Maven Surefire, `[INFO] Running calc.CalcTest`): the
+/// hung test is in the class it was running, not anywhere in the last run
+/// (round 13: the note listed tests that had not even started).
+fn narrow_by_running<'a>(
+    missing: &'a [String],
+    lines: &[String],
+) -> (Vec<&'a String>, Option<String>) {
+    let running = lines.iter().rev().find_map(|l| {
+        let t = l.trim().trim_start_matches("[INFO]").trim();
+        let name = t.strip_prefix("Running ")?.split_whitespace().next()?;
+        (name.contains('.') && !name.contains('/')).then(|| name.to_owned())
+    });
+    if let Some(class) = &running {
+        let narrowed: Vec<&String> = missing
+            .iter()
+            .filter(|m| m.starts_with(&format!("{class}::")) || m.starts_with(&format!("{class}.")))
+            .collect();
+        if !narrowed.is_empty() {
+            return (narrowed, running);
+        }
+    }
+    (missing.iter().collect(), None)
+}
+
 pub fn output_tail(store: &Store, run: &str, n: usize) -> Vec<String> {
     if let Ok(crate::output::Kept::Excerpt(e)) = crate::output::run_excerpt(store, run) {
         return e.tail(n);
@@ -2321,13 +2363,23 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         if let Some((prev, missing, _)) = missing_since_last_run(store, run, &row.suite, &current)?
             && !missing.is_empty()
         {
-            let names: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
-            notes.push(format!(
-                "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
-                missing.len(),
-                names.join(", "),
-                if missing.len() > names.len() { ", ..." } else { "" }
-            ));
+            let lines = output_tail(store, run, 30);
+            let (suspects, class) = narrow_by_running(&missing, &lines);
+            let names: Vec<&str> = suspects.iter().take(5).map(|s| s.as_str()).collect();
+            notes.push(match class {
+                Some(c) => format!(
+                    "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {}{}",
+                    suspects.len(),
+                    names.join(", "),
+                    if suspects.len() > names.len() { ", ..." } else { "" }
+                ),
+                None => format!(
+                    "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {}{}",
+                    missing.len(),
+                    names.join(", "),
+                    if missing.len() > names.len() { ", ..." } else { "" }
+                ),
+            });
         }
     }
     // A selection that ran nothing must not look like a pass.
@@ -2551,5 +2603,31 @@ mod quarantine_tests {
         // A command that could not start, or was killed, is no test failure.
         assert_eq!(quarantined_only_failures(&o, &q(&["a"]), Some(127)), None);
         assert_eq!(quarantined_only_failures(&o, &q(&["a"]), None), None);
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    /// Round 13 (Java): the hang note listed the last run's tests in
+    /// alphabetical order, none of them in the class Surefire was running.
+    #[test]
+    fn a_running_class_narrows_the_suspects() {
+        let missing: Vec<String> = [
+            "calc.CalcParamTest::divides",
+            "calc.CalcTest::hangs",
+            "calc.CalcTest::adds",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let lines = vec![
+            "[INFO] Running calc.CalcParamTest".to_owned(),
+            "[INFO] Running calc.CalcTest".to_owned(),
+        ];
+        let (s, c) = super::narrow_by_running(&missing, &lines);
+        assert_eq!(c.as_deref(), Some("calc.CalcTest"));
+        assert_eq!(s, vec!["calc.CalcTest::hangs", "calc.CalcTest::adds"]);
+        let (s, c) = super::narrow_by_running(&missing, &["building".to_owned()]);
+        assert_eq!((s.len(), c), (3, None));
     }
 }
