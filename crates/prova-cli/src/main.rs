@@ -2752,9 +2752,17 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else if list.is_empty() {
                 println!("no flaky tests in recorded history");
             } else {
+                // Columns named, and a quarantine shown (round 16).
+                let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
+                println!("fail%   retry-passes  same-code flips  test");
                 for s in &list {
+                    let q = if prova_core::quarantine::covers(&quarantined, &s.display).is_some() {
+                        "  (quarantined)"
+                    } else {
+                        ""
+                    };
                     println!(
-                        "{:5.1}% fail  {:2} retry-passes  flipped on {:2} code version(s)  {}",
+                        "{:5.1}%  {:12}  {:15}  {}{q}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,

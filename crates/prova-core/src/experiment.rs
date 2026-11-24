@@ -472,7 +472,9 @@ pub fn judge(
         (
             Verdict::Reject,
             format!(
-                "no practical effect, neither better nor worse beyond ±{0}: CI {ci} inside ±{0}",
+                // (round 16: "CI [...], positive = better inside ±5%" read
+                // as one garbled phrase)
+                "no practical effect, neither better nor worse beyond ±{0}: the CI lies inside ±{0} (CI {ci})",
                 pct(min_effect).trim_start_matches('+')
             ),
         )

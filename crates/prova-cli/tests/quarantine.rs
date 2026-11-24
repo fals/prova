@@ -774,3 +774,17 @@ fn a_file_level_entry_cannot_be_quarantined() {
     assert_eq!(o.status.code(), Some(2), "{t}");
     assert!(t.contains("is not a test but a file"), "{t}");
 }
+
+/// Round 16: `prova flaky` had no column names and did not show a
+/// quarantine.
+#[test]
+fn flaky_names_its_columns_and_quarantines() {
+    let d = workspace("flakycols");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&prova(&d, &["flaky"]));
+    assert!(
+        out.contains("same-code flips") && out.contains("calc::x  (quarantined)"),
+        "{out}"
+    );
+}
