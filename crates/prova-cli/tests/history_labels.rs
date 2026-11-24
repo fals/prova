@@ -919,3 +919,26 @@ fn a_selection_says_skipped_tests_may_be_unselected() {
     let out = text(&prova(&d, &["run", "make", "--select", "calc::a"]));
     assert!(out.contains("1 skipped (or not selected)"), "{out}");
 }
+
+/// Round 16: a failing run in which a panic kept two tests from running
+/// did not say they were missing.
+#[test]
+fn a_failed_run_names_tests_that_did_not_run() {
+    let d = workspace("failmissing");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = {:?}\n",
+            format!(
+                "{WORK_SH}if [ \"$(cat state)\" = pass ]; then echo 'test calc::a ... ok'; echo 'test calc::b ... ok'; echo 'test calc::c ... ok'; else echo 'test calc::a ... FAILED'; exit 101; fi"
+            )
+        ),
+    )
+    .unwrap();
+    run(&d, "make", "pass");
+    let out = run(&d, "make", "fail");
+    assert!(
+        out.contains("2 test(s) from the last passing run") && out.contains("calc::b"),
+        "{out}"
+    );
+}

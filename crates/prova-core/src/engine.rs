@@ -1788,6 +1788,17 @@ fn observe_child(
             )
         });
     }
+    // A failed run's missing tests are news too: a panic or a crash that
+    // stopped the rest is visible only this way (round 16: two tests a
+    // panic kept from running vanished without a word).
+    if outcome != Outcome::Passed {
+        for w in warnings
+            .iter()
+            .filter(|w| w.contains("from the last passing run") && w.contains("did not run"))
+        {
+            sup.emit(EventKind::RunNote { message: w.clone() });
+        }
+    }
     let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
         // A failure no test explains: say so, and show the first error.
