@@ -31,8 +31,10 @@ needs attention.
    the command to continue goes unseen. Need one thing? Ask prova for it:
    `prova status <run>`, `prova output <run> --tail N`,
    `prova history <test>`. If your tool calls are shorter than 9 minutes, pass
-   `--max-wait`. While it waits, prova prints each new failure and a line
-   every 30 s on stderr, for the person watching; the result is on stdout.
+   `--max-wait`. While it waits, prova prints each new failure as it happens on stderr; a
+   person at a terminal also sees a live line (elapsed time, counts, the
+   running test or the command's last output), and a log gets one line
+   every 30 s instead. The result is on stdout.
    Use `--detach` only to do other work meanwhile; then
    `prova wait <run>` (or `--until done`).
 

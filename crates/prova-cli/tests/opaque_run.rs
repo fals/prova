@@ -189,6 +189,35 @@ fn a_busy_child_in_its_own_group_is_not_a_stall() {
     assert_eq!(w.status.code(), Some(5), "never stalled: {}", stdout(&w));
 }
 
+/// A person watching a plain `prova run -- cmd` saw nothing for 50 s: on a
+/// terminal a live line now shows the run moving. In a log (agents, CI) it
+/// never appears.
+#[test]
+fn a_live_line_on_a_terminal_and_never_in_a_log() {
+    let d = workspace("live");
+    let script = "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; echo compiling; i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done";
+    let o = prova(&d, &["run", "--", "sh", "-c", script]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("\x1b[2K"), "live line in a log: {err:?}");
+    // Under a pseudo-terminal (util-linux `script`), the line is drawn.
+    if cfg!(target_os = "linux") && Command::new("script").arg("--version").output().is_ok() {
+        let log = d.join("tty.log");
+        let cmd = format!("{PROVA} run -- sh -c '{script}'");
+        Command::new("script")
+            .args(["-q", "-e", "-c", &cmd])
+            .arg(&log)
+            .current_dir(&d)
+            .env("PROVA_HOME", home_of(&d))
+            .output()
+            .unwrap();
+        let tty = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            tty.contains("\r\x1b[2K"),
+            "no live line on a terminal: {tty:?}"
+        );
+    }
+}
+
 #[test]
 fn kill_after_bounds_the_run() {
     let d = workspace("ceiling");
