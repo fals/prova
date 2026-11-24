@@ -573,3 +573,25 @@ fn surefire_console_failures_take_the_reports_name() {
     assert_eq!(s["counts"]["failed"], 2, "{s}");
     assert_eq!(s["counts"]["passed"], 1, "{s}");
 }
+
+/// Round 16: every Vitest unhandled error was `vitest::(unhandled errors)`,
+/// so a new leaked rejection was "[failed 1x before]" for an unrelated
+/// earlier error, with no error text.
+#[test]
+fn a_vitest_unhandled_error_is_named_by_its_origin_and_error() {
+    let d = workspace("vitest_unhandled_origin");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' ' \u{2713} src/extra.test.ts (1 test) 2ms' '' '\u{23af}\u{23af}\u{23af}\u{23af} Unhandled Errors \u{23af}\u{23af}\u{23af}\u{23af}' '' 'Vitest caught 1 unhandled error during the test run.' 'This might cause false positive tests. Resolve unhandled errors to make sure your tests are not affected.' '' '\u{23af}\u{23af} Unhandled Rejection \u{23af}\u{23af}' 'Error: boom from a leaked promise' ' \u{276f} src/extra.test.ts:3:18' 'This error originated in \"src/extra.test.ts\" test file. It doesn'\"'\"'t mean the error was thrown inside the file itself, but while it was running.' '\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}' '' ' Test Files  1 passed (1)' '      Tests  1 passed (1)' '     Errors  1 error'; exit 1",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    assert_eq!(
+        failure_names(&s),
+        vec!["src/extra.test.ts::(unhandled error)"],
+        "{s}"
+    );
+    assert_eq!(
+        s["failures"][0]["message"], "Error: boom from a leaked promise",
+        "{s}"
+    );
+}

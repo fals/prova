@@ -151,6 +151,10 @@ pub struct Recognizers {
     pub unhandled_errors: u64,
     /// The `Unhandled Errors` block was seen (and recorded as an entry).
     pub unhandled_block: bool,
+    /// Lines of a Vitest unhandled-errors block being read: its error and
+    /// where it originated name the entry (round 16: one fixed name for
+    /// every unhandled error gave a new one an unrelated history).
+    unhandled_lines: Option<Vec<String>>,
     /// Jest files read: its totals are believed against what was recognized.
     pub jest_files: u64,
     jest: JestState,
@@ -927,16 +931,23 @@ impl Recognizers {
             return out;
         }
         self.totals(line);
+        if let Some(lines) = self.unhandled_lines.as_mut() {
+            let t = line.trim();
+            let ends = (t.contains('\u{23af}') && !t.contains("Unhandled"))
+                || t.starts_with("Test Files")
+                || t.starts_with("Tests ")
+                || lines.len() >= 60;
+            if ends {
+                self.flush_unhandled(&mut out);
+            } else {
+                lines.push(t.to_owned());
+                return out;
+            }
+        }
         if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
             self.unhandled_block = true;
-            self.finished(
-                TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
-                Outcome::Errored,
-                None,
-                Some("Vitest caught unhandled errors during the run (see its output)".to_owned()),
-                Level::Recognized,
-                &mut out,
-            );
+            self.unhandled_lines = Some(Vec::new());
+            return out;
         }
         if self.dotnet_message.is_some() {
             if self.dotnet_collect(line) {
@@ -1075,6 +1086,46 @@ impl Recognizers {
             );
         }
         out
+    }
+
+    /// The entry for a Vitest unhandled-errors block: named by the file it
+    /// originated in (`src/x.test.ts::(unhandled error)`), else by Vitest's
+    /// own name; its message is the error itself.
+    fn flush_unhandled(&mut self, out: &mut Vec<EventKind>) {
+        let Some(lines) = self.unhandled_lines.take() else {
+            return;
+        };
+        let origin = lines.iter().find_map(|l| {
+            let rest = l.split_once("originated in \"")?.1;
+            rest.split_once('"').map(|(f, _)| f.to_owned())
+        });
+        let error = lines
+            .iter()
+            .map(|l| l.trim())
+            .find(|l| {
+                !l.is_empty()
+                    && !l.contains('\u{23af}')
+                    && !l.starts_with("Vitest caught")
+                    && !l.starts_with("This might cause")
+            })
+            .map(str::to_owned);
+        let key = match origin {
+            Some(f) => TestKey::new(vec![f], "(unhandled error)"),
+            None => TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
+        };
+        if !lines.is_empty() {
+            self.failure_output.push((key.clone(), lines.join("\n")));
+        }
+        self.finished(
+            key,
+            Outcome::Errored,
+            None,
+            Some(error.unwrap_or_else(|| {
+                "Vitest caught unhandled errors during the run (see its output)".to_owned()
+            })),
+            Level::Recognized,
+            out,
+        );
     }
 
     fn hold(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
@@ -2779,6 +2830,7 @@ impl Recognizers {
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
+        self.flush_unhandled(&mut gts);
         self.go_confirm_tentative(&mut gts);
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
