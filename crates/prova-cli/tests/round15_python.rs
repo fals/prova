@@ -1,0 +1,124 @@
+//! Medium tests for round 15 findings on Python projects run through a
+//! wrapper (`./dev`), each as a real prova process over a scripted output.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const PROVA: &str = env!("CARGO_BIN_EXE_prova");
+
+fn workspace(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-r15py-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn home_of(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", dir.display()))
+}
+
+fn prova(dir: &Path, args: &[&str]) -> Output {
+    Command::new(PROVA)
+        .args(args)
+        .current_dir(dir)
+        .env("PROVA_HOME", home_of(dir))
+        .output()
+        .expect("run prova")
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn json(o: &Output) -> serde_json::Value {
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", stdout(o)))
+}
+
+fn script(d: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = d.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Round 15: with `-v -rfE` the verbose FAILED line came first and the
+/// message only in the short summary: the FAIL line carried none.
+#[test]
+fn a_verbose_failure_takes_its_message_from_the_short_summary() {
+    let d = workspace("summary-msg");
+    std::fs::write(
+        d.join("out.txt"),
+        "tests/test_x.py::test_a PASSED   [ 50%]\ntests/test_x.py::test_y FAILED   [100%]\n=========================== short test summary info ============================\nFAILED tests/test_x.py::test_y - AssertionError: 16 != 4\n========================= 1 failed, 1 passed in 0.03s ==========================\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "--json", "--", "sh", "-c", "cat out.txt; exit 1"]);
+    let v = json(&o);
+    assert_eq!(
+        v["failures"][0]["message"], "AssertionError: 16 != 4",
+        "{v}"
+    );
+}
+
+fn verify(d: &Path, suite: &str, filter: &str) -> String {
+    let o = prova(d, &["adopt", "--verify", suite, "--filter", filter]);
+    stdout(&o)
+}
+
+/// Round 15: a verify whose command could not run blamed the level.
+#[test]
+fn verify_names_why_the_command_could_not_run() {
+    let d = workspace("verify-cause");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.gone]\nrun = \"./nonexistent-wrapper x\"\nselect = \"./nonexistent-wrapper {filter}\"\n\n[suite.nomod]\nrun = \"true\"\nselect = \"echo 'No module named pytest'; exit 1; echo {filter}\"\n",
+    )
+    .unwrap();
+    let out = verify(&d, "gone", "t");
+    assert!(
+        out.contains("could not start") && out.contains("127") && !out.contains("level opaque"),
+        "{out}"
+    );
+    let out = verify(&d, "nomod", "t");
+    assert!(
+        out.contains("No module named pytest") && !out.contains("level opaque"),
+        "{out}"
+    );
+}
+
+/// Round 15: pytest's "matched no test" got Maven's advice, and the split
+/// filter went unnoticed.
+#[test]
+fn verify_advises_for_the_framework_and_spots_a_split_filter() {
+    let d = workspace("verify-split");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.p]\nrun = \"true\"\nselect = \"echo 'pytest ERROR: file or directory not found: 2/-4]'; exit 4; echo {filter}\"\n",
+    )
+    .unwrap();
+    let out = verify(&d, "p", "test_ratio[negative 2/-4]");
+    assert!(
+        out.contains("file or directory not found: 2/-4]")
+            && out.contains("`-k`")
+            && out.contains("split")
+            && !out.contains("Maven"),
+        "{out}"
+    );
+}
+
+/// Round 15: adopt proposed `python3 -m pytest` on the host when the
+/// project's own earlier run went through `./dev`.
+#[test]
+fn adopt_keeps_the_wrapper_of_earlier_runs() {
+    let d = workspace("wrapper");
+    std::fs::write(d.join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
+    std::fs::write(d.join("test_a.py"), "def test_a():\n    pass\n").unwrap();
+    script(&d, "dev", "echo 'ran' \"$@\"");
+    prova(&d, &["run", "--", "./dev", "make", "test"]);
+    let o = prova(&d, &["adopt", "--json"]);
+    let v = json(&o);
+    let t = v["toml"].as_str().unwrap();
+    assert!(t.contains("run = \"./dev python3 -m pytest"), "{t}");
+    assert!(t.contains("select = \"./dev python3 -m pytest"), "{t}");
+}
