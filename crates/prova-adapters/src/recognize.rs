@@ -139,9 +139,17 @@ pub struct Recognizers {
     /// own summary says failed. Such a file can fail without any test of it
     /// failing (an import error), so the count is its own evidence.
     pub suites_failed: u64,
+    /// Vitest's `Errors  N error(s)` line: errors no test owns.
+    pub unhandled_errors: u64,
+    /// The `Unhandled Errors` block was seen (and recorded as an entry).
+    pub unhandled_block: bool,
+    /// Jest files read: its totals are believed against what was recognized.
+    pub jest_files: u64,
     jest: JestState,
-    /// Maven's `Failures:` / `Errors:` summary section is being read.
-    surefire_section: bool,
+    /// Maven's summary section being read (`Failures:`, `Errors:`,
+    /// `Flakes:`), and the rerun test whose `Run N:` lines are being read.
+    surefire_section: Option<SurefireSection>,
+    surefire_rerun: Option<SurefireRerun>,
     /// Go text: results since the last package line. `go test -v` names the
     /// package only after its tests, so they are reported under a provisional
     /// name at once and re-keyed when the package is known (round 14).
@@ -170,9 +178,23 @@ pub struct Recognizers {
     gts_inline: bool,
 }
 
+/// A rerun test: its key, its section, and its attempts so far.
+type SurefireRerun = (TestKey, SurefireSection, Vec<(Outcome, Option<String>)>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurefireSection {
+    Failures,
+    Errors,
+    Flakes,
+}
+
 /// Jest's console reporter: the test file whose results are being read.
 #[derive(Default)]
 struct JestState {
+    /// Verbose failures held until their `●` block gives the message.
+    held: Vec<(TestKey, Option<u64>)>,
+    /// A `Test suite failed to run` block was read in this file.
+    suite_failed_block: bool,
     file: Option<String>,
     /// The file's header said FAIL, and a failing test of it was named.
     failed: bool,
@@ -243,11 +265,42 @@ fn is_gotestsum_text(line: &str) -> bool {
         || t == "=== Skipped"
 }
 
+/// A Jest failure block's message: its first assertion lines, up to the code
+/// frame or the stack.
+fn jest_message(body: &[String]) -> Option<String> {
+    let frame = |l: &str| {
+        l.starts_with('>')
+            || l.split_once('|').is_some_and(|(n, _)| {
+                !n.trim().is_empty() && n.trim().bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+    let lines: Vec<&str> = body
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.is_empty())
+        .take_while(|l| !frame(l) && !l.starts_with("at "))
+        .take(3)
+        .collect();
+    if lines.is_empty() {
+        body.iter().find(|l| !l.is_empty()).cloned()
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// A ruler line (nextest's `------------`): never a message.
+fn is_separator(l: &str) -> bool {
+    let l = l.trim();
+    l.chars().count() >= 3 && l.chars().all(|c| matches!(c, '-' | '\u{2500}' | '='))
+}
+
 fn message(lines: &[String]) -> Option<String> {
     let kept: Vec<&str> = lines
         .iter()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with("=== ") && !l.starts_with("--- "))
+        .filter(|l| {
+            !l.is_empty() && !l.starts_with("=== ") && !l.starts_with("--- ") && !is_separator(l)
+        })
         .collect();
     if kept.is_empty() {
         return None;
@@ -588,6 +641,18 @@ impl Recognizers {
             }
             return;
         }
+        // Vitest "Errors  1 error": unhandled errors no test owns.
+        if let Some(rest) = t.strip_prefix("Errors ") {
+            let mut w = rest.split_whitespace();
+            if let (Some(n), Some("error" | "errors"), None) = (
+                w.next().and_then(|n| n.parse::<u64>().ok()),
+                w.next(),
+                w.next(),
+            ) {
+                self.unhandled_errors += n;
+                return;
+            }
+        }
         // Jest "Test Suites: 1 failed, 1 passed, 2 total"; Vitest "Test Files
         // 1 failed | 1 passed (2)": a file that fails to load fails no test.
         if let Some(rest) = t
@@ -828,6 +893,17 @@ impl Recognizers {
             return out;
         }
         self.totals(line);
+        if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
+            self.unhandled_block = true;
+            self.finished(
+                TestKey::new(vec!["vitest".to_owned()], "(unhandled errors)"),
+                Outcome::Errored,
+                None,
+                Some("Vitest caught unhandled errors during the run (see its output)".to_owned()),
+                Level::Recognized,
+                &mut out,
+            );
+        }
         if self.dotnet_message.is_some() {
             if self.dotnet_collect(line) {
                 return out;
@@ -1874,22 +1950,76 @@ impl Recognizers {
     /// The result files may name only some of the classes (a fork that
     /// died, a partial report): what the console names counts too.
     fn surefire(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
-        let Some(body) = line.trim_end().strip_prefix("[ERROR] ") else {
-            if !line.trim().starts_with("[ERROR]") {
-                self.surefire_section = false;
-            }
+        let line = line.trim_end();
+        let Some(body) = line
+            .strip_prefix("[ERROR] ")
+            .or_else(|| line.strip_prefix("[WARNING] "))
+            .or_else(|| line.strip_prefix("[INFO] "))
+        else {
+            self.surefire_flush(out);
+            self.surefire_section = None;
             return false;
         };
         let head = body.trim();
-        if head == "Failures:" || head == "Errors:" {
-            self.surefire_section = true;
+        let header = match head {
+            "Failures:" => Some(SurefireSection::Failures),
+            "Errors:" => Some(SurefireSection::Errors),
+            "Flakes:" => Some(SurefireSection::Flakes),
+            _ => None,
+        };
+        if header.is_some() {
+            self.surefire_flush(out);
+            self.surefire_section = header;
             return true;
         }
-        if !self.surefire_section {
+        let Some(section) = self.surefire_section else {
+            return false;
+        };
+        let class_ok = |c: &str| {
+            !c.is_empty()
+                && c.chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$'))
+        };
+        // `Run 1: Class.method:12 expected...` / `Run 2: PASS`: a rerun's
+        // attempts, under the test's own (unindented) name.
+        if let Some(run) = head.strip_prefix("Run ")
+            && let Some((n, rest)) = run.split_once(':')
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && let Some((_, _, runs)) = self.surefire_rerun.as_mut()
+        {
+            let rest = rest.trim();
+            let (outcome, msg) = if rest == "PASS" {
+                (Outcome::Passed, None)
+            } else {
+                let outcome = if section == SurefireSection::Errors {
+                    Outcome::Errored
+                } else {
+                    Outcome::Failed
+                };
+                (outcome, Some(rest.to_owned()).filter(|m| !m.is_empty()))
+            };
+            runs.push((outcome, msg));
+            return true;
+        }
+        self.surefire_flush(out);
+        if !body.starts_with("  ") {
+            // A rerun's test: its full name alone on the line.
+            if let Some((class, method)) = head.rsplit_once('.')
+                && class_ok(class)
+                && class_ok(method)
+            {
+                self.surefire_rerun = Some((
+                    TestKey::new(vec![class.to_owned()], method),
+                    section,
+                    Vec::new(),
+                ));
+                return true;
+            }
+            self.surefire_section = None;
             return false;
         }
-        if !body.starts_with("  ") {
-            self.surefire_section = false;
+        if section == SurefireSection::Flakes {
             return false;
         }
         let (token, rest) = head.split_once(' ').unwrap_or((head, ""));
@@ -1903,16 +2033,13 @@ impl Recognizers {
         let Some((class, method)) = id.rsplit_once('.') else {
             return false;
         };
-        if class.is_empty()
-            || method.is_empty()
-            || !class
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '$'))
-        {
+        if !class_ok(class) || method.is_empty() {
             return false;
         }
         let msg = rest.trim().trim_start_matches('\u{bb}').trim();
-        let outcome = if rest.starts_with('\u{bb}') {
+        // The section says what kind of entry it is: `Errors:` lists
+        // errors whether or not the line has a `\u{bb}` (round 15).
+        let outcome = if rest.starts_with('\u{bb}') || section == SurefireSection::Errors {
             Outcome::Errored
         } else {
             Outcome::Failed
@@ -1927,6 +2054,39 @@ impl Recognizers {
             out,
         );
         true
+    }
+
+    /// The rerun test being read ended: its attempts, in order. A test that
+    /// failed and then passed is flaky; one that failed every time failed.
+    fn surefire_flush(&mut self, out: &mut Vec<EventKind>) {
+        let Some((key, _, runs)) = self.surefire_rerun.take() else {
+            return;
+        };
+        match runs.as_slice() {
+            [] => {}
+            [(outcome, msg)] => self.result(
+                key,
+                *outcome,
+                None,
+                msg.clone(),
+                Level::Recognized,
+                false,
+                out,
+            ),
+            _ => {
+                for (i, (outcome, msg)) in runs.into_iter().enumerate() {
+                    self.attempt_result(
+                        key.clone(),
+                        i as u32 + 1,
+                        outcome,
+                        None,
+                        msg,
+                        Level::Recognized,
+                        out,
+                    );
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------- jest
@@ -1953,6 +2113,7 @@ impl Recognizers {
             };
             if !rest.contains(' ') && is_js_file(rest) {
                 self.jest_close_file(out);
+                self.jest_files += 1;
                 self.jest.file = Some(rest.to_owned());
                 self.jest.failed = failed;
                 return true;
@@ -1982,6 +2143,7 @@ impl Recognizers {
             self.jest.console = None;
             let name = name.trim();
             self.jest.block = if name == "Test suite failed to run" {
+                self.jest.suite_failed_block = true;
                 Some((None, Vec::new()))
             } else if name.starts_with("Console") || name.starts_with("Obsolete") {
                 None
@@ -1994,21 +2156,33 @@ impl Recognizers {
             lines.push(t.to_owned());
             return true;
         }
-        // console.log output is indented like describe blocks: skip it.
-        if t.starts_with("console.") && indent <= 2 {
+        // console output looks like the tree (`✕ x`, `✓ y`, headings): it
+        // runs from its `console.log` header to the stack line that ends it
+        // (round 15). Nothing in it is a test.
+        if matches!(
+            t,
+            "console.log"
+                | "console.warn"
+                | "console.error"
+                | "console.info"
+                | "console.debug"
+                | "console.trace"
+                | "console.table"
+                | "console.dir"
+        ) {
             self.jest.console = Some(false);
             return true;
         }
-        if let Some(seen_at) = self.jest.console {
-            if t.is_empty() && seen_at {
-                self.jest.console = None;
-            } else if t.starts_with("at ") {
-                self.jest.console = Some(true);
-            }
-            if !t.starts_with(['✓', '✕', '○', '✎', '√', '×']) {
+        match self.jest.console {
+            Some(false) => {
+                if t.starts_with("at ") {
+                    self.jest.console = Some(true);
+                }
                 return true;
             }
-            self.jest.console = None;
+            Some(true) if t.starts_with("at ") => return true,
+            Some(true) => self.jest.console = None,
+            None => {}
         }
         if t.is_empty() {
             return true;
@@ -2046,7 +2220,10 @@ impl Recognizers {
         parts.push(name);
         let key = TestKey::new(vec![file], parts.join(" > "));
         if outcome.is_failure() {
+            // Held for its `●` block, which has the message.
             self.jest.named = true;
+            self.jest.held.push((key, duration));
+            return true;
         }
         self.finished(key, outcome, duration, None, Level::Recognized, out);
         true
@@ -2069,8 +2246,14 @@ impl Recognizers {
         if !text.is_empty() {
             self.failure_output.push((key.clone(), text));
         }
-        let first = body.iter().find(|l| !l.is_empty()).cloned();
-        self.finished(key, Outcome::Failed, None, first, Level::Recognized, out);
+        let msg = jest_message(&body);
+        let duration = self
+            .jest
+            .held
+            .iter()
+            .position(|(k, _)| *k == key)
+            .and_then(|i| self.jest.held.remove(i).1);
+        self.finished(key, Outcome::Failed, duration, msg, Level::Recognized, out);
     }
 
     /// The file's section ended. A FAIL file without a failing test failed
@@ -2080,7 +2263,12 @@ impl Recognizers {
             return;
         };
         self.jest_close_block(&file, out);
-        if self.jest.failed && !self.jest.named {
+        for (key, duration) in std::mem::take(&mut self.jest.held) {
+            self.finished(key, Outcome::Failed, duration, None, Level::Recognized, out);
+        }
+        // A suite that failed to run is its own entry, with or without a
+        // failing test beside it (an `afterAll` that threw).
+        if self.jest.suite_failed_block || (self.jest.failed && !self.jest.named) {
             let body = std::mem::take(&mut self.jest.suite_error);
             let key = TestKey::new(vec![file.clone()], "(file)");
             let text = body.join("\n").trim().to_owned();
@@ -2331,6 +2519,7 @@ impl Recognizers {
             .map(|l| l.trim())
             .filter(|l| {
                 !l.is_empty()
+                    && !is_separator(l)
                     && !l.ends_with("───")
                     && !l.starts_with("running ")
                     && !l.starts_with("test ")
@@ -2385,6 +2574,7 @@ impl Recognizers {
         self.close_libtest_running();
         self.close_libtest_block();
         let mut held_pass = Vec::new();
+        self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
         self.flush_call_pass(&mut held_pass);
         if let Some((_, key)) = self.pytest_text_pass.take() {
@@ -4823,5 +5013,292 @@ mod go_tests {
             "ok  \texample.com/m/p\t0.001s [no tests to run]\n?   \texample.com/m/c\t[no test files]\n",
         );
         assert!(r.go_no_tests_only());
+    }
+}
+
+/// Round 15 (framework recognizers): probes with a hostile console, a suite
+/// error next to a failing test, and the Surefire rerun sections.
+#[cfg(test)]
+mod round15_fw_tests {
+    use super::*;
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let mut r = Recognizers::default();
+        let mut all = Vec::new();
+        for l in input.lines() {
+            all.extend(r.line(l));
+        }
+        all.extend(r.finish());
+        (r, all)
+    }
+
+    fn results(ev: &[EventKind]) -> Vec<(String, u32, Outcome)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    attempt,
+                    outcome,
+                    ..
+                } => Some((test.display(), *attempt, *outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn msgs(ev: &[EventKind]) -> Vec<(String, String)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Console output looked like tests: `✕ db migration (pending)` printed
+    /// by a `console.log` was recorded as a failed test (exit 0 became 1).
+    #[test]
+    fn jest_console_output_is_not_a_test() {
+        let (_, ev) = feed_all(concat!(
+            " PASS  src/deploy.test.js\n",
+            "  console.log\n",
+            "    Deploy plan:\n",
+            "      \u{2715} db migration (pending)\n",
+            "      \u{2713} web\n",
+            "      at log (src/deploy.test.js:3:11)\n",
+            "  deploy\n",
+            "    \u{2713} plans (4 ms)\n",
+            "Tests: 1 passed, 1 total\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![(
+                "src/deploy.test.js::deploy > plans".into(),
+                1,
+                Outcome::Passed
+            )]
+        );
+    }
+
+    #[test]
+    fn jest_console_after_the_tree_and_in_console_blocks_is_not_a_test() {
+        let (_, ev) = feed_all(concat!(
+            " PASS  src/a.test.js\n",
+            "  deploy\n",
+            "    \u{2713} plans (4 ms)\n",
+            "\n",
+            "  console.warn\n",
+            "    \u{2715} fake one\n",
+            "\n",
+            "      at warn (src/a.test.js:3:11)\n",
+            "\n",
+            " PASS  src/b.test.js\n",
+            "  \u{25cf} Console\n",
+            "\n",
+            "    console.error\n",
+            "      \u{2715} fake two\n",
+            "      \u{2713} fake three\n",
+            "\n",
+            "      at error (src/b.test.js:3:11)\n",
+            "\n",
+            "  other\n",
+            "    \u{2713} real\n",
+            "Tests: 2 passed, 2 total\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/a.test.js::deploy > plans".into(), 1, Outcome::Passed),
+                ("src/b.test.js::other > real".into(), 1, Outcome::Passed),
+            ]
+        );
+    }
+
+    /// A failing test and a suite that failed to run in one file: both.
+    #[test]
+    fn jest_suite_error_next_to_a_failing_test_is_recorded() {
+        let (_, ev) = feed_all(concat!(
+            " FAIL  src/db.test.js\n",
+            "  db\n",
+            "    \u{2715} writes (3 ms)\n",
+            "\n",
+            "  \u{25cf} db \u{203a} writes\n",
+            "\n",
+            "    expect(received).toBe(expected) // Object.is equality\n",
+            "\n",
+            "    Expected: 1\n",
+            "    Received: 2\n",
+            "\n",
+            "      4 |   expect(a).toBe(1);\n",
+            "\n",
+            "  \u{25cf} Test suite failed to run\n",
+            "\n",
+            "    afterAll: connection pool did not drain\n",
+            "\n",
+            "Tests: 1 failed, 1 total\n",
+        ));
+        let got = results(&ev);
+        assert!(
+            got.contains(&("src/db.test.js::db > writes".into(), 1, Outcome::Failed)),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&("src/db.test.js::(file)".into(), 1, Outcome::Errored)),
+            "{got:?}"
+        );
+        // The block's first assertion lines are the message.
+        assert!(
+            msgs(&ev).contains(&(
+                "src/db.test.js::db > writes".into(),
+                "expect(received).toBe(expected) // Object.is equality\nExpected: 1\nReceived: 2"
+                    .into()
+            )),
+            "{:?}",
+            msgs(&ev)
+        );
+        let file_msg = msgs(&ev)
+            .into_iter()
+            .find(|(t, _)| t == "src/db.test.js::(file)")
+            .unwrap();
+        assert!(file_msg.1.contains("connection pool"), "{file_msg:?}");
+    }
+
+    /// A passing verbose file with a bare suite error is the same entry.
+    #[test]
+    fn jest_suite_error_alone_is_the_file_entry() {
+        let (_, ev) = feed_all(concat!(
+            " FAIL  src/db.test.js\n",
+            "  \u{25cf} Test suite failed to run\n",
+            "\n",
+            "    boom\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![("src/db.test.js::(file)".into(), 1, Outcome::Errored)]
+        );
+    }
+
+    /// nextest's separator is not the failure's message.
+    #[test]
+    fn nextest_message_skips_separator_lines() {
+        let (_, ev) = feed_all(concat!(
+            "        FAIL [   0.004s] crate_a tests::it_works\n",
+            "\n",
+            "--- STDOUT:              crate_a tests::it_works ---\n",
+            "------------\n",
+            "thread 'tests::it_works' panicked at src/lib.rs:5:9:\n",
+            "assertion failed: false\n",
+            "------------\n",
+            "     Summary [   0.004s] 1 test run: 0 passed, 1 failed, 0 skipped\n",
+        ));
+        let m = msgs(&ev);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(!m[0].1.starts_with("---"), "{m:?}");
+        assert!(m[0].1.contains("assertion failed"), "{m:?}");
+    }
+
+    #[test]
+    fn nextest_text_keeps_the_binary_apart() {
+        let (_, ev) = feed_all(concat!(
+            "        FAIL [   0.004s] crate_a tests::it_works\n",
+            "        PASS [   0.003s] crate_b tests::it_works\n",
+        ));
+        let files: Vec<Option<String>> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, .. } => Some(test.file.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files, vec![Some("crate_a".into()), Some("crate_b".into())]);
+    }
+
+    #[test]
+    fn surefire_flakes_section_is_a_failed_then_a_passed_attempt() {
+        let (_, ev) = feed_all(concat!(
+            "[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1\n",
+            "[WARNING] Flakes: \n",
+            "[WARNING] com.acme.FlakyTest.sometimes\n",
+            "[ERROR]   Run 1: FlakyTest.sometimes:12 expected:<1> but was:<2>\n",
+            "[INFO]   Run 2: PASS\n",
+            "[INFO] \n",
+            "[INFO] BUILD SUCCESS\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("com.acme.FlakyTest::sometimes".into(), 1, Outcome::Failed),
+                ("com.acme.FlakyTest::sometimes".into(), 2, Outcome::Passed),
+            ]
+        );
+        assert!(
+            msgs(&ev)
+                .iter()
+                .any(|(_, m)| m.contains("expected:<1> but was:<2>"))
+        );
+    }
+
+    #[test]
+    fn surefire_rerun_that_fails_every_time_names_the_test() {
+        let (_, ev) = feed_all(concat!(
+            "[ERROR] Failures: \n",
+            "[ERROR] com.acme.FailTest.always\n",
+            "[ERROR]   Run 1: FailTest.always:5 expected:<1> but was:<2>\n",
+            "[ERROR]   Run 2: FailTest.always:5 expected:<1> but was:<2>\n",
+            "[INFO] \n",
+            "[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n",
+        ));
+        let got = results(&ev);
+        assert_eq!(
+            got.last().unwrap().0,
+            "com.acme.FailTest::always",
+            "{got:?}"
+        );
+        assert!(got.iter().all(|(_, _, o)| *o == Outcome::Failed), "{got:?}");
+    }
+
+    #[test]
+    fn surefire_errors_section_entries_are_errored() {
+        let (_, ev) = feed_all(concat!(
+            "[ERROR] Errors: \n",
+            "[ERROR]   com.acme.CalcTest.io:12 IllegalState disk full\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   com.acme.CalcTest.adds:9 expected:<2> but was:<3>\n",
+        ));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("com.acme.CalcTest::io".into(), 1, Outcome::Errored),
+                ("com.acme.CalcTest::adds".into(), 1, Outcome::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn vitest_unhandled_errors_block_is_an_errored_entry() {
+        let (_, ev) = feed_all(concat!(
+            " \u{2713} src/a.test.ts > adds 1ms\n",
+            "\n",
+            " \u{23af}\u{23af}\u{23af}\u{23af} Unhandled Errors \u{23af}\u{23af}\u{23af}\u{23af}\n",
+            "\n",
+            "Vitest caught 1 unhandled error during the test run.\n",
+            "\n",
+            "     Errors  1 error\n",
+        ));
+        assert!(
+            results(&ev).iter().any(|(_, _, o)| *o == Outcome::Errored),
+            "{:?}",
+            results(&ev)
+        );
+    }
+
+    #[test]
+    fn vitest_errors_count_is_remembered() {
+        let (r, _) = feed_all("     Errors  2 errors\n");
+        assert_eq!(r.unhandled_errors, 2);
     }
 }
