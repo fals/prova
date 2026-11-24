@@ -129,7 +129,13 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
         .copied()
         .filter(|w| !w.starts_with('-'))
         .find(|w| *w != "compose" && *w != "container")?;
-    if !matches!(sub, "run" | "exec" | "debug") {
+    // `docker start -a` runs a created container attached (round 16:
+    // treated as a replay).
+    let attached_start = sub == "start"
+        && rest
+            .iter()
+            .any(|w| matches!(*w, "-a" | "--attach" | "-ai" | "-ia"));
+    if !matches!(sub, "run" | "exec" | "debug") && !attached_start {
         return None;
     }
     // `docker exec box cat results.txt` prints a file: no test runs.
@@ -815,6 +821,8 @@ mod container_tests {
         assert_eq!(c("docker ps"), None);
         // Round 15: replays and file viewers run nothing.
         assert_eq!(c("docker compose logs app"), None);
+        assert_eq!(c("docker start -a box"), Some("docker"));
+        assert_eq!(c("docker start box"), None);
         assert_eq!(c("docker exec box cat /out/results.txt"), None);
         assert_eq!(c("docker compose run --rm app pytest"), Some("docker"));
         assert_eq!(c("dockerd --host x"), None);

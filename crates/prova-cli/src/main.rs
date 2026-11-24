@@ -2071,6 +2071,23 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             // Tests of several binaries or modules sharing the name: only
             // the one named with --in is set aside (round 16: a quarantine
             // of crate calc's `tests::flaky` hid crate geo's failure).
+            // A file-level entry is an error, never a plain failure: a
+            // quarantine could never set it aside (round 16).
+            if [
+                "(file)",
+                "(package)",
+                "(suite)",
+                "(unhandled error)",
+                "(unhandled errors)",
+            ]
+            .iter()
+            .any(|p| name.ends_with(p))
+            {
+                return Err(UsageError(format!(
+                    "{name:?} is not a test but a file, package or suite that failed to load or run: a quarantine sets aside test failures only; fix what keeps it from loading"
+                ))
+                .into());
+            }
             let files = q::files_of(store, &name)?;
             let file = match (in_file.as_deref(), files.as_slice()) {
                 (Some(f), _) if files.iter().any(|x| x == f) => Some(f.to_owned()),

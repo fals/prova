@@ -750,3 +750,27 @@ fn a_quarantine_names_the_binary_when_a_name_is_shared() {
     let o = prova(&d, &["run", "b"]);
     assert_eq!(o.status.code(), Some(1), "geo's failure: {}", text(&o));
 }
+
+/// Round 16: `quarantine add` accepted a file-level entry, which a
+/// quarantine can never set aside.
+#[test]
+fn a_file_level_entry_cannot_be_quarantined() {
+    let d = workspace("fileentry");
+    let script = format!(
+        "{BUSY} printf '%s\\n' 'ERROR tests/test_db.py - ModuleNotFoundError: No module named x' '1 error in 0.1s'; exit 2"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &script]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests/test_db.py::(file)",
+            "--reason",
+            "r",
+        ],
+    );
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{t}");
+    assert!(t.contains("is not a test but a file"), "{t}");
+}
