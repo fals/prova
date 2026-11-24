@@ -248,6 +248,7 @@ fn a_quarantine_sets_aside_only_what_its_test_explains() {
         "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
          pass) echo 'test calc::x ... ok' ;; \
          own) echo 'test calc::x ... FAILED'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
+         summary) echo 'test calc::x ... FAILED'; echo 'error: test run failed'; echo 'error: test failed, to rerun pass `--lib`'; exit 100 ;; \
          race) echo 'test calc::x ... FAILED'; echo 'WARNING: DATA RACE'; exit 101 ;; \
          build) echo 'test calc::x ... FAILED'; echo 'error[E0425]: cannot find value `y` in this scope'; exit 101 ;; \
          more) echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 1 passed; 3 failed; 0 ignored'; exit 101 ;; \
@@ -265,6 +266,11 @@ fn a_quarantine_sets_aside_only_what_its_test_explains() {
     let out = text(&o);
     assert_eq!(o.status.code(), Some(0), "{out}");
     assert!(!out.contains("unverified"), "its own panic: {out}");
+    // Round 15: the runner's own "tests failed" summary is the quarantined
+    // failure's, not something else that failed.
+    let o = run(&d, "make", "summary");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "runner summary: {out}");
     for (state, why) in [
         ("race", "WARNING: DATA RACE"),
         ("build", "error[E0425]"),

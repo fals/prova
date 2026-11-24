@@ -1894,8 +1894,21 @@ fn unexplained_crash(
         .collect();
     Ok(crashes.into_iter().find(|(_, line)| {
         let t = line.trim();
-        !names.iter().any(|n| t.contains(n)) && !own.iter().any(|o| o.contains(t))
+        !names.iter().any(|n| t.contains(n))
+            && !own.iter().any(|o| o.contains(t))
+            && !runner_failure_summary(t)
     }))
+}
+
+/// A test runner's own line saying that tests failed (nextest's `error: test
+/// run failed`, cargo's `error: test failed, to rerun pass ...`): it says
+/// nothing beyond the failures already seen (round 15: it failed every
+/// quarantined pass under nextest).
+fn runner_failure_summary(line: &str) -> bool {
+    line == "error: test run failed"
+        || line.starts_with("error: test failed, to rerun pass")
+        || (line.starts_with("error: ")
+            && (line.ends_with(" target failed:") || line.ends_with(" targets failed:")))
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite
