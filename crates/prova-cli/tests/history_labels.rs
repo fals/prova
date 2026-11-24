@@ -902,3 +902,20 @@ fn skipped_tests_are_named() {
     let out = text(&prova(&d, &["run", "make"]));
     assert!(out.contains("skipped: calc::later"), "{out}");
 }
+
+/// Round 16: a selection's runner reports the tests it filtered out as
+/// skipped, read as disabled tests.
+#[test]
+fn a_selection_says_skipped_tests_may_be_unselected() {
+    let d = workspace("selskip");
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.make]\nrun = \"true\"\nselect = {:?}\n",
+            format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::b ... ignored'")
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "make", "--select", "calc::a"]));
+    assert!(out.contains("1 skipped (or not selected)"), "{out}");
+}

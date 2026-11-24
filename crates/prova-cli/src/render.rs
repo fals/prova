@@ -157,10 +157,17 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {errored}, {} skipped{}{counted}",
+            "tests: {} passed, {} failed, {errored}, {} skipped{}{}{counted}",
             c.passed,
             c.failed,
             c.skipped,
+            // A selection's runner reports the tests it filtered out as
+            // skipped (round 16: read as disabled tests).
+            if s.selection.is_some() && c.skipped > 0 {
+                " (or not selected)"
+            } else {
+                ""
+            },
             if c.subtests > 0 {
                 format!(
                     " (and {} subtests, {} failed{})",
@@ -1183,6 +1190,7 @@ mod live_tests {
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
             skipped_tests: vec![],
+            selection: None,
             framework: None,
             failures: vec![],
             stalled_ms: None,
