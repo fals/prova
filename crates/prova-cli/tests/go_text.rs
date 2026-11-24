@@ -629,3 +629,31 @@ fn a_go_verbose_rerun_that_passes_is_flaky_not_failed() {
     assert_eq!(s["outcome"], "passed", "{s}");
     assert_eq!(s["verified"], false, "{s}");
 }
+
+/// Round 15: gotestsum `--format testname` prints the module's root package
+/// with no package (`PASS TestAdd (0.00s)`, `FAIL .`): its passes were
+/// dropped and `FAIL TestDiv` was read as a package. Real gotestsum output.
+#[test]
+fn gotestsum_testname_root_package_tests_are_tests() {
+    let d = workspace("gts-root");
+    let (code, s) = run_sh(
+        &d,
+        "printf '%s\\n' 'EMPTY cmd/conform' 'PASS TestAdd (0.00s)' '=== RUN   TestDiv' \
+         '    calc_test.go:17: Div(8, 2) = 16, want 4' '--- FAIL: TestDiv (0.00s)' 'FAIL TestDiv (0.00s)' \
+         'PASS TestFlakyClock (0.00s)' 'PASS TestSlowIntegration (1.50s)' 'SKIP TestHang (0.00s)' 'FAIL .' '' \
+         '=== Skipped' '=== SKIP: . TestHang (0.00s)' '    calc_test.go:33: set HANG=1 to hang' '' \
+         '=== Failed' '=== FAIL: . TestDiv (0.00s)' '    calc_test.go:17: Div(8, 2) = 16, want 4' '' \
+         'DONE 5 tests, 1 skipped, 1 failure in 1.503s'; exit 1",
+    );
+    assert_eq!(code, Some(1), "{s}");
+    assert_eq!(failing(&s), vec![".::TestDiv"], "{s}");
+    assert_eq!(
+        (
+            s["counts"]["passed"].as_u64(),
+            s["counts"]["skipped"].as_u64(),
+            s["counts"]["errored"].as_u64()
+        ),
+        (Some(3), Some(1), Some(0)),
+        "{s}"
+    );
+}

@@ -1166,6 +1166,20 @@ impl Recognizers {
             "EMPTY" => return false,
             _ => return false,
         };
+        // The module's root package is printed with no package at all:
+        // `PASS TestAdd (0.00s)` is a test of `.` (round 15: its passes were
+        // dropped and `FAIL TestDiv` read as a package).
+        let root_test = dur.is_some()
+            && ["Test", "Example", "Fuzz", "Benchmark"]
+                .iter()
+                .any(|k| name.starts_with(k));
+        let rooted;
+        let name = if root_test {
+            rooted = format!("..{name}");
+            rooted.as_str()
+        } else {
+            name
+        };
         let split = ["Test", "Example", "Fuzz", "Benchmark"]
             .iter()
             .filter_map(|k| name.find(&format!(".{k}")))
