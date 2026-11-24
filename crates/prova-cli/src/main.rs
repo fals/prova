@@ -3115,6 +3115,16 @@ fn exit_code(s: &Summary) -> u8 {
             {
                 exit::INFRA
             }
+            // pytest found nothing to run (bad selection, empty collection):
+            // not a test failure either.
+            (Some(Outcome::Errored), Status::Finished)
+                if matches!(s.exit_code, Some(4 | 5))
+                    && s.detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with(engine::PYTEST_NO_TEST)) =>
+            {
+                exit::INFRA
+            }
             (_, Status::Cancelled) => exit::STALLED_OR_KILLED,
             (_, Status::Aborted)
                 if s.detail.as_deref().is_some_and(|d| d.starts_with("killed")) =>

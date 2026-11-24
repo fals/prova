@@ -122,3 +122,34 @@ fn adopt_keeps_the_wrapper_of_earlier_runs() {
     assert!(t.contains("run = \"./dev python3 -m pytest"), "{t}");
     assert!(t.contains("select = \"./dev python3 -m pytest"), "{t}");
 }
+
+/// Round 15: pytest's exit 4 (a bad selection) was "FAILED exit 4" and
+/// `prova run` exited 1, a test failure.
+#[test]
+fn pytest_exit_4_with_no_test_is_not_a_test_failure() {
+    let d = workspace("exit4");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "echo 'ERROR: file or directory not found: 2/-4]'; exit 4",
+        ],
+    );
+    let v = json(&o);
+    assert_eq!(o.status.code(), Some(4), "{v}");
+    assert_eq!(v["outcome"], "errored", "{v}");
+    assert!(
+        v["detail"].as_str().unwrap().contains("pytest ran no test"),
+        "{v}"
+    );
+    // A real failure keeps exit 1.
+    let o = prova(
+        &d,
+        &["run", "--json", "--", "sh", "-c", "echo 'boom'; exit 4"],
+    );
+    assert_eq!(o.status.code(), Some(1));
+}

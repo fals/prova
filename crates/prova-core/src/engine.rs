@@ -1582,6 +1582,23 @@ fn observe_child(
             }
         ));
     }
+    // pytest exits 4 (usage error: a selection that names nothing) or 5
+    // (nothing collected) without running a test: that is no test failing
+    // (round 15), like a command that could not start.
+    if let Some(code @ (4 | 5)) = exit_code
+        && status == Status::Finished
+        && observed == 0
+        && sup.tail.iter().any(|l| pytest_ran_nothing(l))
+    {
+        reason = Some(format!(
+            "{PYTEST_NO_TEST} (exit {code}: {}); no test failed",
+            if code == 4 {
+                "usage error, e.g. a selection or option pytest rejected"
+            } else {
+                "nothing collected"
+            }
+        ));
+    }
     if !contradictions.is_empty() {
         let _ = sup.lifecycle.contradict();
         reason.get_or_insert_with(|| contradictions.join("; "));
@@ -1610,6 +1627,13 @@ fn observe_child(
                 names.join(", ")
             ),
         });
+    }
+    if outcome == Outcome::Failed
+        && reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST))
+    {
+        outcome = Outcome::Errored;
     }
     if outcome == Outcome::Passed {
         // A quarantined test's own crash is set aside with it (round 14).
@@ -1737,6 +1761,22 @@ fn observe_child(
     let _ = std::fs::remove_dir_all(&dir);
     crate::output::enforce_budget(store, crate::output::BUDGET_BYTES)?;
     crate::output::sweep(store)
+}
+
+/// The reason prefix of a pytest run that ran no test (exit 4 or 5).
+pub const PYTEST_NO_TEST: &str = "pytest ran no test";
+
+/// A line pytest prints when it ran no test: usage errors and empty
+/// collections.
+fn pytest_ran_nothing(line: &str) -> bool {
+    let l = line.trim();
+    l.starts_with("ERROR: file or directory not found")
+        || l.starts_with("ERROR: not found:")
+        || l.starts_with("ERROR: usage:")
+        || l.starts_with("usage: pytest")
+        || l.starts_with("usage: __main__.py")
+        || l.contains("no tests ran")
+        || l.contains("collected 0 items")
 }
 
 /// The cause a failing test's kept output names: pytest's first `E` line,
