@@ -2456,7 +2456,11 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // Quarantined tests of this run, with their result: relevant when they
     // ran here, or their suite (or one sharing tests with this run) did.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
-    if row.status.is_terminal() {
+    // While the run goes on, the quarantined tests with a result so far:
+    // a "1 failed" that does not end a first-failure wait is explained
+    // (round 14).
+    let live = !row.status.is_terminal();
+    {
         // Without per-test results (opaque level, or a run cut short) a
         // missing quarantined test is not known to have been left out
         // (round 14: "not run" in a cancelled run).
@@ -2469,6 +2473,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name)
                 .map(|f| f.1.as_str().to_owned())
                 .next();
+            if live && result.is_none() {
+                continue;
+            }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
                 let suites: Vec<String> = {
                     let mut stmt = store
@@ -2490,7 +2497,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             });
         }
         // A quarantine that ran out is no longer set aside: say so.
-        for q in crate::quarantine::expired_at(store, row.created_ms)? {
+        for q in crate::quarantine::expired_at(store, row.created_ms)?
+            .into_iter()
+            .filter(|_| !live)
+        {
             if finals.values().any(|f| !f.4 && f.0.display() == q.test) {
                 notes.push(format!(
                     "quarantine of {} expired ({}); it counts again: fix it, or `prova quarantine add` it again with a reason",

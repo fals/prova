@@ -2658,6 +2658,7 @@ fn repeat_runs(
     // never "every test passed" (round 13: five runs whose selection matched
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
+    let mut quarantined = std::collections::BTreeSet::new();
     for i in 1..=n {
         let left = budget.saturating_sub(start.elapsed());
         if left.is_zero() {
@@ -2695,8 +2696,18 @@ fn repeat_runs(
                 }
             }
         }
+        for q in &s.quarantined {
+            quarantined.insert(q.test.clone());
+        }
         if !json {
             let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            // A pass that set a quarantined failure aside says so (round 14).
+            let set_aside: Vec<&str> = s
+                .quarantined
+                .iter()
+                .filter(|q| q.result == "failed" || q.result == "errored")
+                .map(|q| q.test.as_str())
+                .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
             } else if ran == 0 {
@@ -2705,6 +2716,8 @@ fn repeat_runs(
                 (s.outcome, &s.detail)
             {
                 format!(" ({})", render::clean(d))
+            } else if !set_aside.is_empty() {
+                format!(" (quarantined, set aside: {})", set_aside.join(", "))
             } else {
                 String::new()
             };
@@ -2737,10 +2750,20 @@ fn repeat_runs(
     } else {
         println!("{done} run(s) of the same code:");
         for (t, (p, f)) in &mixed {
-            println!("  FLAKY {}: failed {f} of {}", render::clean(t), p + f);
+            let q = if quarantined.contains(*t) {
+                " (quarantined)"
+            } else {
+                ""
+            };
+            println!("  FLAKY {}{q}: failed {f} of {}", render::clean(t), p + f);
         }
         for t in &always {
-            println!("  FAIL {}: failed every time", render::clean(t));
+            let q = if quarantined.contains(*t) {
+                " (quarantined)"
+            } else {
+                ""
+            };
+            println!("  FAIL {}{q}: failed every time", render::clean(t));
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
         if no_tests > 0 {

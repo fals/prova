@@ -305,3 +305,41 @@ fn a_bare_name_with_a_qualified_twin_is_ambiguous() {
     let out = text(&o);
     assert!(out.contains("this machine's prova store"), "{out}");
 }
+
+/// Round 14: a pass that set a quarantined failure aside looked like any
+/// pass in the run list and in `--repeat`; a run of only the quarantined
+/// test, failing, passed.
+#[test]
+fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
+    let d = workspace("marked");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let o = prova(&d, &["run", "make", "--repeat", "2"]);
+    let out = text(&o);
+    assert!(
+        out.contains("(quarantined, set aside: calc::x)")
+            && out.contains("FAIL calc::x (quarantined): failed every time"),
+        "{out}"
+    );
+    let list = text(&prova(&d, &["status"]));
+    assert!(
+        list.contains("passed*") && list.contains("passed*: passed with quarantined tests failing"),
+        "{list}"
+    );
+    let last = text(&prova(&d, &["status", "last"]));
+    assert!(
+        last.contains("PASSED (quarantined failures set aside)"),
+        "{last}"
+    );
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.only]\nrun = {:?}\n",
+            format!("{BUSY} echo 'test calc::x ... FAILED'; exit 101")
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "only"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+}

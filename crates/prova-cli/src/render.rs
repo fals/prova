@@ -27,6 +27,10 @@ fn headline(s: &Summary) -> String {
             {
                 "PASSED (unverified: see warnings)".into()
             }
+            // "PASSED ... exit 100" read as a contradiction (round 14).
+            (Status::Finished, Some(Outcome::Passed)) if s.exit_code.is_some_and(|c| c != 0) => {
+                "PASSED (quarantined failures set aside)".into()
+            }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
             (Status::Finished, Some(Outcome::Errored)) => "ERRORED".into(),
             (Status::Finished, _) => "FAILED".into(),
@@ -697,10 +701,14 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
         );
         return;
     }
+    let mut marks = std::collections::BTreeSet::new();
     for r in rows {
         // A thin pass is not a plain "passed" in the list either (round 9).
         let outcome = match r.outcome {
             Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
+            // Passed although the command failed: only quarantined tests
+            // failed, set aside (round 14: listed as a plain "passed").
+            Some(Outcome::Passed) if r.exit_code.is_some_and(|c| c != 0) => "passed*",
             // A cancelled or killed run has no test outcome of its own:
             // "cancelled errored" read as a test error (round 13).
             _ if matches!(r.status, prova_core::model::Status::Cancelled) => "-",
@@ -724,6 +732,9 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
             .as_str()
             .map(|x| format!("  --select {}", clean(x)))
             .unwrap_or_default();
+        if outcome.ends_with(['?', '*']) {
+            marks.insert(outcome);
+        }
         println!(
             "{}  {:9}  {:7}  {:>7}  {}{sel}",
             r.id,
@@ -731,6 +742,17 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
             outcome,
             dur,
             r.suite
+        );
+    }
+    // The marks are explained where they appear (round 14).
+    for m in marks {
+        println!(
+            "{m}: {}",
+            if m == "passed?" {
+                "passed with warnings, verified little (`prova status <run>` says why)"
+            } else {
+                "passed with quarantined tests failing, set aside (`prova status <run>`)"
+            }
         );
     }
 }
