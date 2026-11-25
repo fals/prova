@@ -43,6 +43,10 @@ are named in a `caveat:` (a result cache kept between iterations). A
 revalidation of the best that is void because of the candidate (its own median moved, forged lines, leaked processes, tampering), like one that fails, withdraws the
 accept; one the machine spoiled (both arms moved alike, load on one arm, a stopped arm) is inconclusive and the accept stands. Files a trial leaves in `/tmp` that the baseline's trials do not leave are what is named.
 
+Known limit: a candidate that makes every revalidation inconclusive (for
+example by being slow or noisy only when revalidated) keeps its accept. An
+accept whose revalidations stay inconclusive is unconfirmed: read its diff.
+
 Recorded samples cannot be changed: `exp status` re-checks every ACCEPT
 against its samples and warns if the record was changed.
 

@@ -1200,11 +1200,27 @@ fn remove_tree(root: &Path) -> std::result::Result<(), String> {
 /// hsperfdata, pytest's directory) is the tools', and is not reported;
 /// paths are compared by their first component.
 fn tmp_caveat(left: &[Vec<String>; 2]) -> Option<String> {
-    let top = |p: &String| p.split('/').next().unwrap_or("").to_owned();
-    let theirs: std::collections::BTreeSet<String> = left[0].iter().map(top).collect();
+    // Digit runs (pids, numbered directories) are normalised; nothing else.
+    let norm = |p: &String| -> String {
+        let mut out = String::new();
+        let mut digits = false;
+        for ch in p.chars() {
+            if ch.is_ascii_digit() {
+                if !digits {
+                    out.push('#');
+                }
+                digits = true;
+            } else {
+                digits = false;
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let theirs: std::collections::BTreeSet<String> = left[0].iter().map(norm).collect();
     let only: Vec<String> = left[1]
         .iter()
-        .filter(|p| !theirs.contains(&top(p)))
+        .filter(|p| !theirs.contains(&norm(p)))
         .cloned()
         .collect();
     if only.is_empty() {
@@ -1647,7 +1663,7 @@ fn work_comparison(
                 // revalidation of the accept does not hold); a plain failure
                 // is not.
                 if left.is_some() {
-                    return end_void(store, &exp, comparison, &cand_name, &why);
+                    return end_offence(store, &exp, comparison, &cand_name, arm, &why);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &why);
             }
@@ -1679,7 +1695,7 @@ fn work_comparison(
                     },
                 );
                 if left.is_some() {
-                    return end_void(store, &exp, comparison, &cand_name, &reason);
+                    return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
@@ -1688,7 +1704,7 @@ fn work_comparison(
                     "trial {} changed tracked files in the {where_}: a workload must not rewrite code or data; the comparison is void",
                     counter.get()
                 );
-                return end_void(store, &exp, comparison, &cand_name, &reason);
+                return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
             }
             c.trial(&fingerprint_of(store, comparison, counter.get())?);
         }
@@ -3095,6 +3111,24 @@ fn end_inconclusive(
     end_failed(store, exp, comparison, candidate, reason)
 }
 
+/// An offence seen in a trial (tampering, a leaked process): the candidate's
+/// own doing only when its arm's trial committed it. The baseline's is not
+/// about the candidate: inconclusive, the accept stands.
+fn end_offence(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    candidate: &str,
+    arm: Arm,
+    reason: &str,
+) -> Result<()> {
+    if arm == Arm::Candidate {
+        end_void(store, exp, comparison, candidate, reason)
+    } else {
+        end_inconclusive(store, exp, comparison, candidate, reason)
+    }
+}
+
 /// A comparison that is void because of the candidate's own doing (it
 /// tampered with tracked files, left processes behind, forged output, or its
 /// own median moved). When it is a revalidation of the current best, the
@@ -3967,6 +4001,17 @@ mod revalidation_tests {
         ])
         .unwrap();
         assert!(c.contains("left 1 file(s) (e.g. cache/a)"), "{c}");
+        // A cache under a directory the baseline also creates is reported.
+        let c = tmp_caveat(&[
+            vec![".cache/x".into(), "pytest-of-u/pytest-3/a".into()],
+            vec![
+                ".cache/x".into(),
+                ".cache/results".into(),
+                "pytest-of-u/pytest-4/a".into(),
+            ],
+        ])
+        .unwrap();
+        assert!(c.contains("left 1 file(s) (e.g. .cache/results)"), "{c}");
     }
 
     /// A revalidation that cannot say anything about the candidate (the
