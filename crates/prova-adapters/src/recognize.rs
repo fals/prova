@@ -27,6 +27,9 @@ pub struct Recognizers {
     /// The run's working directory: pytest names tests from its rootdir,
     /// prova from here (ADR 0031 section 2).
     pub cwd: Option<std::path::PathBuf>,
+    /// The repository root: names are read relative to it, whatever
+    /// directory the run started in (ADR 0034 section 2).
+    pub repo_root: Option<std::path::PathBuf>,
     /// pytest's rootdir as its header printed it (`-q` prints none).
     pytest_root: Option<std::path::PathBuf>,
     /// The run's command line: a `cd` in it moves pytest, whose ids are
@@ -1127,13 +1130,42 @@ impl Recognizers {
         out
     }
 
-    /// Vitest's root, when it lies below the working directory (either
-    /// path may run through a symlink: compared resolved).
+    /// Where the run started below the repository root (`packages/b`), as
+    /// the prefix of every path-bearing name; empty at the root.
+    fn start_prefix(&self) -> String {
+        let (Some(cwd), Some(repo)) = (&self.cwd, &self.repo_root) else {
+            return String::new();
+        };
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        canon(cwd)
+            .strip_prefix(canon(repo))
+            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Settles the directories names are read from: Vitest's root is the
+    /// working directory until its header says otherwise.
+    pub fn set_places(&mut self, cwd: &std::path::Path, repo_root: &std::path::Path) {
+        self.cwd = Some(cwd.to_owned());
+        self.repo_root = Some(repo_root.to_owned());
+        self.vitest_prefix = Some(self.start_prefix()).filter(|p| !p.is_empty());
+    }
+
+    /// Vitest's root, below the repository root (either path may run
+    /// through a symlink: compared resolved).
     fn vitest_root(&mut self, root: &str) {
         let Some(cwd) = &self.cwd else {
             return;
         };
         let root = std::path::Path::new(root);
+        if let Some(repo) = &self.repo_root {
+            let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            if let Ok(rel) = canon(root).strip_prefix(canon(repo)) {
+                self.vitest_prefix = Some(rel.to_string_lossy().trim_matches('/').to_owned())
+                    .filter(|r| !r.is_empty());
+                return;
+            }
+        }
         let rel = root
             .strip_prefix(cwd)
             .map(std::path::Path::to_path_buf)
@@ -1240,8 +1272,17 @@ impl Recognizers {
         if !(id.contains("::") || id.ends_with(".py")) {
             return pytest_key(id);
         }
+        let start = self.start_prefix();
         match self.pytest_dir(id) {
-            PytestDir::Prefix(p) if !p.is_empty() => pytest_key(&format!("{p}/{id}")),
+            PytestDir::Prefix(p) if !p.is_empty() || !start.is_empty() => {
+                let dir = [start.as_str(), p.as_str()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                pytest_key(&format!("{dir}/{id}"))
+            }
             PytestDir::Prefix(_) => pytest_key(id),
             // Another directory's test of the same id must never be taken
             // for this one: its place is marked, and no quarantine covers it.
@@ -2084,8 +2125,11 @@ impl Recognizers {
     /// (`calc/tests/it.rs` -> `calc/Cargo.toml`). `None` when the files are
     /// not there (a container, a relocated target directory).
     fn cargo_package(&self, rest: &str) -> Option<String> {
-        let cwd = self.cwd.as_ref()?;
         let bin = rest.rsplit_once(" (")?.1.trim_end_matches(')');
+        let cwd = [self.cwd.as_ref(), self.repo_root.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|c| c.join(format!("{bin}.d")).is_file())?;
         let dep = std::fs::read_to_string(cwd.join(format!("{bin}.d"))).ok()?;
         let source = dep.lines().next()?.split_once(": ")?.1.split(' ').next()?;
         let mut dir = cwd.join(source);
@@ -2109,14 +2153,14 @@ impl Recognizers {
             r.strip_suffix(" stdout ----")
                 .or_else(|| r.strip_suffix(" stderr ----"))
         }) {
-            self.close_libtest_block();
+            self.close_libtest_block(out);
             self.libtest_block = Some((self.libtest_key(name.trim()), Vec::new()));
             return true;
         }
         if self.libtest_block.is_some() {
             let t = line.trim();
             if t == "failures:" || t.starts_with("test result:") {
-                self.close_libtest_block();
+                self.close_libtest_block(out);
             } else if let Some((_, lines)) = self.libtest_block.as_mut() {
                 lines.push(line.to_owned());
                 return true;
@@ -3275,11 +3319,79 @@ impl Recognizers {
         self.finished(key, Outcome::Failed, ms, msg, Level::Recognized, out);
     }
 
-    fn close_libtest_block(&mut self) {
-        if let Some((key, lines)) = self.libtest_block.take() {
-            let text = lines.join("\n").trim().to_owned();
-            if !text.is_empty() {
-                self.failure_output.push((key, text));
+    /// The failure block of a libtest test is over. A test whose place was
+    /// unknown (`cargo test --quiet` prints no `Running` line) is told by
+    /// the path its panic message names: that place replaces the unknown one
+    /// (ADR 0034 section 2), so another crate's test of the same name never
+    /// lends its history.
+    fn close_libtest_block(&mut self, out: &mut Vec<EventKind>) {
+        let Some((mut key, lines)) = self.libtest_block.take() else {
+            return;
+        };
+        let text = lines.join("\n").trim().to_owned();
+        if key.file.is_none()
+            && !self.holding
+            && let Some(place) = self.panic_place(&text)
+            && let Some((_, Outcome::Failed | Outcome::Errored)) = self.seen.get(&key.unique())
+        {
+            let old = key.clone();
+            key.file = Some(place);
+            out.push(EventKind::TestFinished {
+                test: key.clone(),
+                attempt: 1,
+                outcome: Outcome::Failed,
+                duration_ms: None,
+                message: None,
+                source: Level::Recognized,
+                subtest: false,
+                passed_in_iteration: false,
+            });
+            out.push(EventKind::TestSuperseded {
+                test: old,
+                by: key.clone(),
+            });
+        }
+        if !text.is_empty() {
+            self.failure_output.push((key, text));
+        }
+    }
+
+    /// The place (test binary, as nextest names it) a panic message's path
+    /// gives: `geo/src/lib.rs` is `geo`, `geo/tests/it.rs` is `geo::it`.
+    /// `None` without the file on disk (a container) or a package around it.
+    fn panic_place(&self, text: &str) -> Option<String> {
+        let path = text.lines().find_map(|l| {
+            let (_, rest) = l.split_once(" panicked at ")?;
+            let mut parts = rest.trim().trim_end_matches(':').rsplitn(3, ':');
+            let (_col, _line, file) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(file.to_owned())
+        })?;
+        let bases = [self.cwd.as_ref(), self.repo_root.as_ref()];
+        let abs = bases
+            .into_iter()
+            .flatten()
+            .map(|b| b.join(&path))
+            .find(|p| p.is_file())?;
+        let stop = self.repo_root.as_ref().or(self.cwd.as_ref())?;
+        let mut dir = abs.parent()?.to_path_buf();
+        loop {
+            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
+                && let Some(name) = cargo_package_name(&toml)
+            {
+                let krate = name.replace('-', "_");
+                let rel = abs.strip_prefix(&dir).ok()?;
+                let mut comps = rel.components();
+                return match (comps.next(), comps.next(), comps.next()) {
+                    (Some(a), Some(b), None) if a.as_os_str() == "tests" => {
+                        let stem = std::path::Path::new(b.as_os_str()).file_stem()?;
+                        Some(format!("{krate}::{}", stem.to_string_lossy()))
+                    }
+                    (Some(a), ..) if a.as_os_str() == "src" => Some(krate),
+                    _ => None,
+                };
+            }
+            if dir == *stop || !dir.pop() {
+                return None;
             }
         }
     }
@@ -3338,7 +3450,7 @@ impl Recognizers {
         }
         self.close_pass_output();
         self.close_libtest_running(&mut gts);
-        self.close_libtest_block();
+        self.close_libtest_block(&mut gts);
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
