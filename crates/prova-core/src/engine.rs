@@ -2540,6 +2540,9 @@ pub struct Failure {
 #[derive(Debug, Clone, Serialize)]
 pub struct SlowTest {
     pub test: String,
+    /// The test binary (crate) the name does not carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     pub elapsed_ms: u64,
     pub budget_ms: u64,
     pub budget_from: BudgetFrom,
@@ -3002,6 +3005,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 );
                 let entry = slow.entry(test.unique()).or_insert(SlowTest {
                     test: test.display(),
+                    place: test.place().map(str::to_owned),
                     elapsed_ms: 0,
                     budget_ms: 0,
                     budget_from: *budget_from,

@@ -239,7 +239,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     for t in &s.slow {
         println!(
             "  SLOW {}: running {} (budget {}: {})",
-            clean(&t.test),
+            named(&t.test, t.place.as_deref()),
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
             format_duration(std::time::Duration::from_millis(t.budget_ms)),
             budget_why(t)
@@ -796,10 +796,10 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
         WaitReason::Failure => progress_failures(s, reported),
         WaitReason::Slow => {
             for t in &s.slow {
-                if reported.insert(format!("slow:{}", t.test)) {
+                if reported.insert(format!("slow:{}", named(&t.test, t.place.as_deref()))) {
                     eprintln!(
                         "SLOW {} (over its {} budget: {})",
-                        clean(&t.test),
+                        named(&t.test, t.place.as_deref()),
                         format_duration(std::time::Duration::from_millis(t.budget_ms)),
                         budget_why(t)
                     );
@@ -1342,6 +1342,7 @@ mod budget_tests {
     fn the_minimum_budget_is_named_as_such() {
         let t = |ms| prova_core::engine::SlowTest {
             test: "t".into(),
+            place: None,
             elapsed_ms: 2000,
             budget_ms: ms,
             budget_from: prova_core::model::BudgetFrom::History,
