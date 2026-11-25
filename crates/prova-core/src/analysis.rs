@@ -617,6 +617,9 @@ fn stats_scoped(
     // Same code, opposite results, different environments: name the
     // variables that differ between a pass and a failure.
     let mut env_dependent: BTreeSet<String> = BTreeSet::new();
+    // One earlier pass is too little to call a failure environment-
+    // dependent (ADR 0034 section 3): the pass may be anything else.
+    let mut env_passes: BTreeSet<&str> = BTreeSet::new();
     if flips == 0 {
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
             for f in counted
@@ -626,10 +629,14 @@ fn stats_scoped(
                 for k in p.env.keys().chain(f.env.keys()) {
                     if p.env.get(k) != f.env.get(k) {
                         env_dependent.insert(k.clone());
+                        env_passes.insert(p.run.as_str());
                     }
                 }
             }
         }
+    }
+    if env_passes.len() < 2 {
+        env_dependent.clear();
     }
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
     let mixed = recent.iter().filter(|r| r.passed_and_failed).count();

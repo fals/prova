@@ -150,6 +150,132 @@ fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
     );
 }
 
+/// Round 18 (go-make): `go test -json -count=4` with FAIL, FAIL, FAIL, PASS
+/// was "broken, not flaky" in history; the `-v` text said FLAKY. Why
+/// medium: the label comes from stored attempts.
+#[test]
+fn r18_go_json_count_with_a_late_pass_is_flaky_in_history() {
+    let d = workspace("gojsoncount");
+    let mut events = String::new();
+    for a in ["fail", "fail", "fail", "pass"] {
+        events.push_str(&format!(
+            "{{\"Action\":\"run\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\"}}\n{{\"Action\":\"{a}\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\",\"Elapsed\":0.01}}\n"
+        ));
+    }
+    events.push_str("{\"Action\":\"fail\",\"Package\":\"ex/a\",\"Elapsed\":0.1}\n");
+    std::fs::write(d.join("ev.json"), events).unwrap();
+    let cmd = format!("{BUSY} cat ev.json; exit 1");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let h = text(&prova(&d, &["history", "TestFlaky"]));
+    assert!(
+        h.contains("both passed and failed on 1 code version"),
+        "{h}"
+    );
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(
+        f.contains("TestFlaky"),
+        "prova flaky agrees with history: {f}"
+    );
+}
+
+/// Round 18 (probe M3): a pass with a quarantined failure set aside
+/// (`passed*`) made another place's real failure "likely FLAKY: suite
+/// passed on this exact code before". Why medium: needs a quarantine, a
+/// stored run and the same code across runs.
+#[test]
+fn r18_a_pass_that_set_a_failure_aside_is_not_a_pass_on_this_exact_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = workspace("setaside");
+    let out = PathBuf::from(format!("{}.out", d.display()));
+    std::fs::create_dir_all(&out).unwrap();
+    let nextest = |calc: &str, geo: &str| {
+        format!(
+            "    Starting 2 tests across 2 binaries\n        {calc} [   0.004s] calc tests::flaky\n        {geo} [   0.004s] geo tests::real_bug\n     Summary [   0.020s] 2 tests run\n"
+        )
+    };
+    std::fs::create_dir_all(d.join("rc")).unwrap();
+    let script = d.join("rc/cargo");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{BUSY}\ncat {o}/out.txt\nexit 100\n",
+            o = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.s]\nrun = \"./rc/cargo nextest run\"\n",
+    )
+    .unwrap();
+    std::fs::write(out.join("out.txt"), nextest("FAIL", "PASS")).unwrap();
+    prova(&d, &["run", "s"]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // calc fails again: set aside, the run passes (exit 100, outcome passed).
+    let o = prova(&d, &["run", "s"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // geo's own failure of another test.
+    std::fs::write(out.join("out.txt"), nextest("PASS", "FAIL")).unwrap();
+    let o = prova(&d, &["run", "s"]);
+    let o = text(&o);
+    assert!(o.contains("FAIL tests::real_bug"), "{o}");
+    assert!(!o.contains("likely FLAKY"), "{o}");
+}
+
+/// Round 18 (ts-vitest): "environment-dependent, not flaky" from a single
+/// earlier pass. Why medium: needs two runs with different environments.
+#[test]
+fn r18_one_earlier_pass_is_too_little_to_call_a_failure_environment_dependent() {
+    let d = workspace("envone");
+    let cmd = format!(
+        "{BUSY} if [ -n \"$BADENV\" ]; then echo 'test calc::e ... FAILED'; exit 1; else echo 'test calc::e ... ok'; fi"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let o = Command::new(PROVA)
+        .args(["run", "--", "sh", "-c", &cmd])
+        .current_dir(&d)
+        .env("PROVA_HOME", format!("{}.home", d.display()))
+        .env("BADENV", "1")
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert!(out.contains("FAIL calc::e"), "{out}");
+    assert!(!out.contains("environment-dependent"), "{out}");
+    assert!(out.contains("too little history"), "{out}");
+}
+
+/// Round 18 (ts-vitest): "this code passed in suite a" for a suite that did
+/// not run the failing test at all. Why medium: three stored runs.
+#[test]
+fn r18_another_suite_that_never_ran_the_test_says_nothing_about_it() {
+    let d = workspace("elsewhere");
+    let failing = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... FAILED' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101"
+    );
+    let other = format!(
+        "{BUSY} printf '%s\\n' 'test b::other ... ok' '' 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &failing]);
+    let o = prova(&d, &["run", "--", "sh", "-c", &other]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = text(&prova(&d, &["run", "--", "sh", "-c", &failing]));
+    assert!(o.contains("FAIL a::t1"), "{o}");
+    assert!(!o.contains("this code passed in suite"), "{o}");
+}
+
 /// A name of unknown place that two known places share is none of theirs:
 /// it takes no history, no FLAKY label, and no quarantine of theirs.
 #[test]

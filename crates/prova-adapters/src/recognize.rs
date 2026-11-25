@@ -4966,6 +4966,34 @@ mod tests {
         );
     }
 
+    /// Round 18 (go-make): `go test -json -count=4` with FAIL, FAIL, FAIL,
+    /// PASS was "broken, not flaky"; the `-v` text said FLAKY. The pass in a
+    /// later iteration is flaky evidence in the JSON stream too.
+    #[test]
+    fn go_json_count_with_mixed_iterations_marks_the_pass() {
+        let mut lines = String::new();
+        for (i, a) in ["fail", "fail", "fail", "pass"].iter().enumerate() {
+            lines.push_str(&format!(
+                "{{\"Action\":\"run\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\"}}\n{{\"Action\":\"{a}\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\",\"Elapsed\":0.0{i}}}\n"
+            ));
+        }
+        lines.push_str("{\"Action\":\"fail\",\"Package\":\"ex/a\",\"Elapsed\":0.1}\n");
+        let (_, ev) = feed_all(&lines);
+        let marked = ev
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EventKind::TestFinished {
+                        passed_in_iteration: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(marked, 1, "{ev:?}");
+    }
+
     #[test]
     fn surefire_aggregate_line_is_the_total() {
         let (r, _) = feed(
