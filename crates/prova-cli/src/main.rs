@@ -321,7 +321,7 @@ Examples:
         #[arg(long)]
         all: bool,
         /// How many of the latest runs to look at.
-        #[arg(long, value_name = "RUNS", default_value_t = 100)]
+        #[arg(long, value_name = "RUNS", default_value_t = 50)]
         window: usize,
         /// JSON instead of text.
         #[arg(long)]
