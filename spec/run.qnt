@@ -53,10 +53,14 @@ module runLifecycle {
   // ADR 0031: only when the command is one test-runner call (`runnerOnly`,
   // fixed with the command when the run is created): a step before, after
   // or between runner calls, or one the failure skipped, is out of sight.
+  // ADR 0034: and only when every test the suite's last full pass
+  // reported (`known`, fixed when the run is created) has a result: a
+  // runner that stopped at the quarantined failure never ran the rest.
   pure val QUARANTINED = Set("b")
   pure def withQuarantine(v: Verdict, s: Status, code: int, out: str -> Outcome,
-                          contra: bool, runnerOnly: bool, q: Set[str]): Verdict =
+                          contra: bool, runnerOnly: bool, known: Set[str], q: Set[str]): Verdict =
     if (v == Fail and s == Finished and not(contra) and runnerOnly
+        and known.forall(t => out.keys().contains(t))
         and code != 0 and code != 126 and code != 127
         and out.keys().exists(t => out.get(t) == Failed or out.get(t) == Errored)
         and out.keys().forall(t =>
@@ -299,7 +303,8 @@ module runLifecycle {
   // a pass it grants has a finished run, no contradiction, every other
   // test passed or skipped, and no quarantined test errored.
   val quarantineHidesOnlyItsOwn = Set(true, false).forall(runnerOnly =>
-    withQuarantine(verdict, status, exitCode, outcomes, contradiction, runnerOnly, QUARANTINED) == Pass
+    Set(Set(), Set("a"), Set("a", "b"), Set("a", "c")).forall(known =>
+    withQuarantine(verdict, status, exitCode, outcomes, contradiction, runnerOnly, known, QUARANTINED) == Pass
       implies all {
         status == Finished,
         not(contradiction),
@@ -312,7 +317,9 @@ module runLifecycle {
         verdict != Pass implies
           outcomes.keys().exists(t => outcomes.get(t) == Passed and not(QUARANTINED.contains(t))),
         verdict != Pass implies runnerOnly,
-      })
+        // Every known test reported (ADR 0034).
+        verdict != Pass implies known.forall(t => outcomes.keys().contains(t)),
+      }))
 
   // A command that could not start is not a test failure.
   val couldNotStartIsAnError =
@@ -398,10 +405,13 @@ module runLifecycle {
       .then(exited(1)).then(end(Finished))
       .then(all {
         assert(verdict == Fail),
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Pass),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, Set("a", "b"), QUARANTINED) == Pass),
+        // ADR 0034: a known test that did not report (a runner stopped at
+        // the quarantined failure) leaves the failure standing.
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, Set("a", "b", "c"), QUARANTINED) == Fail),
         // ADR 0031: the same failure under a command that does more than
         // run the tests (make, a script, a chain) is not set aside.
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, false, QUARANTINED) == Fail),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, false, Set("a", "b"), QUARANTINED) == Fail),
         assert(safety),
         late("a", Passed),
       })
@@ -412,7 +422,7 @@ module runLifecycle {
       .then(testStarted("b")).then(testFinished("b", Failed))
       .then(exited(1)).then(end(Finished))
       .then(all {
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Fail),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, Set("a", "b"), QUARANTINED) == Fail),
         late("a", Passed),
       })
 
@@ -421,7 +431,7 @@ module runLifecycle {
     init.then(start).then(testStarted("b")).then(testFinished("b", Failed))
       .then(exited(1)).then(end(Finished))
       .then(all {
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Fail),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, Set("a", "b"), QUARANTINED) == Fail),
         late("b", Failed),
       })
 
