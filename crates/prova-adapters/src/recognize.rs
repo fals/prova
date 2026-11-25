@@ -1797,6 +1797,12 @@ impl Recognizers {
             }
             _ => (name, 1),
         };
+        // The stream's file is relative to Vitest's root, which its events
+        // name: a stream read before the text's `RUN` header (`--root`)
+        // must name tests as the text does (round 18: counted twice).
+        if let Some(root) = v["root"].as_str() {
+            self.vitest_root(root);
+        }
         let key = if let Some(file) = v["file"].as_str() {
             TestKey {
                 file: None,
@@ -4934,6 +4940,29 @@ mod tests {
                 ("calc.CalcTest$Division::exact".into(), Outcome::Failed),
                 ("calc.CalcTest::divides".into(), Outcome::Failed),
             ]
+        );
+    }
+
+    /// Round 18 (probe, `vitest --root pkg`): the stream's events came
+    /// before the text's `RUN` header and named the file bare; the text
+    /// named it with `pkg/`: one failure counted twice.
+    #[test]
+    fn vitest_stream_events_name_the_file_from_the_root_they_carry() {
+        let mut r = Recognizers::default();
+        r.vitest_stream = true;
+        r.set_places(std::path::Path::new("/w"), std::path::Path::new("/w"));
+        let mut ev = Vec::new();
+        ev.extend(r.line(
+            r#"{"type":"test","event":"failed","name":"works","file":"src/a.test.ts","root":"/w/pkg"}"#,
+        ));
+        for l in [" RUN  v3.2.4 /w/pkg", " × src/a.test.ts > works 1ms"] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        let names: BTreeSet<String> = finished(&ev).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["pkg/src/a.test.ts::works".to_owned()]
         );
     }
 
