@@ -68,17 +68,26 @@ fn nextest(calc: &str, geo: &str) -> String {
     )
 }
 
+/// Each suite runs a fake `cargo` printing nextest's output: one
+/// test-runner call, which a quarantine needs (ADR 0031).
 fn two_crates(d: &Path) {
-    std::fs::write(
-        d.join("prova.toml"),
-        format!(
-            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n\n[suite.c]\nrun = {:?}\n",
-            nextest("FAIL", "PASS"),
-            nextest("PASS", "FAIL"),
-            nextest("PASS", "PASS"),
-        ),
-    )
-    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut toml = String::new();
+    for (suite, calc, geo) in [
+        ("a", "FAIL", "PASS"),
+        ("b", "PASS", "FAIL"),
+        ("c", "PASS", "PASS"),
+    ] {
+        let dir = d.join("rc").join(suite);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cargo");
+        std::fs::write(&path, format!("#!/bin/sh\n{}\n", nextest(calc, geo))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        toml.push_str(&format!(
+            "[suite.{suite}]\nrun = \"./rc/{suite}/cargo nextest run\"\n\n"
+        ));
+    }
+    std::fs::write(d.join("prova.toml"), toml).unwrap();
 }
 
 /// Round 17 (probe M1): calc's `tests::flaky` is quarantined; geo's own
