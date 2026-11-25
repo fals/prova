@@ -44,8 +44,9 @@ revalidation of the best that is void because of the candidate (its own median m
 accept; one the machine spoiled (both arms moved alike, load on one arm, a stopped arm) is inconclusive and the accept stands. Files a trial leaves in `/tmp` that the baseline's trials do not leave are what is named.
 
 Known limit: a candidate that makes every revalidation inconclusive (for
-example by being slow or noisy only when revalidated) keeps its accept. An
-accept whose revalidations stay inconclusive is unconfirmed: read its diff.
+example by being slow or noisy only when revalidated), or that simply fails
+its trials when revalidated, keeps its accept. An accept whose
+revalidations do not end in a verdict is unconfirmed: read its diff.
 
 Recorded samples cannot be changed: `exp status` re-checks every ACCEPT
 against its samples and warns if the record was changed.

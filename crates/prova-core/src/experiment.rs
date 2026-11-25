@@ -1198,7 +1198,7 @@ fn remove_tree(root: &Path) -> std::result::Result<(), String> {
 /// baseline's did not, when it matters: files written outside the checkout
 /// can be read back by the next iteration. What both arms leave (a JVM's
 /// hsperfdata, pytest's directory) is the tools', and is not reported;
-/// paths are compared by their first component.
+/// full relative paths are compared with digit runs normalised.
 fn tmp_caveat(left: &[Vec<String>; 2]) -> Option<String> {
     // Digit runs (pids, numbered directories) are normalised; nothing else.
     let norm = |p: &String| -> String {
