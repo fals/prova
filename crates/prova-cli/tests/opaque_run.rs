@@ -1468,6 +1468,80 @@ fn a_live_run_that_is_not_a_container_run_does_not_hold_back_the_cancel() {
     );
 }
 
+/// A rival container run whose argv has a word with a space
+/// (`sh -c "pytest -q"`) and whose own container exists does not contest the
+/// container of another run: the rival's command is read as words, not as
+/// the quoted text `display` prints. Why medium: two live runs, a fake
+/// container client and the store, through the CLI.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rival_with_a_quoted_word_and_its_own_container_does_not_contest() {
+    let d = workspace("cancel-container-quoted-rival");
+    let (path, killed) = fake_docker(&d);
+    let cwd = d.canonicalize().unwrap();
+    let mount = |id: &str, created: &str, cmd: &str| {
+        format!(
+            r#"{{"Id":"{id}ffff","Created":"{created}","Config":{{"Image":"img"}},{cmd},"Mounts":[{{"Type":"bind","Source":"{}"}}]}}"#,
+            cwd.display()
+        )
+    };
+    std::fs::write(d.join("ps.out"), "aaa111bbb222\nbbb222ccc333\n").unwrap();
+    std::fs::write(
+        d.join("inspect.json"),
+        format!(
+            "[{},{}]",
+            mount(
+                "aaa111bbb222",
+                "2999-01-01T00:00:00Z",
+                r#""Path":"sh","Args":["-c","pytest -q"]"#
+            ),
+            mount(
+                "bbb222ccc333",
+                "2999-01-01T00:00:01Z",
+                r#""Path":"t","Args":[]"#
+            ),
+        ),
+    )
+    .unwrap();
+    let o = Command::new(PROVA)
+        .args([
+            "run",
+            "--detach",
+            "--json",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+            "img",
+            "sh",
+            "-c",
+            "pytest -q",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let rival = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(&d, rival.clone());
+    for _ in 0..40 {
+        let w = json(&prova(
+            &d,
+            &["wait", &rival, "--max-wait", "500ms", "--json"],
+        ));
+        if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+    }
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
+        "kill bbb222ccc333",
+        "a rival with its own container contested the cancel: {s}"
+    );
+}
+
 /// Round 18: `--until first-failure` through a container client announced
 /// 30 s and waited 65. The announcement now says 1m05s. Medium: a real
 /// `prova run` process and the fake client.

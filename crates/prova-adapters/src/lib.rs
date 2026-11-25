@@ -65,7 +65,7 @@ pub fn observer_for(spec: &RunSpec, root: &Path, cwd: &Path) -> Box<dyn Observer
     // gotestsum prints the module's root package as `.`; `go test` by its
     // import path. go.mod names it, so both name a test alike (round 15).
     let mut live = recognize::Recognizers::default();
-    live.cwd = Some(cwd.to_owned());
+    live.set_places(cwd, &prova_core::identity::repo_root(cwd));
     live.command = Some(spec.command.raw());
     live.go_module = std::fs::read_to_string(root.join("go.mod"))
         .ok()

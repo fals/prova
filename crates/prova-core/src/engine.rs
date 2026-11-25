@@ -706,7 +706,7 @@ impl Supervisor<'_> {
             .filter_map(|(run, ms, _, spec)| {
                 let cmdline = serde_json::from_str::<RunSpec>(&spec)
                     .ok()
-                    .map(|s| s.command.display())
+                    .map(|s| s.command.raw())
                     .filter(|c| crate::resources::container_client_runs(c));
                 // A wrapper's client is only known from the note it emitted.
                 let noted = || {
@@ -2645,6 +2645,9 @@ pub struct Failure {
 #[derive(Debug, Clone, Serialize)]
 pub struct SlowTest {
     pub test: String,
+    /// The test binary (crate) the name does not carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     pub elapsed_ms: u64,
     pub budget_ms: u64,
     pub budget_from: BudgetFrom,
@@ -2946,14 +2949,15 @@ fn unnarrowed_note(total: usize, prev: &str, listed: &str) -> String {
 
 /// For a run through `make` or another wrapper, a suite of the project
 /// that runs a known test runner directly, by name.
-fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, command: &str) -> Option<String> {
+fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, program: &str) -> Option<String> {
     let first = |c: &str| {
         c.split_whitespace()
             .find(|w| !w.contains('='))
             .map(|w| w.rsplit('/').next().unwrap_or(w).to_owned())
             .unwrap_or_default()
     };
-    if !matches!(first(command).as_str(), "make" | "gmake" | "just" | "task") {
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(program, "make" | "gmake" | "just" | "task") {
         return None;
     }
     let direct = cfg.suite.iter().find(|(name, s)| {
@@ -3152,6 +3156,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 );
                 let entry = slow.entry(test.unique()).or_insert(SlowTest {
                     test: test.display(),
+                    place: test.place().map(str::to_owned),
                     elapsed_ms: 0,
                     budget_ms: 0,
                     budget_from: *budget_from,
@@ -3246,14 +3251,39 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // run's unfinished tests say nothing about the code (ADR 0018).
     // Only a verified pass is evidence the suite can pass on this code
     // (round 11: an echoed pass made a real failure "likely flaky").
-    let suite_passed_on_same_code = row.status == Status::Finished && {
+    // Like with like (ADR 0035 section 2): a pass that set quarantined
+    // failures aside (exit code not 0) did not pass on this code, and a
+    // pass is evidence about a test only if that run ran the test.
+    let passes_on_same_code: Vec<String> = if row.status == Status::Finished {
         let prev = store.suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?;
         let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
         let thin = store.unverified(&ids)?;
-        prev.iter().any(|r| {
-            r.code == row.code && r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id)
-        })
+        prev.iter()
+            .filter(|r| {
+                r.code == row.code
+                    && r.outcome == Some(Outcome::Passed)
+                    && r.exit_code == Some(0)
+                    && !thin.contains(&r.id)
+            })
+            .map(|r| r.id.clone())
+            .collect()
+    } else {
+        Vec::new()
     };
+    // The tests (by name and place) that passed in any of those runs: one
+    // query, not one per run. A pass of another place's test of the same
+    // name is no evidence for this one.
+    let passed_ran: std::collections::BTreeSet<(String, Option<String>)> = {
+        let runs = serde_json::to_string(&passes_on_same_code).unwrap_or_else(|_| "[]".into());
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display, t.file FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id IN (SELECT value FROM json_each(?1)) AND a.outcome = 'passed'",
+        )?;
+        stmt.query_map(rusqlite::params![runs], |q| Ok((q.get(0)?, q.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let suite_passed_ran =
+        |key: &TestKey| -> bool { passed_ran.contains(&(key.display(), key.file.clone())) };
     let mut failures = Vec::new();
     // A failure reported before its message (pytest -v prints the line
     // first, the `-rfE` summary names the cause at the end): the message is
@@ -3285,7 +3315,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             outcome: *outcome,
             message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
-                c.suite_passed_on_same_code = suite_passed_on_same_code;
+                c.suite_passed_on_same_code = suite_passed_ran(key);
                 c
             }),
         });
@@ -3325,6 +3355,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
+                    // A result of unknown place is not that place's when
+                    // the name is shared (ADR 0035 section 1).
+                    (None, Some(_)) => !q.ambiguous,
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
@@ -3416,8 +3449,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let explained = !failures.is_empty() && failures.iter().all(|f| f.message.is_some());
     let want_tail = reason == WaitReason::Stall
         || ((failed_run || reason == WaitReason::Failure) && !explained);
-    let (command, raw_command) = serde_json::from_value::<RunSpec>(row.spec.clone())
-        .map(|s| (s.command.display(), s.command.raw()))
+    let (command, raw_command, program) = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .map(|s| (s.command.display(), s.command.raw(), s.command.program()))
         .unwrap_or_default();
     // A selected run's failure outside the selection: a file-level entry
     // the framework loads whatever the selection (Vitest imports every
@@ -3529,7 +3562,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && stalled_ms.is_some()
         && running.is_empty()
         && let Ok(cfg) = crate::config::load(store.root())
-        && let Some(hint) = direct_suite_hint(&cfg, &row.suite, &command)
+        && let Some(hint) = direct_suite_hint(&cfg, &row.suite, &program)
     {
         notes.push(hint);
     }
@@ -3806,8 +3839,17 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
                        AND status = 'finished' AND outcome = 'passed'
                        AND json_extract(spec, '$.selection') IS NULL
                        AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
+                       -- a suite that did not run the failing test says
+                       -- nothing about it (round 18)
+                       AND (NOT EXISTS (SELECT 1 FROM attempts fa WHERE fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored'))
+                            OR EXISTS (SELECT 1 FROM attempts pa JOIN tests pt ON pt.id = pa.test_id
+                                        JOIN tests ft ON ft.display = pt.display
+                                        JOIN attempts fa ON fa.test_id = ft.id
+                                       WHERE pa.run_id = r.id AND pa.outcome = 'passed'
+                                         AND fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored')))
+                       AND r.exit_code = 0
                      ORDER BY created_ms DESC LIMIT 1",
-                    rusqlite::params![row.code, row.suite],
+                    rusqlite::params![row.code, row.suite, row.id],
                     |r| Ok(serde_json::json!({ "run": r.get::<_, String>(0)?, "suite": r.get::<_, String>(1)? })),
                 )
                 .ok()
@@ -4131,15 +4173,15 @@ mod hang_hint_tests {
             "[suite.make]\nrun = \"make test\"\n[suite.default]\nrun = \"go test -json ./...\"\n",
         )
         .unwrap();
-        let hint = super::direct_suite_hint(&cfg, "make", "make test").unwrap();
+        let hint = super::direct_suite_hint(&cfg, "make", "make").unwrap();
         assert!(
             hint.contains("`prova run default --until first-failure`"),
             "{hint}"
         );
         // Not for a suite that is already the direct one, nor without one.
-        assert!(super::direct_suite_hint(&cfg, "default", "go test -json ./...").is_none());
+        assert!(super::direct_suite_hint(&cfg, "default", "go").is_none());
         let only: crate::config::Config =
             toml::from_str("[suite.make]\nrun = \"make test\"\n").unwrap();
-        assert!(super::direct_suite_hint(&only, "make", "make test").is_none());
+        assert!(super::direct_suite_hint(&only, "make", "make").is_none());
     }
 }

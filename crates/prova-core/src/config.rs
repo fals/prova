@@ -151,6 +151,20 @@ impl CommandSpec {
         }
     }
 
+    /// The program the command runs: the first argv word, whole (a path
+    /// may hold a space), or the first word of a shell line that is not a
+    /// variable assignment. Joined text cannot say where a word ends.
+    pub fn program(&self) -> String {
+        match self {
+            CommandSpec::Argv(a) => a.first().cloned().unwrap_or_default(),
+            CommandSpec::Shell(s) => s
+                .split_whitespace()
+                .find(|w| !w.contains('='))
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
+
     pub fn display(&self) -> String {
         match self {
             // Quoted as a shell would need it, so the line can be pasted
@@ -1047,6 +1061,16 @@ mod tests {
         let ok = "tests/test_calc.py::test_add[2-3]";
         assert_eq!(super::pytest_node(unq, ok, &d).as_deref(), Some(ok));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The program is a whole word: a path with a space stays one (review
+    /// of PR 118); a shell line skips its variable assignments.
+    #[test]
+    fn the_program_is_the_first_whole_word() {
+        let argv = CommandSpec::Argv(vec!["./my tools/make".into(), "test".into()]);
+        assert_eq!(argv.program(), "./my tools/make");
+        let shell = CommandSpec::Shell("CI=1 make test".into());
+        assert_eq!(shell.program(), "make");
     }
 
     #[test]

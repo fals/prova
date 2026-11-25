@@ -479,6 +479,46 @@ fn a_stalled_make_run_names_the_direct_suite() {
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
 }
 
+/// The make hint reads the command's own words, not its shell-quoted
+/// display: a `make` whose path holds a space (`'./my tools/make' test`
+/// once displayed) is still make (review of PR 118). Why medium: a real
+/// stalled argv run and its summary.
+#[test]
+fn a_stalled_make_with_a_spaced_path_names_the_direct_suite() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = workspace("stall-make-space");
+    let tools = d.join("my tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("make"), "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(tools.join("make"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.direct]\nrun = \"go test -json ./...\"\n",
+    )
+    .unwrap();
+    let id = text(&prova(
+        &d,
+        &[
+            "run",
+            "--detach",
+            "--stall-after",
+            "1s",
+            "--",
+            "./my tools/make",
+            "test",
+        ],
+    ))
+    .trim()
+    .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(w.contains("prova run direct --until first-failure"), "{w}");
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
 /// Round 16: a list of suspects cut at five ended in "..." and hid the hung
 /// test. A list cut short says how many it left out.
 #[test]
@@ -739,6 +779,9 @@ fn a_failure_that_depends_on_the_environment_is_not_flaky() {
         format!("[suite.t]\nrun = \"{WORK_SH}if [ -n \\\"$BADENV\\\" ]; then echo 'test calc::e ... FAILED'; exit 1; else echo 'test calc::e ... ok'; fi\"\n"),
     )
     .unwrap();
+    // Two passes: one is too little history to call a failure
+    // environment-dependent (ADR 0035 section 2).
+    prova(&d, &["run", "t"]);
     prova(&d, &["run", "t"]);
     let o = Command::new(PROVA)
         .args(["run", "t"])

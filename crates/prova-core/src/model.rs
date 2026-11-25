@@ -196,7 +196,7 @@ impl BudgetFrom {
         match self {
             BudgetFrom::Runner => "the test runner's own warning",
             BudgetFrom::History => "3x its usual time",
-            BudgetFrom::Default => "the suite's default; no history yet",
+            BudgetFrom::Default => "the suite's default; no duration history yet",
         }
     }
 }
