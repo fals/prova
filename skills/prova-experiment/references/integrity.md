@@ -23,7 +23,10 @@ Trials run in ABBA order. Trials do not see `PROVA_HOME`.
 prova guards the verdict against:
 
 - changed tests and benchmarks, and the expected values and build scripts an
-  oracle reads (`testdata`, `fixtures`, snapshots, golden files, `build.rs`);
+  oracle reads (`testdata`, `fixtures`, snapshots, golden files, `build.rs`),
+  runner configuration that names the program a tool runs (`.npmrc`,
+  `.yarnrc*`, `.cargo/config*`, `rust-toolchain`, `rust-toolchain.toml`, `go.env`, `pip.conf`,
+  `sitecustomize.py`) and compiled modules (`*.pyc`, `__pycache__/`);
 - a skipped oracle;
 - forged extra metric lines;
 - leaked processes;
@@ -34,6 +37,16 @@ prova guards the verdict against:
 - a weak reference: `--against` and `exp best` take only the baseline or a
   kept variant, and an ACCEPT against a baseline that is not an ancestor of
   the candidate says so.
+
+A trial's private `/tmp` is looked at when the trial ends: files left there
+are named in a `caveat:` (a result cache kept between iterations). A
+revalidation of the best that is void because of the candidate (its own median moved, forged lines, leaked processes, tampering), like one that fails, withdraws the
+accept; one the machine spoiled (both arms moved alike, load on one arm, a stopped arm) is inconclusive and the accept stands. Files a trial leaves in `/tmp` that the baseline's trials do not leave are what is named.
+
+Known limit: a candidate that makes every revalidation inconclusive (for
+example by being slow or noisy only when revalidated), or that simply fails
+its trials when revalidated, keeps its accept. An accept whose
+revalidations do not end in a verdict is unconfirmed: read its diff.
 
 Recorded samples cannot be changed: `exp status` re-checks every ACCEPT
 against its samples and warns if the record was changed.

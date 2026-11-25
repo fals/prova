@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reference vectors for crates/prova-core/src/stats.rs, from SciPy.
 
+Needs SciPy >= 1.15 (PermutationMethod, rng=).
 Usage: python3 scripts/stats-reference.py > crates/prova-core/tests/stats_reference.json
 Hodges-Lehmann intervals follow R's wilcox.test(conf.int=TRUE) formula,
 with the exact null distribution of U enumerated by brute force.
@@ -42,8 +43,28 @@ for n, m in [(3, 3), (4, 5), (5, 5), (6, 4), (8, 8), (10, 10)]:
         if n * m <= 64:
             case["hl"] = hl(x, y, 0.05)
         cases.append(case)
-# ties: asymptotic with continuity correction
-for x, y in [([1, 2, 2, 3, 4], [2, 3, 3, 5, 6, 6]), ([10, 10, 11, 12, 12, 12], [12, 13, 13, 14, 10, 15])]:
+# ties, small samples: the exact permutation distribution of U given the tie
+# pattern (midranks). SciPy's PermutationMethod enumerates every arrangement
+# when n_resamples exceeds their number, so these p-values are exact, not
+# sampled. Constant arms (deterministic metrics) are the common case: 5 + 5
+# fully separated is 2 / C(10, 5) = 0.0079, not the asymptotic 0.0040.
+exact_ties = [
+    ([1, 2, 2, 3, 4], [2, 3, 3, 5, 6, 6]),
+    ([10, 10, 11, 12, 12, 12], [12, 13, 13, 14, 10, 15]),
+    ([100] * 5, [50] * 5),
+    ([100] * 5, [100] * 5),
+    ([100] * 5, [100, 100, 100, 100, 50]),
+    ([100, 100, 100, 100, 99], [50, 50, 50, 50, 51]),
+    ([7] * 3, [5] * 3),
+    ([3, 3, 3, 3, 3, 3, 3, 3], [1, 1, 1, 1, 1, 1, 1, 2]),
+    ([1, 1, 2, 2, 3, 3, 4, 4, 5, 5], [2, 2, 3, 3, 4, 4, 5, 5, 6, 6]),
+]
+for x, y in exact_ties:
+    r = stats.mannwhitneyu(x, y, alternative="two-sided", method=stats.PermutationMethod(n_resamples=10**7, rng=0))
+    cases.append({"x": [float(v) for v in x], "y": [float(v) for v in y], "u": float(r.statistic), "p": float(r.pvalue), "method": "exact"})
+# ties, samples too large to enumerate cheaply: normal approximation with tie
+# and continuity correction
+for x, y in [([i // 3 for i in range(24)], [i // 3 + 2 for i in range(24)]), ([i % 7 for i in range(30)], [i % 5 + 1 for i in range(30)])]:
     r = stats.mannwhitneyu(x, y, alternative="two-sided", method="asymptotic", use_continuity=True)
     cases.append({"x": [float(v) for v in x], "y": [float(v) for v in y], "u": float(r.statistic), "p": float(r.pvalue), "method": "asymptotic"})
 

@@ -72,9 +72,14 @@ prova exp new <name> --hypothesis "<what you expect and why>" \
 - By default a candidate may change anything except the files that decide
   the verdict: tests, benchmarks, build and runner files (`*_test.go`,
   `test_*.py`, `conftest.py`, `pytest.ini`, `*.bench.ts`, `src/test/**`,
-  `Makefile`, `*.sh`, ...), and top-level Python files that shadow the
-  standard library (`random.py`). A candidate that touches them is rejected
-  unmeasured. `--change go.mod` (repeatable, globs) also allows those paths;
+  `Makefile`, `*.sh`, ...), runner configuration (`.npmrc`, `.yarnrc*`,
+  `.cargo/config*`, `rust-toolchain`, `rust-toolchain.toml`, `go.env`, `pip.conf`,
+  `sitecustomize.py`), compiled modules (`*.pyc`, `__pycache__/`), and
+  top-level Python files that shadow the standard library (`random.py`). A candidate that touches them is rejected
+  unmeasured. A real change to `.cargo/config*` (rustflags, `target-cpu`)
+  is such a file: allow it with `--change .cargo/config.toml`, and read the
+  diff, since a `runner` there can forge the metric.
+  `--change go.mod` (repeatable, globs) also allows those paths;
   `--change primes.go --change-only` allows nothing else. `prova exp
   protocol <name> --change ...` works until the first trial.
 - Specification files must be committed: `exp new` refuses a `--spec` file
@@ -126,8 +131,11 @@ improvement loop does not get lucky by trying many ideas.
   arm), or the two arms printed the metric a different number of times per
   trial (forged or changed output); `prova exp log <name>` prints what failed
   (`--tail 40` for the end of each log).
-- An ACCEPT of 1000x or more carries a warning: check for caching across
-  iterations or a smaller workload before believing it.
+- An ACCEPT of 1000x or more, against the best or against the original
+  baseline, carries a warning: check for caching across iterations or a
+  smaller workload before believing it. A `caveat:` also says when trials
+  left files in their private `/tmp` (a cache read back by the next
+  iteration measures the cache, not the code).
 - A comparison is also void when a variant's median moved 2x or more from
   its own earlier comparisons in the experiment (something disturbed it),
   or when the machine was much busier during one arm's trials.
@@ -144,7 +152,7 @@ fails the comparison with a reason saying so; it is never a REJECT, so install
 what it needs and run again. `prova exp status` leads with the current best,
 then the latest comparison; it exits 0 when a kept best stands after a later
 REJECT. The Holm family is every hypothesis tested in this experiment on its metric;
-a revalidation replicates one, adds none, and a revalidation that does not hold withdraws the accept (the best goes back). `caveat:` lines in the verdict flag a weak protocol,
+a revalidation replicates one, adds none, and a revalidation that does not hold, or is void because of the candidate (its own median moved 2x or more while the baseline's did not, extra metric lines, leaked processes, rewritten tracked files), withdraws the accept (the best goes back). A revalidation the machine spoiled (both arms moved alike, load, a stopped arm, the oracle failing) is inconclusive: the accept stands, rerun it on a quieter machine. `caveat:` lines in the verdict flag a weak protocol,
 other experiments on the same baseline, or a protocol with no `--oracle` or `--spec`
 (correctness unchecked: only speed was judged). Sandboxed arms have no network
 unless the protocol has `--allow-network`: install dependencies in `--setup`.

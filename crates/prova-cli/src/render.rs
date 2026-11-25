@@ -922,6 +922,16 @@ pub fn exp_progress(r: &prova_core::experiment::Report) {
 }
 
 pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
+    experiment_with_next(r, json, None);
+}
+
+/// `experiment`, with the `next:` of a comparison that is still running
+/// replaced (a timed-out foreground wait hands over its own budget).
+pub fn experiment_with_next(
+    r: &prova_core::experiment::Report,
+    json: bool,
+    running_next: Option<String>,
+) {
     if json {
         println!("{}", serde_json::to_string(r).unwrap_or_default());
         return;
@@ -1025,7 +1035,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             }
         }
         let next = match (c.status.as_str(), c.verdict.as_deref()) {
-            ("running", _) => format!("prova exp wait {}", r.experiment),
+            ("running", _) => running_next
+                .clone()
+                .unwrap_or_else(|| format!("prova exp wait {}", r.experiment)),
             // A revalidation: the best, again, against the original baseline.
             ("decided", Some("accept"))
                 if c.baseline == "baseline"
