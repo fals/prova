@@ -319,6 +319,27 @@ fn r18_quarantine_in_takes_go_packages_and_rust_crates() {
     assert!(o.contains("it is in: calc, geo"), "{o}");
 }
 
+/// Round 18 (rust MINOR): the live SLOW line dropped the crate that the
+/// UNFINISHED line showed. Why medium: needs a run still going.
+#[test]
+fn r18_the_slow_line_names_the_crate() {
+    let d = workspace("slowcrate");
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' '    Starting 1 tests across 1 binaries' '        SLOW [> 60.000s] calc tests::hangs'; while [ ! -f {d}/stop ]; do sleep 0.2; done",
+        d = d.display()
+    );
+    let o = text(&prova(&d, &["run", "--detach", "--", "sh", "-c", &cmd]));
+    let i = o.find("run ").unwrap() + 4;
+    let id = o[i..i + 8].to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "10s"],
+    ));
+    std::fs::write(d.join("stop"), "").unwrap();
+    prova(&d, &["cancel", &id]);
+    assert!(w.contains("SLOW tests::hangs (calc)"), "{w}");
+}
+
 /// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
 /// the tests the second did not print as "removed". Why medium: two stored
 /// runs of two suites.
