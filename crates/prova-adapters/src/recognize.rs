@@ -3615,18 +3615,8 @@ enum PytestDir {
     Unknown,
 }
 
-/// The words after `cd` or `pushd` in a command line: where it may move.
 fn cd_targets(command: &str) -> Vec<String> {
-    let words: Vec<&str> = command
-        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
-        .map(|w| w.trim_matches(['"', '\'']))
-        .filter(|w| !w.is_empty())
-        .collect();
-    words
-        .windows(2)
-        .filter(|w| matches!(w[0], "cd" | "pushd"))
-        .map(|w| w[1].to_owned())
-        .collect()
+    prova_core::config::cd_targets(command)
 }
 
 /// The directories below `base` (a few levels, no hidden or vendored ones)

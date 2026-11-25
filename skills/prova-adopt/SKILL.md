@@ -34,11 +34,8 @@ project's test scripts, Makefile or CI config to adopt prova.
    There prova hands the filter to the inner shell as one single-quoted
    word, so spaces and `$` (`CalcTest$Division`) survive; write no quotes
    around `{filter}` there.
-   `prova adopt` keeps such a wrapper from your earlier runs (the one most
-   runs used, and only one that runs the tests alone: a script that also
-   lints, or that no longer exists, is not proposed). For a script of the
-   project (`./dev`) the `select` it proposes is the quoted form above, so a
-   filter with spaces stays one word; `run` keeps the words you used.
+   `prova adopt` keeps such a wrapper and its quoting from your earlier runs
+   (the one most runs used).
 
 3. Verify selection with one real test name taken from step 1 output:
 

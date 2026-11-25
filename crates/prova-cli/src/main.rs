@@ -3709,7 +3709,9 @@ mod filter_tests {
             "tests/test_calc.py::test_add",
             "tests.test_calc::test_sub"
         ));
-        let l = "ERROR: Wrong expression passed to '-k': a[b: unbalanced".to_owned();
+        // The line pytest 8.3.4 prints (run in the prova-fixture-python image:
+        // `pytest -k "test_a[x y]"`).
+        let l = "ERROR: Wrong expression passed to '-k': test_a[x y]: at column 10: expected end of input; got identifier".to_owned();
         assert!(super::rejected_k_expression(&[&l]).is_some());
         assert!(super::rejected_k_expression(&[]).is_none());
     }

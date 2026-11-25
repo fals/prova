@@ -109,32 +109,47 @@ fn any_file_with_ext(root: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the directory holds a library whose doctests run: `src/lib.rs`,
+/// and no `doctest = false` in its manifest.
+fn doctested_library(dir: &Path) -> bool {
+    dir.join("src/lib.rs").exists()
+        && !read(dir, "Cargo.toml")
+            .lines()
+            .any(|l| l.split_whitespace().collect::<String>() == "doctest=false")
+}
+
 /// Whether the Cargo project has a library to doctest, and whether it is a
 /// workspace: a package with `src/lib.rs`, or a workspace one of whose
-/// members has it (`members` as written, or a `dir/*` glob).
+/// members has it (the `members` key as written, not `default-members`, or
+/// a `dir/*` glob). A library with `doctest = false` has none to run.
 fn rust_libraries(root: &Path) -> (bool, bool) {
     let manifest = read(root, "Cargo.toml");
     let workspace = manifest.lines().any(|l| l.trim() == "[workspace]");
-    let mut lib = root.join("src/lib.rs").exists();
+    let mut lib = doctested_library(root);
     if !workspace {
         return (lib, false);
     }
     let members = manifest
-        .split_once("members")
-        .and_then(|(_, rest)| rest.split_once('['))
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(list, _)| list)
+        .lines()
+        .position(|l| {
+            l.trim_start()
+                .strip_prefix("members")
+                .is_some_and(|r| r.trim_start().starts_with('='))
+        })
+        .map(|i| manifest.lines().skip(i).collect::<Vec<_>>().join("\n"))
+        .and_then(|rest| {
+            rest.split_once('[')
+                .and_then(|(_, r)| r.split_once(']').map(|(l, _)| l.to_owned()))
+        })
         .unwrap_or_default();
     for m in members.split('"').skip(1).step_by(2) {
         match m.strip_suffix("/*") {
-            Some(dir) => {
-                if let Ok(entries) = std::fs::read_dir(root.join(dir)) {
-                    lib |= entries
-                        .flatten()
-                        .any(|e| e.path().join("src/lib.rs").exists());
+            Some(d) => {
+                if let Ok(entries) = std::fs::read_dir(root.join(d)) {
+                    lib |= entries.flatten().any(|e| doctested_library(&e.path()));
                 }
             }
-            None => lib |= root.join(m).join("src/lib.rs").exists(),
+            None => lib |= doctested_library(&root.join(m)),
         }
     }
     (lib, true)
@@ -471,22 +486,9 @@ pub fn apply_wrapper_form(p: &mut Proposal, w: &Wrapper) {
             format!("{wrapper} {cmd}")
         }
     };
-    // A script of the project (`./dev`) re-splits its words with `$*`: a
-    // filter with spaces would arrive in pieces, so its select takes the
-    // command as one quoted argument (round 18).
-    let script = !w.quoted && (wrapper.starts_with("./") || wrapper.starts_with('/'));
-    let wrap_select = |cmd: &str| match cmd.strip_prefix(wrapper) {
-        Some(rest) if script && !cmd.starts_with(&format!("{wrapper} \"")) => {
-            quote(rest.trim_start())
-        }
-        _ => wrap(cmd),
-    };
     for s in &mut p.suites {
         s.run = wrap(&s.run);
-        s.select = s.select.as_deref().map(|c| {
-            let wrapped = wrap(c);
-            wrap_select(&wrapped)
-        });
+        s.select = s.select.as_deref().map(wrap);
     }
     p.existing = p.existing.as_deref().map(wrap);
     p.wrapped = true;
@@ -970,6 +972,44 @@ mod tests {
         );
         let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
         assert_eq!(p.suites[0].run, NEXTEST_JSON);
+        // `default-members` is not `members`; a library with
+        // `doctest = false` has nothing to run.
+        let d = dir(
+            "ws-nodoc",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\ndefault-members = [\"lib\"]\nmembers = [\"app\", \"lib\"]\n",
+                ),
+                ("app/Cargo.toml", "[package]\nname = \"app\""),
+                ("app/src/main.rs", ""),
+                (
+                    "lib/Cargo.toml",
+                    "[package]\nname = \"lib\"\n[lib]\ndoctest = false\n",
+                ),
+                ("lib/src/lib.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON, "no doctest step");
+        let d = dir(
+            "ws-default-members",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\ndefault-members = [\"lib\"]\nmembers = [\"app\"]\n",
+                ),
+                ("app/Cargo.toml", "[package]\nname = \"app\""),
+                ("app/src/main.rs", ""),
+                ("lib/Cargo.toml", "[package]\nname = \"lib\""),
+                ("lib/src/lib.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(
+            p.suites[0].run, NEXTEST_JSON,
+            "default-members is not members"
+        );
     }
 
     /// Round 9: a suite whose `select` loads prova's Vitest reporter must get
@@ -1151,20 +1191,26 @@ mod tests {
         assert_eq!(wrapper_of_shell("FOO=1 cargo test"), None);
     }
 
-    /// Round 18: `./dev python3 -m pytest -k {filter}` was proposed although
-    /// `./dev` re-splits its words with `$*`: the select takes the quoted form.
+    /// Round 18 review: a script that execs its words (`exec "$@"`) keeps
+    /// them; only a wrapper the user ran with one quoted argument gets the
+    /// quoted select.
     #[test]
-    fn a_script_wrapper_gets_a_quoted_select() {
+    fn only_a_wrapper_invoked_quoted_gets_a_quoted_select() {
         let d = dir("py-script-wrap", &[("pytest.ini", "[pytest]")]);
         let mut p = propose(&d);
         apply_wrapper(&mut p, "./dev");
         let sel = p.suites[0].select.as_deref().unwrap();
-        assert_eq!(sel, "./dev \"python3 -m pytest -v -rfE -k {filter}\"");
-        // A program wrapper takes its words as they are.
+        assert_eq!(sel, "./dev python3 -m pytest -v -rfE -k {filter}");
         let mut p = propose(&d);
-        apply_wrapper(&mut p, "docker compose run web");
+        apply_wrapper_form(
+            &mut p,
+            &Wrapper {
+                prefix: "./dev".into(),
+                quoted: true,
+            },
+        );
         let sel = p.suites[0].select.as_deref().unwrap();
-        assert!(sel.starts_with("docker compose run web python3"), "{sel}");
+        assert_eq!(sel, "./dev \"python3 -m pytest -v -rfE -k {filter}\"");
     }
 
     #[test]

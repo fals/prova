@@ -541,7 +541,8 @@ fn python_select_node_id_through_a_wrapper() {
         d.join("tests/test_params.py"),
         "import pytest\nfrom calc import add\n\n\n\
          @pytest.mark.parametrize(\"label,a,b,want\", [\n    (\"two plus $two\", 2, 2, 4),\n    (\"neg one\", -1, 1, 0),\n])\n\
-         def test_add_cases(label, a, b, want):\n    assert add(a, b) == want\n",
+         def test_add_cases(label, a, b, want):\n    assert add(a, b) == want\n\n\n\
+         class TestCls:\n    def test_m(self):\n        assert add(1, 1) == 2\n",
     )
     .unwrap();
     let name = format!("prova-large-select-{}", std::process::id());
@@ -573,6 +574,12 @@ fn python_select_node_id_through_a_wrapper() {
             String::from_utf8_lossy(&o.stderr)
         );
         for (select, want) in [
+            // A method of a class, by prova's own name for it (review: the
+            // class must not become a path).
+            (
+                "tests.test_params.TestCls::test_m",
+                "tests/test_params.py::TestCls::test_m",
+            ),
             (
                 "tests/test_calc.py::test_add",
                 "tests/test_calc.py::test_add",
@@ -637,29 +644,42 @@ fn rust_workspace_doctest_failure_fails_the_adopted_suite() {
         "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n",
     )
     .unwrap();
-    let o = host(&d, &["adopt", "--write"], &[]);
-    assert!(
-        o.status.success(),
-        "adopt: {}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    let s = json_last_line(&host(&d, &["run", "default", "--json"], &[]));
-    assert_eq!(
-        s["outcome"], "failed",
-        "doctest failure must fail the suite: {s}"
-    );
-    let failing: Vec<&str> = s["failures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["test"].as_str().unwrap())
-        .collect();
-    assert!(
-        failing.iter().any(|t| t.contains("b/src/lib.rs")),
-        "member b's doctest is named: {failing:?}"
-    );
+    let check = || {
+        let o = host(&d, &["adopt", "--write"], &[]);
+        assert!(
+            o.status.success(),
+            "adopt: {}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        // Without this the failure below could come from anywhere.
+        let toml = std::fs::read_to_string(d.join("prova.toml")).unwrap();
+        assert!(
+            toml.contains("--doc --workspace"),
+            "the adopted run has a doctest step:\n{toml}"
+        );
+        let s = json_last_line(&host(&d, &["run", "default", "--json"], &[]));
+        assert_eq!(
+            s["outcome"], "failed",
+            "doctest failure must fail the suite: {s}"
+        );
+        let failing: Vec<&str> = s["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["test"].as_str().unwrap())
+            .collect();
+        assert!(
+            failing.iter().any(|t| t.contains("b/src/lib.rs")),
+            "member b's doctest is named: {failing:?}"
+        );
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
     let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(home_of(&d));
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
 }
 
 /// Isolated prova home for a test workspace, outside it (ADR 0014).
