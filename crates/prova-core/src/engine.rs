@@ -2612,7 +2612,11 @@ impl Counts {
 pub struct Summary {
     pub run: String,
     pub suite: String,
+    /// As printed: argv words shell-quoted so the line can be pasted back.
     pub command: String,
+    /// The words unquoted, for code that parses the command line.
+    #[serde(skip)]
+    pub raw_command: String,
     pub reason: WaitReason,
     pub status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3299,8 +3303,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let explained = !failures.is_empty() && failures.iter().all(|f| f.message.is_some());
     let want_tail = reason == WaitReason::Stall
         || ((failed_run || reason == WaitReason::Failure) && !explained);
-    let command = serde_json::from_value::<RunSpec>(row.spec.clone())
-        .map(|s| s.command.raw())
+    let (command, raw_command) = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .map(|s| (s.command.display(), s.command.raw()))
         .unwrap_or_default();
     // A selected run's failure outside the selection: a file-level entry
     // the framework loads whatever the selection (Vitest imports every
@@ -3407,7 +3411,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && stalled_ms.is_some()
         && running.is_empty()
         && counts.results() == 0
-        && let Some(n) = go_buffering_note(&command)
+        && let Some(n) = go_buffering_note(&raw_command)
     {
         notes.push(n);
     }
@@ -3452,6 +3456,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         run: row.id.clone(),
         suite: row.suite.clone(),
         command,
+        raw_command,
         reason,
         status: row.status,
         outcome: row.outcome,

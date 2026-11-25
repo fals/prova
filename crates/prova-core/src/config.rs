@@ -360,6 +360,21 @@ fn pytest_dir(command: &str, cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether the node id would reach pytest as unquoted words behind a
+/// wrapper (`./dev python3 -m pytest -k ... ${PROVA_NODE:+...}`): the
+/// wrapper's `sh -c "$*"` splits it again, so a node with a space, `$`, a
+/// quote, a parenthesis or a backslash breaks. Quoted-argument templates
+/// (`$PROVA_NODE_Q`) and a command that starts with the runner itself
+/// are safe.
+fn unquoted_through_a_wrapper(command: &str) -> bool {
+    if command.contains("PROVA_NODE_Q") {
+        return false;
+    }
+    let first = command.split_whitespace().next().unwrap_or("");
+    let program = first.rsplit('/').next().unwrap_or(first);
+    !(program == "pytest" || program == "py.test" || program.starts_with("python"))
+}
+
 /// The node id pytest takes positionally for a selection that names one
 /// test or case, if a real file resolves for it: a node id as given
 /// (`tests/test_calc.py::test_add[2-3]`), or prova's name
@@ -377,6 +392,11 @@ pub fn pytest_node(command: &str, filter: &str, cwd: &Path) -> Option<String> {
         return None;
     }
     let dir = pytest_dir(command, cwd)?;
+    if unquoted_through_a_wrapper(command)
+        && filter.contains(|c: char| c.is_whitespace() || "\\'\"$()".contains(c))
+    {
+        return None;
+    }
     if head.ends_with(".py") {
         return dir.join(head).is_file().then(|| filter.to_owned());
     }
@@ -987,6 +1007,38 @@ mod tests {
 
     /// Round 18 review: code that reads the command line gets the words, not
     /// the quoted display.
+    /// Round 18 review: behind an unquoted wrapper (`./dev` runs `sh -c
+    /// "$*"`) a node id with a space or `$` would be split again.
+    #[test]
+    fn a_node_id_that_a_wrapper_would_split_is_not_passed() {
+        let d = pytest_tree("wrapsplit");
+        let unq = "./dev python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        let q = "./dev \"python3 -m pytest -k $PROVA_FILTER_Q $PROVA_NODE_Q\"";
+        let direct = "python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        for bad in [
+            "tests/test_calc.py::test_add[two plus-1]",
+            "tests/test_calc.py::test_add[$two]",
+            "tests/test_calc.py::test_add[f(x)]",
+            "tests/test_calc.py::test_add[it's]",
+            "tests/test_calc.py::test_add[a\\b]",
+        ] {
+            assert_eq!(super::pytest_node(unq, bad, &d), None, "{bad}");
+            assert_eq!(
+                super::pytest_node(q, bad, &d).as_deref(),
+                Some(bad),
+                "{bad}"
+            );
+            assert_eq!(
+                super::pytest_node(direct, bad, &d).as_deref(),
+                Some(bad),
+                "{bad}"
+            );
+        }
+        let ok = "tests/test_calc.py::test_add[2-3]";
+        assert_eq!(super::pytest_node(unq, ok, &d).as_deref(), Some(ok));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_raw_command_is_the_words_not_the_shell_quoted_display() {
         let go = CommandSpec::Argv(vec![

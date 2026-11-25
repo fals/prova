@@ -1270,6 +1270,7 @@ mod live_tests {
             run: "r".into(),
             suite: "s".into(),
             command: "make test".into(),
+            raw_command: "make test".into(),
             reason: WaitReason::Running,
             status: Status::Running,
             outcome: None,

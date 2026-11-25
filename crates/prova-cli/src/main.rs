@@ -1616,7 +1616,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 false,
                 format!(
                     "filter {filter:?} matched no test; the framework says: {line}. {}{}",
-                    filter_syntax_advice(&s.command),
+                    filter_syntax_advice(&s.raw_command),
                     split.map_or(String::new(), |f| format!(
                         " The filter was split into words by a wrapper or the shell ({f:?} is only a part of it): use a filter without spaces (pytest: `-k` with a substring)"
                     )),
