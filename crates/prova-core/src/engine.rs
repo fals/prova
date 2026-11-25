@@ -1902,7 +1902,7 @@ fn observe_child(
             .iter()
             .copied()
             .filter(|d| {
-                !quarantine.contains_key(*d)
+                !crate::quarantine::names_test(&quarantine, d)
                     && crate::quarantine::covers(&quarantine, d)
                         .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
             })

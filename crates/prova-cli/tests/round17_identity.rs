@@ -408,3 +408,105 @@ fn two_crates_same_name_stay_apart_in_every_list() {
     let out = text(&prova(&d, &["run", "y"]));
     assert!(out.contains("quarantined: tests::flaky (calc)"), "{out}");
 }
+
+/// Round 17 (rs-make): plain `cargo test` prints `Running tests/it.rs
+/// (target/debug/deps/it-<hash>)` with no crate, so two crates' integration
+/// tests of one file name were one test. cargo's dep-info file of that very
+/// binary names its source, and the source's Cargo.toml the crate; nextest
+/// names it `calc::it`, so does prova. Medium: it reads files cargo wrote.
+#[test]
+fn integration_tests_of_two_crates_run_by_cargo_test_keep_their_crate() {
+    let d = workspace("cargoit");
+    for (krate, hash) in [("calc", "aaaa1111"), ("geo", "bbbb2222")] {
+        std::fs::create_dir_all(d.join(krate).join("tests")).unwrap();
+        std::fs::write(
+            d.join(krate).join("Cargo.toml"),
+            format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join(krate).join("tests/it.rs"), "").unwrap();
+        let deps = d.join("target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(
+            deps.join(format!("it-{hash}.d")),
+            format!(
+                "{p}/it-{hash}.d: {krate}/tests/it.rs\n\n{p}/it-{hash}: {krate}/tests/it.rs\n\n{krate}/tests/it.rs:\n",
+                p = deps.display()
+            ),
+        )
+        .unwrap();
+    }
+    let out = |calc: &str, geo: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '     Running tests/it.rs (target/debug/deps/it-aaaa1111)' '' 'running 1 test' 'test works ... {calc}' '' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' '' '     Running tests/it.rs (target/debug/deps/it-bbbb2222)' '' 'running 1 test' 'test works ... {geo}' '' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit {code}"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n",
+            out("ok", "ok", 0),
+            out("ok", "FAILED", 101),
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "a"]);
+    assert!(text(&o).contains("tests: 2 passed"), "{}", text(&o));
+    let out = text(&prova(&d, &["run", "b"]));
+    assert!(out.contains("FAIL works (geo::it)"), "{out}");
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("works (calc::it)") && all.contains("works (geo::it)"),
+        "{all}"
+    );
+}
+
+/// Round 17 (rs-make): `quarantine add tests::flaky --in geo` replaced the
+/// quarantine `--in calc` made: one entry per name. A quarantine belongs to
+/// a name in a place; `remove` names the place too.
+#[test]
+fn a_quarantine_is_kept_per_name_and_place() {
+    let d = workspace("qplace");
+    two_crates(&d);
+    prova(&d, &["run", "a"]);
+    prova(&d, &["run", "b"]);
+    for krate in ["calc", "geo"] {
+        let o = prova(
+            &d,
+            &[
+                "quarantine",
+                "add",
+                "tests::flaky",
+                "--in",
+                krate,
+                "--reason",
+                krate,
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let list = text(&prova(&d, &["quarantine", "list"]));
+    assert!(
+        list.contains("tests::flaky (calc)") && list.contains("tests::flaky (geo)"),
+        "{list}"
+    );
+    // Both are in force: a failure of either is set aside, on its own.
+    for suite in ["a", "b"] {
+        let o = prova(&d, &["run", suite]);
+        assert_eq!(o.status.code(), Some(0), "{suite}: {}", text(&o));
+    }
+    // Without the place, which one to remove is ambiguous.
+    let o = prova(&d, &["quarantine", "remove", "tests::flaky"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--in"), "{}", text(&o));
+    let o = prova(&d, &["quarantine", "remove", "tests::flaky", "--in", "geo"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let list = text(&prova(&d, &["quarantine", "list"]));
+    assert!(
+        list.contains("tests::flaky (calc)") && !list.contains("(geo)"),
+        "{list}"
+    );
+    // geo's failure counts again; calc's is still set aside.
+    assert_eq!(prova(&d, &["run", "b"]).status.code(), Some(1));
+    assert_eq!(prova(&d, &["run", "a"]).status.code(), Some(0));
+}
