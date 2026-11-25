@@ -52,6 +52,19 @@ const CACHES: &[&str] = &[
     ":(exclude,glob)**/obj/**",
     ":(exclude,glob)**/bin/Debug/**",
     ":(exclude,glob)**/bin/Release/**",
+    // Reports and caches Vitest, Jest, coverage tools and Playwright write
+    // (round 17: every run after a failing run had a new identity).
+    ":(exclude,glob)**/coverage/**",
+    ":(exclude,glob)**/.nyc_output/**",
+    ":(exclude,glob)**/.vitest/**",
+    ":(exclude,glob)**/.vite/**",
+    ":(exclude,glob)**/.cache/**",
+    ":(exclude,glob)**/test-results/**",
+    ":(exclude,glob)**/playwright-report/**",
+    ":(exclude,glob)**/htmlcov/**",
+    ":(exclude,glob)**/.coverage",
+    ":(exclude,glob)**/.coverage.*",
+    ":(exclude,glob)**/node_modules/**",
     // Core dumps from a crashing test (round 9).
     ":(exclude,glob)**/core",
     ":(exclude,glob)**/core.[0-9]*",
@@ -84,7 +97,8 @@ pub fn code_identity(dir: &Path) -> String {
     if status.is_empty() {
         return format!("tree:{short}");
     }
-    let mut material = git(dir, &["diff", "HEAD", "--binary"]).unwrap_or_default();
+    let mut material =
+        git(dir, &with_caches_excluded(&["diff", "HEAD", "--binary"])).unwrap_or_default();
     // Untracked files: hash their content so edits change the identity.
     let untracked = git(
         dir,

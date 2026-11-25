@@ -18,6 +18,11 @@ pub struct TestRun {
     pub attempts: u32,
     /// Failed at least once, then passed, in the same run.
     pub passed_on_retry: bool,
+    /// Passed in one execution and failed in a later one of the same run
+    /// (`go test -count=N`: a failure in any fails the test, 0029): flaky
+    /// evidence from a run that failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub passed_and_failed: bool,
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -32,9 +37,17 @@ pub struct TestRun {
 pub struct TestStats {
     pub test_id: String,
     pub display: String,
+    /// The test binary, when tests of other binaries share the name
+    /// (ADR 0031 section 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     pub suite: String,
     /// Every suite that ran this test (its history is shared, ADR 0018).
     pub suites: Vec<String>,
+    /// Other names of the same test (a Go test recorded bare and
+    /// package-qualified): a quarantine of either covers it.
+    #[serde(skip)]
+    pub aliases: Vec<String>,
     pub runs: usize,
     pub failures: usize,
     pub failure_rate: f64,
@@ -62,6 +75,198 @@ pub struct TestStats {
     pub last_passed: Option<(String, String)>,
     /// Newest first.
     pub recent: Vec<TestRun>,
+    /// Runs cut short (cancelled, killed, stalled out) while this test was
+    /// running: it is no result, but it may be why (round 17: a hung test
+    /// showed "0 runs"). Newest first, at most 10.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cut_short: Vec<CutShortRun>,
+}
+
+/// A run that ended before a test did.
+#[derive(Debug, Clone, Serialize)]
+pub struct CutShortRun {
+    pub run: String,
+    pub code: String,
+    pub status: String,
+}
+
+/// The runs cut short in which the test (by name) was running.
+fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT DISTINCT r.id, r.code, r.status, r.created_ms
+           FROM attempts a JOIN runs r ON r.id = a.run_id
+          WHERE a.test_id IN (SELECT t2.id FROM tests t1 JOIN tests t2 ON t2.display = t1.display
+                               WHERE t1.id = ?1)
+            AND a.outcome = 'errored' AND r.status <> 'finished'
+            AND a.message LIKE 'test did not finish before the run ended%'
+            AND r.id NOT IN (SELECT run_id FROM forgotten)
+          ORDER BY r.created_ms DESC LIMIT 10",
+    )?;
+    let rows = stmt
+        .query_map(params![test_id], |r| {
+            Ok(CutShortRun {
+                run: r.get(0)?,
+                code: r.get(1)?,
+                status: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// A name recorded bare (`TestX`, from text output that named no package)
+/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
+/// test: the same name, or one is the other behind a `::` or `/`.
+pub fn same_test_name(a: &str, b: &str) -> bool {
+    let tail = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
+    };
+    a == b || tail(a, b) || tail(b, a)
+}
+
+/// Names tests with their place where several places hold one name
+/// (ADR 0031 section 2): `tests::flaky` alone when only one test binary
+/// has it, `tests::flaky (geo)` when two do. A result of unknown place (quiet
+/// `cargo test` names no binary) keeps the bare name.
+pub struct Names<'a> {
+    store: &'a Store,
+    shared: std::cell::RefCell<BTreeMap<String, bool>>,
+}
+
+impl<'a> Names<'a> {
+    pub fn new(store: &'a Store) -> Names<'a> {
+        Names {
+            store,
+            shared: Default::default(),
+        }
+    }
+
+    /// The place to show for a test of this name and file: `None` when the
+    /// name is not shared.
+    pub fn place(&self, display: &str, file: Option<&str>) -> Option<String> {
+        let file = file.filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))?;
+        let shared = *self
+            .shared
+            .borrow_mut()
+            .entry(display.to_owned())
+            .or_insert_with(|| {
+                crate::quarantine::files_of(self.store, display).is_ok_and(|f| f.len() > 1)
+            });
+        shared.then(|| file.to_owned())
+    }
+
+    /// The name to show and to group by.
+    pub fn name(&self, display: &str, file: Option<&str>) -> String {
+        match self.place(display, file) {
+            Some(p) => format!("{display} ({p})"),
+            None => display.to_owned(),
+        }
+    }
+}
+
+/// A place in the form that compares: no `./`, no trailing slash, no test
+/// file suffix, `.` for `/` (`tests/test_calc.py` and `tests.test_calc` are
+/// one place, so are `./a` and `ex/a`'s last part).
+fn place_form(s: &str) -> String {
+    let mut s = s.trim().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_owned();
+    }
+    let mut s = s.trim_end_matches('/').to_owned();
+    for suffix in [
+        ".test.js",
+        ".test.ts",
+        ".test.tsx",
+        ".test.jsx",
+        ".test.mjs",
+        ".spec.js",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.jsx",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".cs",
+    ] {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            s = rest.to_owned();
+            break;
+        }
+    }
+    s.replace('/', ".")
+}
+
+/// Whether the place `wanted` (what `--in` says) names the place of a test:
+/// its test binary (Rust), else its package, module or file (the first part
+/// of its name). Whole parts: `a` is `ex/a` but not `ex/data`.
+pub fn place_matches(wanted: &str, file: Option<&str>, path: &[String]) -> bool {
+    place_rank(wanted, file, path) > 0
+}
+
+/// How well `wanted` names a test's place: 2 the same place, 1 the end of
+/// it (`a` for `ex/a`), 0 not it. `tests/test_calc.py` is the same place as
+/// `tests.test_calc`, and only the end of `sub2.tests.test_calc`.
+pub fn place_rank(wanted: &str, file: Option<&str>, path: &[String]) -> u8 {
+    let Some(place) = file
+        .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+        .or(path.first().map(String::as_str))
+    else {
+        return 0;
+    };
+    let (w, p) = (place_form(wanted), place_form(place));
+    if w.is_empty() {
+        0
+    } else if w == p {
+        2
+    } else {
+        u8::from(p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+    }
+}
+
+/// Keeps what `--in wanted` names: the tests of the exact place when there
+/// are any, else those of a place it ends. `place` gives a test's file and
+/// name path.
+pub fn retain_in_place<T>(
+    items: &mut Vec<T>,
+    wanted: &str,
+    place: impl Fn(&T) -> (Option<String>, Vec<String>),
+) {
+    let ranks: Vec<u8> = items
+        .iter()
+        .map(|t| {
+            let (file, path) = place(t);
+            place_rank(wanted, file.as_deref(), &path)
+        })
+        .collect();
+    let best = ranks.iter().copied().max().unwrap_or(0);
+    let mut i = 0;
+    items.retain(|_| {
+        i += 1;
+        best > 0 && ranks[i - 1] == best
+    });
+}
+
+/// The place of a stored test, as `--in` names it: its binary, else the
+/// first part of its name; `None` for a test that has neither.
+pub fn place_of_test(
+    store: &Store,
+    test_id: &str,
+) -> Result<Option<(Option<String>, Vec<String>)>> {
+    let row: Option<(Option<String>, String)> = store
+        .conn()
+        .query_row(
+            "SELECT file, path FROM tests WHERE id = ?1",
+            params![test_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(file, path)| (file, serde_json::from_str(&path).unwrap_or_default())))
 }
 
 /// Nearest-rank percentile of a sorted slice.
@@ -92,6 +297,17 @@ pub fn test_runs_with(
     limit: usize,
     current: Option<&str>,
 ) -> Result<Vec<TestRun>> {
+    test_runs_scoped(store, test_id, limit, current, None)
+}
+
+/// `test_runs_with`, only over the runs of one suite when `suite` is given.
+fn test_runs_scoped(
+    store: &Store,
+    test_id: &str,
+    limit: usize,
+    current: Option<&str>,
+    suite: Option<&str>,
+) -> Result<Vec<TestRun>> {
     let mut stmt = store.conn().prepare(
         "WITH same AS (
              SELECT t2.id FROM tests t1 JOIN tests t2
@@ -119,12 +335,13 @@ pub fn test_runs_with(
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
                                                   AND w.payload LIKE '%; no evidence about the tests%'))
                    AND r3.id NOT IN (SELECT run_id FROM forgotten)
+                   AND (?4 IS NULL OR r3.suite = ?4)
                    -- labels of a run are as of that run: later runs do not
                    -- rewrite them (round 13: 'failed 8x before' on a run
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection')
+                json_extract(r.spec, '$.selection'), a.test_id
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -132,7 +349,7 @@ pub fn test_runs_with(
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
-    let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
+    let rows = stmt.query_map(params![test_id, limit as i64, current, suite], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -144,6 +361,7 @@ pub fn test_runs_with(
             r.get::<_, Option<String>>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, Option<String>>(9)?,
+            r.get::<_, String>(10)?,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -160,8 +378,10 @@ pub fn test_runs_with(
         .ok()
         .map(|d| leaf(&d));
     let mut out: Vec<TestRun> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut had_pass_run = false;
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection) = row?;
+        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection, row_test) = row?;
         if let (Some(sel), Some(this)) = (&selection, &this)
             && leaf(sel).starts_with(&format!("{this}/"))
         {
@@ -183,25 +403,44 @@ pub fn test_runs_with(
                 let earlier_failed = last.outcome.is_failure();
                 last.attempts = attempt as u32;
                 last.passed_on_retry |= earlier_failed && outcome == Outcome::Passed;
+                had_pass_run |= last.outcome == Outcome::Passed;
+                last.passed_and_failed = had_pass_run && outcome == Outcome::Failed;
                 last.outcome = outcome;
                 last.duration_ms = dur.map(|d| d as u64);
                 if outcome.is_failure() {
-                    last.message = msg;
+                    // A later attempt that names no cause keeps the earlier
+                    // one (a teardown error after the failure).
+                    last.message = msg.or(last.message.take());
                     last.fingerprint = fp;
+                    ids.pop();
+                    ids.push(row_test);
                 }
             }
-            _ => out.push(TestRun {
-                run,
-                code,
-                created_ms: created as u64,
-                outcome,
-                attempts: attempt as u32,
-                passed_on_retry: false,
-                duration_ms: dur.map(|d| d as u64),
-                message: if outcome.is_failure() { msg } else { None },
-                fingerprint: fp,
-                env,
-            }),
+            _ => {
+                had_pass_run = outcome == Outcome::Passed;
+                ids.push(row_test);
+                out.push(TestRun {
+                    run,
+                    code,
+                    created_ms: created as u64,
+                    outcome,
+                    attempts: attempt as u32,
+                    passed_on_retry: false,
+                    passed_and_failed: false,
+                    duration_ms: dur.map(|d| d as u64),
+                    message: if outcome.is_failure() { msg } else { None },
+                    fingerprint: fp,
+                    env,
+                })
+            }
+        }
+    }
+    // A failure the framework reported before its message (pytest -v prints
+    // the line first, the summary names the cause): the message is in the
+    // test's kept output, as the run summary shows it (round 17).
+    for (r, id) in out.iter_mut().zip(&ids) {
+        if r.outcome.is_failure() && r.message.is_none() {
+            r.message = crate::output::failure_message(store, &r.run, id);
         }
     }
     Ok(out)
@@ -211,24 +450,45 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
     stats_with(store, test_id, window, None)
 }
 
+/// `stats`, over the runs of one suite only (`prova history --suite`).
+pub fn stats_in_suite(
+    store: &Store,
+    test_id: &str,
+    window: usize,
+    suite: Option<&str>,
+) -> Result<Option<TestStats>> {
+    stats_scoped(store, test_id, window, None, suite)
+}
+
 fn stats_with(
     store: &Store,
     test_id: &str,
     window: usize,
     current: Option<&str>,
 ) -> Result<Option<TestStats>> {
-    let meta: Option<(String, String)> = store
+    stats_scoped(store, test_id, window, current, None)
+}
+
+fn stats_scoped(
+    store: &Store,
+    test_id: &str,
+    window: usize,
+    current: Option<&str>,
+    only_suite: Option<&str>,
+) -> Result<Option<TestStats>> {
+    let meta: Option<(String, String, Option<String>)> = store
         .conn()
         .query_row(
-            "SELECT display, suite FROM tests WHERE id = ?1",
+            "SELECT display, suite, file FROM tests WHERE id = ?1",
             params![test_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    let Some((display, suite)) = meta else {
+    let Some((display, suite, file)) = meta else {
         return Ok(None);
     };
-    let recent = test_runs_with(store, test_id, window, current)?;
+    let place = Names::new(store).place(&display, file.as_deref());
+    let recent = test_runs_scoped(store, test_id, window, current, only_suite)?;
     let suites: Vec<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
@@ -272,10 +532,12 @@ fn stats_with(
     // "the same code" (round 12: a fix in a project without git was
     // called a flaky flip).
     for r in counted.iter().filter(|r| r.code != "nogit") {
-        by_code
-            .entry((r.code.as_str(), env_key(r)))
-            .or_default()
-            .insert(r.outcome.is_failure());
+        let e = by_code.entry((r.code.as_str(), env_key(r))).or_default();
+        e.insert(r.outcome.is_failure());
+        // Passed and failed within the one run: both results on this code.
+        if r.passed_and_failed {
+            e.insert(false);
+        }
     }
     // Code versions, not (code, environment) pairs: one code that flipped
     // in two environments is one (round 14: "2 code version(s)" for one).
@@ -303,6 +565,7 @@ fn stats_with(
         }
     }
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
+    let mixed = recent.iter().filter(|r| r.passed_and_failed).count();
     // A test that failed its last 3 runs in a row is failing now, whatever
     // its past: "known flaky" must not hide a real break (round 9: an
     // environment-dependent test, once flipped, was dismissed for good).
@@ -331,14 +594,20 @@ fn stats_with(
     // And on enough history for the rate to mean something: one earlier
     // pass and three failures is a thin record (round 15: "failing now",
     // then it passed again).
-    let failing_now =
-        streak >= needed && counted.len() >= FAILING_NOW_MIN_RUNS && (retry > 0 || flips > 0);
+    let failing_now = streak >= needed
+        && counted.len() >= FAILING_NOW_MIN_RUNS
+        && (retry > 0 || flips > 0 || mixed > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
         .filter_map(|r| r.duration_ms)
         .collect();
     durations.sort_unstable();
+    // Nothing but zeros: a framework that reports no time (or one measured
+    // between two adjacent lines), not tests that took no time (round 17).
+    if durations.iter().all(|d| *d == 0) {
+        durations.clear();
+    }
     let last_passed = recent
         .iter()
         .find(|r| r.outcome == Outcome::Passed)
@@ -346,8 +615,10 @@ fn stats_with(
     Ok(Some(TestStats {
         test_id: test_id.to_owned(),
         display,
+        place,
         suite,
         suites,
+        aliases: Vec::new(),
         runs: counted.len(),
         failures,
         failure_rate: if counted.is_empty() {
@@ -358,7 +629,7 @@ fn stats_with(
         transitions,
         passed_on_retry: retry,
         flips_on_same_code: flips,
-        flaky: (retry > 0 || flips > 0) && !failing_now,
+        flaky: (retry > 0 || flips > 0 || mixed > 0) && !failing_now,
         env_dependent: env_dependent.into_iter().take(5).collect(),
         failing_now,
         size: observed_size(store, test_id)?,
@@ -366,6 +637,7 @@ fn stats_with(
         p95_ms: percentile(&durations, 95.0),
         last_passed,
         recent,
+        cut_short: cut_short_runs(store, test_id)?,
     }))
 }
 
@@ -452,11 +724,23 @@ pub fn flaky_as_of(
     for id in ids {
         if let Some(s) = stats_with(store, &id, window, as_of)?
             && s.flaky
-            && !out.iter().any(|o| {
-                o.display == s.display
-                    && o.recent.first().map(|r| &r.run) == s.recent.first().map(|r| &r.run)
-            })
         {
+            // One test seen as a bare and as a qualified name is one row
+            // (its history is shared): the qualified name shows.
+            if let Some(o) = out
+                .iter_mut()
+                .find(|o| o.place == s.place && same_test_name(&o.display, &s.display))
+            {
+                if o.display != s.display {
+                    if s.display.len() > o.display.len() {
+                        let old = std::mem::replace(&mut o.display, s.display.clone());
+                        o.aliases.push(old);
+                    } else {
+                        o.aliases.push(s.display.clone());
+                    }
+                }
+                continue;
+            }
             out.push(s);
         }
     }
@@ -642,18 +926,21 @@ pub struct SizeReport {
 pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
     use crate::config::Size;
     let mut stmt = store.conn().prepare(
-        "SELECT id, display FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
+        "SELECT id, display, file FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
     )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let names = Names::new(store);
     // One test, one count: the same test in several suites shares its
     // history (round 12: a 5-test project showed 12 tests). The most
     // decided view wins.
     let mut views: BTreeMap<String, Option<SizeView>> = BTreeMap::new();
-    for (id, display) in rows {
+    for (id, display, file) in rows {
         let view = observed_size(store, &id)?;
-        let e = views.entry(display).or_insert(None);
+        let e = views
+            .entry(names.name(&display, file.as_deref()))
+            .or_insert(None);
         let better = match (&*e, &view) {
             (None, Some(_)) => true,
             (Some(old), Some(new)) => new.size > old.size,
@@ -724,9 +1011,11 @@ pub struct RunDiff {
     pub slower: Vec<(String, u64, u64)>,
 }
 
+/// A run's final outcome per test, by name and place (two binaries' tests
+/// of one name are two entries).
 fn final_outcomes(store: &Store, run: &str) -> Result<BTreeMap<String, (Outcome, Option<u64>)>> {
     let mut stmt = store.conn().prepare(
-        "SELECT t.display, a.outcome, a.duration_ms FROM attempts a JOIN tests t ON t.id = a.test_id
+        "SELECT t.display, a.outcome, a.duration_ms, t.file FROM attempts a JOIN tests t ON t.id = a.test_id
          WHERE a.run_id = ?1 ORDER BY a.attempt",
     )?;
     let rows = stmt.query_map(params![run], |r| {
@@ -734,11 +1023,14 @@ fn final_outcomes(store: &Store, run: &str) -> Result<BTreeMap<String, (Outcome,
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
+    let names = Names::new(store);
     let mut m = BTreeMap::new();
     for row in rows {
-        let (name, o, d) = row?;
+        let (display, o, d, file) = row?;
+        let name = names.name(&display, file.as_deref());
         m.insert(
             name,
             (
@@ -779,9 +1071,10 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
     }
     d.removed = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
     if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
+        let names = Names::new(store);
         let known: Vec<String> = flaky(store, None, 50)?
             .into_iter()
-            .map(|s| s.display)
+            .map(|s| names.name(&s.display, s.place.as_deref()))
             .collect();
         for list in [&mut d.fixed, &mut d.newly_failing] {
             list.retain(|t| {
@@ -885,6 +1178,98 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TestKey;
+
+    /// A store with one finished run per `(code, [(key, outcome)])`.
+    fn store_with(runs: &[(&str, Vec<(TestKey, Outcome)>)]) -> Store {
+        use crate::model::{EVENT_VERSION, Event, EventKind, Status};
+        let d = std::env::temp_dir().join(format!(
+            "prova-analysis-{}-{}",
+            std::process::id(),
+            crate::ids::new_run_id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let s = Store::open_dir(&d, &d.join(".prova")).unwrap();
+        let v = serde_json::json!({});
+        for (i, (code, results)) in runs.iter().enumerate() {
+            let id = format!("r{i}");
+            let ts = 10 + i as u64 * 10;
+            s.create_run(&crate::store::NewRun {
+                id: &id,
+                suite: "s",
+                spec: &v,
+                cwd: "/",
+                code,
+                env: &v,
+                machine: &v,
+                origin: &v,
+                created_ms: ts,
+            })
+            .unwrap();
+            s.mark_started(&id, 1, ts + 1).unwrap();
+            let mut events = vec![Event {
+                v: EVENT_VERSION,
+                run: id.clone(),
+                seq: 1,
+                ts_ms: ts + 1,
+                kind: EventKind::RunStarted { pid: 1 },
+            }];
+            for (n, (key, outcome)) in results.iter().enumerate() {
+                events.push(Event {
+                    v: EVENT_VERSION,
+                    run: id.clone(),
+                    seq: 2 + n as u64,
+                    ts_ms: ts + 2,
+                    kind: EventKind::TestFinished {
+                        test: key.clone(),
+                        attempt: 1,
+                        outcome: *outcome,
+                        duration_ms: Some(5),
+                        message: None,
+                        source: crate::model::Level::Recognized,
+                        subtest: false,
+                    },
+                });
+            }
+            s.append_events(&events).unwrap();
+            s.finish_run(
+                &id,
+                100,
+                ts + 5,
+                Status::Finished,
+                Some(Outcome::Passed),
+                Some(0),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap();
+        }
+        s
+    }
+
+    /// Round 17: `prova flaky` listed a Go test twice, once under the bare
+    /// name the text output gave and once under its package.
+    #[test]
+    fn a_test_recorded_bare_and_qualified_is_one_flaky_row() {
+        let bare = TestKey::new(vec![], "TestFlakyClock");
+        let full = TestKey::new(vec!["example.com/calc".into()], "TestFlakyClock");
+        let s = store_with(&[
+            ("tree:a", vec![(bare.clone(), Outcome::Failed)]),
+            ("tree:a", vec![(bare, Outcome::Passed)]),
+            ("tree:a", vec![(full.clone(), Outcome::Failed)]),
+            ("tree:a", vec![(full, Outcome::Passed)]),
+        ]);
+        let f = flaky(&s, None, 50).unwrap();
+        assert_eq!(
+            f.len(),
+            1,
+            "{:?}",
+            f.iter().map(|t| &t.display).collect::<Vec<_>>()
+        );
+        assert_eq!(f[0].display, "example.com/calc::TestFlakyClock");
+        assert_eq!(f[0].aliases, ["TestFlakyClock"]);
+    }
 
     #[test]
     fn nearest_rank_percentiles() {
@@ -918,7 +1303,7 @@ pub fn slowest(
     window: usize,
 ) -> Result<Vec<SlowRow>> {
     let mut stmt = store.conn().prepare(
-        "SELECT t.display, t.suite, a.duration_ms FROM (
+        "SELECT t.display, t.suite, a.duration_ms, t.file FROM (
              SELECT a.test_id, a.duration_ms,
                     row_number() OVER (PARTITION BY a.test_id ORDER BY a.ts_ms DESC) AS rn
                FROM attempts a JOIN runs r ON r.id = a.run_id
@@ -936,12 +1321,16 @@ pub fn slowest(
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, i64>(2)? as u64,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
+    let names = Names::new(store);
     let mut by_test: BTreeMap<String, (BTreeSet<String>, Vec<u64>)> = BTreeMap::new();
     for row in rows {
-        let (display, suite, ms) = row?;
-        let e = by_test.entry(display).or_default();
+        let (display, suite, ms, file) = row?;
+        let e = by_test
+            .entry(names.name(&display, file.as_deref()))
+            .or_default();
         e.0.insert(suite);
         e.1.push(ms);
     }

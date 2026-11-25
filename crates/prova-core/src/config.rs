@@ -276,16 +276,21 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     // spaces: the name prova shows (`calc > divides`, with or without its
     // file) selects with spaces (round 14: it matched nothing).
     if command.contains(" -t ") || command.contains("--testNamePattern") {
-        let leaf = filter.rsplit_once("::").map_or(filter, |(_, l)| l);
-        let name = leaf.replace(" > ", " ");
+        let leaf = split_node(filter).1;
         // `-t` is a regular expression: a name with `(1, 2)` is a literal
         // unless the user wrote a pattern (`^add`, `sub$`) (round 15).
-        if name.starts_with('^') || name.ends_with('$') {
-            return name;
+        if leaf.starts_with('^') || leaf.ends_with('$') {
+            return leaf.replace(" > ", " ");
         }
-        return regex_escape(&name);
+        // Vitest 5 joins describe blocks with ` > `, older Vitest and Jest
+        // with a space: one pattern matches either (round 17).
+        return leaf
+            .split(" > ")
+            .map(regex_escape)
+            .collect::<Vec<_>>()
+            .join("(?: > | )");
     }
-    let Some((head, leaf)) = filter.rsplit_once("::") else {
+    let (Some(head), leaf) = split_node(filter) else {
         return filter.to_owned();
     };
     if command.contains("-Dtest=") {
@@ -294,10 +299,34 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     } else if command.contains("FullyQualifiedName") {
         format!("{head}.{}", method(leaf))
     } else if command.contains(" -k ") {
-        // pytest -k: the test's own name.
-        leaf.to_owned()
+        // pytest -k: the test's own name; a parameter id with spaces
+        // cannot be one `-k` word, so its test function selects (all of
+        // its cases run).
+        if leaf.contains(char::is_whitespace) {
+            method(leaf)
+        } else {
+            leaf.to_owned()
+        }
     } else {
         filter.to_owned()
+    }
+}
+
+/// A source file extension that makes the text before `::` a file.
+const FILE_EXTS: [&str; 7] = [".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"];
+
+/// A selection as `(head, leaf)`. A node id names its file first
+/// (`tests/test_calc.py::test_param[a b-c::d]`): split after the file, so a
+/// `::` inside a parameter id stays in the leaf. Otherwise the last `::`.
+fn split_node(filter: &str) -> (Option<&str>, &str) {
+    if let Some((head, rest)) = filter.split_once("::")
+        && FILE_EXTS.iter().any(|e| head.ends_with(e))
+    {
+        return (Some(head), rest);
+    }
+    match filter.rsplit_once("::") {
+        Some((h, l)) => (Some(h), l),
+        None => (None, filter),
     }
 }
 
@@ -334,6 +363,47 @@ fn go_run_pattern(name: &str) -> String {
         .join("/")
 }
 
+/// `s` as one single-quoted shell word: nothing in it expands.
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A select template with `{filter}` filled in as a variable. Unquoted it
+/// is `"$PROVA_FILTER"`, one word. Inside a double-quoted argument (a
+/// wrapper's `./dev "pytest -k {filter}"`) a nested `"` would close the
+/// argument, and the value would be parsed again by the inner shell: it
+/// goes in as `$PROVA_FILTER_Q`, the value already single-quoted, so it
+/// reaches the inner shell as one unexpanded word (round 17).
+fn fill_filter(template: &str) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut rest = template;
+    while let Some(c) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix("{filter}") {
+            out.push_str(if double {
+                "$PROVA_FILTER_Q"
+            } else {
+                "\"$PROVA_FILTER\""
+            });
+            rest = after;
+            escaped = false;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && !single {
+            escaped = true;
+        } else if c == '\'' && !double {
+            single = !single;
+        } else if c == '"' && !single {
+            double = !double;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 impl Config {
     pub fn suite(&self, name: &str) -> Result<&SuiteConfig, ConfigError> {
         self.suite.get(name).ok_or_else(|| {
@@ -359,27 +429,23 @@ impl Config {
                 }
                 // The filter is passed in PROVA_FILTER and expanded by the shell
                 // as one quoted word; its text never becomes shell syntax.
-                s.select
-                    .as_ref()
-                    .ok_or_else(|| {
-                        // Point to a suite that can (round 8).
-                        let other: Vec<&String> = self
-                            .suite
-                            .iter()
-                            .filter(|(n, x)| *n != name && x.select.is_some())
-                            .map(|(n, _)| n)
-                            .collect();
-                        ConfigError::NoSelect(
-                            name.into(),
-                            other
-                                .first()
-                                .map(|o| {
-                                    format!("; suite `{o}` can: prova run {o} --select <test>")
-                                })
-                                .unwrap_or_default(),
-                        )
-                    })?
-                    .replace("{filter}", "\"$PROVA_FILTER\"")
+                let template = s.select.as_ref().ok_or_else(|| {
+                    // Point to a suite that can (round 8).
+                    let other: Vec<&String> = self
+                        .suite
+                        .iter()
+                        .filter(|(n, x)| *n != name && x.select.is_some())
+                        .map(|(n, _)| n)
+                        .collect();
+                    ConfigError::NoSelect(
+                        name.into(),
+                        other
+                            .first()
+                            .map(|o| format!("; suite `{o}` can: prova run {o} --select <test>"))
+                            .unwrap_or_default(),
+                    )
+                })?;
+                fill_filter(template)
             }
         };
         let default_stall = s.size.map(Size::stall_after).unwrap_or(DEFAULT_STALL_AFTER);
@@ -466,19 +532,19 @@ mod filter_tests {
     fn a_vitest_or_jest_name_selects_with_spaces() {
         use super::framework_filter as f;
         let vitest = "npx vitest run --reporter=default -t \"$PROVA_FILTER\"";
-        assert_eq!(f(vitest, "calc > divides"), "calc divides");
+        assert_eq!(f(vitest, "calc > divides"), "calc(?: > | )divides");
         assert_eq!(
             f(vitest, "src/calc.test.ts::calc > divides"),
-            "calc divides"
+            "calc(?: > | )divides"
         );
         assert_eq!(f(vitest, "plain"), "plain");
         assert_eq!(
             f("npx jest --ci -t \"$PROVA_FILTER\"", "a > b > c"),
-            "a b c"
+            "a(?: > | )b(?: > | )c"
         );
         assert_eq!(
             f("jest --testNamePattern \"$PROVA_FILTER\"", "a > b"),
-            "a b"
+            "a(?: > | )b"
         );
     }
 
@@ -491,11 +557,80 @@ mod filter_tests {
         assert_eq!(f(jest, "add(1, 2) -> 3"), r"add\(1, 2\) -> 3");
         assert_eq!(
             f(jest, "src/x.test.ts::math > add(1, 2) -> 3"),
-            r"math add\(1, 2\) -> 3"
+            r"math(?: > | )add\(1, 2\) -> 3"
+        );
+        assert_eq!(
+            f(jest, "$a/b `c` 'd' %x $(rm)"),
+            r"\$a/b `c` 'd' %x \$\(rm\)"
         );
         assert_eq!(f(jest, "a.b+c"), r"a\.b\+c");
         // A pattern the user wrote is theirs.
         assert_eq!(f(jest, "^add|sub$"), "^add|sub$");
+    }
+
+    /// Round 17 (Vitest 5): `-t` matches the name joined with ` > `; older
+    /// versions and Jest join with spaces. One pattern matches both.
+    #[test]
+    fn a_nested_vitest_name_matches_in_both_joins() {
+        use super::framework_filter as f;
+        let vitest = "npx vitest run -t \"$PROVA_FILTER\"";
+        let p = f(vitest, "suite > inner > works");
+        assert_eq!(p, "suite(?: > | )inner(?: > | )works");
+        assert_eq!(
+            f(vitest, "src/a/x.test.js::math > ops > adds"),
+            "math(?: > | )ops(?: > | )adds"
+        );
+    }
+
+    /// Round 17: pytest prints node ids; `::` can also sit in a parameter id.
+    #[test]
+    fn a_pytest_node_id_selects_the_test_name() {
+        use super::framework_filter as f;
+        let py = "python3 -m pytest -v -k \"$PROVA_FILTER\"";
+        assert_eq!(f(py, "tests/test_calc.py::test_ok"), "test_ok");
+        assert_eq!(f(py, "tests.test_calc::test_ok"), "test_ok");
+        assert_eq!(
+            f(py, "tests/test_calc.py::test_param[a b-c::d]"),
+            "test_param"
+        );
+        assert_eq!(
+            f(py, "tests.test_calc::test_param[x[1]-y]"),
+            "test_param[x[1]-y]"
+        );
+    }
+
+    /// Round 17: `{filter}` inside a double-quoted argument of a wrapper
+    /// closed the quote, so the shell split the value, and the container's
+    /// shell expanded its `$` again. It goes in single-quoted, unexpanded.
+    #[test]
+    fn a_filter_inside_a_wrapper_argument_arrives_as_one_quoted_word() {
+        use super::*;
+        let c: Config = toml::from_str(
+            r#"
+            [suite.py]
+            run = "./dev \"pytest\""
+            select = "./dev \"python3 -m pytest -v -k {filter}\""
+            [suite.mvn]
+            run = "x"
+            select = "docker run --rm img sh -c 'mvn -Dtest={filter}' && echo {filter}"
+            "#,
+        )
+        .unwrap();
+        let spec = c.run_spec("py", Some("a b")).unwrap();
+        assert_eq!(
+            spec.command,
+            CommandSpec::Shell("./dev \"python3 -m pytest -v -k $PROVA_FILTER_Q\"".into())
+        );
+        // Outside any quote, and inside single quotes, as before.
+        let spec = c.run_spec("mvn", Some("a")).unwrap();
+        assert_eq!(
+            spec.command,
+            CommandSpec::Shell(
+                "docker run --rm img sh -c 'mvn -Dtest=\"$PROVA_FILTER\"' && echo \"$PROVA_FILTER\""
+                    .into()
+            )
+        );
+        assert_eq!(shell_single_quote("Calc$Div'x y"), r"'Calc$Div'\''x y'");
     }
 
     #[test]

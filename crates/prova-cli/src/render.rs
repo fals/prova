@@ -170,8 +170,9 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
             },
             if c.subtests > 0 {
                 format!(
-                    " (and {} subtests, {} failed{})",
+                    " (and {} subtest{}, {} failed{})",
                     c.subtests,
+                    if c.subtests == 1 { "" } else { "s" },
                     c.subtests_failed,
                     if c.subtests_skipped > 0 {
                         format!(", {} skipped", c.subtests_skipped)
@@ -187,19 +188,19 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     for f in &s.failures {
         // An errored test is not a failed assertion; a test cut off by the
         // end of the run is neither (round 5).
-        let tag = match (f.outcome, f.message.as_deref()) {
-            (Outcome::Errored, Some(m)) if m.starts_with("test did not finish") => "UNFINISHED",
-            (Outcome::Errored, _) => "ERROR",
-            _ => "FAIL",
-        };
+        let tag = failure_tag(f.outcome, f.message.as_deref());
         match &f.message {
             Some(m) => println!(
                 "  {tag} {}{}: {}",
-                clean(&f.test),
+                named(&f.test, f.place.as_deref()),
                 context(f),
                 clean(&first_lines(m, 3))
             ),
-            None => println!("  {tag} {}{}", clean(&f.test), context(f)),
+            None => println!(
+                "  {tag} {}{}",
+                named(&f.test, f.place.as_deref()),
+                context(f)
+            ),
         }
     }
     if let Some(ms) = s.stalled_ms {
@@ -264,7 +265,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     for q in s.quarantined.iter().take(5) {
         println!(
             "quarantined: {} {} ({}; {})",
-            clean(&q.test),
+            named(&q.test, q.place.as_deref()),
             q.result,
             clean(&q.reason),
             expires_in(q.expires_ms)
@@ -343,6 +344,14 @@ pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
     }
 }
 
+/// A test's name with its place when names collide: `tests::flaky (geo)`.
+pub fn named(test: &str, place: Option<&str>) -> String {
+    match place {
+        Some(p) => format!("{} ({})", clean(test), clean(p)),
+        None => clean(test),
+    }
+}
+
 fn context(f: &prova_core::engine::Failure) -> String {
     let Some(c) = &f.context else {
         return String::new();
@@ -365,7 +374,7 @@ fn context(f: &prova_core::engine::Failure) -> String {
         // Thin evidence is said (round 12: "new failure" after one pass
         // sent the agent after its own fix).
         parts.push(match c.passes_before {
-            0 | 1 => "new failure (it passed only once before)".to_owned(),
+            0 | 1 => "one earlier pass: too little history to call this new or flaky".to_owned(),
             _ => "new failure".to_owned(),
         });
     } else if !c.flaky {
@@ -397,7 +406,7 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     }
     println!(
         "{}  (suite{} {}{})",
-        clean(&s.display),
+        named(&s.display, s.place.as_deref()),
         if s.suites.len() > 1 { "s" } else { "" },
         s.suites.join(", "),
         if s.suites.len() > 1 {
@@ -418,6 +427,8 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     );
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
         println!("duration p50 {p50}ms  p95 {p95}ms");
+    } else if s.runs > 0 {
+        println!("duration unknown: no run recorded one");
     }
     if let Some(size) = &s.size {
         println!("size: {}", clean(&size.label));
@@ -461,6 +472,20 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     }
     if shown.len() > 15 {
         println!("  ... {} more (`--json` lists all)", shown.len() - 15);
+    }
+    // A test running when a run was cut short has no result there, and may
+    // be why it was cut short (round 17).
+    if !s.cut_short.is_empty() {
+        let runs: Vec<String> = s
+            .cut_short
+            .iter()
+            .map(|c| format!("{} ({})", c.run, c.status))
+            .collect();
+        println!(
+            "  running when {} run(s) were cut short, with no result: {}",
+            s.cut_short.len(),
+            runs.join(", ")
+        );
     }
 }
 
@@ -535,8 +560,14 @@ fn history_line(h: &serde_json::Value) -> String {
             "on this exact code: {}",
             o.iter()
                 .filter_map(|v| v.as_str())
+                // `passed?` is the compact JSON form of an unverified pass.
+                .map(|v| if v == "passed?" {
+                    "passed (unverified)"
+                } else {
+                    v
+                })
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         ));
     }
     parts.join("; ")
@@ -725,15 +756,35 @@ pub fn heartbeat(s: &Summary) {
     eprintln!("{line}");
 }
 
+/// The word a failing test is listed under: an errored test (a setup error,
+/// a crash) is not a failed assertion, and a test cut off by the end of the
+/// run is neither (rounds 5 and 17).
+fn failure_tag(outcome: Outcome, message: Option<&str>) -> &'static str {
+    match (outcome, message) {
+        (Outcome::Errored, Some(m)) if m.starts_with("test did not finish") => "UNFINISHED",
+        (Outcome::Errored, _) => "ERROR",
+        _ => "FAIL",
+    }
+}
+
+/// The live line of each failure not shown yet.
+pub fn progress_failures(s: &Summary, reported: &mut std::collections::BTreeSet<String>) {
+    for f in &s.failures {
+        let name = named(&f.test, f.place.as_deref());
+        if reported.insert(name.clone()) {
+            eprintln!(
+                "{} {}{}",
+                failure_tag(f.outcome, f.message.as_deref()),
+                clean(&name),
+                context(f)
+            );
+        }
+    }
+}
+
 pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) {
     match s.reason {
-        WaitReason::Failure => {
-            for f in &s.failures {
-                if reported.insert(f.test.clone()) {
-                    eprintln!("FAIL {}{}", clean(&f.test), context(f));
-                }
-            }
-        }
+        WaitReason::Failure => progress_failures(s, reported),
         WaitReason::Slow => {
             for t in &s.slow {
                 if reported.insert(format!("slow:{}", t.test)) {
@@ -1062,6 +1113,7 @@ mod label_tests {
     fn label_after(seen_before: usize, flaky: bool, passes_before: usize) -> String {
         super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {
@@ -1080,6 +1132,21 @@ mod label_tests {
         })
     }
 
+    /// Round 17: the live line of an errored test (a setup error) says ERROR.
+    #[test]
+    fn an_errored_test_is_listed_as_an_error_live() {
+        use prova_core::model::Outcome;
+        assert_eq!(
+            super::failure_tag(Outcome::Errored, Some("setup broke")),
+            "ERROR"
+        );
+        assert_eq!(super::failure_tag(Outcome::Failed, None), "FAIL");
+        assert_eq!(
+            super::failure_tag(Outcome::Errored, Some("test did not finish before the end")),
+            "UNFINISHED"
+        );
+    }
+
     /// Usability round 3: "[new failure, FLAKY]" contradicted itself.
     #[test]
     fn a_flaky_test_is_not_a_new_failure() {
@@ -1088,11 +1155,12 @@ mod label_tests {
         // Round 12: one earlier pass is thin evidence, and is said.
         assert_eq!(
             label_after(0, false, 1),
-            " [new failure (it passed only once before)]"
+            " [one earlier pass: too little history to call this new or flaky]"
         );
         assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {
@@ -1113,6 +1181,7 @@ mod label_tests {
         first.clear();
         let never = super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {
@@ -1200,6 +1269,7 @@ mod live_tests {
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
             skipped_tests: vec![],
+            not_reported: vec![],
             selection: None,
             framework: None,
             failures: vec![],

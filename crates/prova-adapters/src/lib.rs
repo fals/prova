@@ -59,12 +59,13 @@ impl Stream {
 
 /// Built before the process starts: the result files already on disk are
 /// remembered, so only the ones this run writes are read at the end.
-pub fn observer_for(spec: &RunSpec, root: &Path) -> Box<dyn Observer> {
+pub fn observer_for(spec: &RunSpec, root: &Path, cwd: &Path) -> Box<dyn Observer> {
     let mut files = results::ResultFiles::new(&spec.results);
     files.snapshot(root);
     // gotestsum prints the module's root package as `.`; `go test` by its
     // import path. go.mod names it, so both name a test alike (round 15).
     let mut live = recognize::Recognizers::default();
+    live.cwd = Some(cwd.to_owned());
     live.go_module = std::fs::read_to_string(root.join("go.mod"))
         .ok()
         .and_then(|m| {
@@ -189,6 +190,26 @@ impl Observer for Ladder {
             report.events.extend(injected.events);
             report.test_outputs.extend(injected.test_outputs);
             report.level = report.level.max(injected.level);
+        }
+        // pytest's JUnit names tests from its rootdir, the live lines from
+        // the working directory (ADR 0031 section 2): a file result of a
+        // test the live output named with the rootdir's prefix is that test.
+        if let Some(prefix) = self.live.pytest_prefix() {
+            let dotted = prefix.replace('/', ".");
+            let live_names: std::collections::BTreeSet<&str> =
+                self.live.seen.values().map(|(d, _)| d.as_str()).collect();
+            for e in &mut report.events {
+                if let EventKind::TestFinished { test, .. } = e
+                    && let Some(first) = test.path.first_mut()
+                    && !first.starts_with(&format!("{dotted}."))
+                {
+                    let mut moved = test.clone();
+                    moved.path[0] = format!("{dotted}.{}", moved.path[0]);
+                    if live_names.contains(moved.display().as_str()) {
+                        *test = moved;
+                    }
+                }
+            }
         }
         // Live and file results are matched by display name (best effort:
         // result files rarely carry the same file attribute).
@@ -394,6 +415,41 @@ impl Observer for Ladder {
             .count() as u64;
         let seen =
             (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
+        if !self.live.pytest_xpass.is_empty() {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "{} test(s) xpassed (expected to fail, passed; counted as passed): {}",
+                    self.live.pytest_xpass.len(),
+                    self.live
+                        .pytest_xpass
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        let (failed_td, passed_td) = self.live.teardown_doubles();
+        if failed_td + passed_td > 0 {
+            // pytest counts such a test twice in its summary; prova counts
+            // tests (round 17).
+            let part = |n: u64, what: &str| {
+                (n > 0).then(|| {
+                    format!(
+                        "{n} test{} {what} and also errored in teardown",
+                        if n == 1 { "" } else { "s" }
+                    )
+                })
+            };
+            let parts: Vec<String> = [part(failed_td, "failed"), part(passed_td, "passed")]
+                .into_iter()
+                .flatten()
+                .collect();
+            report.events.push(EventKind::RunNote {
+                message: format!("{} (pytest counts each twice)", parts.join("; ")),
+            });
+        }
         if self.live.summary_seen {
             report.events.push(EventKind::RunTotals {
                 tests: self.live.total(),

@@ -24,6 +24,12 @@ pub struct Recognizers {
     /// The Go module of the run's directory (go.mod), for packages printed
     /// as `.`.
     pub go_module: Option<String>,
+    /// The run's working directory: pytest names tests from its rootdir,
+    /// prova from here (ADR 0031 section 2).
+    pub cwd: Option<std::path::PathBuf>,
+    /// Where pytest's rootdir lies below the working directory
+    /// (`sub2` for `rootdir: <cwd>/sub2`): put before its ids.
+    pytest_prefix: Option<String>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -145,10 +151,22 @@ pub struct Recognizers {
     /// pytest verbose text: a passing line held one line, for the same
     /// reason (pytest prints the teardown error as a second line).
     pytest_text_pass: Option<(String, TestKey)>,
+    /// pytest counts a test that errored in teardown once more than the
+    /// test itself (a pass or a failure plus an error): unique key -> the
+    /// test had failed before the error. Tests, not report lines.
+    pytest_doubles: BTreeMap<String, bool>,
+    /// pytest `XPASS`: tests expected to fail that passed (non-strict).
+    pub pytest_xpass: Vec<String>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
     pytest_in_failures: bool,
+    /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
+    /// then `× fails`): the open ones, by indentation.
+    vitest_suites: Vec<(usize, String)>,
+    /// Test classes Surefire's class lines named in full (`-- in
+    /// calc.CalcTest`): its summary names them without the package.
+    surefire_classes: Vec<String>,
     pytest_blocks: Vec<(String, Vec<String>)>,
     /// Test files (Jest `Test Suites:`, Vitest `Test Files`) the framework's
     /// own summary says failed. Such a file can fail without any test of it
@@ -178,6 +196,9 @@ pub struct Recognizers {
     go_full_pkgs: Vec<String>,
     /// Executions of each test so far (`-count=N`, reruns): its attempts.
     go_attempts: BTreeMap<String, u32>,
+    /// The message of the latest failure of each Go test: a later iteration
+    /// that passes records the failure standing, with it.
+    go_failure_msg: BTreeMap<String, Option<String>>,
     /// Tests that failed and passed on a rerun: failures a summary counted.
     go_recovered: u64,
     /// Packages in which a test failed.
@@ -507,6 +528,10 @@ impl Recognizers {
                 let mut other = key.clone();
                 other.name = format!("{} (second result)", key.name);
                 return self.result(other, outcome, duration_ms, message, level, subtest, out);
+            }
+            // pytest: a failure and then its own teardown error.
+            if before.is_failure() && *before != Outcome::Errored && outcome == Outcome::Errored {
+                self.pytest_doubles.entry(d.clone()).or_insert(true);
             }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
@@ -842,10 +867,20 @@ impl Recognizers {
         }
     }
 
+    /// Tests that errored in teardown after a failure, and after a pass:
+    /// pytest counts each of them twice.
+    pub fn teardown_doubles(&self) -> (u64, u64) {
+        let failed = self.pytest_doubles.values().filter(|f| **f).count() as u64;
+        (failed, self.pytest_doubles.len() as u64 - failed)
+    }
+
     /// Failures the framework reported (structured streams win over text).
     pub fn failed_reported(&self) -> u64 {
-        self.structured_failed
-            .unwrap_or(self.reported_failed.saturating_sub(self.go_recovered))
+        self.structured_failed.unwrap_or(
+            self.reported_failed
+                .saturating_sub(self.go_recovered)
+                .saturating_sub(self.teardown_doubles().0),
+        )
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
@@ -997,6 +1032,9 @@ impl Recognizers {
         } else if !line.starts_with('{') && !line.starts_with("?   \t") {
             self.go_segment_line(line);
         }
+        if let Some(root) = line.strip_prefix("rootdir: ") {
+            self.pytest_rootdir(root);
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -1049,6 +1087,41 @@ impl Recognizers {
         out
     }
 
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header: when the
+    /// rootdir lies below the working directory, ids are read from there.
+    fn pytest_rootdir(&mut self, header: &str) {
+        let Some(cwd) = &self.cwd else {
+            return;
+        };
+        let dir = std::path::Path::new(header.split(", ").next().unwrap_or(header).trim());
+        // Either path may run through a symlink (macOS `/var` is
+        // `/private/var`): compare them resolved when they differ as written.
+        let rel = dir
+            .strip_prefix(cwd)
+            .map(|r| r.to_path_buf())
+            .ok()
+            .or_else(|| {
+                let (d, c) = (dir.canonicalize().ok()?, cwd.canonicalize().ok()?);
+                d.strip_prefix(&c).map(|r| r.to_path_buf()).ok()
+            });
+        self.pytest_prefix = rel
+            .map(|rel| rel.to_string_lossy().trim_matches('/').to_owned())
+            .filter(|rel| !rel.is_empty());
+    }
+
+    /// Where pytest's rootdir lies below the working directory, if it does.
+    pub fn pytest_prefix(&self) -> Option<&str> {
+        self.pytest_prefix.as_deref()
+    }
+
+    /// A pytest node id as prova names it, from the working directory.
+    fn pytest_key(&self, id: &str) -> TestKey {
+        match &self.pytest_prefix {
+            Some(p) if id.contains("::") || id.ends_with(".py") => pytest_key(&format!("{p}/{id}")),
+            _ => pytest_key(id),
+        }
+    }
+
     /// The start of an unfinished output line. A pytest `-v` line shows the
     /// test's id, then its outcome once it ends: an id followed by a space
     /// and nothing else is a test running now (round 15: a stall named the
@@ -1083,7 +1156,7 @@ impl Recognizers {
         if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
             return out;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if self
             .pytest_text_pass
             .as_ref()
@@ -1643,7 +1716,7 @@ impl Recognizers {
             return;
         };
         lift(&mut self.level, Level::Native);
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         let outcome = match (when, result) {
             ("setup", "passed") => return self.started(key, out),
             ("setup", "failed") => Outcome::Errored,
@@ -1676,6 +1749,13 @@ impl Recognizers {
         };
         // A teardown error on a passed call: the one test errored.
         if when == "teardown" {
+            if self
+                .pytest_call_pass
+                .as_ref()
+                .is_some_and(|(h, _, _)| h == id)
+            {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
+            }
             self.pytest_call_pass = None;
         }
         let longrepr = &v["longrepr"];
@@ -1753,7 +1833,7 @@ impl Recognizers {
             "skipped" => Outcome::Skipped,
             _ => return,
         };
-        let parent = pytest_key(id);
+        let parent = self.pytest_key(id);
         let label = if label.trim().is_empty() {
             // No context to tell subtests apart: by order within the
             // parent, so none is merged into another or into the parent.
@@ -1980,6 +2060,7 @@ impl Recognizers {
                 .strip_prefix(id.as_str())
                 .is_some_and(|r| r.trim_start().starts_with("ERROR"));
             if errored {
+                self.pytest_doubles.entry(hkey.unique()).or_insert(false);
                 self.finished(hkey, Outcome::Errored, None, None, Level::Recognized, out);
                 return true;
             }
@@ -2052,13 +2133,23 @@ impl Recognizers {
             let start = left[..at].rfind(' ').map_or(0, |i| i + 1);
             let id = left[start..].trim();
             let label = left[..start].trim();
-            let key = pytest_key(id);
+            let key = self.pytest_key(id);
             let (key, sub) = if sub {
                 (pytest_subtest(key, label), true)
             } else {
                 (key, false)
             };
             let msg = msg.filter(|_| outcome.is_failure());
+            // An expected failure is skipped, an unexpected pass a pass:
+            // both are named (round 17).
+            let msg = if word == "XFAIL" {
+                Some(XFAIL.to_owned())
+            } else {
+                msg
+            };
+            if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+                self.pytest_xpass.push(key.display());
+            }
             if outcome.is_failure() && !sub {
                 self.claim_pytest_block(&key);
             }
@@ -2067,6 +2158,7 @@ impl Recognizers {
             if outcome == Outcome::Errored
                 && matches!(self.seen.get(&key.unique()), Some((_, Outcome::Passed)))
             {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
                 self.attempt_result(key, 2, outcome, None, msg, Level::Recognized, out);
                 return true;
             }
@@ -2124,11 +2216,11 @@ impl Recognizers {
         if matches!(word, "SUBPASS" | "SUBFAIL" | "SUBSKIP")
             && let Some((parent, label)) = id.rsplit_once(" [")
         {
-            let key = pytest_subtest(pytest_key(parent.trim()), &format!("[{label}"));
+            let key = pytest_subtest(self.pytest_key(parent.trim()), &format!("[{label}"));
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if word == "RERUN" {
             let n = self.reruns.get(&key.unique()).copied().unwrap_or(0) + 1;
             self.reruns.insert(key.unique(), n);
@@ -2146,6 +2238,9 @@ impl Recognizers {
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
+        if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+            self.pytest_xpass.push(key.display());
+        }
         // Failures are recorded now to keep first-failure fast; the message
         // only appears later in the summary section. A pass waits one line:
         // a teardown error follows it as a second line for the same test.
@@ -2153,7 +2248,8 @@ impl Recognizers {
             self.pytest_text_pass = Some((id.to_owned(), key));
             return true;
         }
-        self.finished(key, outcome, None, None, Level::Recognized, out);
+        let message = (word == "XFAIL").then(|| XFAIL.to_owned());
+        self.finished(key, outcome, None, message, Level::Recognized, out);
         true
     }
 
@@ -2262,12 +2358,38 @@ impl Recognizers {
             && !rest.contains(" > ")
         {
             self.vitest_file = Some(f.trim().to_owned());
+            self.vitest_suites.clear();
             return true;
         }
+        let indent = line.len() - t.len();
+        self.vitest_suites.retain(|(i, _)| *i < indent);
         if t.starts_with("❯ ") {
+            // A suite of the default reporter's tree: `suite (2)`.
+            if self.vitest_file.is_some()
+                && let Some((name, count)) = rest.rsplit_once(" (")
+                && count.trim_end().ends_with(')')
+                && count
+                    .trim_end()
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+                && !name.contains(" > ")
+            {
+                self.vitest_suites.push((indent, name.trim().to_owned()));
+                return true;
+            }
             return false;
         }
         let mut parts: Vec<String> = rest.split(" > ").map(|p| p.trim().to_owned()).collect();
+        // `× fails` under `❯ suite` and `❯ inner`: the whole name, as the
+        // verbose reporter and the stream give it (round 17: the short one
+        // split history and let two describes' `works` collide).
+        if parts.len() == 1 && !self.vitest_suites.is_empty() {
+            let mut full: Vec<String> = self.vitest_suites.iter().map(|(_, n)| n.clone()).collect();
+            full.append(&mut parts);
+            parts = full;
+        }
         let file = if parts.len() > 1 && is_file(&parts[0]) {
             Some(parts.remove(0))
         } else if parts.len() > 1 || self.vitest_file.is_some() {
@@ -2307,8 +2429,29 @@ impl Recognizers {
     ///   `[ERROR]   CalcTest.io \u{bb} IO disk full`.
     /// The result files may name only some of the classes (a fork that
     /// died, a partial report): what the console names counts too.
+    /// The class as the XML will name it: Surefire's summary prints the
+    /// simple name, the class lines before it the package too. Only a
+    /// class that one full name ends with is qualified.
+    fn surefire_class(&self, class: &str) -> String {
+        let mut found = self
+            .surefire_classes
+            .iter()
+            .filter(|c| c.as_str() == class || c.ends_with(&format!(".{class}")));
+        match (found.next(), found.next()) {
+            (Some(c), None) => c.clone(),
+            _ => class.to_owned(),
+        }
+    }
+
     fn surefire(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let line = line.trim_end();
+        if let Some((_, class)) = line.rsplit_once(" -- in ")
+            && !class.is_empty()
+            && !class.contains(char::is_whitespace)
+            && !self.surefire_classes.iter().any(|c| c == class)
+        {
+            self.surefire_classes.push(class.to_owned());
+        }
         let Some(body) = line
             .strip_prefix("[ERROR] ")
             .or_else(|| line.strip_prefix("[WARNING] "))
@@ -2368,7 +2511,7 @@ impl Recognizers {
                 && class_ok(method)
             {
                 self.surefire_rerun = Some((
-                    TestKey::new(vec![class.to_owned()], method),
+                    TestKey::new(vec![self.surefire_class(class)], method),
                     section,
                     Vec::new(),
                 ));
@@ -2403,7 +2546,7 @@ impl Recognizers {
             Outcome::Failed
         };
         self.result(
-            TestKey::new(vec![class.to_owned()], method),
+            TestKey::new(vec![self.surefire_class(class)], method),
             outcome,
             None,
             Some(msg.to_owned()).filter(|m| !m.is_empty()),
@@ -2744,7 +2887,10 @@ impl Recognizers {
 
     /// Tests the framework says it ran.
     pub fn total(&self) -> u64 {
-        self.structured_total.unwrap_or(self.reported_total)
+        self.structured_total.unwrap_or(
+            self.reported_total
+                .saturating_sub(self.pytest_doubles.len() as u64),
+        )
     }
 
     // ------------------------------------------------------------- nextest
@@ -2907,6 +3053,27 @@ impl Recognizers {
         }
     }
 
+    /// Counts the results of held text events as seen, as `result` does for
+    /// a live one.
+    fn adopt_held(&mut self, held: &[EventKind]) {
+        for e in held {
+            if let EventKind::TestFinished {
+                test,
+                outcome,
+                source,
+                ..
+            } = e
+            {
+                let d = test.unique();
+                self.seen_keys
+                    .entry(d.clone())
+                    .or_insert_with(|| test.clone());
+                self.seen.entry(d).or_insert((test.display(), *outcome));
+                lift(&mut self.level, *source);
+            }
+        }
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
@@ -2953,7 +3120,11 @@ impl Recognizers {
         let mut out = held_pass;
         // The injected stream never came: the text results are all there is.
         if self.level < Some(Level::Native) {
-            out.append(&mut self.held_text_events);
+            // They are the run's results now: counted as seen, and they
+            // set the level (round 17: "2 failed" beside "prova saw 0").
+            let mut held = std::mem::take(&mut self.held_text_events);
+            self.adopt_held(&held);
+            out.append(&mut held);
         }
         out.append(&mut gts);
         self.flush_nextest(&mut out);
@@ -2961,6 +3132,7 @@ impl Recognizers {
             let mut held = Vec::new();
             self.flush_vitest(&mut held);
             if self.level < Some(Level::Native) {
+                self.adopt_held(&held);
                 out.extend(held);
             }
         } else {
@@ -3181,12 +3353,24 @@ fn nextest_status(line: &str) -> Option<(&str, &str, &str, &str)> {
     Some((status, dur.trim(), binary, test))
 }
 
-/// Rust test binaries are named by target (ADR 0018): nextest's binary id
-/// keeps its last segment (`calc::calc` and `calc` give `calc`,
-/// `prova-cli::live` gives `live`, `crate::bin/tool` gives `tool`).
+/// Rust test binaries are named by crate and target (ADR 0018, 0031): the
+/// crate's own binary is `calc` (`calc::calc` too), another target of it
+/// `calc::live`, a bin `calc::tool`. The crate stays in the name: two
+/// crates' `it` integration tests are two binaries, whatever order they ran
+/// in (round 17).
 fn nextest_binary(id: &str) -> String {
-    let last = id.rsplit("::").next().unwrap_or(id);
-    last.trim_start_matches("bin/").replace('-', "_")
+    let id = id.replace('-', "_");
+    match id.rsplit_once("::") {
+        Some((krate, target)) => {
+            let target = target.trim_start_matches("bin/");
+            if krate == target {
+                krate.to_owned()
+            } else {
+                format!("{krate}::{target}")
+            }
+        }
+        None => id,
+    }
 }
 
 /// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
@@ -3245,6 +3429,9 @@ fn is_pytest_file(f: &str) -> bool {
     let f = f.trim();
     f.ends_with(".py") && !f.contains(' ') && !f.contains("::")
 }
+
+/// The message of a skipped result that pytest called an expected failure.
+pub const XFAIL: &str = "xfail";
 
 fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
     if !label.is_empty() {
@@ -3879,8 +4066,12 @@ mod tests {
             cargo_binary("tests/live.rs (target/debug/deps/live-0123abcd)"),
             "live"
         );
-        assert_eq!(nextest_binary("prova-cli::live"), "live");
-        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova");
+        assert_eq!(nextest_binary("prova-cli::live"), "prova_cli::live");
+        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova_cli::prova");
+        assert_eq!(nextest_binary("calc::calc"), "calc");
+        assert_eq!(nextest_binary("calc"), "calc");
+        // Two crates' integration tests of one name are two binaries.
+        assert_ne!(nextest_binary("alpha::it"), nextest_binary("beta::it"));
     }
 
     /// Round 5: in quiet mode libtest's 60 s warning followed the progress
@@ -3919,6 +4110,26 @@ mod tests {
                 .is_empty(),
             "the stream decides"
         );
+    }
+
+    /// Round 17 (python-make): a pytest-reportlog stream that never came
+    /// (the report was written inside a container) left the text results
+    /// held; releasing them at the end did not count them as seen, so the
+    /// summary said "2 failed" and "prova saw 0 individually" at once.
+    #[test]
+    fn held_text_results_released_for_a_missing_stream_count_as_seen() {
+        let mut r = Recognizers {
+            pytest_stream: true,
+            ..Recognizers::default()
+        };
+        r.line("=== short test summary info ===");
+        r.line("FAILED tests/t.py::test_a - assert 1");
+        r.line("FAILED tests/t.py::test_b - assert 2");
+        r.line("=== 2 failed in 0.10s ===");
+        let ev = r.finish();
+        assert_eq!(finished(&ev).len(), 2, "{ev:?}");
+        assert_eq!(r.seen.len(), 2);
+        assert_eq!(r.level, Some(Level::Recognized));
     }
 
     /// Round 12 (blocker): with an injected stream, pytest -v and Vitest
@@ -4118,6 +4329,30 @@ mod tests {
         assert_eq!(message.as_deref(), Some("expected 16 to be 4"));
     }
 
+    /// Round 17: the default reporter prints suites as a tree and a test
+    /// under its own short name; the verbose reporter and the stream give
+    /// the whole name. One test, one name (real Vitest 5.1.1 output).
+    #[test]
+    fn vitest_default_reporter_tree_gives_the_whole_name() {
+        let (_, ev) = feed(
+            " ❯ src/c/y.test.js (2 tests | 1 failed) 4ms\n   ❯ suite (2)\n     ❯ inner (2)\n       × fails 3ms\n         → expected '1' to be undefined\n       ✓ works 0ms\n   ❯ other (1)\n     ✓ works 1ms\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                (
+                    "src/c/y.test.js::suite > inner > fails".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "src/c/y.test.js::suite > inner > works".into(),
+                    Outcome::Passed
+                ),
+                ("src/c/y.test.js::other > works".into(), Outcome::Passed),
+            ]
+        );
+    }
+
     #[test]
     fn same_names_in_different_test_binaries_stay_apart() {
         let (r, ev) = feed(
@@ -4173,6 +4408,26 @@ mod tests {
         );
         assert_eq!(finished(&ev).len(), 2);
         assert_eq!(r.total(), 2, "the skipped test seen by name counts");
+    }
+
+    /// Round 17 (java-maven): the live FAIL line said `CalcTest::flakyClock`
+    /// (the summary's simple class name) where the XML says
+    /// `calc.CalcTest::flakyClock`: the class lines before it carry the
+    /// package (real Surefire 3.5.2 output).
+    #[test]
+    fn surefire_summary_names_the_package_the_class_lines_gave() {
+        let (_, ev) = feed(concat!(
+            "[INFO] Running calc.CalcTest\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.040 s <<< FAILURE! -- in calc.CalcTest\n",
+            "[INFO] Results:\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   CalcTest.flakyClock:21 clock tick landed on a bad boundary\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![("calc.CalcTest::flakyClock".into(), Outcome::Failed)]
+        );
     }
 
     #[test]
@@ -4405,6 +4660,65 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n.contains("second result"))
         );
+    }
+
+    /// Round 17: an expected failure and an unexpected pass are named.
+    #[test]
+    fn pytest_names_xfail_and_xpass() {
+        let (r, ev) = feed_all(
+            "tests/t.py::test_xfail XFAIL (not yet)    [ 50%]\ntests/t.py::test_xpass XPASS (fixed)    [100%]\n",
+        );
+        assert_eq!(r.pytest_xpass, vec!["tests.t::test_xpass".to_owned()]);
+        let xf: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            xf,
+            vec![("tests.t::test_xfail".to_owned(), XFAIL.to_owned())]
+        );
+    }
+
+    /// Round 17: pytest counts a test that failed and also errored in
+    /// teardown twice ("1 failed, 3 passed, 2 errors" for four tests). The
+    /// counts prova compares are of tests, not report lines.
+    #[test]
+    fn pytest_counts_tests_not_report_lines() {
+        let (r, _) = feed_all(
+            "tests/t.py::test_a FAILED   [ 25%]\ntests/t.py::test_a ERROR   [ 25%]\n\
+             tests/t.py::test_b PASSED   [ 50%]\ntests/t.py::test_b ERROR   [ 50%]\n\
+             tests/t.py::test_c PASSED   [ 75%]\n\
+             tests/t.py::test_d PASSED   [100%]\n\
+             FAILED tests/t.py::test_a - assert 0\nERROR tests/t.py::test_a - teardown\n\
+             ERROR tests/t.py::test_b - teardown\n\
+             === 1 failed, 3 passed, 2 errors in 0.1s ===",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (4, 2));
+        assert_eq!(r.teardown_doubles(), (1, 1));
+    }
+
+    #[test]
+    fn pytest_reportlog_teardown_double_is_counted_once() {
+        let a = "tests/t.py::test_a";
+        let b = "tests/t.py::test_b";
+        let lines = [
+            report(a, "setup", "passed"),
+            report(a, "call", "failed"),
+            report(a, "teardown", "failed"),
+            report(b, "setup", "passed"),
+            report(b, "call", "passed"),
+            report(b, "teardown", "failed"),
+            "=== 1 failed, 1 passed, 2 errors in 0.1s ===".to_owned(),
+        ];
+        let (r, _) = feed_all(&lines.join("\n"));
+        assert_eq!((r.total(), r.failed_reported()), (2, 2));
     }
 
     #[test]
@@ -5036,29 +5350,50 @@ impl Recognizers {
         }
         let Some((_, before)) = self.seen.get(&d).cloned().filter(|_| !self.holding) else {
             if !self.holding {
+                if outcome.is_failure() {
+                    self.go_failure_msg.insert(d.clone(), message.clone());
+                }
                 self.go_attempts.insert(d, 1);
             }
             return self.result(key, outcome, duration_ms, message, level, subtest, out);
         };
         self.repeats += 1;
+        // Every execution is an attempt: the number counts them all, even
+        // the ones that change nothing (round 17: `-count=4` showed 3).
+        let n = self.go_attempts.entry(d.clone()).or_insert(1);
+        *n += 1;
+        let attempt = *n;
         if !before.is_failure() && !outcome.is_failure() {
             return;
         }
-        if before.is_failure() && !outcome.is_failure() {
+        let (outcome, message) = if before.is_failure() && !outcome.is_failure() {
             if !retry {
-                // A later iteration passing does not undo the failure.
-                return;
+                // A later iteration passing does not undo the failure: it is
+                // recorded as the failure standing, with its message.
+                let kept = self.go_failure_msg.get(&d).cloned().flatten();
+                (before, kept)
+            } else {
+                self.go_recovered += 1;
+                (outcome, message)
             }
-            self.go_recovered += 1;
+        } else {
+            (outcome, message)
+        };
+        if outcome.is_failure() {
+            self.go_failure_msg
+                .entry(d.clone())
+                .and_modify(|m| {
+                    if message.is_some() {
+                        m.clone_from(&message);
+                    }
+                })
+                .or_insert_with(|| message.clone());
         }
         if outcome.is_failure()
             && let Some(m) = &message
         {
             self.failure_fallback.push((key.clone(), m.clone()));
         }
-        let n = self.go_attempts.entry(d.clone()).or_insert(1);
-        *n += 1;
-        let attempt = *n;
         self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         out.push(EventKind::TestFinished {
@@ -5496,7 +5831,8 @@ mod go_tests {
         let s = settled(&ev);
         assert_eq!(
             one(&s, "example.com/m/r::TestRace"),
-            vec![Outcome::Passed, Outcome::Failed]
+            vec![Outcome::Passed, Outcome::Failed, Outcome::Failed],
+            "three executions, three attempts: the last pass leaves the failure standing"
         );
         assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
     }
@@ -5509,7 +5845,10 @@ mod go_tests {
             "FAIL\nFAIL\texample.com/f\t0.01s\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "example.com/f::TestF"), vec![Outcome::Failed]);
+        assert_eq!(
+            one(&s, "example.com/f::TestF"),
+            vec![Outcome::Failed, Outcome::Failed]
+        );
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(r.failed_reported(), 0, "no stale totals");
     }
@@ -5545,8 +5884,31 @@ mod go_tests {
             "\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed, Outcome::Failed]);
         assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    /// Round 17: `-count=4` (pass, fail, pass, fail) is four attempts, and
+    /// the pass and the failure of one run are both in them.
+    #[test]
+    fn go_count_four_counts_four_attempts() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "FAIL\nFAIL\texample.com/c\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/c::TestC"),
+            vec![
+                Outcome::Passed,
+                Outcome::Failed,
+                Outcome::Failed,
+                Outcome::Failed
+            ]
+        );
     }
 
     /// A panic outside any test fails the package even when a test of it

@@ -26,6 +26,11 @@ pub struct Proposal {
     /// The project's own test command runs gotestsum: its event stream can
     /// be injected (`gotestsum-json`).
     pub gotestsum: bool,
+    /// The commands run through a wrapper (`./dev`, `docker compose run`):
+    /// a report or stream an inject recipe writes may not be visible where
+    /// the tests run.
+    #[serde(default)]
+    pub wrapped: bool,
 }
 
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
@@ -422,15 +427,16 @@ pub fn apply_wrapper_form(p: &mut Proposal, w: &Wrapper) {
         s.select = s.select.as_deref().map(wrap);
     }
     p.existing = p.existing.as_deref().map(wrap);
+    p.wrapped = true;
     // Whether the host has pytest-reportlog says nothing about the wrapper.
     p.reportlog = false;
     p.notes.push(if w.quoted {
         format!(
-            "commands run through `{wrapper}`, as your earlier runs did, with the whole command as one quoted argument; `{{filter}}` stays inside that argument"
+            "commands run through `{wrapper}`, as your earlier runs did, with the whole command as one quoted argument; `{{filter}}` stays inside that argument, and prova passes it as one single-quoted word"
         )
     } else {
         format!(
-            "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none"
+            "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none, or pass the whole command as one quoted argument"
         )
     });
 }
@@ -643,6 +649,17 @@ pub fn to_toml(p: &Proposal) -> String {
             ] {
                 if p.languages.iter().any(|l| l == lang) {
                     s.push_str(&format!("# inject = [\"{recipe}\"]  # opt-in: {what}\n"));
+                    // A report or stream is a file on the host: a command
+                    // run through a wrapper or container writes it where
+                    // prova cannot read it (round 17: it vanished with the
+                    // container).
+                    if (p.wrapped || prova_core::resources::container_client(&suite.run).is_some())
+                        && recipe != "go-nocache"
+                    {
+                        s.push_str(&format!(
+                            "#   caveat: this command runs through a wrapper or container; `{recipe}` needs the variable forwarded into it (`-e PYTEST_ADDOPTS`) and the run's `inject` directory under $PROVA_HOME mounted at the same path, or the report never appears (prova warns when it does not)\n"
+                        ));
+                    }
                 }
             }
         }
@@ -708,6 +725,26 @@ mod tests {
             assert!(s.select.as_deref().is_none_or(|x| x.starts_with("./dev ")));
         }
         assert!(!p.reportlog);
+    }
+
+    /// Round 17: a report inject offered for a command run through a wrapper
+    /// wrote the report inside the container, where prova never saw it.
+    #[test]
+    fn a_report_inject_through_a_wrapper_comes_with_its_caveat() {
+        let mut p = propose(&dir(
+            "wrapped-hint",
+            &[
+                ("pytest.ini", "[pytest]"),
+                ("Makefile", "test: lint\n\truff .\n\tpytest -q\n"),
+            ],
+        ));
+        assert!(!to_toml(&p).contains("caveat"));
+        apply_wrapper(&mut p, "./dev");
+        let t = to_toml(&p);
+        assert!(
+            t.contains("# inject = [\"pytest-junit\"]") && t.contains("caveat"),
+            "{t}"
+        );
     }
 
     #[test]

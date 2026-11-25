@@ -1,0 +1,37 @@
+   Compiling calc v0.1.0 (/w)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+────────────
+ Nextest run ID 383f2632-f02b-4d39-ac7b-845aa3321ae8 with nextest profile: default
+    Starting 3 tests across 1 binary
+        PASS [   0.003s] (1/3) calc tests::divides
+        PASS [   0.003s] (2/3) calc tests::adds
+        FAIL [   0.003s] (3/3) calc tests::flaky_clock
+  output ───
+
+    running 1 test
+
+    thread 'tests::flaky_clock' (2408185) panicked at src/lib.rs:10:24:
+    tick
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    test tests::flaky_clock ... FAILED
+
+    failures:
+
+    failures:
+        tests::flaky_clock
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+{"type":"suite","event":"started","test_count":3}
+{"type":"test","event":"started","name":"calc::calc$tests::flaky_clock"}
+{"type":"test","event":"started","name":"calc::calc$tests::divides"}
+{"type":"test","event":"started","name":"calc::calc$tests::adds"}
+{"type":"test","event":"ok","name":"calc::calc$tests::divides","exec_time":0.00332336}
+{"type":"test","event":"ok","name":"calc::calc$tests::adds","exec_time":0.003400369}
+{"type":"test","event":"failed","name":"calc::calc$tests::flaky_clock","exec_time":0.00335973,"stdout":"\nthread 'tests::flaky_clock' (2408185) panicked at src/lib.rs:10:24:\ntick\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"}
+{"type":"suite","event":"failed","passed":2,"failed":1,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.010083459}
+────────────
+     Summary [   0.004s] 3 tests run: 2 passed, 1 failed, 0 skipped
+        FAIL [   0.003s] (3/3) calc tests::flaky_clock
+error: test run failed

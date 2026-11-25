@@ -64,6 +64,45 @@ fn text(o: &Output) -> String {
     )
 }
 
+/// A script named like the capture's test runner that prints the capture
+/// (a quarantine sets aside only the failures of one runner call, ADR 0031),
+/// and the command that runs it.
+fn runner(d: &Path, tag: &str, capture: &str, body: &str) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let prog = if capture.starts_with("gotestsum") {
+        "gotestsum"
+    } else if capture.starts_with("go-") {
+        "go"
+    } else if capture.starts_with("cargo") {
+        "cargo"
+    } else if capture.starts_with("vitest") {
+        "vitest"
+    } else if capture.starts_with("pytest") {
+        "pytest"
+    } else if capture.starts_with("dotnet") {
+        "dotnet"
+    } else if capture.starts_with("mvn") {
+        "mvn"
+    } else {
+        "jest"
+    };
+    let dir = d.join("rc").join(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(prog);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vec![format!("./rc/{tag}/{prog}"), "test".to_owned()]
+}
+
+/// Runs `argv` as `prova run <flags> -- argv...`.
+fn run_argv(d: &Path, flags: &[&str], argv: &[String]) -> Output {
+    let mut args: Vec<&str> = vec!["run"];
+    args.extend(flags);
+    args.push("--");
+    args.extend(argv.iter().map(String::as_str));
+    prova(d, &args)
+}
+
 /// Whether the run's verdict line says PASSED (the output it quotes, as in
 /// pytest's `PASSED tests/..`, is prefixed).
 fn passed(t: &str) -> bool {
@@ -99,11 +138,17 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str), expect:
             dir.join(file).display()
         )
     });
-    let script = |with_extra: bool| {
-        let more = if with_extra { " extra.txt" } else { "" };
-        format!("{BUSY} {copy} cat {}{more}; exit {code}", output.display())
-    };
-    let learn = prova(&d, &["run", "--json", "--", "sh", "-c", &script(false)]);
+    // `extra.txt` is empty until a case appends to it.
+    let argv = runner(
+        &d,
+        "one",
+        name,
+        &format!(
+            "{BUSY} {copy} cat {} extra.txt; exit {code}",
+            output.display()
+        ),
+    );
+    let learn = run_argv(&d, &["--json"], &argv);
     let json: serde_json::Value = serde_json::from_slice(&learn.stdout)
         .unwrap_or_else(|e| panic!("{name}: {e}: {}", text(&learn)));
     let failures = json["failures"].as_array().unwrap();
@@ -121,12 +166,13 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str), expect:
     let o = prova(&d, &["quarantine", "add", flaky[0], "--reason", "clock"]);
     assert_eq!(o.status.code(), Some(0), "{name}: {}", text(&o));
 
-    let o = prova(&d, &["run", "--", "sh", "-c", &script(false)]);
+    let o = run_argv(&d, &[], &argv);
     let t = text(&o);
     match expect {
         Expect::Passes => {
             assert_eq!(o.status.code(), Some(0), "{name} must pass: {t}");
             assert!(passed(&t), "{name}: {t}");
+            assert!(!t.contains("outside any failing test"), "{name}: {t}");
         }
         Expect::NoOtherPass => {
             assert_eq!(o.status.code(), Some(1), "{name}: {t}");
@@ -141,7 +187,7 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str), expect:
     // guard says so. Another test's failure: the run fails (its own way).
     for (extra, is_guard) in [(error, true), (failure, false)] {
         std::fs::write(d.join("extra.txt"), extra).unwrap();
-        let o = prova(&d, &["run", "--", "sh", "-c", &script(true)]);
+        let o = run_argv(&d, &[], &argv);
         let t = text(&o);
         assert_eq!(o.status.code(), Some(1), "{name} plus {extra:?}: {t}");
         assert!(!passed(&t), "{name} plus {extra:?}: {t}");
@@ -206,6 +252,7 @@ cases! {
     corpus_gotestsum_standard_verbose: "gotestsum-standard-verbose", None, GO, Expect::Passes;
     corpus_cargo_test: "cargo-test", None, CARGO, Expect::Passes;
     corpus_cargo_nextest: "cargo-nextest", None, CARGO, Expect::Passes;
+    corpus_cargo_nextest_libtest_json: "cargo-nextest-libtest-json", None, CARGO, Expect::Passes;
     corpus_vitest_default: "vitest-default", None, VITEST, Expect::Passes;
     corpus_vitest_verbose: "vitest-verbose", None, VITEST, Expect::Passes;
     corpus_pytest_quiet: "pytest-q", None, PYTEST, Expect::NoOtherPass;
@@ -234,11 +281,8 @@ fn probe(name: &str, edit: &dyn Fn(&str) -> String, why: &str) {
     let d = workspace(&format!("probe-{name}-{n}"));
     std::fs::write(d.join("base.txt"), &raw).unwrap();
     std::fs::write(d.join("edited.txt"), edit(&raw)).unwrap();
-    let script = |f: &str| format!("{BUSY} cat {f}; exit {code}");
-    let learn = prova(
-        &d,
-        &["run", "--json", "--", "sh", "-c", &script("base.txt")],
-    );
+    let script = |f: &str| runner(&d, f, name, &format!("{BUSY} cat {f}; exit {code}"));
+    let learn = run_argv(&d, &["--json"], &script("base.txt"));
     let json: serde_json::Value = serde_json::from_slice(&learn.stdout).unwrap();
     let flaky = json["failures"]
         .as_array()
@@ -248,9 +292,9 @@ fn probe(name: &str, edit: &dyn Fn(&str) -> String, why: &str) {
         .find(|t| t.to_lowercase().contains("flaky"))
         .unwrap_or_else(|| panic!("{name}: {}", text(&learn)));
     prova(&d, &["quarantine", "add", flaky, "--reason", "clock"]);
-    let o = prova(&d, &["run", "--", "sh", "-c", &script("base.txt")]);
+    let o = run_argv(&d, &[], &script("base.txt"));
     assert_eq!(o.status.code(), Some(0), "{name} base: {}", text(&o));
-    let o = prova(&d, &["run", "--", "sh", "-c", &script("edited.txt")]);
+    let o = run_argv(&d, &[], &script("edited.txt"));
     let t = text(&o);
     assert_eq!(o.status.code(), Some(1), "{name} edited ({why}): {t}");
     assert!(!passed(&t), "{name} edited ({why}): {t}");

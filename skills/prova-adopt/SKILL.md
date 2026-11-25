@@ -31,6 +31,9 @@ project's test scripts, Makefile or CI config to adopt prova.
    own, with one exception: a wrapper that runs `sh -c "$*"` (`./dev`) takes
    the whole command as one quoted argument, and then `{filter}` goes inside
    that argument: `./dev "dotnet test --filter FullyQualifiedName~{filter}"`.
+   There prova hands the filter to the inner shell as one single-quoted
+   word, so spaces and `$` (`CalcTest$Division`) survive; write no quotes
+   around `{filter}` there.
    `prova adopt` keeps such a wrapper and its quoting from your earlier runs
    (the one most runs used).
 
@@ -75,4 +78,7 @@ If the project's tests run through a wrapper (`./dev make test`,
 command>` before `prova adopt`: the proposal keeps that wrapper in `run` and
 `select`. `prova adopt --verify` says first why a command could not run
 (exit 127, `No module named pytest`) and gives the filter syntax of the
-framework it found; a filter with spaces may be split by the wrapper.
+framework it found. When a selection ran 0 tests it says the filter did
+not reach the framework or matched nothing, and shows the output to read.
+Surefire and VSTest select by method: a parameterized case runs with its
+siblings.
