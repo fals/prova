@@ -2946,14 +2946,15 @@ fn unnarrowed_note(total: usize, prev: &str, listed: &str) -> String {
 
 /// For a run through `make` or another wrapper, a suite of the project
 /// that runs a known test runner directly, by name.
-fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, command: &str) -> Option<String> {
+fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, program: &str) -> Option<String> {
     let first = |c: &str| {
         c.split_whitespace()
             .find(|w| !w.contains('='))
             .map(|w| w.rsplit('/').next().unwrap_or(w).to_owned())
             .unwrap_or_default()
     };
-    if !matches!(first(command).as_str(), "make" | "gmake" | "just" | "task") {
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(program, "make" | "gmake" | "just" | "task") {
         return None;
     }
     let direct = cfg.suite.iter().find(|(name, s)| {
@@ -3416,8 +3417,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let explained = !failures.is_empty() && failures.iter().all(|f| f.message.is_some());
     let want_tail = reason == WaitReason::Stall
         || ((failed_run || reason == WaitReason::Failure) && !explained);
-    let (command, raw_command) = serde_json::from_value::<RunSpec>(row.spec.clone())
-        .map(|s| (s.command.display(), s.command.raw()))
+    let (command, raw_command, program) = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .map(|s| (s.command.display(), s.command.raw(), s.command.program()))
         .unwrap_or_default();
     // A selected run's failure outside the selection: a file-level entry
     // the framework loads whatever the selection (Vitest imports every
@@ -3529,7 +3530,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && stalled_ms.is_some()
         && running.is_empty()
         && let Ok(cfg) = crate::config::load(store.root())
-        && let Some(hint) = direct_suite_hint(&cfg, &row.suite, &command)
+        && let Some(hint) = direct_suite_hint(&cfg, &row.suite, &program)
     {
         notes.push(hint);
     }
@@ -4131,15 +4132,15 @@ mod hang_hint_tests {
             "[suite.make]\nrun = \"make test\"\n[suite.default]\nrun = \"go test -json ./...\"\n",
         )
         .unwrap();
-        let hint = super::direct_suite_hint(&cfg, "make", "make test").unwrap();
+        let hint = super::direct_suite_hint(&cfg, "make", "make").unwrap();
         assert!(
             hint.contains("`prova run default --until first-failure`"),
             "{hint}"
         );
         // Not for a suite that is already the direct one, nor without one.
-        assert!(super::direct_suite_hint(&cfg, "default", "go test -json ./...").is_none());
+        assert!(super::direct_suite_hint(&cfg, "default", "go").is_none());
         let only: crate::config::Config =
             toml::from_str("[suite.make]\nrun = \"make test\"\n").unwrap();
-        assert!(super::direct_suite_hint(&only, "make", "make test").is_none());
+        assert!(super::direct_suite_hint(&only, "make", "make").is_none());
     }
 }
