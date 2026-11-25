@@ -18,7 +18,7 @@ set the variables on the `sh` side of the pipe:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh \
-  | PROVA_VERSION=v0.1.8 PROVA_INSTALL_DIR=/usr/local/bin sh
+  | PROVA_VERSION=v0.1.9 PROVA_INSTALL_DIR=/usr/local/bin sh
 ```
 
 The tarballs and their checksums are also attached to each
@@ -26,7 +26,7 @@ The tarballs and their checksums are also attached to each
 
 ### Docker
 
-`ghcr.io/fals/prova` (tags `v0.1.8` and `latest`, amd64 and arm64) contains
+`ghcr.io/fals/prova` (tags `v0.1.9` and `latest`, amd64 and arm64) contains
 only the static binary: no shell and no toolchain. prova runs your
 project's own test command, so it must live where that toolchain is.
 `docker run ghcr.io/fals/prova` can therefore only print its version; to
@@ -35,13 +35,13 @@ use it, copy the binary into the image where your tests run
 
 ```dockerfile
 FROM rust:1.95            # your project's own build image
-COPY --from=ghcr.io/fals/prova:v0.1.8 /prova /usr/local/bin/prova
+COPY --from=ghcr.io/fals/prova:v0.1.9 /prova /usr/local/bin/prova
 ```
 
 To take the binary out of the image without a Dockerfile:
 
 ```sh
-id=$(docker create ghcr.io/fals/prova:v0.1.8)
+id=$(docker create ghcr.io/fals/prova:v0.1.9)
 docker cp "$id":/prova ~/.local/bin/prova
 docker rm "$id"
 ```
@@ -52,7 +52,7 @@ prova under you.
 ### From source
 
 ```sh
-cargo install --git https://github.com/fals/prova --tag v0.1.8 prova-cli
+cargo install --git https://github.com/fals/prova --tag v0.1.9 prova-cli
 ```
 
 ### Shell completion
