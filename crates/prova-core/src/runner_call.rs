@@ -904,6 +904,44 @@ fn import_candidates(base: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// A runner call that suits the project the command runs in, for advice: from
+/// the command's own words, else from the project's files.
+pub fn runner_example(command: &CommandSpec, cwd: &Path) -> Option<&'static str> {
+    let text = command.display();
+    let has = |w: &str| {
+        text.split(|c: char| !c.is_alphanumeric() && c != '.')
+            .any(|t| t == w)
+    };
+    let file = |n: &str| cwd.join(n).exists();
+    let pkg = std::fs::read_to_string(cwd.join("package.json")).unwrap_or_default();
+    if has("go") || has("gotestsum") || file("go.mod") {
+        Some("go test -v ./...")
+    } else if has("cargo") || has("nextest") || file("Cargo.toml") {
+        Some("cargo test")
+    } else if has("pytest")
+        || has("python")
+        || has("python3")
+        || file("pyproject.toml")
+        || file("pytest.ini")
+        || file("setup.cfg")
+        || file("tox.ini")
+    {
+        Some("python3 -m pytest -v")
+    } else if has("vitest") || pkg.contains("\"vitest\"") {
+        Some("npx vitest run")
+    } else if has("jest") || pkg.contains("\"jest\"") {
+        Some("npx jest")
+    } else if has("mvn") || has("mvnw") || file("pom.xml") {
+        Some("mvn test")
+    } else if has("gradle") || has("gradlew") || file("build.gradle") || file("build.gradle.kts") {
+        Some("gradle test")
+    } else if has("dotnet") {
+        Some("dotnet test")
+    } else {
+        None
+    }
+}
+
 /// The Go package a test's lifecycle key belongs to: its file part when
 /// the key has one, else the package in its display name
 /// (`example.com/m/a::TestX`; round 18: a Go test's key has no file, so the

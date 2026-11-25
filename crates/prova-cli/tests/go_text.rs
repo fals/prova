@@ -594,7 +594,7 @@ fn go_verbose_failures_count_once_under_their_package() {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
         out.contains("FAIL example.com/m::TestF (quarantined): failed every time")
             && !out.contains("FAIL TestF"),

@@ -27,6 +27,22 @@ is its exit code. Paths are rewritten to `/w`. Used by
 | mvn-q | `mvn -q test` | 1 |
 | mvn | `mvn test` | 1 |
 
+Round 18 captures (the flaky test fails on demand through `FLAKY_FAIL=1`;
+paths rewritten to `/w`, durations to 0.01s where the tests are replayed):
+
+| name | command | exit |
+|---|---|---|
+| go-test-v-full-pass | `go test -v -count=1 ./...` (go-make fixture, bugs fixed) | 0 |
+| go-test-v-full-fail | `FLAKY_FAIL=1 go test -v -count=1 ./...` | 1 |
+| go-test-v-failfast | `FLAKY_FAIL=1 go test -v -count=1 -failfast ./...` | 1 |
+| cargo-test-ws-full-pass | `cargo test` in a two-crate workspace (calc, geo) | 0 |
+| cargo-test-ws-full-fail | `FLAKY_FAIL=1 cargo test --no-fail-fast` | 101 |
+| cargo-test-ws-stops | `FLAKY_FAIL=1 cargo test` (geo's tests never run) | 101 |
+| pytest-v-full-pass | `python3 -m pytest -v` in `prova-fixture-python` | 0 |
+| pytest-v-full-fail | `FLAKY_FAIL=1 python3 -m pytest -v` | 1 |
+| pytest-v-maxfail | `FLAKY_FAIL=1 python3 -m pytest -v -x` | 1 |
+| vitest-coverage | `vitest run --reporter=verbose --coverage` (Vitest 3.2.4, a failing `flaky clock` test) | 1 |
+
 Result files written by the same runs: `dotnet-test-normal.trx` (the TRX of
 `dotnet-test-normal`; the quiet `dotnet-test` writes none, the test gives it
 the same one) and `mvn.junit.xml` (surefire's `TEST-calc.CalcTest.xml`).

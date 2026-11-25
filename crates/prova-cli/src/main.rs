@@ -3167,6 +3167,7 @@ fn repeat_runs(
     let mut tally: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
     let mut runs = Vec::new();
     let mut any_failed = false;
+    let selection = request.spec.selection.clone();
     // Runs that ran no test, and runs that failed with no failing test:
     // never "every test passed" (round 13: five runs whose selection matched
     // nothing were tallied as all green).
@@ -3175,6 +3176,9 @@ fn repeat_runs(
     // set aside), and tests skipped whenever they appeared.
     let mut failed_quarantined = 0u32;
     let mut quarantined_why: Option<String> = None;
+    let (mut refused, mut refused_why) = (0u32, None::<String>);
+    let mut not_visible = 0u32;
+    let mut cache_note: Option<String> = None;
     let mut skipped_in: std::collections::BTreeMap<String, u32> = Default::default();
     let mut quarantined = std::collections::BTreeSet::new();
     let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
@@ -3207,15 +3211,33 @@ fn repeat_runs(
         // Quiet output: the framework counted tests prova did not see one
         // by one; that is not "no test ran" (round 15).
         let counted = s.framework.is_some_and(|(t, _)| t > 0);
-        if ran == 0 && !counted {
+        if let Some(n) = s.notes.iter().find(|n| n.contains("replayed cached")) {
+            cache_note.get_or_insert_with(|| n.clone());
+        }
+        if ran == 0 && !counted && s.outcome == Some(Outcome::Passed) {
+            // Passed, with nothing visible one by one: quiet output, not a
+            // run that ran no test (round 18: `go test` prints package lines).
+            not_visible += 1;
+        } else if ran == 0 && !counted {
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
-            if s.quarantined
+            let quarantined_failed = s
+                .quarantined
                 .iter()
-                .any(|q| q.result == "failed" || q.result == "errored")
+                .any(|q| q.result == "failed" || q.result == "errored");
+            if quarantined_failed
+                && s.detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("only quarantined test(s) failed"))
             {
                 failed_quarantined += 1;
                 quarantined_why = quarantined_why.or_else(|| s.detail.clone());
+            } else if quarantined_failed {
+                // Refused for another reason (another step failed, the
+                // command is not one runner call): not the quarantine's
+                // doing alone (round 18).
+                refused += 1;
+                refused_why = refused_why.or_else(|| s.detail.clone());
             } else {
                 failed_otherwise += 1;
                 failed_why = failed_why.or_else(|| s.detail.clone());
@@ -3296,6 +3318,8 @@ fn repeat_runs(
                 .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
+            } else if ran == 0 && !counted && s.outcome == Some(Outcome::Passed) {
+                " (tests not visible: quiet output)".to_owned()
             } else if ran == 0 && !counted {
                 " (no test ran)".to_owned()
             } else if let (Some(Outcome::Failed | Outcome::Errored), Some(d)) =
@@ -3396,7 +3420,22 @@ fn repeat_runs(
             );
         }
         if no_tests > 0 {
-            println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
+            println!(
+                "  {no_tests} of {done} run(s) ran no test{}",
+                if selection.is_some() {
+                    " (did the selection match one?)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if not_visible > 0 {
+            println!(
+                "  {not_visible} of {done} run(s) passed with tests not visible (quiet output): only the exit code backs them; run the tests verbosely to see each one"
+            );
+        }
+        if let Some(n) = &cache_note {
+            println!("  note: {}", render::clean(n));
         }
         if quiet > 0 {
             println!(
@@ -3421,6 +3460,12 @@ fn repeat_runs(
                 )
             );
         }
+        if refused > 0 {
+            println!(
+                "  {refused} of {done} run(s) failed, and the quarantine could not set the failure aside: {}",
+                render::clean(refused_why.as_deref().unwrap_or("see each run's status"))
+            );
+        }
         if failed_otherwise > 0 {
             println!(
                 "  {failed_otherwise} of {done} run(s) failed with no failing test shown: {}",
@@ -3434,6 +3479,8 @@ fn repeat_runs(
             && no_tests == 0
             && failed_otherwise == 0
             && failed_quarantined == 0
+            && refused == 0
+            && not_visible == 0
             && skipped_every.is_empty()
             && quiet == 0
             && unverified.is_empty()
@@ -3466,7 +3513,14 @@ fn repeat_runs(
             );
         }
     }
-    Ok(if any_failed {
+    // A quarantined test that failed in every run is broken, not flaky: the
+    // run exits non-zero (round 18; the quarantine hides it from the
+    // verdict of one run, not from a repeat that shows it always fails).
+    let broken_quarantined = done > 0
+        && always
+            .iter()
+            .any(|t| quarantined.contains(*t) && seen_in.get(*t).copied().unwrap_or(0) >= done);
+    Ok(if any_failed || broken_quarantined {
         exit::FAILED
     } else if done < n {
         exit::RUNNING

@@ -155,11 +155,22 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     } else {
         format!("{} errored", c.errored)
     };
+    // A quarantined failure is counted as failed and may be set aside, not
+    // listed: say how many of the failed it is (round 18).
+    let quarantined_failed = s
+        .quarantined
+        .iter()
+        .filter(|q| q.result == "failed")
+        .count();
+    let failed_text = if quarantined_failed > 0 {
+        format!("{} failed ({quarantined_failed} quarantined)", c.failed)
+    } else {
+        format!("{} failed", c.failed)
+    };
     if seen > 0 || !counted.is_empty() {
         println!(
-            "tests: {} passed, {} failed, {errored}, {} skipped{}{}{counted}",
+            "tests: {} passed, {failed_text}, {errored}, {} skipped{}{}{counted}",
             c.passed,
-            c.failed,
             c.skipped,
             // A selection's runner reports the tests it filtered out as
             // skipped (round 16: read as disabled tests).

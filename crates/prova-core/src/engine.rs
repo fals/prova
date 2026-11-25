@@ -1730,6 +1730,12 @@ fn observe_child(
         .map(|(k, o)| (k.clone(), *o))
         .collect();
     let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
+    let advice = quarantine_advice(
+        store.root(),
+        Path::new(&sup.run_cwd),
+        &spec.command,
+        &sup.suite,
+    );
     if let Some(names) = &set_aside {
         if let Some(why) = runner_refusal(
             &spec.command,
@@ -1737,9 +1743,16 @@ fn observe_child(
             &outcomes,
             names,
             sup.coverage_line.as_deref(),
+            &advice,
         ) {
+            // What else went wrong, in the output's own words (round 18: a
+            // chained step's SyntaxError was never named).
+            let mut why = why;
+            if let Some(more) = other_step_error(store, run, sup, names, &report.test_outputs)? {
+                why.push_str(&format!("; {more}"));
+            }
             contradictions.push(why);
-        } else if let Some(why) = unreported_refusal(store, run, &sup, spec, &outcomes, names)? {
+        } else if let Some(why) = unreported_refusal(store, run, sup, spec, &outcomes, names)? {
             contradictions.push(why);
         } else if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -1922,10 +1935,26 @@ fn observe_child(
         let verified_other = outcomes.iter().any(|(k, o)| {
             *o == Outcome::Passed && crate::quarantine::covers_key(&quarantine, k).is_none()
         });
+        // Not one runner call (make, a chain): that is the reason, whatever
+        // the output shows (round 18: "no other test passed" under make).
+        let not_one_call = crate::runner_call::check(&spec.command, Path::new(&sup.run_cwd)).err();
+        let more = match &not_one_call {
+            Some(_) => {
+                let own: Vec<String> = failing.iter().map(|s| (*s).to_owned()).collect();
+                other_step_error(store, run, sup, &own, &report.test_outputs)?
+            }
+            None => None,
+        };
         reason = Some(if !errored.is_empty() {
             format!(
                 "quarantined test(s) errored, not plainly failed ({}): a quarantine sets aside failures, not errors",
                 errored.join(", ")
+            )
+        } else if let Some(why) = not_one_call {
+            format!(
+                "only quarantined test(s) failed ({}), but a quarantine cannot set them aside: {why}. {advice}{}",
+                failing.join(", "),
+                more.map(|m| format!("; {m}")).unwrap_or_default()
             )
         } else if !new_subtests.is_empty() {
             format!(
@@ -2531,6 +2560,49 @@ fn summary_of_failures(t: &str) -> bool {
     false
 }
 
+/// An exception line (`SyntaxError: invalid syntax`) of the output.
+fn exception_line(line: &str) -> bool {
+    let t = line.trim();
+    t.split_once(':').is_some_and(|(head, _)| {
+        !head.contains(char::is_whitespace)
+            && (head.ends_with("Error") || head.ends_with("Exception"))
+    })
+}
+
+/// What else went wrong in a run whose command is more than one runner
+/// call: the first exception line of the output that is not a quarantined
+/// test's own (round 18: a chained `compileall`'s SyntaxError was never
+/// named), else what `unaccounted_error` finds.
+fn other_step_error(
+    store: &Store,
+    run: &str,
+    sup: &Supervisor<'_>,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+) -> Result<Option<String>> {
+    let own: Vec<&String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o)
+        .collect();
+    if let Some(line) = sup.tail.iter().find(|l| {
+        let t = l.trim();
+        !t.starts_with("E ")
+            && !t.starts_with("FAILED")
+            && exception_line(t)
+            && !own.iter().any(|o| o.contains(t))
+    }) {
+        return Ok(Some(format!(
+            "the output also shows an error that is not a test's: {}",
+            line.trim().chars().take(160).collect::<String>()
+        )));
+    }
+    Ok(
+        unaccounted_error(store, run, &sup.distiller, quarantined, outputs)?
+            .map(|m| format!("and {m}")),
+    )
+}
+
 /// The first error-looking line of the output that the quarantined
 /// failing tests do not account for, as the reason a quarantine cannot
 /// set the run aside (ADR 0029): it names one of them (as a whole name),
@@ -2638,6 +2710,39 @@ fn unaccounted_error(
     }))
 }
 
+/// What to do when a quarantine cannot set a failure aside because the
+/// command is not one test-runner call: a suite of `prova.toml` that is one
+/// (named), else an example for the project's own runner.
+fn quarantine_advice(root: &Path, cwd: &Path, command: &CommandSpec, suite: &str) -> String {
+    let direct: Vec<String> = crate::config::load(root)
+        .map(|c| {
+            c.suite
+                .iter()
+                .filter(|(n, s)| {
+                    n.as_str() != suite
+                        && crate::runner_call::check(&CommandSpec::Shell(s.run.clone()), cwd)
+                            .is_ok()
+                })
+                .map(|(n, _)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let head = "A quarantine sets aside the failures of one test-runner call only";
+    let name = direct
+        .iter()
+        .find(|n| n.as_str() == "default")
+        .or(direct.first());
+    if let Some(n) = name {
+        return format!("{head}: `prova run {n}` runs the tests that way");
+    }
+    match crate::runner_call::runner_example(command, cwd) {
+        Some(ex) => format!(
+            "{head}: run the tests in a suite whose command is the runner alone (for example `{ex}`)"
+        ),
+        None => format!("{head}: run the tests in a suite whose command is the runner alone"),
+    }
+}
+
 /// Why a quarantine cannot set the failures aside although only they
 /// failed: the command is not one test-runner call, or the runner skips a
 /// check once a test fails (ADR 0031 §1). `None` when it can.
@@ -2647,13 +2752,14 @@ fn runner_refusal(
     outcomes: &BTreeMap<String, Outcome>,
     names: &[String],
     coverage_line: Option<&str>,
+    advice: &str,
 ) -> Option<String> {
     let listed = names.join(", ");
     let call = match crate::runner_call::check(command, cwd) {
         Ok(c) => c,
         Err(why) => {
             return Some(format!(
-                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. A quarantine sets aside only the failures of one test-runner call (ADR 0031); run them in a suite whose command is the runner alone (for example `go test ./...`)"
+                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. {advice}"
             ));
         }
     };
