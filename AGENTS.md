@@ -12,7 +12,7 @@ prova is built with prova. As soon as a usable version exists, every test run an
 
 - Phase: M0 to M7 merged to main. **Dogfooding Stage B is active**: run tests through prova.
 - CI is GitHub Actions (`.github/workflows/ci.yml`: jobs rust on Linux x86_64, Linux arm64 and macOS, spec, package); `scripts/ci.sh` is the local mirror of the rust and spec jobs. Documentation-only changes (`docs/`, top-level `*.md`, `llms.txt`, `LICENSE`) skip CI; skills do not, they are compiled into the binary.
-- ADRs 0001 to 0030 are **Accepted** (2026-11-22 to 24). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
+- ADRs 0001 to 0031 are **Accepted** (2026-11-22 to 25). Code that contradicts one is a bug; change a decision with a new ADR that supersedes it.
 - [0013](docs/adr/0013-black-box-adoption.md) amends 0001, 0003, 0004, 0005 and 0012: `prova run -- <existing command>` works with zero config, fidelity rises from opaque process to result files to output recognizers to native streams, and test size is observed before it is declared. Where they conflict, 0013 wins.
 - Work is tracked as GitHub milestones M0 to M7 with issues.
 

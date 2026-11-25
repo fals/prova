@@ -357,7 +357,9 @@ Examples:
   prova quarantine remove calc::flaky_clock
 
 A quarantined test still runs and keeps its history. If it is the only thing
-that fails, the run passes; every summary lists it. A quarantine expires.
+that fails, the run passes (when the suite's command is one test-runner call: a make
+target, a script or a chain of steps is refused); every summary lists it. A
+quarantine expires.
 It is kept in this machine's prova store (PROVA_HOME), not in the repository:
 CI and teammates do not see it; each quarantines in its own store.")]
     Quarantine {
@@ -2111,7 +2113,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             let e = q::add(store, &name, file.as_deref(), &reason, days, now_ms())?;
             println!(
-                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
+                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure of a suite that calls the test runner directly, the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
                 render::clean(&e.reason),
                 render::expires_in(e.expires_ms)
@@ -2912,6 +2914,11 @@ fn repeat_runs(
     // never "every test passed" (round 13: five runs whose selection matched
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
+    // Runs that failed although only quarantined tests failed (refused, not
+    // set aside), and tests skipped whenever they appeared.
+    let mut failed_quarantined = 0u32;
+    let mut quarantined_why: Option<String> = None;
+    let mut skipped_in: std::collections::BTreeMap<String, u32> = Default::default();
     let mut quarantined = std::collections::BTreeSet::new();
     let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
     let mut unverified_why: Option<String> = None;
@@ -2946,8 +2953,16 @@ fn repeat_runs(
         if ran == 0 && !counted {
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
-            failed_otherwise += 1;
-            failed_why = failed_why.or_else(|| s.detail.clone());
+            if s.quarantined
+                .iter()
+                .any(|q| q.result == "failed" || q.result == "errored")
+            {
+                failed_quarantined += 1;
+                quarantined_why = quarantined_why.or_else(|| s.detail.clone());
+            } else {
+                failed_otherwise += 1;
+                failed_why = failed_why.or_else(|| s.detail.clone());
+            }
         }
         if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
             quiet += 1;
@@ -2985,14 +3000,17 @@ fn repeat_runs(
         }
         let mut this_run = std::collections::BTreeSet::new();
         for (_, display, outcome) in results.into_iter().filter(|(u, _, _)| !gone.contains(u)) {
-            if this_run.insert(display.clone()) {
+            let first = this_run.insert(display.clone());
+            if first {
                 *seen_in.entry(display.clone()).or_default() += 1;
             }
-            let t = tally.entry(display).or_default();
+            let t = tally.entry(display.clone()).or_default();
             if outcome.is_failure() {
                 t.1 += 1;
             } else if outcome == Outcome::Passed {
                 t.0 += 1;
+            } else if outcome == Outcome::Skipped && first {
+                *skipped_in.entry(display).or_default() += 1;
             }
         }
         for q in &s.quarantined {
@@ -3082,9 +3100,32 @@ fn repeat_runs(
                 );
             } else {
                 println!("  FAIL {}{q}: failed every time", render::clean(t));
+                if !q.is_empty() {
+                    println!(
+                        "  note: {} failed in every run: it is broken, not flaky; a quarantine only hides it (fix it, then `prova quarantine remove`)",
+                        render::clean(t)
+                    );
+                }
             }
         }
         let steady = tally.values().filter(|(p, f)| *f == 0 && *p > 0).count();
+        let skipped_every: Vec<&String> = skipped_in
+            .iter()
+            .filter(|(t, n)| **n >= done && tally.get(*t).is_some_and(|(p, f)| *p == 0 && *f == 0))
+            .map(|(t, _)| t)
+            .collect();
+        if !skipped_every.is_empty() {
+            println!(
+                "  {} test(s) skipped in every run, so never verified: {}",
+                skipped_every.len(),
+                skipped_every
+                    .iter()
+                    .take(5)
+                    .map(|t| render::clean(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if no_tests > 0 {
             println!("  {no_tests} of {done} run(s) ran no test (did the selection match one?)");
         }
@@ -3101,6 +3142,16 @@ fn repeat_runs(
                 render::clean(unverified_why.as_deref().unwrap_or("see each run's status"))
             );
         }
+        if failed_quarantined > 0 {
+            println!(
+                "  {failed_quarantined} of {done} run(s) failed although only quarantined test(s) failed: {}",
+                render::clean(
+                    quarantined_why
+                        .as_deref()
+                        .unwrap_or("see each run's status")
+                )
+            );
+        }
         if failed_otherwise > 0 {
             println!(
                 "  {failed_otherwise} of {done} run(s) failed with no failing test shown: {}",
@@ -3113,6 +3164,8 @@ fn repeat_runs(
             && always.is_empty()
             && no_tests == 0
             && failed_otherwise == 0
+            && failed_quarantined == 0
+            && skipped_every.is_empty()
             && quiet == 0
             && unverified.is_empty()
         {

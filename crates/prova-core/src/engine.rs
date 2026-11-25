@@ -1391,9 +1391,15 @@ fn observe_child(
                 if current.is_empty() && observed == 0 && sup.framework_total.unwrap_or(0) == 0 {
                     // Say why when the output does (a compile error, round 8).
                     let cause = (exit_code != Some(0))
-                        .then(|| sup.distiller.first_crash())
+                        .then(|| {
+                            sup.distiller.first_crash().map(|(_, t)| t).or_else(|| {
+                                // A compiler or vet diagnostic carries no
+                                // error word (round 17: `go vet`).
+                                sup.tail.iter().find(|l| code_diagnostic(l)).cloned()
+                            })
+                        })
                         .flatten()
-                        .map(|(_, t)| {
+                        .map(|t| {
                             format!(
                                 "; the command failed first: {}",
                                 t.trim().chars().take(160).collect::<String>()
@@ -1904,6 +1910,15 @@ fn observe_child(
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
         // A failure no test explains: say so, and show the first error.
         reason = Some(match sup.distiller.first_error() {
+            // make's own `make: *** [..] Error 1` says only that a step
+            // failed: the line above it is the step's own word (round 17).
+            Some((_, text)) if let Some(step) = line_before_make_stop(&sup.tail, &text) => {
+                format!(
+                    "no test failed; exit {}; the step that failed said: {} (then make stopped)",
+                    exit_code.unwrap_or(-1),
+                    step.chars().take(200).collect::<String>()
+                )
+            }
             Some((line, text)) => format!(
                 "no test failed; exit {}; first error at line {line}: {}",
                 exit_code.unwrap_or(-1),
@@ -2129,7 +2144,13 @@ fn missing_since(
         .filter(|(id, d)| !current.contains(id) && !now.iter().any(|n| same_test_name(n, d)))
         .map(|(_, d)| d.clone())
         .collect();
-    Ok(Some((prev, missing, earlier.len())))
+    // Tests, not their subtests: the count the summary shows (round 17: "ran
+    // 4 test(s)" for a run that showed 5).
+    let top_level = earlier
+        .iter()
+        .filter(|(_, d)| !d.rsplit("::").next().unwrap_or(d).contains('/'))
+        .count();
+    Ok(Some((prev, missing, top_level)))
 }
 
 /// A name recorded bare (`TestX`, from text output that named no package)
@@ -2508,6 +2529,46 @@ fn runner_refusal(
         }
     }
     None
+}
+
+/// Whether `line` is a compiler, vet or linter diagnostic of the project's
+/// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
+fn code_diagnostic(line: &str) -> bool {
+    let mut parts = line.trim().splitn(4, ':');
+    let (Some(path), Some(l), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    let has_path = !path.is_empty()
+        && !path.contains(char::is_whitespace)
+        && path.rsplit_once('.').is_some_and(|(_, ext)| {
+            !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    has_path && number(l) && (number(c) || c.starts_with(' '))
+}
+
+/// Whether `line` is make's own wrap-up of a failed step.
+fn is_make_wrapup(line: &str) -> bool {
+    let t = line.trim_start();
+    (t.starts_with("make") && t.contains("*** "))
+        || (t.starts_with("make") && t.contains("Target '") && t.contains("not remade"))
+        || (t.starts_with("make")
+            && (t.contains("Entering directory") || t.contains("Leaving directory")))
+}
+
+/// When `error` is make's own stop, the nearest output line above it that
+/// is not make's: the failed step's own word.
+fn line_before_make_stop(tail: &VecDeque<String>, error: &str) -> Option<String> {
+    if !is_make_wrapup(error) {
+        return None;
+    }
+    let at = tail.iter().rposition(|l| l.trim() == error.trim())?;
+    tail.iter()
+        .take(at)
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !is_make_wrapup(l))
+        .map(str::to_owned)
 }
 
 /// Whether `line` is libtest's JSON event of one of the quarantined tests
@@ -3309,7 +3370,28 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     failing.sort_by_key(|f| f.3); // in the order they happened
     // Quarantined tests are listed apart, with their result (ADR 0027).
     let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
-    failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
+    // A subtest first seen after its parent's quarantine is news, not set
+    // aside with it (round 17: refused, but no FAIL line named it).
+    let first_seen = |d: &str| -> Option<u64> {
+        store
+            .conn()
+            .query_row(
+                "SELECT MIN(first_seen_ms) FROM tests WHERE display = ?1",
+                rusqlite::params![d],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    };
+    failing.retain(|f| {
+        let display = f.0.display();
+        match crate::quarantine::covers(&quarantine, &display) {
+            None => true,
+            Some(p) if p.test == display => false,
+            Some(p) => first_seen(&display).is_none_or(|t| t >= p.created_ms),
+        }
+    });
     // Did the same suite (same selection) pass on exactly this code before?
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
@@ -3374,6 +3456,12 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         // missing quarantined test is not known to have been left out
         // (round 14: "not run" in a cancelled run).
         let blind = row.level < Level::Recognized || row.status != Status::Finished;
+        // Quiet output (pytest -q) counts tests without naming the passing
+        // ones: a quarantined test with no result there was not seen, which
+        // is not "not run" (round 17).
+        let quiet = row.status == Status::Finished
+            && framework.is_some_and(|(t, _)| t > 0)
+            && !finals.values().any(|f| f.1 == Outcome::Passed);
         for (name, q) in &quarantine {
             // A quarantined subtest is listed by its own result (round 14:
             // "not run" for a subtest that ran and failed).
@@ -3401,8 +3489,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             }
             quarantined.push(QuarantinedTest {
                 test: name.clone(),
-                result: result
-                    .unwrap_or_else(|| if blind { "not reported" } else { "not run" }.to_owned()),
+                result: result.unwrap_or_else(|| {
+                    if blind {
+                        "not reported"
+                    } else if quiet {
+                        "not seen (quiet output)"
+                    } else {
+                        "not run"
+                    }
+                    .to_owned()
+                }),
                 reason: q.reason.clone(),
                 expires_ms: q.expires_ms,
             });
@@ -3508,6 +3604,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         // failure came after them (round 16: a lint step's failure got a
         // `forget` hint).
         && framework.is_none_or(|(t, _)| t == 0)
+        // A diagnostic of the code (`vetbad.go:6:57: ...`) is a code failure,
+        // not the environment's (round 17: the hint invited erasing it).
+        && !output_tail(store, run, 40).iter().any(|l| code_diagnostic(l))
     {
         notes.push(format!(
             "no test result was seen: if this failed for the environment (a missing tool or SDK), not the code, `prova forget {run} --reason \"...\"` keeps it out of history"
@@ -4043,5 +4142,65 @@ mod readable_tests {
             super::readable(lines),
             vec!["    a_test.go:9: boom".to_owned(), "plain line".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_libtest_json_event_of_a_quarantined_test_is_its_own_output() {
+        let q = vec!["tests::flaky_clock".to_owned()];
+        let own = r#"{"type":"test","event":"failed","name":"calc::calc$tests::flaky_clock","stdout":"thread panicked"}"#;
+        assert!(super::libtest_event_of(own, &q));
+        let plain = r#"{"type":"test","event":"failed","name":"tests::flaky_clock"}"#;
+        assert!(super::libtest_event_of(plain, &q));
+        let other = r#"{"type":"test","event":"failed","name":"calc::calc$tests::divides","stdout":"panicked"}"#;
+        assert!(!super::libtest_event_of(other, &q));
+        let suffix = r#"{"type":"test","event":"failed","name":"calc::calc$tests::flaky_clock_2"}"#;
+        assert!(!super::libtest_event_of(suffix, &q));
+        assert!(!super::libtest_event_of("not json", &q));
+        let suite = r#"{"type":"suite","event":"failed","name":"tests::flaky_clock"}"#;
+        assert!(!super::libtest_event_of(suite, &q));
+    }
+
+    #[test]
+    fn compiler_diagnostics_are_told_from_prose() {
+        for l in [
+            "vetbad.go:6:57: fmt.Sprintf format %s has arg n of wrong type int",
+            "./app/core.py:3:1: F401 'os' imported but unused",
+            "src/lib.rs:12:5: warning: unused",
+            "app.ts:3: error: bad",
+        ] {
+            assert!(super::code_diagnostic(l), "{l}");
+        }
+        for l in [
+            "make: *** [Makefile:3: ci] Error 1",
+            "Total time: 3.2s",
+            "12:30: started",
+            "see https://example.com:8080/x",
+            "",
+        ] {
+            assert!(!super::code_diagnostic(l), "{l}");
+        }
+    }
+
+    #[test]
+    fn makes_stop_points_at_the_step_above_it() {
+        let tail: std::collections::VecDeque<String> = [
+            "lint: TODO markers are not allowed in src/main",
+            "",
+            "make: *** [Makefile:3: ci] Error 1",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(
+            super::line_before_make_stop(&tail, "make: *** [Makefile:3: ci] Error 1"),
+            Some("lint: TODO markers are not allowed in src/main".to_owned())
+        );
+        assert_eq!(super::line_before_make_stop(&tail, "error: boom"), None);
+    }
+
+    #[test]
+    fn mavens_wrap_up_of_a_failed_test_step_is_the_runners() {
+        assert!(super::runner_failure_summary("[INFO] BUILD FAILURE"));
+        assert!(!super::runner_failure_summary("[INFO] BUILD SUCCESS"));
     }
 }

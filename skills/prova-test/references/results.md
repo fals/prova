@@ -42,20 +42,31 @@ Contents: [Failure history](#failure-history) ·
   the only failure the run passes, verified for the rest, with the header
   `PASSED (quarantined failures set aside)`. Every summary lists it as
   `quarantined: <test> <result> (<reason>; expires in Nd)` (`not reported`
-  when the run gave no per-test results or was cut short);
-  `prova quarantine list` and `remove` manage it. It sets aside nothing
-  else: every error line of the output must be its own (in its section,
-  naming it, or the runner's summary of failures), so another failure, an
-  error, a lint, type-check or coverage step, a framework count above its
-  failures, or a run killed by a signal fails the run, and `detail:` says
-  which. Nothing may follow the tests' summary but the command's own
-  wrap-up of the failed test step: a lint or coverage step after the tests
-  refuses the quarantine. When tests of several binaries share a name,
+  when the run gave no per-test results or was cut short, `not seen (quiet
+  output)` when quiet output hides passing tests);
+  `prova quarantine list` and `remove` manage it. **A quarantine sets aside
+  the failures of one test-runner call, nothing more.** The suite's command
+  must be the runner alone (`go test ./...`, `cargo nextest run`, `pytest`,
+  `vitest run`, `mvn test`, `dotnet test`, ...), optionally behind `sh -c`,
+  `docker run`/`exec`, `npx`, `uv run`, `npm test` (read through
+  package.json) or a script given the command as one quoted argument. A
+  `make` target, a script, or a chain (`&&`, `;`, `|`) fails the run
+  while the quarantined test fails, and `detail:` says what made it so:
+  another step could have failed or been skipped, and prova cannot see it.
+  The fix is a second suite whose command is the runner itself, next to the
+  full one. Vitest with coverage thresholds and a Go package with
+  `TestMain` are refused too (the runner skips a check once a test fails).
+  Within one runner call, every error line of the output must be its
+  own (in its section, naming it, or the runner's summary of failures), so
+  another failure, an error, a framework count above its failures, or a run
+  killed by a signal fails the run, and `detail:` says which. Nothing may
+  follow the tests' summary but the runner's own wrap-up. When tests of several binaries share a name,
   `prova quarantine add <test> --in <binary>` names which; a parent's quarantine does not cover a
   subtest first seen after it; a run where only quarantined tests ran and
   failed fails. A quarantine lives in this machine's prova store, not in
   the repository: CI and teammates do not see it. Do not quarantine a test
-  that fails every time now; that is a real failure.
+  that fails every time now; that is a real failure (`--repeat` says "broken,
+  not flaky" when a quarantined test failed in every run).
 - `slow tests: a 1.5s, b 1.1s (prova slowest)`: the slowest tests of this run
   (1 s or more). `prova slowest [--suite S] [-n N]` lists p50 and p95 from
   history, worst first.

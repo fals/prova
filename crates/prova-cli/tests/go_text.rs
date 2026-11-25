@@ -12,6 +12,15 @@ use std::process::{Command, Output};
 
 const PROVA: &str = env!("CARGO_BIN_EXE_prova");
 
+/// A script named `go` that prints what the scripted command printed: a
+/// quarantine sets aside only the failures of one runner call (ADR 0031), so
+/// the command is `./rc/go test`.
+fn fake_go(d: &Path, script: &str) {
+    std::fs::create_dir_all(d.join("rc")).unwrap();
+    std::fs::write(d.join("rc/go"), format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(d.join("rc/go"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn workspace(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-gotext-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -564,7 +573,8 @@ fn go_verbose_failures_count_once_under_their_package() {
         "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestF' \
          '    f_test.go:4: flake' '--- FAIL: TestF (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
     );
-    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    fake_go(&d, &script);
+    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
     let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(failing(&s), vec!["example.com/m::TestF"], "{s}");
     let o = prova(
@@ -578,7 +588,7 @@ fn go_verbose_failures_count_once_under_their_package() {
         ],
     );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let o = prova(&d, &["run", "--repeat", "2", "--", "sh", "-c", &script]);
+    let o = prova(&d, &["run", "--repeat", "2", "--", "./rc/go", "test"]);
     let out = format!(
         "{}{}",
         String::from_utf8_lossy(&o.stdout),
@@ -738,10 +748,7 @@ fn a_quarantined_go_failure_is_no_retry() {
     let script = format!(
         "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
     );
-    // A quarantine needs one runner call (ADR 0031): a script named `go`.
-    std::fs::create_dir_all(d.join("rc")).unwrap();
-    std::fs::write(d.join("rc/go"), format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(d.join("rc/go"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake_go(&d, &script);
     prova(&d, &["run", "--", "./rc/go", "test"]);
     prova(
         &d,
@@ -757,6 +764,45 @@ fn a_quarantined_go_failure_is_no_retry() {
     let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(s["outcome"], "passed", "{s}");
     assert!(!s.to_string().contains("passed on a retry"), "{s}");
+}
+
+/// ADR 0031 §1: code after `m.Run()` in a `TestMain` (goleak) may check only
+/// when every test passed, so a quarantined failure of that package cannot be
+/// set aside; the same failure in a package without one can.
+#[test]
+fn a_package_with_testmain_cannot_set_a_failure_aside() {
+    let d = workspace("q-testmain");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+    );
+    fake_go(&d, &script);
+    std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
+    prova(&d, &["run", "--", "./rc/go", "test"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "passed", "no TestMain: {s}");
+    std::fs::write(
+        d.join("main_test.go"),
+        "package m\n\nfunc TestMain(m *testing.M) {\n\tgoleak.VerifyTestMain(m)\n}\n",
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "failed", "TestMain: {s}");
+    assert!(
+        s.to_string().contains("defines TestMain"),
+        "must say why: {s}"
+    );
 }
 
 /// Round 16: gotestsum prints a subpackage relative to the module

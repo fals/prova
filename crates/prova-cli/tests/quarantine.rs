@@ -128,7 +128,7 @@ fn without_x() -> String {
 
 fn suites(d: &Path) {
     put(
-        &d,
+        d,
         format!(
             "[suite.make]\nrun = {:?}\n\n[suite.stable]\nrun = {:?}\n",
             full(),
@@ -621,6 +621,8 @@ fn a_refused_quarantine_says_why() {
         ),
         "{out}"
     );
+    // Round 17: the new subtest is named, not only the detail.
+    assert!(out.contains("FAIL example.com/m::TestQ/new"), "{out}");
 }
 
 /// Round 15: a narrow suite (unit tests) was warned that a flaky test of
@@ -890,4 +892,128 @@ fn a_quarantine_is_refused_unless_the_command_is_one_runner_call() {
         let o = prova(&d, &args);
         assert_eq!(o.status.code(), Some(0), "{argv:?}: {}", text(&o));
     }
+}
+
+/// Round 17: a quarantined test that failed in every run exited 0 with no
+/// word that it is broken, not flaky.
+#[test]
+fn repeat_says_a_quarantined_test_that_failed_every_time_is_broken() {
+    let d = workspace("repeat-broken");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let o = prova(&d, &["run", "make", "--repeat", "3"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains("calc::x (quarantined): failed every time")
+            && out.contains("broken, not flaky"),
+        "{out}"
+    );
+}
+
+/// Round 17: runs refused because only a quarantined test failed were
+/// tallied "with no failing test shown", right under the FLAKY line that
+/// showed that failing test.
+#[test]
+fn repeat_names_what_failed_when_only_a_quarantined_test_did() {
+    let d = workspace("repeat-refused");
+    let body = format!(
+        "{BUSY} n=$(cat n 2>/dev/null || echo 0); n=$((n+1)); echo $n > n; \
+         if [ $((n % 2)) -eq 1 ]; then echo 'test calc::x ... FAILED'; exit 101; \
+         else echo 'test calc::x ... ok'; fi"
+    );
+    put(&d, format!("[suite.only]\nrun = {body:?}\n"));
+    prova(&d, &["run", "only"]);
+    prova(&d, &["run", "only"]);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&prova(&d, &["run", "only", "--repeat", "4"]));
+    assert!(out.contains("FLAKY calc::x (quarantined)"), "{out}");
+    assert!(
+        !out.contains("no failing test shown"),
+        "a quarantined test failed: {out}"
+    );
+    assert!(
+        out.contains("run(s) failed although only quarantined test(s) failed"),
+        "{out}"
+    );
+}
+
+/// Round 17: a quarantined test was "not run" when quiet output (pytest -q)
+/// simply does not print passing tests.
+#[test]
+fn a_quarantined_test_hidden_by_quiet_output_is_not_seen_not_missing() {
+    let d = workspace("quiet-not-seen");
+    let body = format!(
+        "{BUSY} if [ \"$(cat state)\" = quiet ]; then echo 'test calc::z ... ignored'; echo 'test result: ok. 3 passed; 0 failed; 1 ignored'; else echo 'test calc::ok ... ok'; echo 'test calc::x ... ok'; fi"
+    );
+    put(&d, format!("[suite.make]\nrun = {body:?}\n"));
+    let first = run(&d, "make", "pass");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+    assert!(!text(&first).contains("unverified"), "{}", text(&first));
+    let o = prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let out = text(&run(&d, "make", "quiet"));
+    assert!(
+        out.contains("quarantined: calc::x") && out.contains("not seen (quiet output)"),
+        "{out}"
+    );
+    assert!(!out.contains("calc::x not run"), "{out}");
+}
+
+/// Round 17: a failed command with no failing test named make's own
+/// `make: *** ... Error 1` as the reason, not the line just above it.
+#[test]
+fn the_detail_of_a_failed_make_names_the_step_not_makes_wrap_up() {
+    let d = workspace("make-detail");
+    let script = format!(
+        "{BUSY} echo 'lint: TODO markers are not allowed in src/main'; echo 'make: *** [Makefile:3: ci] Error 1'; exit 2"
+    );
+    let o = prova(&d, &["run", "--", "sh", "-c", &script]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    let detail = out
+        .lines()
+        .find(|l| l.starts_with("detail:"))
+        .unwrap_or_default();
+    assert!(
+        detail.contains("TODO markers are not allowed"),
+        "the culprit, not make's line: {out}"
+    );
+}
+
+/// Round 17: a vet step that failed before the tests (a compiler diagnostic
+/// `file.go:6:57: ...`) offered `prova forget` as if the environment had
+/// failed, and the detail did not name the diagnostic.
+#[test]
+fn a_compiler_diagnostic_is_a_code_failure_not_an_environment_one() {
+    let d = workspace("diagnostic");
+    let body = format!(
+        "{BUSY} if [ \"$(cat state)\" = vet ]; then echo 'vetbad.go:6:57: fmt.Sprintf format %s has arg n of wrong type int'; exit 1; fi; echo 'test calc::ok ... ok'; echo 'test calc::y ... ok'"
+    );
+    put(&d, format!("[suite.make]\nrun = {body:?}\n"));
+    run(&d, "make", "ok");
+    let o = run(&d, "make", "vet");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(!out.contains("prova forget"), "a code failure: {out}");
+    assert!(
+        out.contains("the command failed first: vetbad.go:6:57"),
+        "{out}"
+    );
+}
+
+/// Round 17: "every test passed every time" while a test was skipped in
+/// every run.
+#[test]
+fn repeat_does_not_call_a_skipped_test_passed() {
+    let d = workspace("repeat-skipped");
+    let body = format!("{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::s ... ignored'");
+    put(&d, format!("[suite.sk]\nrun = {body:?}\n"));
+    let out = text(&prova(&d, &["run", "sk", "--repeat", "2"]));
+    assert!(!out.contains("every test passed every time"), "{out}");
+    assert!(
+        out.contains("calc::s") && out.contains("skipped in every run"),
+        "{out}"
+    );
 }
