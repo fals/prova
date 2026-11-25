@@ -41,12 +41,14 @@ fn text(o: &Output) -> String {
 /// Each test spins first: what a test starts in the instant its start line
 /// is read can be missed (a lower bound, ADR 0025 §5). The suite spins
 /// before its first test too: the shell's own start, in the same instant
-/// as an immediate first test, was once that test's (CI run 45642558379). The socket is held
+/// as an immediate first test, was once that test's (CI run 45642558379).
+/// `spin N` waits N-1 to N seconds (`$SECONDS` counts whole seconds), so
+/// `spin 2` keeps at least 1 s, and a sample, before the first test. The socket is held
 /// for 3 to 4 s: `$SECONDS` counts whole seconds, and sampling sockets on
 /// macOS is slow (a 1 to 2 s hold was missed there).
 const SUITE: &str = r#"
 spin() { end=$((SECONDS + $1)); while [ $SECONDS -lt $end ]; do :; done; }
-spin 1
+spin 2
 echo '{"type":"suite","event":"started","test_count":3}'
 echo '{"type":"test","event":"started","name":"m::computes"}'
 spin 3
