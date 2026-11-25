@@ -565,6 +565,17 @@ fn repo_with(name: &str, files: &[(&str, &str)]) -> PathBuf {
     d
 }
 
+/// Removes a test's temporary directories when it ends, however it ends.
+struct Cleanup(Vec<PathBuf>);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        for d in &self.0 {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
 fn said(o: &Output) -> String {
     format!(
         "{}{}",
@@ -608,6 +619,7 @@ fn rust_workspace_quiet_failures_keep_their_crates() {
         ],
     );
     let target = format!("{}.target", d.display());
+    let _cleanup = Cleanup(vec![d.clone(), home_of(&d), PathBuf::from(&target)]);
     let env_for = |fail: &'static str| [("FAIL", fail), ("CARGO_TARGET_DIR", target.as_str())];
     // calc's own test fails twice: it has a failing history of its own.
     for _ in 0..2 {
@@ -626,7 +638,9 @@ fn rust_workspace_quiet_failures_keep_their_crates() {
         "geo's failure names its crate: {out}"
     );
     assert!(
-        out.contains("first time seen") && !out.contains("FLAKY") && !out.contains("before"),
+        out.lines()
+            .find(|l| l.trim_start().starts_with("FAIL "))
+            .is_some_and(|l| l.contains("[first time seen") && !l.contains("FLAKY")),
         "geo's failure borrowed calc's history: {out}"
     );
     let h = said(&host(&d, &["history", "tests::flaky_clock"], &[]));
@@ -634,8 +648,6 @@ fn rust_workspace_quiet_failures_keep_their_crates() {
         h.contains("(calc)") && h.contains("(geo)"),
         "each crate's test is its own in history: {h}"
     );
-    let _ = std::fs::remove_dir_all(&target);
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Round 18 (ts-vitest BLOCKER): `cd packages/b && prova run` named tests
@@ -658,6 +670,7 @@ fn typescript_packages_started_from_a_subdirectory_keep_repository_names() {
             (".gitignore", "node_modules\n"),
         ],
     );
+    let _cleanup = Cleanup(vec![d.clone(), home_of(&d)]);
     let tag = image("node");
     let vitest = "../../node_modules/.bin/vitest run --reporter=verbose";
     let script = format!(
@@ -681,7 +694,6 @@ fn typescript_packages_started_from_a_subdirectory_keep_repository_names() {
             && history.contains("packages/b/src/calc.test.ts"),
         "the two packages' same-named tests stay apart: {out}"
     );
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Round 18 (probe M1): pytest through docker with `-w` in two directories
@@ -696,6 +708,7 @@ fn python_container_workdirs_keep_same_named_tests_apart() {
         "pyworkdirs",
         &[("tests/a/test_x.py", t), ("tests/b/test_x.py", t)],
     );
+    let _cleanup = Cleanup(vec![d.clone(), home_of(&d)]);
     let tag = image("python");
     let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
     let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout).unwrap();
@@ -756,5 +769,4 @@ fn python_container_workdirs_keep_same_named_tests_apart() {
         h.contains("tests.a.test_x") && h.contains("tests.b.test_x"),
         "two tests in history: {h}"
     );
-    let _ = std::fs::remove_dir_all(&d);
 }

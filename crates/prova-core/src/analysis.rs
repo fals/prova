@@ -264,7 +264,16 @@ pub fn place_label(file: Option<&str>, path: &[String]) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| {
             path.first()
-                .filter(|p| p.contains(['/', '.']))
+                // A Go module's root package has no `/` or `.` (`calc`):
+                // its tests are told by their names (`place_of_test` puts
+                // the test's own name after the path).
+                .filter(|p| {
+                    p.contains(['/', '.'])
+                        || (path.len() == 2
+                            && ["Test", "Benchmark", "Example", "Fuzz"]
+                                .iter()
+                                .any(|g| path[1].starts_with(g)))
+                })
                 .map(|p| p.to_owned())
         })
 }
@@ -298,15 +307,21 @@ pub fn place_of_test(
     store: &Store,
     test_id: &str,
 ) -> Result<Option<(Option<String>, Vec<String>)>> {
-    let row: Option<(Option<String>, String)> = store
+    let row: Option<(Option<String>, String, String)> = store
         .conn()
         .query_row(
-            "SELECT file, path FROM tests WHERE id = ?1",
+            "SELECT file, path, name FROM tests WHERE id = ?1",
             params![test_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    Ok(row.map(|(file, path)| (file, serde_json::from_str(&path).unwrap_or_default())))
+    Ok(row.map(|(file, path, name)| {
+        let mut path: Vec<String> = serde_json::from_str(&path).unwrap_or_default();
+        // The test's own name closes the path: `place_label` tells a Go
+        // root package from a Rust module by it.
+        path.push(name);
+        (file, path)
+    }))
 }
 
 /// Nearest-rank percentile of a sorted slice.
@@ -788,6 +803,24 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
     flaky_as_of(store, suite, window, None)
 }
 
+/// Tests that failed somewhere, whose history is worth reading for flakiness.
+/// A history is shared across suites (ADR 0018), so a flip between suites
+/// counts (round 6). A failure of a provisional name whose package was
+/// learned later (superseded in that run) is the qualified test's, which
+/// history shows (round 18); but a test superseded in one run is still its
+/// own where it failed unsuperseded in another.
+fn flaky_candidates(store: &Store, suite: Option<&str>) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT DISTINCT t.id FROM tests t JOIN attempts a ON a.test_id = t.id
+         WHERE (?1 IS NULL OR t.suite = ?1) AND a.outcome IN ('failed','errored')
+           AND NOT EXISTS (SELECT 1 FROM superseded s
+                           WHERE s.run_id = a.run_id AND s.test_id = a.test_id)",
+    )?;
+    Ok(stmt
+        .query_map(params![suite], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Tests flaky as of run `as_of` (its history up to it, its own result
 /// included): a run's labels do not change when later runs come in.
 pub fn flaky_as_of(
@@ -796,19 +829,7 @@ pub fn flaky_as_of(
     window: usize,
     as_of: Option<&str>,
 ) -> Result<Vec<TestStats>> {
-    let mut stmt = store.conn().prepare(
-        // Any test that failed somewhere: its history is shared across
-        // suites (ADR 0018), so a flip between suites counts (round 6).
-        "SELECT DISTINCT t.id FROM tests t JOIN attempts a ON a.test_id = t.id
-         WHERE (?1 IS NULL OR t.suite = ?1) AND a.outcome IN ('failed','errored')
-           -- the provisional name of a test whose package was learned later
-           -- is the qualified test, which history shows (round 18: flaky
-           -- listed the bare one with a thinner history)
-           AND t.id NOT IN (SELECT test_id FROM superseded)",
-    )?;
-    let ids: Vec<String> = stmt
-        .query_map(params![suite], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let ids = flaky_candidates(store, suite)?;
     let mut out: Vec<TestStats> = Vec::new();
     for id in ids {
         if let Some(s) = stats_with(store, &id, window, as_of)?
@@ -1403,6 +1424,40 @@ mod tests {
         );
         assert_eq!(f[0].display, "example.com/calc::TestFlakyClock");
         assert_eq!(f[0].aliases, ["TestFlakyClock"]);
+    }
+
+    /// Review of PR 115 (C): a test superseded in one run is still a
+    /// candidate for `flaky` through its other runs' own failures.
+    #[test]
+    fn a_test_superseded_in_one_run_is_still_flaky_through_its_other_runs() {
+        let bare = TestKey::new(vec![], "tests::x");
+        let full = TestKey::new(vec!["calc".into()], "tests::x");
+        let s = store_with(&[
+            (
+                "tree:a",
+                vec![
+                    (bare.clone(), Outcome::Failed),
+                    (full.clone(), Outcome::Failed),
+                ],
+            ),
+            ("tree:a", vec![(bare.clone(), Outcome::Failed)]),
+            ("tree:a", vec![(bare.clone(), Outcome::Passed)]),
+            ("tree:a", vec![(bare.clone(), Outcome::Failed)]),
+        ]);
+        s.conn()
+            .execute(
+                "INSERT INTO superseded (run_id, test_id, by_id) VALUES ('r0', ?1, ?2)",
+                params![
+                    crate::store::test_id("s", &bare),
+                    crate::store::test_id("s", &full)
+                ],
+            )
+            .unwrap();
+        let ids = flaky_candidates(&s, None).unwrap();
+        assert!(
+            ids.contains(&crate::store::test_id("s", &bare)),
+            "the bare name failed unsuperseded in runs 1 and 3: {ids:?}"
+        );
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub struct Recognizers {
     /// Where Vitest's root (its `RUN` header) lies below the working
     /// directory: Vitest names files from its root, prova from here.
     vitest_prefix: Option<String>,
+    /// The `RUN` root last read: the stream repeats it on every event, and
+    /// resolving it touches the disk.
+    vitest_root_seen: Option<String>,
+    /// Where the run started below the repository root, settled once.
+    start_cache: std::cell::OnceCell<String>,
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
@@ -1133,14 +1138,19 @@ impl Recognizers {
     /// Where the run started below the repository root (`packages/b`), as
     /// the prefix of every path-bearing name; empty at the root.
     fn start_prefix(&self) -> String {
-        let (Some(cwd), Some(repo)) = (&self.cwd, &self.repo_root) else {
-            return String::new();
-        };
-        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        canon(cwd)
-            .strip_prefix(canon(repo))
-            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
-            .unwrap_or_default()
+        self.start_cache
+            .get_or_init(|| {
+                let (Some(cwd), Some(repo)) = (&self.cwd, &self.repo_root) else {
+                    return String::new();
+                };
+                let canon =
+                    |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(cwd)
+                    .strip_prefix(canon(repo))
+                    .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 
     /// Settles the directories names are read from: Vitest's root is the
@@ -1148,12 +1158,18 @@ impl Recognizers {
     pub fn set_places(&mut self, cwd: &std::path::Path, repo_root: &std::path::Path) {
         self.cwd = Some(cwd.to_owned());
         self.repo_root = Some(repo_root.to_owned());
+        self.start_cache = std::cell::OnceCell::new();
+        self.vitest_root_seen = None;
         self.vitest_prefix = Some(self.start_prefix()).filter(|p| !p.is_empty());
     }
 
     /// Vitest's root, below the repository root (either path may run
     /// through a symlink: compared resolved).
     fn vitest_root(&mut self, root: &str) {
+        if self.vitest_root_seen.as_deref() == Some(root) {
+            return;
+        }
+        self.vitest_root_seen = Some(root.to_owned());
         let Some(cwd) = &self.cwd else {
             return;
         };
@@ -1174,9 +1190,13 @@ impl Recognizers {
                 let (r, c) = (root.canonicalize().ok()?, cwd.canonicalize().ok()?);
                 r.strip_prefix(&c).map(std::path::Path::to_path_buf).ok()
             });
-        self.vitest_prefix = rel
-            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
-            .filter(|r| !r.is_empty());
+        // A root that maps to neither the repository nor the working
+        // directory (a path inside a container) leaves the prefix the places
+        // gave: no worse than not reading the header.
+        if let Some(r) = rel {
+            self.vitest_prefix =
+                Some(r.to_string_lossy().trim_matches('/').to_owned()).filter(|r| !r.is_empty());
+        }
     }
 
     /// A Vitest file as prova names it, from the working directory.
@@ -1271,10 +1291,19 @@ impl Recognizers {
     fn container_dir(&self) -> Option<std::path::PathBuf> {
         let cwd = self.cwd.as_ref()?;
         let cmd = self.command.as_deref()?;
-        let words: Vec<&str> = cmd
-            .split(|c: char| c.is_whitespace() || c == '\'')
+        // Words without their quotes: `-v "$PWD":/w` is `-v $PWD:/w`.
+        let all: Vec<String> = cmd
+            .split_whitespace()
+            .map(|w| {
+                w.chars()
+                    .filter(|c| *c != '"' && *c != '\'')
+                    .collect::<String>()
+            })
             .filter(|w| !w.is_empty())
             .collect();
+        // Only the client's own options count (`docker run ... IMAGE`):
+        // pytest's `-v` after the image is not a volume.
+        let words: Vec<&str> = docker_options(&all);
         let host_of = |h: &str| {
             let h = h
                 .replace("${PWD}", &cwd.to_string_lossy())
@@ -3428,7 +3457,7 @@ impl Recognizers {
         let text = lines.join("\n").trim().to_owned();
         if key.file.is_none()
             && !self.holding
-            && let Some(place) = self.panic_place(&text)
+            && let Some(place) = self.panic_place(&text, &key.name)
             && let Some((_, Outcome::Failed | Outcome::Errored)) = self.seen.get(&key.unique())
         {
             let old = key.clone();
@@ -3456,7 +3485,7 @@ impl Recognizers {
     /// The place (test binary, as nextest names it) a panic message's path
     /// gives: `geo/src/lib.rs` is `geo`, `geo/tests/it.rs` is `geo::it`.
     /// `None` without the file on disk (a container) or a package around it.
-    fn panic_place(&self, text: &str) -> Option<String> {
+    fn panic_place(&self, text: &str, test: &str) -> Option<String> {
         let path = text.lines().find_map(|l| {
             let (_, rest) = l.split_once(" panicked at ")?;
             let mut parts = rest.trim().trim_end_matches(':').rsplitn(3, ':');
@@ -3470,6 +3499,22 @@ impl Recognizers {
             .map(|b| b.join(&path))
             .find(|p| p.is_file())?;
         let stop = self.repo_root.as_ref().or(self.cwd.as_ref())?;
+        // Only a file of this repository's own code, not a dependency's, and
+        // only the file that holds the test itself: a panic inside a helper
+        // crate or library code names where the failure surfaced, not where
+        // the test lives. When unsure the place stays unknown.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let abs = canon(&abs);
+        let stop = canon(stop);
+        let rel_to_repo = abs.strip_prefix(&stop).ok()?;
+        if rel_to_repo.components().any(|c| c.as_os_str() == ".cargo") {
+            return None;
+        }
+        let leaf = test.rsplit("::").next().unwrap_or(test);
+        let source = std::fs::read_to_string(&abs).ok()?;
+        if !source.contains(&format!("fn {leaf}(")) {
+            return None;
+        }
         let mut dir = abs.parent()?.to_path_buf();
         loop {
             if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
@@ -3487,7 +3532,7 @@ impl Recognizers {
                     _ => None,
                 };
             }
-            if dir == *stop || !dir.pop() {
+            if dir == stop || !dir.pop() {
                 return None;
             }
         }
@@ -3822,6 +3867,78 @@ fn nextest_binary(id: &str) -> String {
 enum PytestDir {
     Prefix(String),
     Unknown,
+}
+
+/// The words of a container client's own options in a command line: after
+/// `docker run` (or `podman run`/`exec`) up to the image. Empty without one.
+fn docker_options(words: &[String]) -> Vec<&str> {
+    // Options that take their value as the next word.
+    const VALUED: &[&str] = &[
+        "-v",
+        "--volume",
+        "-w",
+        "--workdir",
+        "--mount",
+        "-e",
+        "--env",
+        "-u",
+        "--user",
+        "--name",
+        "-p",
+        "--publish",
+        "--network",
+        "--net",
+        "--entrypoint",
+        "-h",
+        "--hostname",
+        "--env-file",
+        "--platform",
+        "--cpus",
+        "-m",
+        "--memory",
+        "--label",
+        "-l",
+        "--add-host",
+        "--tmpfs",
+        "--device",
+        "--group-add",
+        "--cap-add",
+        "--cap-drop",
+        "--security-opt",
+        "--shm-size",
+        "--ulimit",
+        "--workdir",
+        "--pull",
+        "--restart",
+        "--runtime",
+    ];
+    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
+    let Some(at) = words
+        .iter()
+        .position(|w| matches!(base(w).as_str(), "docker" | "podman" | "nerdctl"))
+    else {
+        return Vec::new();
+    };
+    let mut rest = words[at + 1..].iter();
+    if !matches!(
+        rest.next().map(String::as_str),
+        Some("run" | "exec" | "create")
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    while let Some(w) = rest.next() {
+        if !w.starts_with('-') {
+            break; // the image
+        }
+        out.push(w.as_str());
+        if VALUED.contains(&w.as_str())
+            && let Some(v) = rest.next()
+        {
+            out.push(v.as_str());
+        }
+    }
+    out
 }
 
 /// The words after `cd` or `pushd` in a command line: where it may move.
@@ -5039,6 +5156,30 @@ mod tests {
             " FAIL  src/calc.test.ts > adds",
             "AssertionError: expected +0 to be 1 // Object.is equality",
         ] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![(
+                "packages/b/src/calc.test.ts::adds".to_owned(),
+                Outcome::Failed
+            )]
+        );
+    }
+
+    /// Review of PR 115 (E): a Vitest root printed as a container path maps
+    /// to neither the repository nor the working directory; it must not
+    /// wipe the prefix the run's own place gave.
+    #[test]
+    fn vitest_root_from_an_unmapped_path_keeps_the_start_prefix() {
+        let mut r = Recognizers::default();
+        r.set_places(
+            std::path::Path::new("/w/packages/b"),
+            std::path::Path::new("/w"),
+        );
+        let mut ev = Vec::new();
+        for l in [" RUN  v3.2.4 /app", " × src/calc.test.ts > adds 3ms"] {
             ev.extend(r.line(l));
         }
         ev.extend(r.finish());

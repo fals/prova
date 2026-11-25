@@ -3119,19 +3119,20 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     } else {
         Vec::new()
     };
-    let suite_passed_ran = |display: &str| -> bool {
-        passes_on_same_code.iter().any(|r| {
-            store
-                .conn()
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
-                      WHERE a.run_id = ?1 AND t.display = ?2 AND a.outcome = 'passed')",
-                    rusqlite::params![r, display],
-                    |q| q.get::<_, bool>(0),
-                )
-                .unwrap_or(false)
-        })
+    // The tests (by name and place) that passed in any of those runs: one
+    // query, not one per run. A pass of another place's test of the same
+    // name is no evidence for this one.
+    let passed_ran: std::collections::BTreeSet<(String, Option<String>)> = {
+        let runs = serde_json::to_string(&passes_on_same_code).unwrap_or_else(|_| "[]".into());
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT t.display, t.file FROM attempts a JOIN tests t ON t.id = a.test_id
+              WHERE a.run_id IN (SELECT value FROM json_each(?1)) AND a.outcome = 'passed'",
+        )?;
+        stmt.query_map(rusqlite::params![runs], |q| Ok((q.get(0)?, q.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
     };
+    let suite_passed_ran =
+        |key: &TestKey| -> bool { passed_ran.contains(&(key.display(), key.file.clone())) };
     let mut failures = Vec::new();
     // A failure reported before its message (pytest -v prints the line
     // first, the `-rfE` summary names the cause at the end): the message is
@@ -3163,7 +3164,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             outcome: *outcome,
             message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
-                c.suite_passed_on_same_code = suite_passed_ran(&key.display());
+                c.suite_passed_on_same_code = suite_passed_ran(key);
                 c
             }),
         });

@@ -97,6 +97,27 @@ fn r18_tests_are_named_from_the_repository_root_whatever_directory_prova_started
     );
 }
 
+/// Review of PR 115 (B): a project in a subdirectory with its own
+/// `prova.toml` is its own root: its tests keep their `src/...` names (and
+/// the history recorded under them), though the git work tree is above.
+/// Why medium: needs a git work tree and a run started in the subproject.
+#[test]
+fn r18_a_subproject_with_its_own_prova_toml_names_tests_from_it() {
+    let d = workspace("subproject");
+    let api = d.join("services/api");
+    std::fs::create_dir_all(&api).unwrap();
+    std::fs::write(api.join("prova.toml"), "").unwrap();
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' '' ' RUN  v3.2.4 {}' '' ' × src/x.test.ts > works 1ms' '' ' Test Files  1 failed (1)' '      Tests  1 failed (1)'; exit 1",
+        api.display()
+    );
+    let out = text(&prova_in(&d, &api, &["run", "--", "sh", "-c", &cmd]));
+    assert!(
+        out.contains("FAIL src/x.test.ts::works") && !out.contains("services/api/src"),
+        "{out}"
+    );
+}
+
 /// The same for pytest, whose ids are relative to the directory it runs in.
 #[test]
 fn r18_pytest_ids_run_from_a_subdirectory_carry_its_path() {
@@ -119,6 +140,113 @@ fn quiet_cargo_failure(crate_dir: &str) -> String {
     )
 }
 
+/// Review of PR 115 (A): a panic path is a place only when it lies inside
+/// the repository, outside `.cargo/`, and the file holds the test's own
+/// function. A panic in a dependency, in a helper crate, or in the library
+/// code an integration test calls leaves the place unknown: the failure
+/// borrows no crate's history and is named with no crate. Why medium: the
+/// files are found on disk.
+#[test]
+fn r18_a_panic_path_that_is_not_the_tests_own_file_leaves_the_place_unknown() {
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, String);
+    let cases: [Case; 4] = [
+        (
+            "dependency under .cargo",
+            vec![
+                (
+                    ".cargo/registry/src/x/foo-1.0/Cargo.toml",
+                    "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n",
+                ),
+                (
+                    ".cargo/registry/src/x/foo-1.0/src/lib.rs",
+                    "fn flaky_clock() {}\n",
+                ),
+            ],
+            ".cargo/registry/src/x/foo-1.0/src/lib.rs".to_owned(),
+        ),
+        (
+            "helper crate",
+            vec![
+                (
+                    "testutil/Cargo.toml",
+                    "[package]\nname = \"testutil\"\nversion = \"0.1.0\"\n",
+                ),
+                ("testutil/src/lib.rs", "pub fn helper() {}\n"),
+            ],
+            "testutil/src/lib.rs".to_owned(),
+        ),
+        (
+            "integration test panicking in library code",
+            vec![
+                (
+                    "calc/Cargo.toml",
+                    "[package]\nname = \"calc\"\nversion = \"0.1.0\"\n",
+                ),
+                ("calc/src/lib.rs", "pub fn helper() {}\n"),
+                ("calc/tests/it.rs", "#[test]\nfn flaky_clock() {}\n"),
+            ],
+            "calc/src/lib.rs".to_owned(),
+        ),
+        (
+            "outside the repository",
+            vec![],
+            String::new(), // filled in below: a sibling directory
+        ),
+    ];
+    for (i, (what, files, path)) in cases.into_iter().enumerate() {
+        let d = workspace(&format!("panicpath{i}"));
+        for krate in ["geo", "alpha"] {
+            std::fs::create_dir_all(d.join(krate).join("src")).unwrap();
+            std::fs::write(
+                d.join(krate).join("Cargo.toml"),
+                format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+            std::fs::write(d.join(krate).join("src/lib.rs"), "fn flaky_clock() {}\n").unwrap();
+        }
+        let mut path = path;
+        if files.is_empty() {
+            let outside = PathBuf::from(format!("{}.dep", d.display()));
+            std::fs::create_dir_all(outside.join("src")).unwrap();
+            std::fs::write(
+                outside.join("Cargo.toml"),
+                "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            std::fs::write(outside.join("src/lib.rs"), "fn flaky_clock() {}\n").unwrap();
+            path = format!("{}/src/lib.rs", outside.display());
+        }
+        for (f, c) in &files {
+            let p = d.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, c).unwrap();
+        }
+        let at = |p: &str| {
+            format!(
+                "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at {p}:29:9:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
+            )
+        };
+        // geo's own failure: the history a misplaced one would borrow.
+        for h in ["geo", "alpha"] {
+            prova(
+                &d,
+                &["run", "--", "sh", "-c", &at(&format!("{h}/src/lib.rs"))],
+            );
+        }
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &at(&path)]));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("FAIL "))
+            .unwrap_or_else(|| panic!("{what}: no FAIL line: {out}"));
+        assert!(
+            line.contains("[first time seen")
+                && !line.contains("FLAKY")
+                && !line.contains("flaky_clock ("),
+            "{what}: the place stays unknown: {out}"
+        );
+    }
+}
+
 /// Round 18 (rust-make): quiet `cargo test` names `tests::flaky_clock` with
 /// no crate, and geo's real failure took calc's history (FLAKY). The panic
 /// message's path gives the crate. Why medium: the crate is found on disk.
@@ -132,7 +260,11 @@ fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
             format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
-        std::fs::write(d.join(krate).join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            d.join(krate).join("src/lib.rs"),
+            "#[test]\nfn flaky_clock() {}\n",
+        )
+        .unwrap();
     }
     let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("calc")]);
     let out = text(&o);
@@ -140,7 +272,9 @@ fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
     let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("geo")]);
     let out = text(&o);
     assert!(
-        out.contains("first time seen") && !out.contains("FLAKY") && !out.contains("before"),
+        out.lines()
+            .find(|l| l.trim_start().starts_with("FAIL "))
+            .is_some_and(|l| l.contains("[first time seen") && !l.contains("FLAKY")),
         "geo's failure borrowed calc's history: {out}"
     );
     let all = text(&prova(&d, &["history", "tests::flaky_clock"]));
@@ -525,6 +659,101 @@ fn r18_pytest_in_a_container_workdir_is_placed_by_the_mount() {
     let b = text(&prova(&d, &["run", "--", "sh", "-c", &run("b")]));
     assert!(b.contains("FAIL tests.b.test_x::test_flaky"), "{b}");
     assert!(b.contains("first time seen") && !b.contains("FLAKY"), "{b}");
+}
+
+/// Review of PR 115 (F): the client's mounts are read in their quoted
+/// spellings (`-v "$PWD":/w`, `--mount ...,source="$(pwd)",target=/w`), and
+/// only between `docker run` and the image: pytest's own `-w` after the
+/// image is no workdir. Why medium: the files are found on disk.
+#[test]
+fn r18_container_mounts_in_quoted_spellings_place_pytest_ids() {
+    let d = workspace("pyquoted");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(d.join("tests").join(sub)).unwrap();
+        std::fs::write(d.join("tests").join(sub).join("test_x.py"), "").unwrap();
+    }
+    let out =
+        "'rootdir: /w/tests/b' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='";
+    for mount in [
+        r#"-v "$PWD":/w"#,
+        r#"--mount type=bind,source="$(pwd)",target=/w"#,
+    ] {
+        let cmd = format!(
+            "{BUSY} : docker run --rm {mount} -w /w/tests/b img pytest -v; printf '%s\\n' {out}; exit 1"
+        );
+        let b = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
+        assert!(
+            b.contains("FAIL tests.b.test_x::test_flaky"),
+            "{mount}: {b}"
+        );
+    }
+    // pytest's `-w` after the image is not the client's workdir.
+    let cmd = format!(
+        "{BUSY} : docker run --rm img pytest -v -w /w/tests/a; printf '%s\\n' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1"
+    );
+    let o = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
+    assert!(!o.contains("tests.a.test_x"), "{o}");
+}
+
+/// Review of PR 115 (G): a Go module's root package has no `/` or `.` in
+/// its path (`calc`); it is still a place `quarantine --in` takes, while a
+/// Rust module (`tests`) is not. Why medium: stored tests and quarantines.
+#[test]
+fn r18_a_go_root_package_without_a_slash_is_a_place() {
+    let d = workspace("goroot");
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok  \tcalc\t0.01s'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "TestFlaky",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+}
+
+/// Review of PR 115 (H): a pass of crate calc's `tests::x` on this exact
+/// code is no evidence that crate geo's `tests::x` can pass: its failure is
+/// not "likely FLAKY: suite passed on this exact code". Why medium: needs
+/// stored runs of the same code.
+#[test]
+fn r18_a_pass_of_another_places_test_is_no_pass_of_this_one() {
+    let d = workspace("passplace");
+    let out = PathBuf::from(format!("{}.out", d.display()));
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        d.join("t.sh"),
+        format!(
+            "{BUSY}\ncat {o}/out.txt\nexit $(cat {o}/code)\n",
+            o = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(d.join("prova.toml"), "[suite.s]\nrun = \"sh t.sh\"\n").unwrap();
+    let run = |calc: &str, geo: &str, code: i32| {
+        std::fs::write(
+            out.join("out.txt"),
+            format!(
+                "    Starting 2 tests across 2 binaries\n        {calc} [   0.004s] calc tests::x\n        {geo} [   0.004s] geo tests::x\n     Summary [   0.020s] 2 tests run\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(out.join("code"), code.to_string()).unwrap();
+        prova(&d, &["run", "s"])
+    };
+    let o = run("PASS", "SKIP", 0);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = text(&run("PASS", "FAIL", 100));
+    assert!(o.contains("FAIL tests::x (geo)"), "{o}");
+    assert!(!o.contains("likely FLAKY"), "{o}");
 }
 
 /// Round 18 (ts-vitest): "no history yet" for a budget, though the test has

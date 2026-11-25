@@ -74,15 +74,29 @@ const CACHES: &[&str] = &[
     ":(exclude,top,glob).prova/**",
 ];
 
-/// The repository a directory belongs to: the git work tree, else the
-/// nearest directory holding `prova.toml`, else the directory itself. Test
-/// names are read relative to it (ADR 0035 section 1).
+/// The project a directory belongs to: the nearest directory holding
+/// `prova.toml` at or below the git work tree's root, else the git work
+/// tree's root, else the nearest `prova.toml` above, else the directory
+/// itself. Test names are read relative to it (ADR 0035 section 1), so a
+/// project in `services/api` with its own `prova.toml` keeps `src/x.test.ts`
+/// names, and a monorepo with one `prova.toml` at its root names every
+/// test from there.
 pub fn repo_root(dir: &Path) -> std::path::PathBuf {
-    if let Some(top) = git(dir, &["rev-parse", "--show-toplevel"]) {
-        let top = String::from_utf8_lossy(&top).trim().to_owned();
-        if !top.is_empty() {
-            return std::path::PathBuf::from(top);
-        }
+    let top = git(dir, &["rev-parse", "--show-toplevel"])
+        .map(|t| String::from_utf8_lossy(&t).trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(top) = top {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let (top_c, dir_c) = (canon(&top), canon(dir));
+        // Walk up from the directory to the work tree's root; the nearest
+        // `prova.toml` on the way is the project's.
+        return dir_c
+            .ancestors()
+            .take_while(|d| d.starts_with(&top_c))
+            .find(|d| d.join("prova.toml").exists())
+            .map(Path::to_path_buf)
+            .unwrap_or(top);
     }
     dir.ancestors()
         .find(|d| d.join("prova.toml").exists())
