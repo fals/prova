@@ -240,11 +240,144 @@ fn rfc3339_ms(t: &str) -> Option<u64> {
         .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
 }
 
+/// The host directories the client's own `-v`/`--volume`/`--mount`
+/// arguments bind, resolved against the run's directory. Named volumes
+/// (no path) are left out.
+pub fn client_mount_sources(cmdline: &str, cwd: &str) -> Vec<std::path::PathBuf> {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    let mut specs: Vec<&str> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if matches!(*w, "-v" | "--volume" | "--mount") {
+            if let Some(v) = words.get(i + 1) {
+                specs.push(v);
+            }
+        } else if let Some(v) = w.strip_prefix("--volume=").or(w.strip_prefix("--mount=")) {
+            specs.push(v);
+        } else if let Some(v) = w.strip_prefix("-v").filter(|v| v.contains(':')) {
+            specs.push(v);
+        }
+    }
+    let mut out = Vec::new();
+    for spec in specs {
+        let src = if spec.contains("source=") || spec.contains("src=") {
+            spec.split(',').find_map(|kv| {
+                kv.strip_prefix("source=")
+                    .or_else(|| kv.strip_prefix("src="))
+            })
+        } else {
+            spec.split(':').next()
+        };
+        let Some(src) = src.map(|s| s.trim_matches('"')) else {
+            continue;
+        };
+        // A named volume has no path; a bind mount starts with `/`, `.` or `~`.
+        if !(src.starts_with('/') || src.starts_with('.')) {
+            continue;
+        }
+        let path = std::path::Path::new(src);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(cwd).join(path)
+        };
+        out.push(normalize(&abs));
+    }
+    out
+}
+
+/// A path without `.` and `..` components, without touching the disk.
+fn normalize(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component::{CurDir, ParentDir};
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The words of the client's command after its image: the command the
+/// container runs, when the client gave one. `Config.Image` of the
+/// container names the image.
+fn client_command_after<'a>(cmdline: &'a str, image: &str) -> Vec<&'a str> {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    words
+        .iter()
+        .position(|w| *w == image)
+        .map(|at| words[at + 1..].to_vec())
+        .unwrap_or_default()
+}
+
+/// Which of the inspected containers are the run's own: created after the
+/// run started; mounting every directory the client's own `-v`/`--mount`
+/// arguments name (when it named none, mounting the run's directory or a
+/// parent of it); and running the client's command when it gave one.
+pub fn select_run_containers(
+    all: &[serde_json::Value],
+    cmdline: &str,
+    cwd: &str,
+    started_ms: u64,
+) -> Vec<String> {
+    let named = client_mount_sources(cmdline, cwd);
+    let cwd = std::path::Path::new(cwd);
+    all.iter()
+        .filter(|c| {
+            let created = c["Created"].as_str().and_then(rfc3339_ms);
+            created.is_some_and(|t| t >= started_ms)
+        })
+        .filter(|c| {
+            let sources: Vec<std::path::PathBuf> = c["Mounts"]
+                .as_array()
+                .map(|ms| {
+                    ms.iter()
+                        .filter(|m| m["Type"].as_str().is_none_or(|t| t == "bind"))
+                        .filter_map(|m| m["Source"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| normalize(std::path::Path::new(s)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if named.is_empty() {
+                sources.iter().any(|s| cwd.starts_with(s))
+            } else {
+                named.iter().all(|n| sources.iter().any(|s| s == n))
+            }
+        })
+        .filter(|c| {
+            let Some(image) = c["Config"]["Image"].as_str() else {
+                return true;
+            };
+            let wanted = client_command_after(cmdline, image);
+            if wanted.is_empty() {
+                return true;
+            }
+            let Some(path) = c["Path"].as_str() else {
+                return true;
+            };
+            let mut ran = vec![path.to_owned()];
+            ran.extend(
+                c["Args"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.as_str().map(str::to_owned)),
+            );
+            ran.iter().map(String::as_str).eq(wanted.iter().copied())
+        })
+        .filter_map(|c| c["Id"].as_str())
+        .map(|id| id.chars().take(12).collect())
+        .collect()
+}
+
 /// Running containers that look like the run's own, when its client was
-/// given no `--name` or `--cidfile`: created after the run started, with a
-/// bind mount of the run's working directory or a parent of it. Bounded: a
-/// client that hangs yields nothing. Ids, shortest form.
-pub fn containers_of_run(client: &str, cwd: &str, started_ms: u64) -> Vec<String> {
+/// given no `--name` or `--cidfile` (see `select_run_containers`).
+/// Bounded: a client that hangs yields nothing. Ids, shortest form.
+pub fn containers_of_run(client: &str, cmdline: &str, cwd: &str, started_ms: u64) -> Vec<String> {
     let Some(ids) = client_output(client, &["ps", "-q"], 3) else {
         return Vec::new();
     };
@@ -260,25 +393,7 @@ pub fn containers_of_run(client: &str, cwd: &str, started_ms: u64) -> Vec<String
     let Ok(serde_json::Value::Array(all)) = serde_json::from_str::<serde_json::Value>(&json) else {
         return Vec::new();
     };
-    let cwd = std::path::Path::new(cwd);
-    all.iter()
-        .filter(|c| {
-            let created = c["Created"].as_str().and_then(rfc3339_ms);
-            // A second of slack: the client records the run's start before
-            // the container exists, but clocks are read at different points.
-            created.is_some_and(|t| t + 1000 >= started_ms)
-                && c["Mounts"].as_array().is_some_and(|ms| {
-                    ms.iter().any(|m| {
-                        m["Type"].as_str().is_none_or(|t| t == "bind")
-                            && m["Source"]
-                                .as_str()
-                                .is_some_and(|s| !s.is_empty() && cwd.starts_with(s))
-                    })
-                })
-        })
-        .filter_map(|c| c["Id"].as_str())
-        .map(|id| id.chars().take(12).collect())
-        .collect()
+    select_run_containers(&all, cmdline, cwd, started_ms)
 }
 
 /// Kills a container by name or id with its client; true when it did.
@@ -826,5 +941,81 @@ mod container_tests {
         assert_eq!(c("docker exec box cat /out/results.txt"), None);
         assert_eq!(c("docker compose run --rm app pytest"), Some("docker"));
         assert_eq!(c("dockerd --host x"), None);
+    }
+}
+
+#[cfg(test)]
+mod container_choice_tests {
+    use super::select_run_containers as pick;
+    use serde_json::json;
+
+    fn c(id: &str, created: &str, mounts: &[&str]) -> serde_json::Value {
+        let ms: Vec<_> = mounts
+            .iter()
+            .map(|s| json!({"Type":"bind","Source":s}))
+            .collect();
+        json!({"Id":format!("{id}ffffffffff"),"Created":created,"Mounts":ms})
+    }
+
+    fn short(id: &str) -> String {
+        format!("{id}ffffffffff").chars().take(12).collect()
+    }
+
+    #[test]
+    fn a_container_mounting_a_parent_is_not_the_run_that_mounted_a_subdirectory() {
+        // Round 17 B5: `docker run -v $PWD/src:/src` was cancelled by
+        // killing an unrelated container that mounted $PWD.
+        let all = vec![
+            c("mine", "2999-01-01T00:00:01Z", &["/w/src"]),
+            c("other", "2999-01-01T00:00:02Z", &["/w"]),
+        ];
+        let got = pick(
+            &all,
+            "docker run --rm -v /w/src:/src img sh -c unit",
+            "/w",
+            0,
+        );
+        assert_eq!(got, vec![short("mine")]);
+    }
+
+    #[test]
+    fn every_named_mount_is_needed_and_relative_ones_resolve_against_the_run_dir() {
+        let all = vec![
+            c("one", "2999-01-01T00:00:00Z", &["/w/a"]),
+            c("both", "2999-01-01T00:00:00Z", &["/w/a", "/w/b"]),
+        ];
+        let got = pick(&all, "docker run -v ./a:/a -v /w/b:/b img t", "/w", 0);
+        assert_eq!(got, vec![short("both")]);
+        let got = pick(
+            &all,
+            "docker run --mount type=bind,source=/w/a,target=/a img t",
+            "/w",
+            0,
+        );
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn a_container_created_before_the_run_is_never_a_candidate() {
+        let all = vec![c("dev", "2000-01-01T00:00:00Z", &["/w"])];
+        assert!(pick(&all, "docker run img t", "/w", 2_000_000_000_000).is_empty());
+        // Not even by the second of slack the old check allowed.
+        let started = super::rfc3339_ms("2026-11-25T10:00:00.9Z").unwrap();
+        let all = vec![c("dev", "2026-11-25T10:00:00.2Z", &["/w"])];
+        assert!(pick(&all, "docker run img t", "/w", started).is_empty());
+    }
+
+    #[test]
+    fn the_clients_command_must_match_when_it_gave_one() {
+        let mut a = c("aaa", "2999-01-01T00:00:00Z", &["/w"]);
+        a["Config"] = json!({"Image":"img"});
+        a["Path"] = json!("sh");
+        a["Args"] = json!(["-c", "unit"]);
+        let mut b = c("bbb", "2999-01-01T00:00:00Z", &["/w"]);
+        b["Config"] = json!({"Image":"img"});
+        b["Path"] = json!("sleep");
+        b["Args"] = json!(["999"]);
+        let got = pick(&[a, b], "docker run --rm -v /w:/w img sh -c unit", "/w", 0);
+        assert_eq!(got, vec![short("aaa")]);
     }
 }

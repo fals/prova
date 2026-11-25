@@ -343,6 +343,36 @@ fn a_test_killed_by_the_cancel_is_unfinished_not_failed() {
     );
 }
 
+/// Round 17: `prova history TestHang` said "0 runs with a result" though the
+/// test was the one running when two runs were cut short. History names the
+/// cut-short runs in which the test was running (ADR 0031 §4).
+#[test]
+fn history_names_the_cut_short_runs_in_which_a_test_was_running() {
+    let d = workspace("history-cut-short");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.go]\nrun = \"echo '=== RUN   TestHang'; sleep 30 & wait\"\n",
+    )
+    .unwrap();
+    let id = text(&prova(&d, &["run", "go", "--detach"]))
+        .trim()
+        .to_owned();
+    prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "2s"],
+    );
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+    let h = text(&prova(&d, &["history", "TestHang"]));
+    assert!(
+        h.contains("cut short") && h.contains(&id[..8.min(id.len())]),
+        "{h}"
+    );
+    let j = text(&prova(&d, &["history", "TestHang", "--json"]));
+    let j: serde_json::Value = serde_json::from_str(&j).unwrap();
+    assert_eq!(j["cut_short"][0]["run"], id.as_str(), "{j}");
+}
+
 /// Round 8: result files arrive only at the end, so a hung xUnit/JUnit run
 /// named no test; the tests of the last passing run that never reported
 /// are the suspects.
@@ -413,6 +443,60 @@ fn a_long_suspect_list_says_how_many_it_left_out() {
     assert!(
         w.contains("12 of the last finished run") && w.contains("first 8 of 12; 4 more not listed"),
         "{w}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
+/// Round 17: the "not reported yet" list was alphabetical and left out the
+/// tests the last run skipped (`TestHang`, skipped unless HANG=1), so the
+/// hung test was hidden. The list follows the last run's order, counts its
+/// skipped tests, and is whole in `status --json` (ADR 0031 §4).
+#[test]
+fn the_suspects_follow_the_last_runs_order_and_include_its_skipped_tests() {
+    let d = workspace("suspects-order");
+    std::fs::write(
+        d.join("prova.toml"),
+        concat!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; ",
+            "printf '<testsuite name=\\\"s\\\"><testcase classname=\\\"s\\\" name=\\\"zeta\\\"/><testcase classname=\\\"s\\\" name=\\\"alpha\\\"/><testcase classname=\\\"s\\\" name=\\\"hangs\\\"><skipped/></testcase></testsuite>' ",
+            "> build/test-results/junit.xml\"\n",
+        ),
+    )
+    .unwrap();
+    let first = text(&prova(&d, &["run", "j"]));
+    assert!(first.contains("PASSED"), "{first}");
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    let at = |n: &str| w.find(n).unwrap_or(usize::MAX);
+    assert!(
+        at("s::zeta") < at("s::alpha") && at("s::alpha") < at("s::hangs"),
+        "{w}"
+    );
+    let j: serde_json::Value = serde_json::from_str(&text(&prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "5s",
+            "--json",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(
+        j["not_reported"],
+        serde_json::json!(["s::zeta", "s::alpha", "s::hangs"]),
+        "{j}"
     );
     prova(&d, &["cancel", &id]);
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);

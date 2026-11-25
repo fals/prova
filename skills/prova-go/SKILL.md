@@ -17,7 +17,10 @@ description: Gives the go test flags and prova.toml settings that let prova see 
   then reads gotestsum's own event stream (every test, with packages), and
   ignores its text.
 - Plain `go test ./...` (often in `make test`) prints only failures;
-  `go test -v` prints every test and is recognized live too.
+  `go test -v` prints every test and is recognized, but Go buffers each
+  package's output until the package ends when it tests several packages
+  (`./...`): nothing shows live until a package finishes, and a slow package
+  looks like a stall. For live, per-test events use `go test -json ./...`.
 - Single test: `select = "go test -json -count=1 -run {filter} ./..."`.
   `--select TestDiv` (or a subtest, `TestPod/case_1`, as prova prints it)
   runs exactly that test: prova escapes and anchors each level for `-run`.

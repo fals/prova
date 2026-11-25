@@ -2907,6 +2907,27 @@ impl Recognizers {
         }
     }
 
+    /// Counts the results of held text events as seen, as `result` does for
+    /// a live one.
+    fn adopt_held(&mut self, held: &[EventKind]) {
+        for e in held {
+            if let EventKind::TestFinished {
+                test,
+                outcome,
+                source,
+                ..
+            } = e
+            {
+                let d = test.unique();
+                self.seen_keys
+                    .entry(d.clone())
+                    .or_insert_with(|| test.clone());
+                self.seen.entry(d).or_insert((test.display(), *outcome));
+                lift(&mut self.level, *source);
+            }
+        }
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
@@ -2953,7 +2974,11 @@ impl Recognizers {
         let mut out = held_pass;
         // The injected stream never came: the text results are all there is.
         if self.level < Some(Level::Native) {
-            out.append(&mut self.held_text_events);
+            // They are the run's results now: counted as seen, and they
+            // set the level (round 17: "2 failed" beside "prova saw 0").
+            let mut held = std::mem::take(&mut self.held_text_events);
+            self.adopt_held(&held);
+            out.append(&mut held);
         }
         out.append(&mut gts);
         self.flush_nextest(&mut out);
@@ -2961,6 +2986,7 @@ impl Recognizers {
             let mut held = Vec::new();
             self.flush_vitest(&mut held);
             if self.level < Some(Level::Native) {
+                self.adopt_held(&held);
                 out.extend(held);
             }
         } else {
@@ -3919,6 +3945,26 @@ mod tests {
                 .is_empty(),
             "the stream decides"
         );
+    }
+
+    /// Round 17 (python-make): a pytest-reportlog stream that never came
+    /// (the report was written inside a container) left the text results
+    /// held; releasing them at the end did not count them as seen, so the
+    /// summary said "2 failed" and "prova saw 0 individually" at once.
+    #[test]
+    fn held_text_results_released_for_a_missing_stream_count_as_seen() {
+        let mut r = Recognizers {
+            pytest_stream: true,
+            ..Recognizers::default()
+        };
+        r.line("=== short test summary info ===");
+        r.line("FAILED tests/t.py::test_a - assert 1");
+        r.line("FAILED tests/t.py::test_b - assert 2");
+        r.line("=== 2 failed in 0.10s ===");
+        let ev = r.finish();
+        assert_eq!(finished(&ev).len(), 2, "{ev:?}");
+        assert_eq!(r.seen.len(), 2);
+        assert_eq!(r.level, Some(Level::Recognized));
     }
 
     /// Round 12 (blocker): with an injected stream, pytest -v and Vitest

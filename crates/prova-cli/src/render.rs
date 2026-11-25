@@ -462,6 +462,20 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     if shown.len() > 15 {
         println!("  ... {} more (`--json` lists all)", shown.len() - 15);
     }
+    // A test running when a run was cut short has no result there, and may
+    // be why it was cut short (round 17).
+    if !s.cut_short.is_empty() {
+        let runs: Vec<String> = s
+            .cut_short
+            .iter()
+            .map(|c| format!("{} ({})", c.run, c.status))
+            .collect();
+        println!(
+            "  running when {} run(s) were cut short, with no result: {}",
+            s.cut_short.len(),
+            runs.join(", ")
+        );
+    }
 }
 
 fn first_lines(m: &str, n: usize) -> String {
@@ -1200,6 +1214,7 @@ mod live_tests {
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
             skipped_tests: vec![],
+            not_reported: vec![],
             selection: None,
             framework: None,
             failures: vec![],
