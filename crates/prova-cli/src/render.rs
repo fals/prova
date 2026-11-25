@@ -418,6 +418,8 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     );
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
         println!("duration p50 {p50}ms  p95 {p95}ms");
+    } else if s.runs > 0 {
+        println!("duration unknown: no run recorded one");
     }
     if let Some(size) = &s.size {
         println!("size: {}", clean(&size.label));

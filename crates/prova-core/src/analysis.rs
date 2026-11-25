@@ -92,6 +92,17 @@ pub fn test_runs_with(
     limit: usize,
     current: Option<&str>,
 ) -> Result<Vec<TestRun>> {
+    test_runs_scoped(store, test_id, limit, current, None)
+}
+
+/// `test_runs_with`, only over the runs of one suite when `suite` is given.
+fn test_runs_scoped(
+    store: &Store,
+    test_id: &str,
+    limit: usize,
+    current: Option<&str>,
+    suite: Option<&str>,
+) -> Result<Vec<TestRun>> {
     let mut stmt = store.conn().prepare(
         "WITH same AS (
              SELECT t2.id FROM tests t1 JOIN tests t2
@@ -119,12 +130,13 @@ pub fn test_runs_with(
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
                                                   AND w.payload LIKE '%; no evidence about the tests%'))
                    AND r3.id NOT IN (SELECT run_id FROM forgotten)
+                   AND (?4 IS NULL OR r3.suite = ?4)
                    -- labels of a run are as of that run: later runs do not
                    -- rewrite them (round 13: 'failed 8x before' on a run
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection')
+                json_extract(r.spec, '$.selection'), a.test_id
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -132,7 +144,7 @@ pub fn test_runs_with(
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
     )?;
-    let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
+    let rows = stmt.query_map(params![test_id, limit as i64, current, suite], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -144,6 +156,7 @@ pub fn test_runs_with(
             r.get::<_, Option<String>>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, Option<String>>(9)?,
+            r.get::<_, String>(10)?,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -160,8 +173,9 @@ pub fn test_runs_with(
         .ok()
         .map(|d| leaf(&d));
     let mut out: Vec<TestRun> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection) = row?;
+        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection, row_test) = row?;
         if let (Some(sel), Some(this)) = (&selection, &this)
             && leaf(sel).starts_with(&format!("{this}/"))
         {
@@ -186,22 +200,37 @@ pub fn test_runs_with(
                 last.outcome = outcome;
                 last.duration_ms = dur.map(|d| d as u64);
                 if outcome.is_failure() {
-                    last.message = msg;
+                    // A later attempt that names no cause keeps the earlier
+                    // one (a teardown error after the failure).
+                    last.message = msg.or(last.message.take());
                     last.fingerprint = fp;
+                    ids.pop();
+                    ids.push(row_test);
                 }
             }
-            _ => out.push(TestRun {
-                run,
-                code,
-                created_ms: created as u64,
-                outcome,
-                attempts: attempt as u32,
-                passed_on_retry: false,
-                duration_ms: dur.map(|d| d as u64),
-                message: if outcome.is_failure() { msg } else { None },
-                fingerprint: fp,
-                env,
-            }),
+            _ => {
+                ids.push(row_test);
+                out.push(TestRun {
+                    run,
+                    code,
+                    created_ms: created as u64,
+                    outcome,
+                    attempts: attempt as u32,
+                    passed_on_retry: false,
+                    duration_ms: dur.map(|d| d as u64),
+                    message: if outcome.is_failure() { msg } else { None },
+                    fingerprint: fp,
+                    env,
+                })
+            }
+        }
+    }
+    // A failure the framework reported before its message (pytest -v prints
+    // the line first, the summary names the cause): the message is in the
+    // test's kept output, as the run summary shows it (round 17).
+    for (r, id) in out.iter_mut().zip(&ids) {
+        if r.outcome.is_failure() && r.message.is_none() {
+            r.message = crate::output::failure_message(store, &r.run, id);
         }
     }
     Ok(out)
@@ -211,11 +240,31 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
     stats_with(store, test_id, window, None)
 }
 
+/// `stats`, over the runs of one suite only (`prova history --suite`).
+pub fn stats_in_suite(
+    store: &Store,
+    test_id: &str,
+    window: usize,
+    suite: Option<&str>,
+) -> Result<Option<TestStats>> {
+    stats_scoped(store, test_id, window, None, suite)
+}
+
 fn stats_with(
     store: &Store,
     test_id: &str,
     window: usize,
     current: Option<&str>,
+) -> Result<Option<TestStats>> {
+    stats_scoped(store, test_id, window, current, None)
+}
+
+fn stats_scoped(
+    store: &Store,
+    test_id: &str,
+    window: usize,
+    current: Option<&str>,
+    only_suite: Option<&str>,
 ) -> Result<Option<TestStats>> {
     let meta: Option<(String, String)> = store
         .conn()
@@ -228,7 +277,7 @@ fn stats_with(
     let Some((display, suite)) = meta else {
         return Ok(None);
     };
-    let recent = test_runs_with(store, test_id, window, current)?;
+    let recent = test_runs_scoped(store, test_id, window, current, only_suite)?;
     let suites: Vec<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
@@ -339,6 +388,11 @@ fn stats_with(
         .filter_map(|r| r.duration_ms)
         .collect();
     durations.sort_unstable();
+    // Nothing but zeros: a framework that reports no time (or one measured
+    // between two adjacent lines), not tests that took no time (round 17).
+    if durations.iter().all(|d| *d == 0) {
+        durations.clear();
+    }
     let last_passed = recent
         .iter()
         .find(|r| r.outcome == Outcome::Passed)

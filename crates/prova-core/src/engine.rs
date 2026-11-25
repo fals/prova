@@ -2009,7 +2009,7 @@ fn pytest_ran_nothing(line: &str) -> bool {
 
 /// The cause a failing test's kept output names: pytest's first `E` line,
 /// or the whole output when it is one line (a short summary's message).
-fn message_from_output(text: &str) -> Option<String> {
+pub(crate) fn message_from_output(text: &str) -> Option<String> {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)

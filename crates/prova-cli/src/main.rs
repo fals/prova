@@ -2695,17 +2695,26 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     for (_, display, suite) in &found {
                         by_name.entry(display).or_default().push(suite);
                     }
-                    println!("{} tests match {test:?}; be more specific:", by_name.len());
+                    // An empty name asks for the list (as the help says).
+                    if test.is_empty() {
+                        println!("{} tests prova knows:", by_name.len());
+                    } else {
+                        println!("{} tests match {test:?}; be more specific:", by_name.len());
+                    }
                     for (display, suites) in by_name.iter().take(20) {
                         println!("  {display}  (suite {})", suites.join(", "));
                     }
                     if by_name.len() > 20 {
                         println!("  ... and {} more", by_name.len() - 20);
                     }
-                    return Ok(exit::USAGE);
+                    return Ok(if test.is_empty() {
+                        exit::PASSED
+                    } else {
+                        exit::USAGE
+                    });
                 }
             };
-            match analysis::stats(&store, &pick, window)? {
+            match analysis::stats_in_suite(&store, &pick, window, suite.as_deref())? {
                 Some(s) => render::test_stats(&s, json),
                 None => bail!("test disappeared"),
             }
