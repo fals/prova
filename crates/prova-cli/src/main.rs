@@ -99,6 +99,10 @@ Example:
         /// The quarantined test's name, or a substring that matches one.
         #[arg(add = ArgValueCompleter::new(complete_quarantined))]
         test: String,
+        /// Where the test lives, when it is quarantined in several places
+        /// (the place `quarantine list` shows).
+        #[arg(long = "in", value_name = "FILE")]
+        in_file: Option<String>,
     },
 }
 
@@ -1691,7 +1695,19 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             bail!("nothing to write");
         }
         std::fs::write(&path, &toml)?;
+        // A short nextest slow-timeout (issue #88), only in a project that
+        // has no nextest config of its own: an existing file is the owner's.
+        let nextest_cfg = root.join(".config/nextest.toml");
+        let wrote_nextest = p.nextest_slow_timeout
+            && !nextest_cfg.exists()
+            && std::fs::create_dir_all(root.join(".config")).is_ok()
+            && std::fs::write(&nextest_cfg, prova_adapters::adopt::NEXTEST_SLOW_CONFIG).is_ok();
         if !json {
+            if wrote_nextest {
+                println!(
+                    "wrote .config/nextest.toml (slow-timeout 5s: a hung test is named while it runs)"
+                );
+            }
             let names: Vec<&str> = p.suites.iter().map(|s| s.name.as_str()).collect();
             println!("wrote prova.toml with suite(s) {}", names.join(", "));
             for n in &p.notes {
@@ -2275,28 +2291,48 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             }
             Ok(exit::PASSED)
         }
-        QuarantineCmd::Remove { test } => {
-            let open: Vec<String> = q::list(store, false)?.into_iter().map(|e| e.test).collect();
-            let name = match open.iter().find(|n| **n == test) {
-                Some(n) => n.clone(),
-                None => {
-                    let hits: Vec<&String> = open.iter().filter(|n| n.contains(&test)).collect();
-                    match hits.as_slice() {
-                        [one] => (*one).clone(),
-                        _ => {
-                            return Err(UsageError(format!(
-                                "{} quarantined tests match {test:?} (`prova quarantine list` shows them)",
-                                hits.len()
-                            ))
-                            .into());
-                        }
-                    }
+        QuarantineCmd::Remove { test, in_file } => {
+            let open = q::list(store, false)?;
+            let exact: Vec<&q::Entry> = open.iter().filter(|e| e.test == test).collect();
+            let mut hits: Vec<&q::Entry> = if exact.is_empty() {
+                open.iter().filter(|e| e.test.contains(&test)).collect()
+            } else {
+                exact
+            };
+            // A name quarantined in several places: `--in` says which.
+            if let Some(w) = in_file.as_deref() {
+                analysis::retain_in_place(&mut hits, w, |e| (e.file.clone(), Vec::new()));
+            }
+            let entry = match hits.as_slice() {
+                [one] => *one,
+                [] => {
+                    return Err(UsageError(format!(
+                        "no quarantined test matches {test:?}{} (`prova quarantine list` shows them)",
+                        in_file
+                            .as_deref()
+                            .map(|w| format!(" in {w:?}"))
+                            .unwrap_or_default()
+                    ))
+                    .into());
+                }
+                many => {
+                    let listed: Vec<String> = many
+                        .iter()
+                        .take(5)
+                        .map(|e| render::named(&e.test, e.file.as_deref()))
+                        .collect();
+                    return Err(UsageError(format!(
+                        "{} quarantined tests match {test:?}; say which with --in <place>: {}",
+                        many.len(),
+                        listed.join(", ")
+                    ))
+                    .into());
                 }
             };
-            q::remove(store, &name, now_ms())?;
+            q::remove(store, &entry.test, entry.file.as_deref(), now_ms())?;
             println!(
                 "removed the quarantine of {}: it counts again",
-                render::clean(&name)
+                render::named(&entry.test, entry.file.as_deref())
             );
             Ok(exit::PASSED)
         }

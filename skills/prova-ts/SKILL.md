@@ -18,15 +18,19 @@ description: Gives the Vitest, Jest and node --test settings that let prova see 
 
   Through npm: `npm test -- --reporter=default --reporter="$PROVA_VITEST_REPORTER"`.
   Vitest 3.x sends a worker's task updates in batches (its `throttle` in
-  `@vitest/runner` can leave the last update unsent until the next one), so a
-  start or an early failure can reach prova seconds late, until another test
-  starts or ends. A test that hangs is still named by the stall, a few seconds
-  later than the others.
+  `@vitest/runner` can leave the last update unsent until the next one). The
+  reporter adds a setup file of its own (`prova-vitest-setup.mjs`, next to it)
+  to the project's `setupFiles`, which writes each test's start and result from
+  inside the worker, so starts and early failures arrive within a second. If a
+  Vitest does not take it (no `setupFiles` array to extend), the reporter's own
+  events remain and can arrive late.
 - Vitest without the reporter: `npx vitest run --reporter=verbose` prints
   each test with ✓/×, recognized live. Add `--reporter=junit --outputFile=reports/junit.xml`
   (as a second reporter) for durations and messages.
-- Jest: add `jest-junit` and run `npx jest --ci --reporters=default --reporters=jest-junit`;
-  prova ingests `junit.xml`.
+- Jest: `npx jest --ci --verbose` prints every test (`✓`, `✕`, `○ skipped`,
+  `✎ todo`), which prova recognizes live; without `--verbose` Jest names only
+  failures. For durations and messages add `jest-junit`
+  (`--reporters=default --reporters=jest-junit`); prova ingests `junit.xml`.
 - Single test: Vitest `-t {filter}`, Jest `-t {filter}` (test name pattern).
 - Always `vitest run`, never watch mode: watch mode never ends.
 - Node's own runner (`node --test`) prints TAP with `--test-reporter=tap`,

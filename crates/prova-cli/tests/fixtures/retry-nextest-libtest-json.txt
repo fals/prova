@@ -1,0 +1,52 @@
+   Compiling hang v0.1.0 (/tmp/claude-1000/-home-fals-Projects-toe/28288bbe-d650-4569-9413-a9ad916aae1d/scratchpad/h/crate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+────────────
+ Nextest run ID dc7f06b3-c7b5-433d-9184-d760eb3f476e with nextest profile: default
+    Starting 2 tests across 1 binary
+        PASS [   0.004s] (1/2) hang t::quick
+  TRY 1 FAIL [   0.004s] (───) hang t::flaky
+  output ───
+
+    running 1 test
+
+    thread 't::flaky' (3370595) panicked at src/lib.rs:10:13:
+    first try fails
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    test t::flaky ... FAILED
+
+    failures:
+
+    failures:
+        t::flaky
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+  TRY 2 PASS [   0.003s] (2/2) hang t::flaky
+{"type":"suite","event":"started","test_count":2}
+{"type":"test","event":"started","name":"hang::hang$t::flaky"}
+{"type":"test","event":"started","name":"hang::hang$t::quick"}
+{"type":"test","event":"ok","name":"hang::hang$t::quick","exec_time":0.00445318}
+{"type":"test","event":"ok","name":"hang::hang$t::flaky#2","exec_time":0.00302897}
+{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.00748215}
+────────────
+     Summary [   0.009s] 2 tests run: 2 passed (1 flaky), 0 skipped
+        PASS [   0.004s] (1/2) hang t::quick
+  output ───
+
+    running 1 test
+    test t::quick ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+   FLAKY 2/2 [   0.003s] (2/2) hang t::flaky
+  output ───
+
+    running 1 test
+    test t::flaky ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+exit 0

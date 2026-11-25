@@ -122,6 +122,10 @@
         "outcome": {
           "$ref": "#/$defs/Outcome"
         },
+        "passed_in_iteration": {
+          "description": "This execution passed, but the outcome recorded is the failure\nof an earlier iteration of the same run, which stands (`go test\n-count=N`: repeats are not retries, ADR 0029 section 2). History\nreads it as a pass within a failed run: flaky evidence.",
+          "type": "boolean"
+        },
         "source": {
           "$ref": "#/$defs/Level"
         },

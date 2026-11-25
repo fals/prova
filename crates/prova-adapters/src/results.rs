@@ -228,6 +228,7 @@ impl ResultFiles {
                         message: a.message,
                         source: Level::ResultFiles,
                         subtest: false,
+                        passed_in_iteration: false,
                     });
                 }
             }

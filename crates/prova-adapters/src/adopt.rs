@@ -31,7 +31,19 @@ pub struct Proposal {
     /// the tests run.
     #[serde(default)]
     pub wrapped: bool,
+    /// A nextest suite and no `slow-timeout` in the project's nextest
+    /// config: `prova adopt --write` adds one (`NEXTEST_SLOW_CONFIG`), so
+    /// nextest names a hung test while it runs. Its libtest JSON gives a
+    /// test's start only with its result (issue #88).
+    #[serde(default)]
+    pub nextest_slow_timeout: bool,
 }
+
+/// `.config/nextest.toml` written by `prova adopt --write` when the project
+/// has none: nextest prints `SLOW [> 5.000s] <test>` every 5 s a test runs,
+/// which prova reads live as a slow test. A hung test is named after 5 s,
+/// not after nextest's default 60 s.
+pub const NEXTEST_SLOW_CONFIG: &str = "# Written by `prova adopt`: nextest prints SLOW for a test that runs longer than\n# the period, every period, so a hung test is named while it runs.\n[profile.default]\nslow-timeout = { period = \"5s\" }\n";
 
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
 /// with the format version pinned so a change upstream cannot silently
@@ -167,9 +179,9 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         out.push(Framework {
             language: "ts",
             base: "jest",
-            run: "npx jest --ci",
-            select: "npx jest --ci -t {filter}",
-            why: "jest in package.json; add jest-junit for per-test results".into(),
+            run: "npx jest --ci --verbose",
+            select: "npx jest --ci --verbose -t {filter}",
+            why: "jest in package.json; --verbose prints every test, which prova reads live (recognized)".into(),
         });
     }
     if root.join("pom.xml").exists() {
@@ -464,6 +476,13 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
             || read(root, "package.json").contains("gotestsum"),
         ..Proposal::default()
     };
+    p.nextest_slow_timeout = frameworks
+        .iter()
+        .any(|f| f.run.contains("cargo nextest run"))
+        && !read(root, ".config/nextest.toml").contains("slow-timeout");
+    if p.nextest_slow_timeout {
+        p.notes.push("nextest names a running test only when it finishes, unless it has a slow-timeout: `prova adopt --write` writes .config/nextest.toml with a 5 s period when the project has none (a hung test is then named after 5 s, not 60 s); with your own file, add `slow-timeout = { period = \"5s\" }` to its profile".into());
+    }
     match (frameworks.as_slice(), &existing) {
         ([], None) => p
             .notes
@@ -517,6 +536,10 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                 let run = match &existing {
                     Some(cmd) if f.base == "vitest" && cmd.starts_with("npm ") => {
                         format!("{cmd} -- --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\"")
+                    }
+                    // Jest prints a line per test only with --verbose.
+                    Some(cmd) if f.base == "jest" && cmd.starts_with("npm ") => {
+                        format!("{cmd} -- --verbose")
                     }
                     Some(cmd) => cmd.clone(),
                     None => f.run.into(),
@@ -818,6 +841,35 @@ mod tests {
         assert!(p.notes[0].contains("quiet"), "{:?}", p.notes);
     }
 
+    /// Issue #88: nextest's libtest JSON shows a test only with its result, so
+    /// a hung test is named by nextest's own SLOW line: adopt asks for a
+    /// short slow-timeout unless the project already sets one.
+    #[test]
+    fn a_nextest_suite_gets_a_short_slow_timeout() {
+        let d = dir("nextest-slow", &[("Cargo.toml", "[package]\nname = \"x\"")]);
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(p.nextest_slow_timeout);
+        assert!(
+            p.notes.iter().any(|n| n.contains("slow-timeout")),
+            "{:?}",
+            p.notes
+        );
+        let own = dir(
+            "nextest-slow-own",
+            &[
+                ("Cargo.toml", "[package]\nname = \"x\""),
+                (
+                    ".config/nextest.toml",
+                    "[profile.default]\nslow-timeout = \"30s\"\n",
+                ),
+            ],
+        );
+        let p = propose_with(&own, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(!p.nextest_slow_timeout);
+        let p = propose_with(&d, |_| None);
+        assert!(!p.nextest_slow_timeout);
+    }
+
     /// Round 9: nextest skips doctests; a failing doctest gave a clean pass.
     #[test]
     fn a_rust_library_runs_its_doctests_after_nextest() {
@@ -930,6 +982,37 @@ mod tests {
         assert!(
             t.contains("\ninject = [\"vitest-stream\"]") && t.contains("$PROVA_VITEST_REPORTER"),
             "{t}"
+        );
+    }
+
+    /// #92: Jest prints a line per test only with --verbose, which prova
+    /// reads live; the proposal asks for it, also behind `npm test`.
+    #[test]
+    fn jest_suite_runs_verbose() {
+        let p = propose(&dir(
+            "jest-verbose",
+            &[("package.json", r#"{"devDependencies":{"jest":"29"}}"#)],
+        ));
+        assert!(p.suites[0].run.contains("--verbose"), "{:?}", p.suites[0]);
+        assert!(
+            p.suites[0]
+                .select
+                .as_deref()
+                .is_some_and(|s| s.contains("--verbose")),
+            "{:?}",
+            p.suites[0]
+        );
+        let p = propose(&dir(
+            "jest-npm",
+            &[(
+                "package.json",
+                r#"{"scripts":{"test":"jest"},"devDependencies":{"jest":"29"}}"#,
+            )],
+        ));
+        assert_eq!(
+            p.suites[0].run, "npm test -- --verbose",
+            "{:?}",
+            p.suites[0]
         );
     }
 

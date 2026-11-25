@@ -278,6 +278,41 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
     Some(sorted[rank.min(sorted.len()) - 1])
 }
 
+/// The p95 of a test's recent passing durations, for the slow budget of a
+/// test that just started. `stats` answers the same and much more; that is
+/// too much to read once per test while a run records (issue 91). Only
+/// finished, remembered, verified runs count, as in `stats`. A test not yet
+/// recorded under this id is known by its name from other suites.
+pub fn usual_p95_ms(store: &Store, test_id: &str, display: &str) -> Result<Option<u64>> {
+    let read = |ids_sql: &str, key: &str| -> Result<Vec<u64>> {
+        let mut stmt = store.conn().prepare(&format!(
+            "SELECT a.duration_ms FROM attempts a JOIN runs r ON r.id = a.run_id
+              WHERE a.test_id IN ({ids_sql}) AND a.outcome = 'passed' AND a.duration_ms IS NOT NULL
+                AND r.status = 'finished'
+                AND r.id NOT IN (SELECT run_id FROM forgotten)
+                AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
+                                AND w.payload LIKE '%; no evidence about the tests%')
+                AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+              ORDER BY r.created_ms DESC LIMIT 20"
+        ))?;
+        let mut v: Vec<u64> = stmt
+            .query_map(params![key], |r| r.get::<_, i64>(0))?
+            .map(|d| d.map(|d| d.max(0) as u64))
+            .collect::<rusqlite::Result<_>>()?;
+        v.sort_unstable();
+        // Nothing but zeros: a framework that reports no time (round 17).
+        if v.iter().all(|d| *d == 0) {
+            v.clear();
+        }
+        Ok(v)
+    };
+    let mut ms = read("?1", test_id)?;
+    if ms.is_empty() {
+        ms = read("SELECT id FROM tests WHERE display = ?1", display)?;
+    }
+    Ok(percentile(&ms, 95.0))
+}
+
 /// Per-run results of a test, newest first, at most `limit` runs.
 /// One test's results, newest first, over every suite that ran it (ADR 0018).
 /// Results are the same test when their full names match and their files
@@ -341,7 +376,7 @@ fn test_runs_scoped(
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection'), a.test_id
+                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -362,6 +397,7 @@ fn test_runs_scoped(
             r.get::<_, String>(8)?,
             r.get::<_, Option<String>>(9)?,
             r.get::<_, String>(10)?,
+            r.get::<_, i64>(11)? != 0,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -381,7 +417,20 @@ fn test_runs_scoped(
     let mut ids: Vec<String> = Vec::new();
     let mut had_pass_run = false;
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection, row_test) = row?;
+        let (
+            run,
+            code,
+            created,
+            attempt,
+            outcome,
+            dur,
+            msg,
+            fp,
+            env,
+            selection,
+            row_test,
+            passed_in_iteration,
+        ) = row?;
         if let (Some(sel), Some(this)) = (&selection, &this)
             && leaf(sel).starts_with(&format!("{this}/"))
         {
@@ -403,7 +452,7 @@ fn test_runs_scoped(
                 let earlier_failed = last.outcome.is_failure();
                 last.attempts = attempt as u32;
                 last.passed_on_retry |= earlier_failed && outcome == Outcome::Passed;
-                had_pass_run |= last.outcome == Outcome::Passed;
+                had_pass_run |= last.outcome == Outcome::Passed || passed_in_iteration;
                 last.passed_and_failed = had_pass_run && outcome == Outcome::Failed;
                 last.outcome = outcome;
                 last.duration_ms = dur.map(|d| d as u64);
@@ -1182,6 +1231,11 @@ mod tests {
 
     /// A store with one finished run per `(code, [(key, outcome)])`.
     fn store_with(runs: &[(&str, Vec<(TestKey, Outcome)>)]) -> Store {
+        store_with_ms(runs, |_| 5)
+    }
+
+    /// `store_with`, the test of run `i` taking `ms(i)`.
+    fn store_with_ms(runs: &[(&str, Vec<(TestKey, Outcome)>)], ms: impl Fn(usize) -> u64) -> Store {
         use crate::model::{EVENT_VERSION, Event, EventKind, Status};
         let d = std::env::temp_dir().join(format!(
             "prova-analysis-{}-{}",
@@ -1224,10 +1278,11 @@ mod tests {
                         test: key.clone(),
                         attempt: 1,
                         outcome: *outcome,
-                        duration_ms: Some(5),
+                        duration_ms: Some(ms(i)),
                         message: None,
                         source: crate::model::Level::Recognized,
                         subtest: false,
+                        passed_in_iteration: false,
                     },
                 });
             }
@@ -1246,6 +1301,27 @@ mod tests {
             .unwrap();
         }
         s
+    }
+
+    /// Issue 91: the slow budget read the whole `stats` of each test as it
+    /// started; the lean query must give the same p95 (and none for zeros).
+    #[test]
+    fn the_slow_budget_p95_matches_the_stats_p95() {
+        let k = TestKey::new(vec!["example.com/calc".into()], "TestTiming");
+        let runs: Vec<_> = (0..8)
+            .map(|_| ("tree:a", vec![(k.clone(), Outcome::Passed)]))
+            .collect();
+        let s = store_with_ms(&runs, |i| 100 * (i as u64 + 1));
+        let id = crate::store::test_id("s", &k);
+        let full = stats(&s, &id, 20).unwrap().unwrap().p95_ms;
+        assert_eq!(full, Some(800));
+        assert_eq!(usual_p95_ms(&s, &id, &k.display()).unwrap(), full);
+        // A test never seen under this id is known by its name.
+        let other = crate::store::test_id("other", &k);
+        assert_eq!(usual_p95_ms(&s, &other, &k.display()).unwrap(), full);
+        // Zero durations are a framework that reports no time.
+        let z = store_with_ms(&runs, |_| 0);
+        assert_eq!(usual_p95_ms(&z, &id, &k.display()).unwrap(), None);
     }
 
     /// Round 17: `prova flaky` listed a Go test twice, once under the bare

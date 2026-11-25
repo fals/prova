@@ -1,0 +1,5 @@
+# prova's own suites read nextest's libtest JSON, which names a test only when
+# it finishes. A SLOW line every 5 s of a running test lets prova name a hung
+# test while it runs (issue #88) instead of after nextest's default 60 s.
+[profile.default]
+slow-timeout = { period = "5s" }

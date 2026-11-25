@@ -9,13 +9,21 @@ protocol has `--allow-network`. Each arm has its own build caches, and
 secret-named variables are not passed. Without bubblewrap, the verdict says
 the arms were not isolated.
 
+The oracle runs the candidate's own code, so it sees the checkout through a
+throwaway layer: what it writes there (a planted result file, a binary, a
+marker) is gone before the trials, and only its exit status and log count.
+Build in `--setup`, not in the oracle, if the trials need the output. Without
+bubblewrap, or where the system cannot do this, the `sandbox:` line says what
+the oracle wrote stayed.
+
 Trials run in ABBA order. Trials do not see `PROVA_HOME`.
 
 ## Checks on the verdict
 
 prova guards the verdict against:
 
-- changed tests and benchmarks;
+- changed tests and benchmarks, and the expected values and build scripts an
+  oracle reads (`testdata`, `fixtures`, snapshots, golden files, `build.rs`);
 - a skipped oracle;
 - forged extra metric lines;
 - leaked processes;
@@ -33,5 +41,7 @@ against its samples and warns if the record was changed.
 ## What it cannot judge
 
 Code that detects the oracle or the benchmark and behaves differently
-there, or that rewrites its own output in process. Read the candidate's
+there, or that rewrites its own output in process (code imported by the
+oracle's tests can print passing lines and exit 0: the same tests must pass
+as in the baseline's oracle, which a forger who read them can fake). Read the candidate's
 diff before reporting a win, large or not.

@@ -38,6 +38,17 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 const BUSY_TICKS: u64 = 10;
 const BUSY_WINDOW: Duration = Duration::from_secs(5);
 const GRACE: Duration = Duration::from_secs(3);
+
+/// When the process tree last used CPU, if it was busy over the window:
+/// `samples` are (sample time, CPU ticks since the previous sample) for the
+/// last `BUSY_WINDOW`. Busy is `BUSY_TICKS` or more in all; the time is that
+/// of the newest sample with any ticks.
+fn busy_since(samples: &VecDeque<(Instant, u64)>) -> Option<Instant> {
+    if samples.iter().map(|(_, d)| d).sum::<u64>() < BUSY_TICKS {
+        return None;
+    }
+    samples.iter().rev().find(|(_, d)| *d > 0).map(|(t, _)| *t)
+}
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 const TAIL_LINES: usize = 40;
 
@@ -583,28 +594,13 @@ impl Supervisor<'_> {
         let id = crate::store::test_id(&self.suite, test);
         // The history is shared across suites (ADR 0018): a test this suite
         // has not recorded yet may be known from another (round 9: 60 s
-        // default in `make` while `default` knew it takes 3 ms).
-        let known = match crate::analysis::stats(self.store, &id, 20) {
-            Ok(Some(s)) => Ok(Some(s)),
-            _ => {
-                let other: Option<String> = self
-                    .store
-                    .conn()
-                    .query_row(
-                        "SELECT id FROM tests WHERE display = ?1 LIMIT 1",
-                        rusqlite::params![test.display()],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                match other {
-                    Some(o) => crate::analysis::stats(self.store, &o, 20),
-                    None => Ok(None),
-                }
-            }
-        };
-        match known {
-            Ok(Some(s)) if s.p95_ms.is_some() => (
-                Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000)),
+        // default in `make` while `default` knew it takes 3 ms). Only the
+        // p95 is needed, and this runs once per test while recording: the
+        // full `stats` made a run with history cost milliseconds per test
+        // (issue 91).
+        match crate::analysis::usual_p95_ms(self.store, &id, &test.display()) {
+            Ok(Some(p95)) => (
+                Duration::from_millis((p95 * 3).max(1000)),
                 BudgetFrom::History,
             ),
             _ => (self.default_slow, BudgetFrom::Default),
@@ -1132,8 +1128,14 @@ fn observe_child(
             {
                 recent_ticks.pop_front();
             }
-            let busy = recent_ticks.iter().map(|(_, d)| d).sum::<u64>() >= BUSY_TICKS;
-            if busy || !s.pids.is_subset(&sample.pids) {
+            // The window decides whether the tree is busy at all; the time
+            // credited is that of the latest sample that used CPU, not
+            // `now`: CPU used 4 s ago is not activity now, and crediting it
+            // as such delayed a stall by the whole window (issue #89).
+            if let Some(at) = busy_since(&recent_ticks) {
+                last_activity = last_activity.max(at);
+            }
+            if !s.pids.is_subset(&sample.pids) {
                 last_activity = now;
             }
             sample = s;
@@ -1738,14 +1740,9 @@ fn observe_child(
                 "the command was killed (exit {}): a quarantine sets aside test failures, not a killed run",
                 exit_code.unwrap_or(0)
             ));
-        } else if let Some(why) = unaccounted_error(
-            store,
-            run,
-            &sup.distiller,
-            names,
-            &report.test_outputs,
-            &spec.command.display(),
-        )? {
+        } else if let Some(why) =
+            unaccounted_error(store, run, &sup.distiller, names, &report.test_outputs)?
+        {
             contradictions.push(why);
         }
     }
@@ -1902,7 +1899,7 @@ fn observe_child(
             .iter()
             .copied()
             .filter(|d| {
-                !quarantine.contains_key(*d)
+                !crate::quarantine::names_test(&quarantine, d)
                     && crate::quarantine::covers(&quarantine, d)
                         .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
             })
@@ -2008,6 +2005,7 @@ fn observe_child(
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
             subtest: false,
+            passed_in_iteration: false,
         };
         sup.pending.push(Event {
             v: EVENT_VERSION,
@@ -2448,9 +2446,8 @@ fn printed_names(display: &str) -> Vec<String> {
 
 /// A test runner's own summary of failing tests that says nothing more
 /// than the failures seen: counts of failures with no error, the bare
-/// `FAIL` lines, a package's result, Maven's and make's wrap-up of a
-/// failed test step.
-fn summary_of_failures(t: &str, command: &str) -> bool {
+/// `FAIL` lines, a package's result, Maven's wrap-up of a failed test step.
+fn summary_of_failures(t: &str) -> bool {
     let lower = t.to_lowercase();
     let no_errors =
         !lower.contains("error") || lower.contains("errors: 0") || lower.contains(" 0 error");
@@ -2516,37 +2513,6 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
                 && (r.contains("surefire") || r.contains("failsafe"))
                 && r.contains("There are test failures"));
     }
-    // make's line for the target the suite runs (`make test`).
-    if let Some(rest) = t
-        .strip_prefix("make: *** [")
-        .or_else(|| t.split_once("]: *** [").map(|(_, r)| r))
-        && let Some((target, _)) = rest.split_once(']')
-    {
-        let target = target.rsplit(':').next().unwrap_or(target).trim();
-        return !target.is_empty() && make_names_target(command, target);
-    }
-    false
-}
-
-/// Whether `command` runs `make` with `target` among its goals: a word
-/// after a `make` word, up to the end of that command (`;`, `&&`, `|`).
-/// A word of a script that merely spells the target (a `case` pattern
-/// `lint)`) is not the suite running it.
-fn make_names_target(command: &str, target: &str) -> bool {
-    let mut in_make = false;
-    for word in command.split_whitespace() {
-        let w = word.trim_matches(['"', '\'', '(', ')']);
-        let ends = w.ends_with([';', '&', '|']) || matches!(w, "&&" | "||" | "|");
-        let w = w.trim_matches([';', '&', '|']);
-        if in_make && !w.starts_with('-') && w == target {
-            return true;
-        }
-        if w == "make" || w.ends_with("/make") {
-            in_make = true;
-        } else if ends {
-            in_make = false;
-        }
-    }
     false
 }
 
@@ -2561,7 +2527,6 @@ fn unaccounted_error(
     distiller: &crate::output::Distiller,
     quarantined: &[String],
     outputs: &[(TestKey, String)],
-    command: &str,
 ) -> Result<Option<String>> {
     let (lines, overflow) = distiller.error_lines();
     if overflow {
@@ -2588,10 +2553,7 @@ fn unaccounted_error(
     // printed after it (a linter, a smoke check, a coverage gate) failed or
     // passed in words prova cannot tell from the quarantined failure.
     let (after, after_overflow) = distiller.after_summary();
-    if let Some((n, line)) = after
-        .iter()
-        .find(|(_, l)| !wrapper_line(l, command, &names))
-    {
+    if let Some((n, line)) = after.iter().find(|(_, l)| !wrapper_line(l, &names)) {
         return Ok(Some(format!(
             "the command printed more after the tests' summary (line {n}: {}): another step ran, and its result cannot be told apart from the quarantined failure",
             line.chars().take(160).collect::<String>()
@@ -2651,11 +2613,7 @@ fn unaccounted_error(
         let own_event = libtest_event_of(t, quarantined);
         let accounted = !gate
             && !rerun_again
-            && (in_own_section
-                || by_name
-                || own_line
-                || own_event
-                || summary_of_failures(t, command));
+            && (in_own_section || by_name || own_line || own_event || summary_of_failures(t));
         (!accounted).then(|| {
             format!(
                 "the output shows an error outside the quarantined test(s) (line {n}): {}",
@@ -2795,15 +2753,12 @@ fn failed_count(line: &str) -> Option<u64> {
 }
 
 /// A line after the runner's summary that belongs to the test command's own
-/// wrap-up: the runner's summary of failures, make's line for the suite's
-/// target, a runner's timing lines, npm's report of its test script, a line
+/// wrap-up: the runner's summary of failures, a runner's timing lines, npm's report of its test script, a line
 /// of the quarantined test's own (without a crash).
-fn wrapper_line(t: &str, command: &str, names: &[String]) -> bool {
+fn wrapper_line(t: &str, names: &[String]) -> bool {
     let t = t.trim();
     let info = t.strip_prefix("[INFO]").map(str::trim);
-    summary_of_failures(t, command)
-        || (t.starts_with("make")
-            && (t.contains("Entering directory") || t.contains("Leaving directory")))
+    summary_of_failures(t)
         || t.starts_with("Start at ")
         || t.starts_with("Duration ")
         || t.starts_with("Snapshots:")
@@ -3649,18 +3604,28 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         let quiet = row.status == Status::Finished
             && framework.is_some_and(|(t, _)| t > 0)
             && !finals.values().any(|f| f.1 == Outcome::Passed);
-        for (name, q) in &quarantine {
+        for q in quarantine.values() {
+            let name = &q.test;
             // A quarantined subtest is listed by its own result (round 14:
             // "not run" for a subtest that ran and failed).
             let result = finals
                 .values()
-                .filter(|f| f.0.display() == *name)
+                .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
-                .next();
+                .next()
+                // A test of that name whose directory could not be told is
+                // not set aside: say what it did (round 17 follow-up: it
+                // read "not seen").
+                .or_else(|| {
+                    finals
+                        .values()
+                        .find(|f| f.0.display() == *name && f.0.place_unknown())
+                        .map(|f| format!("{} in an unknown directory: not set aside", f.1.as_str()))
+                });
             // A selection that did not include it says nothing of it
             // (round 15: "not run" on every --select run).
             if (live || selection.is_some()) && result.is_none() {
@@ -4131,21 +4096,6 @@ mod quarantine_tests {
     use super::*;
     use crate::quarantine::Entry;
 
-    /// Round 16: make's line for a target is the runner's own only when the
-    /// suite's command runs that target, not when a script spells the word.
-    #[test]
-    fn make_failing_a_target_the_command_runs_is_a_summary_and_no_other_is() {
-        let line = "make: *** [Makefile:2: test] Error 2";
-        let lint = "make: *** [Makefile:5: lint] Error 1";
-        let script = "sh -c : make test; case $s in lint) echo x ;; esac";
-        assert!(summary_of_failures(line, script));
-        assert!(!summary_of_failures(lint, script));
-        assert!(summary_of_failures(lint, "make test lint"));
-        assert!(summary_of_failures(line, "make -C sub test && echo done"));
-        assert!(!summary_of_failures(lint, "make test && lint"));
-        assert!(!summary_of_failures(lint, "make test; lint"));
-    }
-
     /// Round 16: wrap-up lines after a runner's summary, and counts.
     #[test]
     fn only_the_commands_own_wrap_up_may_follow_the_summary() {
@@ -4154,21 +4104,19 @@ mod quarantine_tests {
             "error: test run failed",
             "error: 1 target failed:",
             "`--lib`",
-            "make[1]: Leaving directory '/w'",
             "Start at  20:41:15",
             "npm error Lifecycle script `test` failed",
             "FAIL [   0.004s] (4/5) calc tests::flaky",
         ] {
-            assert!(wrapper_line(t, "make test", &names), "{t}");
+            assert!(wrapper_line(t, &names), "{t}");
         }
         for t in [
             "smoke: GET /health returned 503",
             "Found 1 error.",
             "error: 2 targets failed:",
             "Segmentation fault (core dumped) ./bin/tests::flaky",
-            "make[1]: *** [Makefile:6: lint] Error 1",
         ] {
-            assert!(!wrapper_line(t, "make test", &names), "{t}");
+            assert!(!wrapper_line(t, &names), "{t}");
         }
         assert_eq!(
             failed_count("Test Suites: 2 failed, 1 passed, 3 total"),
@@ -4188,14 +4136,14 @@ mod quarantine_tests {
             "[ERROR] Failures: ",
             "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0",
         ] {
-            assert!(summary_of_failures(t, "mvn test"), "{t}");
+            assert!(summary_of_failures(t), "{t}");
         }
         for t in [
             "[ERROR] See you at /w/src/Other.java:[3,5] ';' expected",
             "[ERROR] COMPILATION ERROR :",
             "[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 0",
         ] {
-            assert!(!summary_of_failures(t, "mvn test"), "{t}");
+            assert!(!summary_of_failures(t), "{t}");
         }
     }
 
@@ -4494,5 +4442,25 @@ mod selection_tests {
             "src/a.test.js::math > ops > adds"
         ));
         assert!(in_selection("m::TestTable", "m::TestTable/x"));
+    }
+
+    /// Issue #89: busy over the window, but the CPU was used earlier in it.
+    #[test]
+    fn busy_credits_the_last_cpu_use_not_now() {
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut w: VecDeque<(Instant, u64)> = VecDeque::new();
+        w.push_back((at(500), 30));
+        w.push_back((at(1000), 0));
+        w.push_back((at(1500), 0));
+        w.push_back((at(4000), 0));
+        assert_eq!(super::busy_since(&w), Some(at(500)));
+        // A few stray ticks are no activity (an idle runtime).
+        let mut idle: VecDeque<(Instant, u64)> = VecDeque::new();
+        idle.push_back((at(500), 1));
+        idle.push_back((at(1000), 1));
+        assert_eq!(super::busy_since(&idle), None);
     }
 }
