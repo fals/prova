@@ -859,8 +859,7 @@ impl Recognizers {
 
     /// Failures the framework reported (structured streams win over text).
     pub fn failed_reported(&self) -> u64 {
-        self.structured_failed
-            .unwrap_or(
+        self.structured_failed.unwrap_or(
             self.reported_failed
                 .saturating_sub(self.go_recovered)
                 .saturating_sub(self.teardown_doubles().0),
@@ -1695,7 +1694,11 @@ impl Recognizers {
         };
         // A teardown error on a passed call: the one test errored.
         if when == "teardown" {
-            if self.pytest_call_pass.as_ref().is_some_and(|(h, _, _)| h == id) {
+            if self
+                .pytest_call_pass
+                .as_ref()
+                .is_some_and(|(h, _, _)| h == id)
+            {
                 self.pytest_doubles.entry(key.unique()).or_insert(false);
             }
             self.pytest_call_pass = None;
@@ -2768,8 +2771,10 @@ impl Recognizers {
 
     /// Tests the framework says it ran.
     pub fn total(&self) -> u64 {
-        self.structured_total
-            .unwrap_or(self.reported_total.saturating_sub(self.pytest_doubles.len() as u64))
+        self.structured_total.unwrap_or(
+            self.reported_total
+                .saturating_sub(self.pytest_doubles.len() as u64),
+        )
     }
 
     // ------------------------------------------------------------- nextest
