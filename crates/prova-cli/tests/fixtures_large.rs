@@ -671,6 +671,161 @@ fn go_lean_spec_experiment() {
     );
 }
 
+/// Round 18 (python MAJOR 4 and 5): a pytest node id, and a parametrized case
+/// whose id has a space and a `$`, selected through the adopted `./dev`
+/// wrapper run exactly that one test. Large: a real pytest in the language
+/// image behind a real container wrapper; a fake `./dev` cannot show that the
+/// id reaches pytest as one word (small and medium tests cover the template).
+#[test]
+#[ignore = "large: needs docker"]
+fn python_select_node_id_through_a_wrapper() {
+    let tag = image("python");
+    let d = copy_fixture_as("python-make", "python-make-select");
+    std::fs::write(
+        d.join("tests/test_params.py"),
+        "import pytest\nfrom calc import add\n\n\n\
+         @pytest.mark.parametrize(\"label,a,b,want\", [\n    (\"two plus $two\", 2, 2, 4),\n    (\"neg one\", -1, 1, 0),\n])\n\
+         def test_add_cases(label, a, b, want):\n    assert add(a, b) == want\n\n\n\
+         class TestCls:\n    def test_m(self):\n        assert add(1, 1) == 2\n",
+    )
+    .unwrap();
+    let name = format!("prova-large-select-{}", std::process::id());
+    let dev = d.join("dev");
+    std::fs::write(
+        &dev,
+        format!(
+            "#!/bin/sh\nexec docker run --rm --name {name} --user \"$(id -u):$(id -g)\" -e HOME=/tmp \
+             -e PYTEST_ADDOPTS -v \"$PWD\":/w -w /w {tag} sh -c \"$*\"\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let check = || {
+        // An earlier ad-hoc run through the wrapper: adopt learns it.
+        host(
+            &d,
+            &["run", "--json", "--", "./dev", "python3 -m pytest -q"],
+            &[],
+        );
+        let o = host(&d, &["adopt", "--write"], &[]);
+        assert!(
+            o.status.success(),
+            "adopt: {}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        for (select, want) in [
+            // A method of a class, by prova's own name for it (review: the
+            // class must not become a path).
+            (
+                "tests.test_params.TestCls::test_m",
+                "tests/test_params.py::TestCls::test_m",
+            ),
+            (
+                "tests/test_calc.py::test_add",
+                "tests/test_calc.py::test_add",
+            ),
+            (
+                "tests/test_params.py::test_add_cases[two plus $two-2-2-4]",
+                "test_add_cases[two plus $two-2-2-4]",
+            ),
+        ] {
+            let s = json_last_line(&host(
+                &d,
+                &["run", "default", "--select", select, "--json"],
+                &[],
+            ));
+            assert_eq!(s["outcome"], "passed", "{select}: {s}");
+            assert_eq!(
+                (
+                    s["counts"]["passed"].as_u64(),
+                    s["counts"]["failed"].as_u64()
+                ),
+                (Some(1), Some(0)),
+                "exactly one test ran for {select} ({want}): {s}"
+            );
+            assert_eq!(s["selection"], select, "{s}");
+        }
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
+    let _ = docker(&["rm", "-f", &name]);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Round 18 (rust BLOCKER B1): the suite `prova adopt` proposes for a Cargo
+/// workspace runs the doctests of every member; one failing doctest fails
+/// it. Large: a real cargo (and cargo-nextest) building a real two-crate
+/// workspace.
+#[test]
+#[ignore = "large: needs cargo and cargo-nextest, compiles a workspace"]
+fn rust_workspace_doctest_failure_fails_the_adopted_suite() {
+    let d = std::env::temp_dir().join(format!("prova-large-rust-ws-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    for (member, name, doc, tests) in [("a", "one", 1, 1), ("b", "two", 3, 2)] {
+        std::fs::create_dir_all(d.join(member).join("src")).unwrap();
+        std::fs::write(
+            d.join(member).join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+        // Member b's doctest asserts 3 for a function that returns 2.
+        std::fs::write(
+            d.join(member).join("src/lib.rs"),
+            format!(
+                "/// ```\n/// assert_eq!({member}::{name}(), {doc});\n/// ```\npub fn {name}() -> i32 {{\n    {tests}\n}}\n\n\
+                 #[cfg(test)]\nmod tests {{\n    #[test]\n    fn it_is_{name}() {{\n        assert_eq!(super::{name}(), {tests});\n    }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        d.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    let check = || {
+        let o = host(&d, &["adopt", "--write"], &[]);
+        assert!(
+            o.status.success(),
+            "adopt: {}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        // Without this the failure below could come from anywhere.
+        let toml = std::fs::read_to_string(d.join("prova.toml")).unwrap();
+        assert!(
+            toml.contains("--doc --workspace"),
+            "the adopted run has a doctest step:\n{toml}"
+        );
+        let s = json_last_line(&host(&d, &["run", "default", "--json"], &[]));
+        assert_eq!(
+            s["outcome"], "failed",
+            "doctest failure must fail the suite: {s}"
+        );
+        let failing: Vec<&str> = s["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["test"].as_str().unwrap())
+            .collect();
+        assert!(
+            failing.iter().any(|t| t.contains("b/src/lib.rs")),
+            "member b's doctest is named: {failing:?}"
+        );
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(home_of(&d));
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
 /// Isolated prova home for a test workspace, outside it (ADR 0014).
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))

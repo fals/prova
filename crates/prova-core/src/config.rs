@@ -141,9 +141,34 @@ pub enum CommandSpec {
 }
 
 impl CommandSpec {
-    pub fn display(&self) -> String {
+    /// The command's words joined by spaces, unquoted: what code that reads
+    /// the command line (container clients, `cd` targets, filter syntax)
+    /// parses. `display` is for printing.
+    pub fn raw(&self) -> String {
         match self {
             CommandSpec::Argv(a) => a.join(" "),
+            CommandSpec::Shell(s) => s.clone(),
+        }
+    }
+
+    pub fn display(&self) -> String {
+        match self {
+            // Quoted as a shell would need it, so the line can be pasted
+            // back (round 18).
+            CommandSpec::Argv(a) => a
+                .iter()
+                .map(|w| {
+                    let plain = !w.is_empty()
+                        && w.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "_./=:,@%+-".contains(c));
+                    if plain {
+                        w.clone()
+                    } else {
+                        shell_single_quote(w)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
             CommandSpec::Shell(s) => s.clone(),
         }
     }
@@ -299,17 +324,138 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
     } else if command.contains("FullyQualifiedName") {
         format!("{head}.{}", method(leaf))
     } else if command.contains(" -k ") {
-        // pytest -k: the test's own name; a parameter id with spaces
-        // cannot be one `-k` word, so its test function selects (all of
-        // its cases run).
-        if leaf.contains(char::is_whitespace) {
-            method(leaf)
+        // pytest -k: the test's own name; a class (`TestCls::test_a`) is not
+        // part of a `-k` word, and a parameter id (spaces, brackets) cannot
+        // be one, so its test function selects (the node id, when it
+        // resolves, narrows it to the case).
+        // A parameter id that is one `-k` identifier (no space, `$`, `=`...)
+        // stays as it was.
+        let cut = leaf.find('[').unwrap_or(leaf.len());
+        let func = leaf[..cut].rsplit("::").next().unwrap_or(leaf);
+        let named = if cut < leaf.len() {
+            format!("{func}{}", &leaf[cut..])
         } else {
-            leaf.to_owned()
-        }
+            func.to_owned()
+        };
+        let k_word = |w: &str| {
+            w.chars()
+                .all(|c| c.is_alphanumeric() || "_:+-.[]\\/".contains(c))
+        };
+        if k_word(&named) { named } else { method(func) }
     } else {
         filter.to_owned()
     }
+}
+
+/// The directory pytest runs in: the last `cd` target of the command that
+/// exists below `cwd`, else `cwd`. None when the command moves somewhere
+/// that is not there (inside a container, say): no file can be resolved.
+fn pytest_dir(command: &str, cwd: &Path) -> Option<PathBuf> {
+    match cd_targets(command).last() {
+        None => Some(cwd.to_owned()),
+        Some(t) => {
+            let d = cwd.join(t);
+            d.is_dir().then_some(d)
+        }
+    }
+}
+
+/// Whether the node id would reach pytest as unquoted words behind a
+/// wrapper (`./dev python3 -m pytest -k ... ${PROVA_NODE:+...}`): the
+/// wrapper's `sh -c "$*"` splits it again, so a node with a space, `$`, a
+/// quote, a parenthesis or a backslash breaks. Quoted-argument templates
+/// (`$PROVA_NODE_Q`) and a command that starts with the runner itself
+/// (`pytest`, `py.test`, `python -m pytest`) are safe.
+fn unquoted_through_a_wrapper(command: &str) -> bool {
+    if command.contains("PROVA_NODE_Q") {
+        return false;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let first = words.first().copied().unwrap_or("");
+    let program = first.rsplit('/').next().unwrap_or(first);
+    // `python -m pytest` is the runner; another Python script is a wrapper
+    // that may join its arguments into a shell string.
+    let python_m_pytest = program.starts_with("python")
+        && words.get(1) == Some(&"-m")
+        && words.get(2) == Some(&"pytest");
+    !(program == "pytest" || program == "py.test" || python_m_pytest)
+}
+
+/// The node id pytest takes positionally for a selection that names one
+/// test or case, if a real file resolves for it: a node id as given
+/// (`tests/test_calc.py::test_add[2-3]`), or prova's name
+/// (`tests.test_calc.TestCalc::test_add[2-3]`) with the longest dotted
+/// prefix that is a `.py` file turned into its path and the rest
+/// `::`-joined (`tests/test_calc.py::TestCalc::test_add[2-3]`). None for a
+/// plain substring, for a command that does not run pytest, and when no
+/// file resolves: the `-k` form is then all that is used.
+pub fn pytest_node(command: &str, filter: &str, cwd: &Path) -> Option<String> {
+    if !command.contains("pytest") {
+        return None;
+    }
+    let (head, rest) = filter.split_once("::")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let dir = pytest_dir(command, cwd)?;
+    if unquoted_through_a_wrapper(command)
+        && filter.contains(|c: char| c.is_whitespace() || "\\'\"$()".contains(c))
+    {
+        return None;
+    }
+    if head.ends_with(".py") {
+        return dir.join(head).is_file().then(|| filter.to_owned());
+    }
+    if head.is_empty()
+        || !head
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let parts: Vec<&str> = head.split('.').collect();
+    (1..=parts.len()).rev().find_map(|n| {
+        let path = format!("{}.py", parts[..n].join("/"));
+        dir.join(&path).is_file().then(|| {
+            let classes: String = parts[n..].iter().map(|c| format!("::{c}")).collect();
+            format!("{path}{classes}::{rest}")
+        })
+    })
+}
+
+/// prova's name for a pytest node id (`tests/test_calc.py::TestCalc::test_add`
+/// is `tests.test_calc.TestCalc::test_add`); anything else unchanged.
+pub fn pytest_prova_name(filter: &str) -> String {
+    let Some((head, rest)) = filter.split_once("::") else {
+        return filter.to_owned();
+    };
+    if !head.ends_with(".py") {
+        return filter.to_owned();
+    }
+    let cut = rest.find('[').unwrap_or(rest.len());
+    let (path, param) = rest.split_at(cut);
+    let mut names: Vec<&str> = path.split("::").collect();
+    let func = names.pop().unwrap_or("");
+    let mut module = head.trim_end_matches(".py").replace('/', ".");
+    for c in names {
+        module.push('.');
+        module.push_str(c);
+    }
+    format!("{module}::{func}{param}")
+}
+
+/// The words after `cd` or `pushd` in a command line: where it may move.
+pub fn cd_targets(command: &str) -> Vec<String> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .map(|w| w.trim_matches(['"', '\'']))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| matches!(w[0], "cd" | "pushd"))
+        .map(|w| w[1].to_owned())
+        .collect()
 }
 
 /// A source file extension that makes the text before `::` a file.
@@ -379,6 +525,17 @@ fn fill_filter(template: &str) -> String {
     let (mut single, mut double, mut escaped) = (false, false, false);
     let mut rest = template;
     while let Some(c) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix("{node}") {
+            // Nothing when unset: no empty argument reaches the command.
+            out.push_str(if double {
+                "$PROVA_NODE_Q"
+            } else {
+                "${PROVA_NODE:+\"$PROVA_NODE\"}"
+            });
+            rest = after;
+            escaped = false;
+            continue;
+        }
         if let Some(after) = rest.strip_prefix("{filter}") {
             out.push_str(if double {
                 "$PROVA_FILTER_Q"
@@ -445,7 +602,19 @@ impl Config {
                             .unwrap_or_default(),
                     )
                 })?;
-                fill_filter(template)
+                // A pytest node id also goes to pytest as its own argument
+                // (`{node}`, empty unless a real file resolves): `-k` alone
+                // rejects `::` and `[..]` ids or matches loosely (round 18).
+                // `-k` stays, so a template with paths of its own keeps
+                // selecting by name.
+                if f.contains("::")
+                    && template.contains("pytest")
+                    && template.contains("-k {filter}")
+                {
+                    fill_filter(&template.replace("-k {filter}", "-k {filter} {node}"))
+                } else {
+                    fill_filter(template)
+                }
             }
         };
         let default_stall = s.size.map(Size::stall_after).unwrap_or(DEFAULT_STALL_AFTER);
@@ -704,6 +873,209 @@ mod tests {
             c.run_spec("nope", None),
             Err(ConfigError::UnknownSuite(..))
         ));
+    }
+
+    /// Round 18: `./dev "cd sub2 && python -m pytest -q"` was shown without
+    /// its quotes, so it could not be pasted back.
+    #[test]
+    fn an_argv_command_is_shown_shell_quoted() {
+        let c = CommandSpec::Argv(vec![
+            "./dev".into(),
+            "cd sub2 && python -m pytest -q".into(),
+            "it's".into(),
+            "-k".into(),
+            "a=b".into(),
+        ]);
+        assert_eq!(
+            c.display(),
+            r"./dev 'cd sub2 && python -m pytest -q' 'it'\''s' -k a=b"
+        );
+        let plain = CommandSpec::Argv(vec!["make".into(), "test".into()]);
+        assert_eq!(plain.display(), "make test");
+    }
+
+    fn pytest_tree(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("prova-node-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in [
+            "tests/test_calc.py",
+            "tests/test_x.py",
+            "sub/tests/test_s.py",
+        ] {
+            std::fs::create_dir_all(d.join(f).parent().unwrap()).unwrap();
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        d
+    }
+
+    /// Round 18: a node id or a parametrized case went to `-k`.
+    #[test]
+    fn a_pytest_node_id_is_also_passed_positionally_when_a_file_resolves() {
+        let c: Config = toml::from_str(
+            r#"
+            [suite.p]
+            run = "python3 -m pytest -v"
+            select = "python3 -m pytest -v -rfE -k {filter}"
+            [suite.w]
+            run = "./dev x"
+            select = "./dev \"python3 -m pytest -v -k {filter}\""
+            [suite.paths]
+            run = "pytest tests/"
+            select = "pytest tests/ -k {filter}"
+            [suite.tox]
+            run = "tox"
+            select = "tox -k {filter}"
+            "#,
+        )
+        .unwrap();
+        let cmd = |s: &str, f: &str| match c.run_spec(s, Some(f)).unwrap().command {
+            CommandSpec::Shell(x) => x,
+            _ => unreachable!(),
+        };
+        // `-k` stays; `{node}` adds the node id when one resolves.
+        assert_eq!(
+            cmd("p", "tests/test_calc.py::test_add"),
+            "python3 -m pytest -v -rfE -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}"
+        );
+        assert_eq!(
+            cmd("w", "tests.test_calc::test_add"),
+            "./dev \"python3 -m pytest -v -k $PROVA_FILTER_Q $PROVA_NODE_Q\""
+        );
+        // A plain substring, and a command that is not pytest, are untouched.
+        assert_eq!(
+            cmd("p", "test_add"),
+            "python3 -m pytest -v -rfE -k \"$PROVA_FILTER\""
+        );
+        assert_eq!(cmd("tox", "a::b"), "tox -k \"$PROVA_FILTER\"");
+        // A template with paths of its own keeps selecting by `-k`.
+        assert!(cmd("paths", "tests/test_calc.py::test_add").starts_with("pytest tests/ -k "));
+        // `-k` takes the function's name: no class, no parameter id.
+        let k = "python3 -m pytest -k \"$PROVA_FILTER\"";
+        for (sel, want) in [
+            ("tests.test_x.TestCls::test_a", "test_a"),
+            ("tests/test_x.py::TestCls::test_a", "test_a"),
+            (
+                "tests.test_params::test_add_cases[two plus $two-2-2-4]",
+                "test_add_cases",
+            ),
+            ("tests/test_p.py::TestCls::test_c[1-2]", "test_c[1-2]"),
+            ("tests.test_calc::test_add", "test_add"),
+        ] {
+            assert_eq!(super::framework_filter(k, sel), want, "{sel}");
+        }
+    }
+
+    #[test]
+    fn a_pytest_node_resolves_only_to_a_file_that_exists() {
+        let d = pytest_tree("resolve");
+        let node = |cmd: &str, f: &str| super::pytest_node(cmd, f, &d);
+        let py = "python3 -m pytest -k x";
+        assert_eq!(
+            node(py, "tests/test_calc.py::test_add").as_deref(),
+            Some("tests/test_calc.py::test_add")
+        );
+        assert_eq!(node(py, "tests/gone.py::test_add"), None);
+        // prova's name for a method of a class: the file is the longest
+        // dotted prefix that exists, the rest joins with `::`.
+        assert_eq!(
+            node(py, "tests.test_x.TestCls::test_a").as_deref(),
+            Some("tests/test_x.py::TestCls::test_a")
+        );
+        assert_eq!(
+            node(py, "tests.test_calc::test_add[a b-1]").as_deref(),
+            Some("tests/test_calc.py::test_add[a b-1]")
+        );
+        assert_eq!(node(py, "tests.gone.TestCls::test_a"), None);
+        assert_eq!(node("tox -k x", "tests/test_calc.py::test_add"), None);
+        // From a `cd` target: pytest's own directory.
+        let cd = "cd sub && python3 -m pytest -k x";
+        assert_eq!(
+            node(cd, "tests.test_s::t").as_deref(),
+            Some("tests/test_s.py::t")
+        );
+        assert_eq!(node(cd, "tests.test_calc::test_add"), None);
+        // A `cd` somewhere that is not here (a container): nothing resolves.
+        assert_eq!(
+            node("cd /nowhere && pytest", "tests.test_calc::test_add"),
+            None
+        );
+        // And back: pytest's node id is prova's name.
+        assert_eq!(
+            super::pytest_prova_name("tests/test_x.py::TestCls::test_a"),
+            "tests.test_x.TestCls::test_a"
+        );
+        assert_eq!(
+            super::pytest_prova_name("tests/test_calc.py::test_add[a::b]"),
+            "tests.test_calc::test_add[a::b]"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Round 18 review: code that reads the command line gets the words, not
+    /// the quoted display.
+    /// Round 18 review: behind an unquoted wrapper (`./dev` runs `sh -c
+    /// "$*"`) a node id with a space or `$` would be split again.
+    #[test]
+    fn a_node_id_that_a_wrapper_would_split_is_not_passed() {
+        let d = pytest_tree("wrapsplit");
+        let unq = "./dev python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        let q = "./dev \"python3 -m pytest -k $PROVA_FILTER_Q $PROVA_NODE_Q\"";
+        let direct = "python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        // A Python script that is not pytest may join its argv into a shell
+        // string: no exemption for it (review of PR 113).
+        let script = "python3 ./dev.py pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        for bad in [
+            "tests/test_calc.py::test_add[two plus-1]",
+            "tests/test_calc.py::test_add[$two]",
+            "tests/test_calc.py::test_add[f(x)]",
+            "tests/test_calc.py::test_add[it's]",
+            "tests/test_calc.py::test_add[a\\b]",
+        ] {
+            assert_eq!(super::pytest_node(unq, bad, &d), None, "{bad}");
+            assert_eq!(super::pytest_node(script, bad, &d), None, "{bad}");
+            assert_eq!(
+                super::pytest_node(q, bad, &d).as_deref(),
+                Some(bad),
+                "{bad}"
+            );
+            assert_eq!(
+                super::pytest_node(direct, bad, &d).as_deref(),
+                Some(bad),
+                "{bad}"
+            );
+        }
+        let ok = "tests/test_calc.py::test_add[2-3]";
+        assert_eq!(super::pytest_node(unq, ok, &d).as_deref(), Some(ok));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_raw_command_is_the_words_not_the_shell_quoted_display() {
+        let go = CommandSpec::Argv(vec![
+            "go".into(),
+            "test".into(),
+            "-run=^TestDiv$".into(),
+            "-json".into(),
+        ]);
+        assert_eq!(go.raw(), "go test -run=^TestDiv$ -json");
+        // The display quotes `-run=^TestDiv$`: ` -run=` is no longer found.
+        assert!(!go.display().contains(" -run="), "{}", go.display());
+        assert_eq!(
+            super::framework_filter(&go.raw(), "calc::TestAdd"),
+            "^TestAdd$"
+        );
+        // A word with a space or a quote: the words stay as they are.
+        let it = CommandSpec::Argv(vec![
+            "docker".into(),
+            "exec".into(),
+            "it's a ctr".into(),
+            "pytest".into(),
+        ]);
+        assert_eq!(it.raw(), "docker exec it's a ctr pytest");
+        assert_eq!(
+            crate::resources::container_client(&it.raw()),
+            Some("docker")
+        );
     }
 
     #[test]

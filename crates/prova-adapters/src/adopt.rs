@@ -52,6 +52,8 @@ const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest ru
 /// nextest does not run doctests (round 9: a failing doctest gave a clean
 /// PASS while `make test` failed): a crate with a library runs them after.
 const NEXTEST_JSON_DOC: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc || exit 1; exit $s";
+/// The same for a workspace: every member's doctests.
+const NEXTEST_JSON_DOC_WORKSPACE: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc --workspace || exit 1; exit $s";
 const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}";
 
 /// `cargo nextest --version` output, if nextest is installed.
@@ -107,6 +109,52 @@ fn any_file_with_ext(root: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the directory holds a library whose doctests run: `src/lib.rs`,
+/// and no `doctest = false` in its manifest.
+fn doctested_library(dir: &Path) -> bool {
+    dir.join("src/lib.rs").exists()
+        && !read(dir, "Cargo.toml")
+            .lines()
+            .any(|l| l.split_whitespace().collect::<String>() == "doctest=false")
+}
+
+/// Whether the Cargo project has a library to doctest, and whether it is a
+/// workspace: a package with `src/lib.rs`, or a workspace one of whose
+/// members has it (the `members` key as written, not `default-members`, or
+/// a `dir/*` glob). A library with `doctest = false` has none to run.
+fn rust_libraries(root: &Path) -> (bool, bool) {
+    let manifest = read(root, "Cargo.toml");
+    let workspace = manifest.lines().any(|l| l.trim() == "[workspace]");
+    let mut lib = doctested_library(root);
+    if !workspace {
+        return (lib, false);
+    }
+    let members = manifest
+        .lines()
+        .position(|l| {
+            l.trim_start()
+                .strip_prefix("members")
+                .is_some_and(|r| r.trim_start().starts_with('='))
+        })
+        .map(|i| manifest.lines().skip(i).collect::<Vec<_>>().join("\n"))
+        .and_then(|rest| {
+            rest.split_once('[')
+                .and_then(|(_, r)| r.split_once(']').map(|(l, _)| l.to_owned()))
+        })
+        .unwrap_or_default();
+    for m in members.split('"').skip(1).step_by(2) {
+        match m.strip_suffix("/*") {
+            Some(d) => {
+                if let Ok(entries) = std::fs::read_dir(root.join(d)) {
+                    lib |= entries.flatten().any(|e| doctested_library(&e.path()));
+                }
+            }
+            None => lib |= doctested_library(&root.join(m)),
+        }
+    }
+    (lib, true)
+}
+
 /// Installed tool versions `prova adopt` asks about (replaced in tests).
 type Probe = fn(&Path) -> Option<String>;
 
@@ -116,11 +164,15 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         let nextest = nextest(root);
         out.push(match nextest.as_deref().filter(|v| nextest_has_libtest_json(v)) {
             Some(v) => {
-                let lib = root.join("src/lib.rs").exists();
+                let (lib, workspace) = rust_libraries(root);
                 Framework {
                     language: "rust",
                     base: "cargo test",
-                    run: if lib { NEXTEST_JSON_DOC } else { NEXTEST_JSON },
+                    run: match (lib, workspace) {
+                        (false, _) => NEXTEST_JSON,
+                        (true, false) => NEXTEST_JSON_DOC,
+                        (true, true) => NEXTEST_JSON_DOC_WORKSPACE,
+                    },
                     select: NEXTEST_JSON_SELECT,
                     why: format!(
                         "Cargo.toml and {v}; its libtest JSON stream is read live (native; experimental format pinned to 0.1){}",
@@ -885,6 +937,81 @@ mod tests {
         assert!(p.suites[0].why.contains("doctests"));
     }
 
+    /// Round 18: a workspace dropped the doctest step of a single crate.
+    #[test]
+    fn a_rust_workspace_runs_its_doctests_after_nextest() {
+        let d = dir(
+            "ws-doctests",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nresolver = \"3\"\nmembers = [\"calc\", \"crates/*\"]\n",
+                ),
+                ("calc/Cargo.toml", "[package]\nname = \"calc\""),
+                ("calc/src/lib.rs", ""),
+                ("crates/app/Cargo.toml", "[package]\nname = \"app\""),
+                ("crates/app/src/main.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(
+            p.suites[0]
+                .run
+                .ends_with("cargo test --doc --workspace || exit 1; exit $s"),
+            "{}",
+            p.suites[0].run
+        );
+        // Binaries only: nothing to doctest, and `cargo test --doc` would fail.
+        let d = dir(
+            "ws-bins",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+                ("crates/app/Cargo.toml", "[package]\nname = \"app\""),
+                ("crates/app/src/main.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON);
+        // `default-members` is not `members`; a library with
+        // `doctest = false` has nothing to run.
+        let d = dir(
+            "ws-nodoc",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\ndefault-members = [\"lib\"]\nmembers = [\"app\", \"lib\"]\n",
+                ),
+                ("app/Cargo.toml", "[package]\nname = \"app\""),
+                ("app/src/main.rs", ""),
+                (
+                    "lib/Cargo.toml",
+                    "[package]\nname = \"lib\"\n[lib]\ndoctest = false\n",
+                ),
+                ("lib/src/lib.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON, "no doctest step");
+        let d = dir(
+            "ws-default-members",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\ndefault-members = [\"lib\"]\nmembers = [\"app\"]\n",
+                ),
+                ("app/Cargo.toml", "[package]\nname = \"app\""),
+                ("app/src/main.rs", ""),
+                ("lib/Cargo.toml", "[package]\nname = \"lib\""),
+                ("lib/src/lib.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(
+            p.suites[0].run, NEXTEST_JSON,
+            "default-members is not members"
+        );
+    }
+
     /// Round 9: a suite whose `select` loads prova's Vitest reporter must get
     /// the injection, even when `run` is the project's own `npm test`.
     #[test]
@@ -1062,6 +1189,28 @@ mod tests {
         assert!(!w.quoted);
         assert_eq!(wrapper_of_shell("cd x && make test"), None);
         assert_eq!(wrapper_of_shell("FOO=1 cargo test"), None);
+    }
+
+    /// Round 18 review: a script that execs its words (`exec "$@"`) keeps
+    /// them; only a wrapper the user ran with one quoted argument gets the
+    /// quoted select.
+    #[test]
+    fn only_a_wrapper_invoked_quoted_gets_a_quoted_select() {
+        let d = dir("py-script-wrap", &[("pytest.ini", "[pytest]")]);
+        let mut p = propose(&d);
+        apply_wrapper(&mut p, "./dev");
+        let sel = p.suites[0].select.as_deref().unwrap();
+        assert_eq!(sel, "./dev python3 -m pytest -v -rfE -k {filter}");
+        let mut p = propose(&d);
+        apply_wrapper_form(
+            &mut p,
+            &Wrapper {
+                prefix: "./dev".into(),
+                quoted: true,
+            },
+        );
+        let sel = p.suites[0].select.as_deref().unwrap();
+        assert_eq!(sel, "./dev \"python3 -m pytest -v -rfE -k {filter}\"");
     }
 
     #[test]
