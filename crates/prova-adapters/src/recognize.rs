@@ -47,6 +47,9 @@ pub struct Recognizers {
     pub seen_keys: BTreeMap<String, TestKey>,
     /// Vitest: current test file header, and a failure held for its message.
     vitest_file: Option<String>,
+    /// Where Vitest's root (its `RUN` header) lies below the working
+    /// directory: Vitest names files from its root, prova from here.
+    vitest_prefix: Option<String>,
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
@@ -1044,6 +1047,14 @@ impl Recognizers {
         if let Some(root) = line.strip_prefix("rootdir: ") {
             self.pytest_rootdir(root);
         }
+        // Vitest: " RUN  v3.2.4 /abs/root"
+        if let Some(rest) = line.trim_start().strip_prefix("RUN ")
+            && let Some((version, root)) = rest.trim_start().split_once(' ')
+            && version.starts_with('v')
+            && root.trim().starts_with('/')
+        {
+            self.vitest_root(root.trim());
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -1094,6 +1105,34 @@ impl Recognizers {
             self.held_text_events = held;
         }
         out
+    }
+
+    /// Vitest's root, when it lies below the working directory (either
+    /// path may run through a symlink: compared resolved).
+    fn vitest_root(&mut self, root: &str) {
+        let Some(cwd) = &self.cwd else {
+            return;
+        };
+        let root = std::path::Path::new(root);
+        let rel = root
+            .strip_prefix(cwd)
+            .map(std::path::Path::to_path_buf)
+            .ok()
+            .or_else(|| {
+                let (r, c) = (root.canonicalize().ok()?, cwd.canonicalize().ok()?);
+                r.strip_prefix(&c).map(std::path::Path::to_path_buf).ok()
+            });
+        self.vitest_prefix = rel
+            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+            .filter(|r| !r.is_empty());
+    }
+
+    /// A Vitest file as prova names it, from the working directory.
+    fn vitest_path(&self, file: &str) -> String {
+        match &self.vitest_prefix {
+            Some(p) => format!("{p}/{file}"),
+            None => file.to_owned(),
+        }
     }
 
     /// pytest's `rootdir: /abs/dir[, configfile: ...]` header.
@@ -1164,6 +1203,11 @@ impl Recognizers {
                     .unwrap_or_default(),
             )
         })
+    }
+
+    /// Whether Vitest's root lies below the working directory.
+    pub fn vitest_prefixed(&self) -> bool {
+        self.vitest_prefix.is_some()
     }
 
     /// Whether a pytest test was named in this run.
@@ -1695,7 +1739,7 @@ impl Recognizers {
         let key = if let Some(file) = v["file"].as_str() {
             TestKey {
                 file: None,
-                path: vec![file.to_owned()],
+                path: vec![self.vitest_path(file)],
                 name: name.to_owned(),
             }
         } else if let Some((binary, test)) = name.split_once('$') {
@@ -2422,7 +2466,7 @@ impl Recognizers {
             && bracket.trim_end().trim_end_matches(']').trim() == f.trim()
             && is_js_file(f.trim())
         {
-            let key = TestKey::new(vec![f.trim().to_owned()], "(file)");
+            let key = TestKey::new(vec![self.vitest_path(f.trim())], "(file)");
             self.finished(
                 key,
                 Outcome::Errored,
@@ -2504,7 +2548,7 @@ impl Recognizers {
         }
         let key = TestKey {
             file: None,
-            path: file.into_iter().collect(),
+            path: file.map(|f| self.vitest_path(&f)).into_iter().collect(),
             name: parts.join(" > "),
         };
         let mut held = Vec::new();

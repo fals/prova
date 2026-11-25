@@ -196,7 +196,13 @@ impl Observer for Ladder {
         // the working directory (ADR 0031 section 2): a file result that
         // names no live test, but is the tail of exactly one live name, is
         // that test (`tests.test_calc::t` is `sub2.tests.test_calc::t`).
-        if self.live.pytest_ran() {
+        // Vitest's JUnit names files from its root: the same, with `/`.
+        if self.live.pytest_ran() || self.live.vitest_prefixed() {
+            let sep = if self.live.vitest_prefixed() {
+                '/'
+            } else {
+                '.'
+            };
             let live: Vec<&TestKey> = self.live.seen_keys.values().collect();
             let live_names: std::collections::BTreeSet<String> =
                 live.iter().map(|k| k.display()).collect();
@@ -205,7 +211,7 @@ impl Observer for Ladder {
                     && !test.path.is_empty()
                     && !live_names.contains(&test.display())
                 {
-                    let tail = format!(".{}", test.display());
+                    let tail = format!("{sep}{}", test.display());
                     let mut hits = live.iter().filter(|k| k.display().ends_with(&tail));
                     if let (Some(hit), None) = (hits.next(), hits.next()) {
                         test.path[0].clone_from(&hit.path[0]);

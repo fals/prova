@@ -317,6 +317,46 @@ fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
     assert!(!out.contains("test_flaky failed (r"), "{out}");
 }
 
+/// Vitest names files from its root, which its `RUN` header prints: from a
+/// package directory (`cd pkg && vitest run`, `--root pkg`) two packages'
+/// `src/a.test.ts` were one file.
+#[test]
+fn vitest_files_are_named_from_the_working_directory_not_the_root() {
+    let d = workspace("vtroot");
+    std::fs::create_dir_all(d.join("pkg")).unwrap();
+    // Through a symlink of the working directory, as macOS temp dirs are.
+    let link = PathBuf::from(format!("{}.link", d.display()));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&d, &link).unwrap();
+    let run = |root: &Path, ok: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' '' ' RUN  v3.2.4 {}' '' ' {ok} src/a.test.ts > works 1ms' ' ✓ src/a.test.ts > other 1ms' '' ' Test Files  1 failed (1)' '      Tests  1 failed | 1 passed (2)'; exit {}",
+            root.display(),
+            u8::from(ok != "✓")
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.root]\nrun = {:?}\n\n[suite.pkg]\nrun = {:?}\n",
+            run(&d, "✓"),
+            run(&link.join("pkg"), "×"),
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "root"]);
+    let out = text(&prova(&d, &["run", "pkg"]));
+    assert!(
+        out.contains("FAIL pkg/src/a.test.ts::works"),
+        "named from the working directory: {out}"
+    );
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("pkg/src/a.test.ts::works") && all.contains("  src/a.test.ts::works"),
+        "{all}"
+    );
+}
+
 /// Round 17 (java-maven): the live line and the XML record of one failing
 /// test were two tests in `adopt --verify`: "1 tests ran that do not match"
 /// for the full name, "2 matching test(s) ran" for `Class#method`.
