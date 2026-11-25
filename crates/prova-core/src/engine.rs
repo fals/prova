@@ -1391,6 +1391,7 @@ fn observe_child(
             }
         }
         if spec.selection.is_none() {
+            let warned_before = warnings.len();
             sup.flush()?; // this run's results must be in the store to compare
             // A skipped test did not run (round 9: `#[ignore]` on a test
             // that passed before gave a clean pass).
@@ -1438,6 +1439,25 @@ fn observe_child(
                             ""
                         }
                     ));
+                }
+            }
+            // No test names to compare (quiet output), but the framework's
+            // own count fell: a failing crate stops `cargo test` before the
+            // next one runs (round 17: 5 counted, 9 in the passing runs).
+            if let (Some(now), true) = (sup.framework_total, warnings.len() == warned_before)
+                && let Some((prev, before)) = last_pass_total(store, run, &sup.suite)?
+                && before > now
+            {
+                let message = format!(
+                    "the framework counted {now} test(s), the last passing run {prev} counted {before}: {} did not run (a failing crate or step can stop the command before the others)",
+                    before - now
+                );
+                // A pass that ran fewer tests is unverified; a failure shows
+                // notes, not warnings.
+                if exit_code == Some(0) {
+                    warnings.push(message);
+                } else {
+                    sup.emit(EventKind::RunNote { message });
                 }
             }
         }
@@ -1564,6 +1584,9 @@ fn observe_child(
             && sup.container.is_none()
             && sup.cpu_start.is_some()
             && process::children_ticks() == sup.cpu_start
+            // A framework that printed its own totals ran: a warm build's
+            // tests can finish inside one clock tick (round 17).
+            && sup.framework_total.unwrap_or(0) == 0
         {
             let passed: i64 = store.conn().query_row(
                 "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND outcome = 'passed'",
@@ -2040,7 +2063,7 @@ fn pytest_ran_nothing(line: &str) -> bool {
 
 /// The cause a failing test's kept output names: pytest's first `E` line,
 /// or the whole output when it is one line (a short summary's message).
-fn message_from_output(text: &str) -> Option<String> {
+pub(crate) fn message_from_output(text: &str) -> Option<String> {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
@@ -2101,6 +2124,50 @@ fn list_suspects(suspects: &[&String]) -> String {
         ));
     }
     text
+}
+
+/// A failing parent is listed before its failing subtests, whichever the
+/// runner reported first (round 17: full and selected runs listed them in
+/// different orders).
+fn parents_before_subtests(failing: &mut Vec<&(TestKey, Outcome, Option<String>, u64, bool)>) {
+    let mut i = 0;
+    while i < failing.len() {
+        let parent = failing[i].0.display();
+        if !failing[i].4
+            && let Some(j) = failing[..i].iter().position(|s| {
+                s.4 && s
+                    .0
+                    .display()
+                    .strip_prefix(parent.as_str())
+                    .is_some_and(|rest| rest.starts_with(['/', '[', ' ']))
+            })
+        {
+            let f = failing.remove(i);
+            failing.insert(j, f);
+        }
+        i += 1;
+    }
+}
+
+/// The suite's last passing full run before `run` and the test count its
+/// framework summary gave.
+fn last_pass_total(store: &Store, run: &str, suite: &str) -> Result<Option<(String, u64)>> {
+    use rusqlite::OptionalExtension;
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT r.id, CAST(json_extract(e.payload, '$.tests') AS INTEGER)
+               FROM runs r JOIN events e ON e.run_id = r.id AND e.kind = 'run_totals'
+              WHERE r.suite = ?1 AND r.id <> ?2 AND r.status = 'finished' AND r.outcome = 'passed'
+                AND json_extract(r.spec, '$.selection') IS NULL
+                AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
+                                 AND w.payload LIKE '%; no evidence about the tests%')
+                AND r.created_ms < (SELECT created_ms FROM runs WHERE id = ?2)
+              ORDER BY r.created_ms DESC, e.seq DESC LIMIT 1",
+            rusqlite::params![suite, run],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64)),
+        )
+        .optional()?)
 }
 
 /// Like `missing_since_last_pass`, from the last finished full run whatever
@@ -3366,6 +3433,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
+    parents_before_subtests(&mut failing);
     // Quarantined tests are listed apart, with their result (ADR 0027).
     let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
     failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
@@ -3685,7 +3753,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             let mut v: Vec<String> = finals
                 .values()
                 .filter(|f| f.1 == Outcome::Skipped && !f.4)
-                .map(|f| f.0.display())
+                .map(|f| match f.2.as_deref() {
+                    Some("xfail") => format!("{} (xfail: expected to fail)", f.0.display()),
+                    _ => f.0.display(),
+                })
                 .collect();
             v.sort();
             v.truncate(10);

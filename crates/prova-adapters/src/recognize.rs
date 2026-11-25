@@ -145,6 +145,12 @@ pub struct Recognizers {
     /// pytest verbose text: a passing line held one line, for the same
     /// reason (pytest prints the teardown error as a second line).
     pytest_text_pass: Option<(String, TestKey)>,
+    /// pytest counts a test that errored in teardown once more than the
+    /// test itself (a pass or a failure plus an error): unique key -> the
+    /// test had failed before the error. Tests, not report lines.
+    pytest_doubles: BTreeMap<String, bool>,
+    /// pytest `XPASS`: tests expected to fail that passed (non-strict).
+    pub pytest_xpass: Vec<String>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
@@ -178,6 +184,9 @@ pub struct Recognizers {
     go_full_pkgs: Vec<String>,
     /// Executions of each test so far (`-count=N`, reruns): its attempts.
     go_attempts: BTreeMap<String, u32>,
+    /// The message of the latest failure of each Go test: a later iteration
+    /// that passes records the failure standing, with it.
+    go_failure_msg: BTreeMap<String, Option<String>>,
     /// Tests that failed and passed on a rerun: failures a summary counted.
     go_recovered: u64,
     /// Packages in which a test failed.
@@ -507,6 +516,10 @@ impl Recognizers {
                 let mut other = key.clone();
                 other.name = format!("{} (second result)", key.name);
                 return self.result(other, outcome, duration_ms, message, level, subtest, out);
+            }
+            // pytest: a failure and then its own teardown error.
+            if before.is_failure() && *before != Outcome::Errored && outcome == Outcome::Errored {
+                self.pytest_doubles.entry(d.clone()).or_insert(true);
             }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
@@ -842,10 +855,20 @@ impl Recognizers {
         }
     }
 
+    /// Tests that errored in teardown after a failure, and after a pass:
+    /// pytest counts each of them twice.
+    pub fn teardown_doubles(&self) -> (u64, u64) {
+        let failed = self.pytest_doubles.values().filter(|f| **f).count() as u64;
+        (failed, self.pytest_doubles.len() as u64 - failed)
+    }
+
     /// Failures the framework reported (structured streams win over text).
     pub fn failed_reported(&self) -> u64 {
-        self.structured_failed
-            .unwrap_or(self.reported_failed.saturating_sub(self.go_recovered))
+        self.structured_failed.unwrap_or(
+            self.reported_failed
+                .saturating_sub(self.go_recovered)
+                .saturating_sub(self.teardown_doubles().0),
+        )
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
@@ -1676,6 +1699,13 @@ impl Recognizers {
         };
         // A teardown error on a passed call: the one test errored.
         if when == "teardown" {
+            if self
+                .pytest_call_pass
+                .as_ref()
+                .is_some_and(|(h, _, _)| h == id)
+            {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
+            }
             self.pytest_call_pass = None;
         }
         let longrepr = &v["longrepr"];
@@ -1980,6 +2010,7 @@ impl Recognizers {
                 .strip_prefix(id.as_str())
                 .is_some_and(|r| r.trim_start().starts_with("ERROR"));
             if errored {
+                self.pytest_doubles.entry(hkey.unique()).or_insert(false);
                 self.finished(hkey, Outcome::Errored, None, None, Level::Recognized, out);
                 return true;
             }
@@ -2059,6 +2090,16 @@ impl Recognizers {
                 (key, false)
             };
             let msg = msg.filter(|_| outcome.is_failure());
+            // An expected failure is skipped, an unexpected pass a pass:
+            // both are named (round 17).
+            let msg = if word == "XFAIL" {
+                Some(XFAIL.to_owned())
+            } else {
+                msg
+            };
+            if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+                self.pytest_xpass.push(key.display());
+            }
             if outcome.is_failure() && !sub {
                 self.claim_pytest_block(&key);
             }
@@ -2067,6 +2108,7 @@ impl Recognizers {
             if outcome == Outcome::Errored
                 && matches!(self.seen.get(&key.unique()), Some((_, Outcome::Passed)))
             {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
                 self.attempt_result(key, 2, outcome, None, msg, Level::Recognized, out);
                 return true;
             }
@@ -2146,6 +2188,9 @@ impl Recognizers {
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
+        if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+            self.pytest_xpass.push(key.display());
+        }
         // Failures are recorded now to keep first-failure fast; the message
         // only appears later in the summary section. A pass waits one line:
         // a teardown error follows it as a second line for the same test.
@@ -2153,7 +2198,8 @@ impl Recognizers {
             self.pytest_text_pass = Some((id.to_owned(), key));
             return true;
         }
-        self.finished(key, outcome, None, None, Level::Recognized, out);
+        let message = (word == "XFAIL").then(|| XFAIL.to_owned());
+        self.finished(key, outcome, None, message, Level::Recognized, out);
         true
     }
 
@@ -2744,7 +2790,10 @@ impl Recognizers {
 
     /// Tests the framework says it ran.
     pub fn total(&self) -> u64 {
-        self.structured_total.unwrap_or(self.reported_total)
+        self.structured_total.unwrap_or(
+            self.reported_total
+                .saturating_sub(self.pytest_doubles.len() as u64),
+        )
     }
 
     // ------------------------------------------------------------- nextest
@@ -3271,6 +3320,9 @@ fn is_pytest_file(f: &str) -> bool {
     let f = f.trim();
     f.ends_with(".py") && !f.contains(' ') && !f.contains("::")
 }
+
+/// The message of a skipped result that pytest called an expected failure.
+pub const XFAIL: &str = "xfail";
 
 fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
     if !label.is_empty() {
@@ -4453,6 +4505,65 @@ mod tests {
         );
     }
 
+    /// Round 17: an expected failure and an unexpected pass are named.
+    #[test]
+    fn pytest_names_xfail_and_xpass() {
+        let (r, ev) = feed_all(
+            "tests/t.py::test_xfail XFAIL (not yet)    [ 50%]\ntests/t.py::test_xpass XPASS (fixed)    [100%]\n",
+        );
+        assert_eq!(r.pytest_xpass, vec!["tests.t::test_xpass".to_owned()]);
+        let xf: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            xf,
+            vec![("tests.t::test_xfail".to_owned(), XFAIL.to_owned())]
+        );
+    }
+
+    /// Round 17: pytest counts a test that failed and also errored in
+    /// teardown twice ("1 failed, 3 passed, 2 errors" for four tests). The
+    /// counts prova compares are of tests, not report lines.
+    #[test]
+    fn pytest_counts_tests_not_report_lines() {
+        let (r, _) = feed_all(
+            "tests/t.py::test_a FAILED   [ 25%]\ntests/t.py::test_a ERROR   [ 25%]\n\
+             tests/t.py::test_b PASSED   [ 50%]\ntests/t.py::test_b ERROR   [ 50%]\n\
+             tests/t.py::test_c PASSED   [ 75%]\n\
+             tests/t.py::test_d PASSED   [100%]\n\
+             FAILED tests/t.py::test_a - assert 0\nERROR tests/t.py::test_a - teardown\n\
+             ERROR tests/t.py::test_b - teardown\n\
+             === 1 failed, 3 passed, 2 errors in 0.1s ===",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (4, 2));
+        assert_eq!(r.teardown_doubles(), (1, 1));
+    }
+
+    #[test]
+    fn pytest_reportlog_teardown_double_is_counted_once() {
+        let a = "tests/t.py::test_a";
+        let b = "tests/t.py::test_b";
+        let lines = [
+            report(a, "setup", "passed"),
+            report(a, "call", "failed"),
+            report(a, "teardown", "failed"),
+            report(b, "setup", "passed"),
+            report(b, "call", "passed"),
+            report(b, "teardown", "failed"),
+            "=== 1 failed, 1 passed, 2 errors in 0.1s ===".to_owned(),
+        ];
+        let (r, _) = feed_all(&lines.join("\n"));
+        assert_eq!((r.total(), r.failed_reported()), (2, 2));
+    }
+
     #[test]
     fn pytest_parameter_ids_with_spaces_start_only_when_whole() {
         let mut r = Recognizers::default();
@@ -5082,29 +5193,50 @@ impl Recognizers {
         }
         let Some((_, before)) = self.seen.get(&d).cloned().filter(|_| !self.holding) else {
             if !self.holding {
+                if outcome.is_failure() {
+                    self.go_failure_msg.insert(d.clone(), message.clone());
+                }
                 self.go_attempts.insert(d, 1);
             }
             return self.result(key, outcome, duration_ms, message, level, subtest, out);
         };
         self.repeats += 1;
+        // Every execution is an attempt: the number counts them all, even
+        // the ones that change nothing (round 17: `-count=4` showed 3).
+        let n = self.go_attempts.entry(d.clone()).or_insert(1);
+        *n += 1;
+        let attempt = *n;
         if !before.is_failure() && !outcome.is_failure() {
             return;
         }
-        if before.is_failure() && !outcome.is_failure() {
+        let (outcome, message) = if before.is_failure() && !outcome.is_failure() {
             if !retry {
-                // A later iteration passing does not undo the failure.
-                return;
+                // A later iteration passing does not undo the failure: it is
+                // recorded as the failure standing, with its message.
+                let kept = self.go_failure_msg.get(&d).cloned().flatten();
+                (before, kept)
+            } else {
+                self.go_recovered += 1;
+                (outcome, message)
             }
-            self.go_recovered += 1;
+        } else {
+            (outcome, message)
+        };
+        if outcome.is_failure() {
+            self.go_failure_msg
+                .entry(d.clone())
+                .and_modify(|m| {
+                    if message.is_some() {
+                        m.clone_from(&message);
+                    }
+                })
+                .or_insert_with(|| message.clone());
         }
         if outcome.is_failure()
             && let Some(m) = &message
         {
             self.failure_fallback.push((key.clone(), m.clone()));
         }
-        let n = self.go_attempts.entry(d.clone()).or_insert(1);
-        *n += 1;
-        let attempt = *n;
         self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         out.push(EventKind::TestFinished {
@@ -5542,7 +5674,8 @@ mod go_tests {
         let s = settled(&ev);
         assert_eq!(
             one(&s, "example.com/m/r::TestRace"),
-            vec![Outcome::Passed, Outcome::Failed]
+            vec![Outcome::Passed, Outcome::Failed, Outcome::Failed],
+            "three executions, three attempts: the last pass leaves the failure standing"
         );
         assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
     }
@@ -5555,7 +5688,10 @@ mod go_tests {
             "FAIL\nFAIL\texample.com/f\t0.01s\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "example.com/f::TestF"), vec![Outcome::Failed]);
+        assert_eq!(
+            one(&s, "example.com/f::TestF"),
+            vec![Outcome::Failed, Outcome::Failed]
+        );
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(r.failed_reported(), 0, "no stale totals");
     }
@@ -5591,8 +5727,31 @@ mod go_tests {
             "\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed, Outcome::Failed]);
         assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    /// Round 17: `-count=4` (pass, fail, pass, fail) is four attempts, and
+    /// the pass and the failure of one run are both in them.
+    #[test]
+    fn go_count_four_counts_four_attempts() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "FAIL\nFAIL\texample.com/c\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/c::TestC"),
+            vec![
+                Outcome::Passed,
+                Outcome::Failed,
+                Outcome::Failed,
+                Outcome::Failed
+            ]
+        );
     }
 
     /// A panic outside any test fails the package even when a test of it

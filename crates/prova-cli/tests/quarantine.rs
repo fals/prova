@@ -199,7 +199,9 @@ fn leaving_a_known_flaky_test_out_of_another_suite_is_warned_about() {
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
     let out = text(&run(&d, "stable", "pass"));
     assert!(
-        out.contains("PASSED") && !out.contains("unverified") && !out.contains("did not run"),
+        out.contains("PASSED")
+            && !out.contains("PASSED (unverified")
+            && !out.contains("did not run"),
         "{out}"
     );
     assert!(

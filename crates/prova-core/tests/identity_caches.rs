@@ -65,3 +65,50 @@ fn samples_cannot_be_rewritten() {
     assert!(c.execute("UPDATE samples SET value = 1", []).is_err());
     assert!(c.execute("DELETE FROM samples", []).is_err());
 }
+
+/// Round 17: files Vitest, Jest and coverage tools write (reports, caches)
+/// and an agent's own folders are not code: a project that forgot to ignore
+/// them must not get a new identity per run. Needs a real git repo.
+#[test]
+fn test_reports_and_coverage_do_not_change_the_code_identity() {
+    let d = std::env::temp_dir().join(format!("prova-ident-cov-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("calc.ts"), "export const a = 1;\n").unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(&d)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "x"]);
+    let clean = prova_core::identity::code_identity(&d);
+    for (dir, file) in [
+        ("coverage", "lcov.info"),
+        (".nyc_output", "out.json"),
+        (".vitest", "results.json"),
+        ("test-results", "junit.xml"),
+        ("playwright-report", "index.html"),
+        ("htmlcov", "index.html"),
+        ("pkg/coverage", "lcov.info"),
+        ("node_modules/.vite", "deps.json"),
+    ] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join(file), "1").unwrap();
+    }
+    std::fs::write(d.join(".coverage"), "sqlite").unwrap();
+    assert_eq!(
+        prova_core::identity::code_identity(&d),
+        clean,
+        "what a test run writes is not code"
+    );
+    std::fs::write(d.join("coverage/lcov.info"), "2").unwrap();
+    assert_eq!(prova_core::identity::code_identity(&d), clean);
+}

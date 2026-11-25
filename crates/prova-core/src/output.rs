@@ -810,6 +810,23 @@ pub fn run_full(store: &Store, run: &str) -> Result<Option<String>> {
         .map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
+/// The message of a failing test from its kept output, the way a run's
+/// summary names it: pytest's `E` line, else what the test printed.
+pub fn failure_message(store: &Store, run: &str, test_id: &str) -> Option<String> {
+    let blob: Vec<u8> = store
+        .conn()
+        .query_row(
+            "SELECT output FROM test_output WHERE run_id = ?1 AND test_id = ?2 AND output IS NOT NULL",
+            params![run, test_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let text = String::from_utf8_lossy(&decompress(&blob)?).into_owned();
+    crate::engine::message_from_output(&text).or_else(|| test_output_summary(store, run, test_id))
+}
+
 /// What a failing test printed, in a line or two, for a failure the
 /// framework gave no message for (Go prints a test's message after its
 /// `--- FAIL` line, or a panic after it): a panic and the test's own frame,

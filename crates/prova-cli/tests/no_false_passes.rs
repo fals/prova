@@ -242,6 +242,33 @@ fn results_printed_without_any_work_are_unverified() {
     );
 }
 
+/// Round 17: a warm `cargo test` finishes under a clock tick of CPU. Tests
+/// that reported results and the framework's own totals are no "printed, not
+/// run" (medium: needs the supervisor's CPU accounting).
+#[cfg(target_os = "linux")]
+#[test]
+fn results_with_the_frameworks_totals_are_not_called_unrun() {
+    let d = workspace("warmtotals");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "echo 'test calc::divides ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'",
+        ],
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let s: serde_json::Value =
+        serde_json::from_str(out.lines().rev().find(|l| l.starts_with('{')).unwrap()).unwrap();
+    assert!(
+        !s["warnings"].to_string().contains("used no CPU time"),
+        "{s}"
+    );
+}
+
 /// Round 10: `mvn -fn` (and a crashed fork) end with exit 0 but say the
 /// build failed.
 #[test]
