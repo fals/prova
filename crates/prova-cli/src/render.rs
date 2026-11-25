@@ -247,7 +247,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     for t in &s.slow {
         println!(
             "  SLOW {}: running {} (budget {}: {})",
-            clean(&t.test),
+            named(&t.test, t.place.as_deref()),
             format_duration(std::time::Duration::from_millis(t.elapsed_ms)),
             format_duration(std::time::Duration::from_millis(t.budget_ms)),
             budget_why(t)
@@ -442,8 +442,18 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         s.flips_on_same_code,
         if s.flaky { "  => FLAKY" } else { "" }
     );
+    if s.failing_now {
+        println!("failing now: more failures in a row than its flakiness explains");
+    }
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
-        println!("duration p50 {p50}ms  p95 {p95}ms");
+        let show = |ms: u64| {
+            if ms == 0 {
+                "<1ms".to_owned()
+            } else {
+                format!("{ms}ms")
+            }
+        };
+        println!("duration p50 {}  p95 {}", show(p50), show(p95));
     } else if s.runs > 0 {
         println!("duration unknown: no run recorded one");
     }
@@ -810,10 +820,10 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
         WaitReason::Failure => progress_failures(s, reported),
         WaitReason::Slow => {
             for t in &s.slow {
-                if reported.insert(format!("slow:{}", t.test)) {
+                if reported.insert(format!("slow:{}", named(&t.test, t.place.as_deref()))) {
                     eprintln!(
                         "SLOW {} (over its {} budget: {})",
-                        clean(&t.test),
+                        named(&t.test, t.place.as_deref()),
                         format_duration(std::time::Duration::from_millis(t.budget_ms)),
                         budget_why(t)
                     );
@@ -1382,6 +1392,7 @@ mod budget_tests {
     fn the_minimum_budget_is_named_as_such() {
         let t = |ms| prova_core::engine::SlowTest {
             test: "t".into(),
+            place: None,
             elapsed_ms: 2000,
             budget_ms: ms,
             budget_from: prova_core::model::BudgetFrom::History,

@@ -27,6 +27,9 @@ pub struct Recognizers {
     /// The run's working directory: pytest names tests from its rootdir,
     /// prova from here (ADR 0031 section 2).
     pub cwd: Option<std::path::PathBuf>,
+    /// The repository root: names are read relative to it, whatever
+    /// directory the run started in (ADR 0035 section 1).
+    pub repo_root: Option<std::path::PathBuf>,
     /// pytest's rootdir as its header printed it (`-q` prints none).
     pytest_root: Option<std::path::PathBuf>,
     /// The run's command line: a `cd` in it moves pytest, whose ids are
@@ -50,6 +53,11 @@ pub struct Recognizers {
     /// Where Vitest's root (its `RUN` header) lies below the working
     /// directory: Vitest names files from its root, prova from here.
     vitest_prefix: Option<String>,
+    /// The `RUN` root last read: the stream repeats it on every event, and
+    /// resolving it touches the disk.
+    vitest_root_seen: Option<String>,
+    /// Where the run started below the repository root, settled once.
+    start_cache: std::cell::OnceCell<String>,
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
@@ -1127,13 +1135,53 @@ impl Recognizers {
         out
     }
 
-    /// Vitest's root, when it lies below the working directory (either
-    /// path may run through a symlink: compared resolved).
+    /// Where the run started below the repository root (`packages/b`), as
+    /// the prefix of every path-bearing name; empty at the root.
+    fn start_prefix(&self) -> String {
+        self.start_cache
+            .get_or_init(|| {
+                let (Some(cwd), Some(repo)) = (&self.cwd, &self.repo_root) else {
+                    return String::new();
+                };
+                let canon =
+                    |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(cwd)
+                    .strip_prefix(canon(repo))
+                    .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
+    /// Settles the directories names are read from: Vitest's root is the
+    /// working directory until its header says otherwise.
+    pub fn set_places(&mut self, cwd: &std::path::Path, repo_root: &std::path::Path) {
+        self.cwd = Some(cwd.to_owned());
+        self.repo_root = Some(repo_root.to_owned());
+        self.start_cache = std::cell::OnceCell::new();
+        self.vitest_root_seen = None;
+        self.vitest_prefix = Some(self.start_prefix()).filter(|p| !p.is_empty());
+    }
+
+    /// Vitest's root, below the repository root (either path may run
+    /// through a symlink: compared resolved).
     fn vitest_root(&mut self, root: &str) {
+        if self.vitest_root_seen.as_deref() == Some(root) {
+            return;
+        }
+        self.vitest_root_seen = Some(root.to_owned());
         let Some(cwd) = &self.cwd else {
             return;
         };
         let root = std::path::Path::new(root);
+        if let Some(repo) = &self.repo_root {
+            let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            if let Ok(rel) = canon(root).strip_prefix(canon(repo)) {
+                self.vitest_prefix = Some(rel.to_string_lossy().trim_matches('/').to_owned())
+                    .filter(|r| !r.is_empty());
+                return;
+            }
+        }
         let rel = root
             .strip_prefix(cwd)
             .map(std::path::Path::to_path_buf)
@@ -1142,9 +1190,13 @@ impl Recognizers {
                 let (r, c) = (root.canonicalize().ok()?, cwd.canonicalize().ok()?);
                 r.strip_prefix(&c).map(std::path::Path::to_path_buf).ok()
             });
-        self.vitest_prefix = rel
-            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
-            .filter(|r| !r.is_empty());
+        // A root that maps to neither the repository nor the working
+        // directory (a path inside a container) leaves the prefix the places
+        // gave: no worse than not reading the header.
+        if let Some(r) = rel {
+            self.vitest_prefix =
+                Some(r.to_string_lossy().trim_matches('/').to_owned()).filter(|r| !r.is_empty());
+        }
     }
 
     /// A Vitest file as prova names it, from the working directory.
@@ -1184,6 +1236,14 @@ impl Recognizers {
                     .ok()
                     .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
             };
+            // Through a container client the directory pytest ran in is the
+            // container's: the client's mount maps it under the repository.
+            if let Some(dir) = self.container_dir()
+                && has(&dir)
+                && let Some(p) = rel(&dir)
+            {
+                return PytestDir::Prefix(p);
+            }
             let moved: Vec<String> = self
                 .command
                 .as_deref()
@@ -1225,6 +1285,84 @@ impl Recognizers {
         })
     }
 
+    /// The host directory a container client's `-w`/pytest's rootdir names:
+    /// the container path under one of the `-v host:container` mounts (or
+    /// `--mount src=..,dst=..`) of the command.
+    fn container_dir(&self) -> Option<std::path::PathBuf> {
+        let cwd = self.cwd.as_ref()?;
+        let cmd = self.command.as_deref()?;
+        // Words without their quotes: `-v "$PWD":/w` is `-v $PWD:/w`.
+        let all: Vec<String> = cmd
+            .split_whitespace()
+            .map(|w| {
+                w.chars()
+                    .filter(|c| *c != '"' && *c != '\'')
+                    .collect::<String>()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        // Only the client's own options count (`docker run ... IMAGE`):
+        // pytest's `-v` after the image is not a volume.
+        let words: Vec<&str> = docker_options(&all);
+        let host_of = |h: &str| {
+            let h = h
+                .replace("${PWD}", &cwd.to_string_lossy())
+                .replace("$PWD", &cwd.to_string_lossy())
+                .replace("$(pwd)", &cwd.to_string_lossy());
+            let p = std::path::PathBuf::from(&h);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        };
+        let mut mounts: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut workdir: Option<String> = None;
+        for (i, w) in words.iter().enumerate() {
+            let next = words.get(i + 1).copied();
+            match *w {
+                "-v" | "--volume" => {
+                    if let Some((h, rest)) = next.and_then(|n| n.split_once(':')) {
+                        let c = rest.split(':').next().unwrap_or(rest);
+                        mounts.push((host_of(h), c.to_owned()));
+                    }
+                }
+                "-w" | "--workdir" => workdir = next.map(str::to_owned),
+                "--mount" => {
+                    let kv = |k: &[&str]| {
+                        next?.split(',').find_map(|p| {
+                            let (a, b) = p.split_once('=')?;
+                            k.contains(&a).then(|| b.to_owned())
+                        })
+                    };
+                    if let (Some(h), Some(c)) = (kv(&["src", "source"]), kv(&["dst", "target"])) {
+                        mounts.push((host_of(&h), c));
+                    }
+                }
+                other => {
+                    if let Some(v) = other
+                        .strip_prefix("--workdir=")
+                        .or_else(|| other.strip_prefix("-w="))
+                    {
+                        workdir = Some(v.to_owned());
+                    }
+                }
+            }
+        }
+        let at = self
+            .pytest_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or(workdir)?;
+        mounts
+            .iter()
+            .filter(|(_, c)| {
+                let c = c.trim_end_matches('/');
+                at == c || at.starts_with(&format!("{c}/"))
+            })
+            .max_by_key(|(_, c)| c.len())
+            .map(|(h, c)| {
+                let rest = at[c.trim_end_matches('/').len()..].trim_start_matches('/');
+                h.join(rest)
+            })
+    }
+
     /// Whether Vitest's root lies below the working directory.
     pub fn vitest_prefixed(&self) -> bool {
         self.vitest_prefix.is_some()
@@ -1240,8 +1378,17 @@ impl Recognizers {
         if !(id.contains("::") || id.ends_with(".py")) {
             return pytest_key(id);
         }
+        let start = self.start_prefix();
         match self.pytest_dir(id) {
-            PytestDir::Prefix(p) if !p.is_empty() => pytest_key(&format!("{p}/{id}")),
+            PytestDir::Prefix(p) if !p.is_empty() || !start.is_empty() => {
+                let dir = [start.as_str(), p.as_str()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                pytest_key(&format!("{dir}/{id}"))
+            }
             PytestDir::Prefix(_) => pytest_key(id),
             // Another directory's test of the same id must never be taken
             // for this one: its place is marked, and no quarantine covers it.
@@ -1756,6 +1903,12 @@ impl Recognizers {
             }
             _ => (name, 1),
         };
+        // The stream's file is relative to Vitest's root, which its events
+        // name: a stream read before the text's `RUN` header (`--root`)
+        // must name tests as the text does (round 18: counted twice).
+        if let Some(root) = v["root"].as_str() {
+            self.vitest_root(root);
+        }
         let key = if let Some(file) = v["file"].as_str() {
             TestKey {
                 file: None,
@@ -2084,8 +2237,11 @@ impl Recognizers {
     /// (`calc/tests/it.rs` -> `calc/Cargo.toml`). `None` when the files are
     /// not there (a container, a relocated target directory).
     fn cargo_package(&self, rest: &str) -> Option<String> {
-        let cwd = self.cwd.as_ref()?;
         let bin = rest.rsplit_once(" (")?.1.trim_end_matches(')');
+        let cwd = [self.cwd.as_ref(), self.repo_root.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|c| c.join(format!("{bin}.d")).is_file())?;
         let dep = std::fs::read_to_string(cwd.join(format!("{bin}.d"))).ok()?;
         let source = dep.lines().next()?.split_once(": ")?.1.split(' ').next()?;
         let mut dir = cwd.join(source);
@@ -2109,14 +2265,14 @@ impl Recognizers {
             r.strip_suffix(" stdout ----")
                 .or_else(|| r.strip_suffix(" stderr ----"))
         }) {
-            self.close_libtest_block();
+            self.close_libtest_block(out);
             self.libtest_block = Some((self.libtest_key(name.trim()), Vec::new()));
             return true;
         }
         if self.libtest_block.is_some() {
             let t = line.trim();
             if t == "failures:" || t.starts_with("test result:") {
-                self.close_libtest_block();
+                self.close_libtest_block(out);
             } else if let Some((_, lines)) = self.libtest_block.as_mut() {
                 lines.push(line.to_owned());
                 return true;
@@ -2516,7 +2672,7 @@ impl Recognizers {
             && is_js_file(f.trim())
             && !name.trim().is_empty()
         {
-            let key = TestKey::new(vec![f.trim().to_owned()], name.trim());
+            let key = TestKey::new(vec![self.vitest_path(f.trim())], name.trim());
             let mut held = Vec::new();
             self.finished(
                 key,
@@ -2644,6 +2800,20 @@ impl Recognizers {
         if let Some((_, class)) = line.rsplit_once(" -- in ")
             && !class.is_empty()
             && !class.contains(char::is_whitespace)
+            && !self.surefire_classes.iter().any(|c| c == class)
+        {
+            self.surefire_classes.push(class.to_owned());
+        }
+        // `[ERROR] calc.CalcTest.divides -- Time elapsed: 0.003 s <<<
+        // FAILURE!` names the failing test in full: its class is the one
+        // the summary's `CalcTest.divides:19` means (`-q` prints no
+        // `-- in calc.CalcTest` line for a class whose tests all ran).
+        if let Some(rest) = line.strip_prefix("[ERROR] ")
+            && let Some((name, tail)) = rest.split_once(" -- Time elapsed: ")
+            && tail.contains("<<<")
+            && !name.contains(char::is_whitespace)
+            && let Some((class, _)) = name.rsplit_once('.')
+            && !class.is_empty()
             && !self.surefire_classes.iter().any(|c| c == class)
         {
             self.surefire_classes.push(class.to_owned());
@@ -3275,11 +3445,95 @@ impl Recognizers {
         self.finished(key, Outcome::Failed, ms, msg, Level::Recognized, out);
     }
 
-    fn close_libtest_block(&mut self) {
-        if let Some((key, lines)) = self.libtest_block.take() {
-            let text = lines.join("\n").trim().to_owned();
-            if !text.is_empty() {
-                self.failure_output.push((key, text));
+    /// The failure block of a libtest test is over. A test whose place was
+    /// unknown (`cargo test --quiet` prints no `Running` line) is told by
+    /// the path its panic message names: that place replaces the unknown one
+    /// (ADR 0035 section 1), so another crate's test of the same name never
+    /// lends its history.
+    fn close_libtest_block(&mut self, out: &mut Vec<EventKind>) {
+        let Some((mut key, lines)) = self.libtest_block.take() else {
+            return;
+        };
+        let text = lines.join("\n").trim().to_owned();
+        if key.file.is_none()
+            && !self.holding
+            && let Some(place) = self.panic_place(&text, &key.name)
+            && let Some((_, Outcome::Failed | Outcome::Errored)) = self.seen.get(&key.unique())
+        {
+            let old = key.clone();
+            key.file = Some(place);
+            out.push(EventKind::TestFinished {
+                test: key.clone(),
+                attempt: 1,
+                outcome: Outcome::Failed,
+                duration_ms: None,
+                message: None,
+                source: Level::Recognized,
+                subtest: false,
+                passed_in_iteration: false,
+            });
+            out.push(EventKind::TestSuperseded {
+                test: old,
+                by: key.clone(),
+            });
+        }
+        if !text.is_empty() {
+            self.failure_output.push((key, text));
+        }
+    }
+
+    /// The place (test binary, as nextest names it) a panic message's path
+    /// gives: `geo/src/lib.rs` is `geo`, `geo/tests/it.rs` is `geo::it`.
+    /// `None` without the file on disk (a container) or a package around it.
+    fn panic_place(&self, text: &str, test: &str) -> Option<String> {
+        let path = text.lines().find_map(|l| {
+            let (_, rest) = l.split_once(" panicked at ")?;
+            let mut parts = rest.trim().trim_end_matches(':').rsplitn(3, ':');
+            let (_col, _line, file) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(file.to_owned())
+        })?;
+        let bases = [self.cwd.as_ref(), self.repo_root.as_ref()];
+        let abs = bases
+            .into_iter()
+            .flatten()
+            .map(|b| b.join(&path))
+            .find(|p| p.is_file())?;
+        let stop = self.repo_root.as_ref().or(self.cwd.as_ref())?;
+        // Only a file of this repository's own code, not a dependency's, and
+        // only the file that holds the test itself: a panic inside a helper
+        // crate or library code names where the failure surfaced, not where
+        // the test lives. When unsure the place stays unknown.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let abs = canon(&abs);
+        let stop = canon(stop);
+        let rel_to_repo = abs.strip_prefix(&stop).ok()?;
+        if rel_to_repo.components().any(|c| c.as_os_str() == ".cargo") {
+            return None;
+        }
+        let leaf = test.rsplit("::").next().unwrap_or(test);
+        let source = std::fs::read_to_string(&abs).ok()?;
+        if !source.contains(&format!("fn {leaf}(")) {
+            return None;
+        }
+        let mut dir = abs.parent()?.to_path_buf();
+        loop {
+            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
+                && let Some(name) = cargo_package_name(&toml)
+            {
+                let krate = name.replace('-', "_");
+                let rel = abs.strip_prefix(&dir).ok()?;
+                let mut comps = rel.components();
+                return match (comps.next(), comps.next(), comps.next()) {
+                    (Some(a), Some(b), None) if a.as_os_str() == "tests" => {
+                        let stem = std::path::Path::new(b.as_os_str()).file_stem()?;
+                        Some(format!("{krate}::{}", stem.to_string_lossy()))
+                    }
+                    (Some(a), ..) if a.as_os_str() == "src" => Some(krate),
+                    _ => None,
+                };
+            }
+            if dir == stop || !dir.pop() {
+                return None;
             }
         }
     }
@@ -3338,7 +3592,7 @@ impl Recognizers {
         }
         self.close_pass_output();
         self.close_libtest_running(&mut gts);
-        self.close_libtest_block();
+        self.close_libtest_block(&mut gts);
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
@@ -3615,6 +3869,78 @@ enum PytestDir {
     Unknown,
 }
 
+/// The words of a container client's own options in a command line: after
+/// `docker run` (or `podman run`/`exec`) up to the image. Empty without one.
+fn docker_options(words: &[String]) -> Vec<&str> {
+    // Options that take their value as the next word.
+    const VALUED: &[&str] = &[
+        "-v",
+        "--volume",
+        "-w",
+        "--workdir",
+        "--mount",
+        "-e",
+        "--env",
+        "-u",
+        "--user",
+        "--name",
+        "-p",
+        "--publish",
+        "--network",
+        "--net",
+        "--entrypoint",
+        "-h",
+        "--hostname",
+        "--env-file",
+        "--platform",
+        "--cpus",
+        "-m",
+        "--memory",
+        "--label",
+        "-l",
+        "--add-host",
+        "--tmpfs",
+        "--device",
+        "--group-add",
+        "--cap-add",
+        "--cap-drop",
+        "--security-opt",
+        "--shm-size",
+        "--ulimit",
+        "--pull",
+        "--restart",
+        "--runtime",
+    ];
+    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
+    let Some(at) = words
+        .iter()
+        .position(|w| matches!(base(w).as_str(), "docker" | "podman" | "nerdctl"))
+    else {
+        return Vec::new();
+    };
+    let mut rest = words[at + 1..].iter();
+    if !matches!(
+        rest.next().map(String::as_str),
+        Some("run" | "exec" | "create")
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    while let Some(w) = rest.next() {
+        if !w.starts_with('-') {
+            break; // the image
+        }
+        out.push(w.as_str());
+        if VALUED.contains(&w.as_str())
+            && let Some(v) = rest.next()
+        {
+            out.push(v.as_str());
+        }
+    }
+    out
+}
+
+/// The words after `cd` or `pushd` in a command line: where it may move.
 fn cd_targets(command: &str) -> Vec<String> {
     prova_core::config::cd_targets(command)
 }
@@ -4773,6 +5099,140 @@ mod tests {
             finished(&ev),
             vec![("calc.CalcTest::flakyClock".into(), Outcome::Failed)]
         );
+    }
+
+    /// Round 18 (java-maven, `mvn -q`): the summary's `CalcTest.divides:19`
+    /// was a phantom `CalcTest::divides` beside the XML's
+    /// `calc.CalcTest::divides`: the failure's own full-name line says the
+    /// class.
+    #[test]
+    fn surefire_summary_takes_the_class_from_the_full_name_failure_line() {
+        let (_, ev) = feed(concat!(
+            "[ERROR] Tests run: 10, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.003 s <<< FAILURE! -- in calc.CalcTest$Division\n",
+            "[ERROR] calc.CalcTest.divides -- Time elapsed: 0.003 s <<< FAILURE!\n",
+            "org.opentest4j.AssertionFailedError: expected: <4> but was: <16>\n",
+            "\tat calc.CalcTest.divides(CalcTest.java:19)\n",
+            "\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   CalcTest$Division.exact:37 expected: <3> but was: <27>\n",
+            "[ERROR]   CalcTest.divides:19 expected: <4> but was: <16>\n",
+            "[ERROR] Tests run: 10, Failures: 2, Errors: 0, Skipped: 0\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("calc.CalcTest$Division::exact".into(), Outcome::Failed),
+                ("calc.CalcTest::divides".into(), Outcome::Failed),
+            ]
+        );
+    }
+
+    /// Round 18 (ts BLOCKER, found by the real-Vitest large test): started
+    /// in `packages/b`, the verbose reporter names the file `src/...` in its
+    /// lines and again in the failures section after them. Both name it from
+    /// the repository root: one failure, not two.
+    #[test]
+    fn vitest_failures_section_names_the_file_from_the_repository_root() {
+        let mut r = Recognizers::default();
+        r.set_places(
+            std::path::Path::new("/w/packages/b"),
+            std::path::Path::new("/w"),
+        );
+        let mut ev = Vec::new();
+        for l in [
+            " RUN  v3.2.4 /w/packages/b",
+            " × src/calc.test.ts > adds 3ms",
+            "      → expected +0 to be 1 // Object.is equality",
+            " FAIL  src/calc.test.ts > adds",
+            "AssertionError: expected +0 to be 1 // Object.is equality",
+        ] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![(
+                "packages/b/src/calc.test.ts::adds".to_owned(),
+                Outcome::Failed
+            )]
+        );
+    }
+
+    /// Review of PR 115 (E): a Vitest root printed as a container path maps
+    /// to neither the repository nor the working directory; it must not
+    /// wipe the prefix the run's own place gave.
+    #[test]
+    fn vitest_root_from_an_unmapped_path_keeps_the_start_prefix() {
+        let mut r = Recognizers::default();
+        r.set_places(
+            std::path::Path::new("/w/packages/b"),
+            std::path::Path::new("/w"),
+        );
+        let mut ev = Vec::new();
+        for l in [" RUN  v3.2.4 /app", " × src/calc.test.ts > adds 3ms"] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![(
+                "packages/b/src/calc.test.ts::adds".to_owned(),
+                Outcome::Failed
+            )]
+        );
+    }
+
+    /// Round 18 (probe, `vitest --root pkg`): the stream's events came
+    /// before the text's `RUN` header and named the file bare; the text
+    /// named it with `pkg/`: one failure counted twice.
+    #[test]
+    fn vitest_stream_events_name_the_file_from_the_root_they_carry() {
+        let mut r = Recognizers {
+            vitest_stream: true,
+            ..Default::default()
+        };
+        r.set_places(std::path::Path::new("/w"), std::path::Path::new("/w"));
+        let mut ev = Vec::new();
+        ev.extend(r.line(
+            r#"{"type":"test","event":"failed","name":"works","file":"src/a.test.ts","root":"/w/pkg"}"#,
+        ));
+        for l in [" RUN  v3.2.4 /w/pkg", " × src/a.test.ts > works 1ms"] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        let names: BTreeSet<String> = finished(&ev).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["pkg/src/a.test.ts::works".to_owned()]
+        );
+    }
+
+    /// Round 18 (go-make): `go test -json -count=4` with FAIL, FAIL, FAIL,
+    /// PASS was "broken, not flaky"; the `-v` text said FLAKY. The pass in a
+    /// later iteration is flaky evidence in the JSON stream too.
+    #[test]
+    fn go_json_count_with_mixed_iterations_marks_the_pass() {
+        let mut lines = String::new();
+        for (i, a) in ["fail", "fail", "fail", "pass"].iter().enumerate() {
+            lines.push_str(&format!(
+                "{{\"Action\":\"run\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\"}}\n{{\"Action\":\"{a}\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\",\"Elapsed\":0.0{i}}}\n"
+            ));
+        }
+        lines.push_str("{\"Action\":\"fail\",\"Package\":\"ex/a\",\"Elapsed\":0.1}\n");
+        let (_, ev) = feed_all(&lines);
+        let marked = ev
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EventKind::TestFinished {
+                        passed_in_iteration: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(marked, 1, "{ev:?}");
     }
 
     #[test]

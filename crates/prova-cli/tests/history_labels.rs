@@ -739,6 +739,9 @@ fn a_failure_that_depends_on_the_environment_is_not_flaky() {
         format!("[suite.t]\nrun = \"{WORK_SH}if [ -n \\\"$BADENV\\\" ]; then echo 'test calc::e ... FAILED'; exit 1; else echo 'test calc::e ... ok'; fi\"\n"),
     )
     .unwrap();
+    // Two passes: one is too little history to call a failure
+    // environment-dependent (ADR 0035 section 2).
+    prova(&d, &["run", "t"]);
     prova(&d, &["run", "t"]);
     let o = Command::new(PROVA)
         .args(["run", "t"])

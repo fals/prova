@@ -34,7 +34,7 @@ if (out && typeof vitest.beforeEach === "function") {
     const task = ctx?.task;
     const filepath = task?.file?.filepath;
     if (!filepath) return;
-    const base = { type: "test", name: fullName(task), file: relative(root, filepath) };
+    const base = { type: "test", name: fullName(task), file: relative(root, filepath), root };
     const began = performance.now();
     write({ ...base, event: "started" });
     const onFinished = ctx.onTestFinished ?? vitest.onTestFinished;
