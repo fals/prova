@@ -34,7 +34,7 @@ Examples:
   prova run -- make test                   any test command, no config
   prova run unit --until first-failure     a suite from prova.toml; back at the first failure
   prova output                             what the last run printed
-  prova history calc::divides              new failure, pre-existing, or flaky?
+  prova history tests::divides             new failure, pre-existing, or flaky?
   prova exp new speed --hypothesis \"...\" -- go test -bench .
 
 Shell completion (commands, options, suite names, run ids):
@@ -60,7 +60,7 @@ enum QuarantineCmd {
     /// Quarantine a test prova has seen, with the reason it is set aside.
     #[command(after_help = "\
 Example:
-  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"")]
+  prova quarantine add tests::flaky_clock --reason \"clock tick, issue 42\"")]
     Add {
         /// The test's full name, or a substring that matches one test.
         #[arg(add = ArgValueCompleter::new(complete_tests))]
@@ -72,7 +72,8 @@ Example:
         #[arg(long, value_name = "DAYS", default_value_t = prova_core::quarantine::DEFAULT_DAYS,
               value_parser = clap::value_parser!(u32).range(1..=prova_core::quarantine::MAX_DAYS as i64))]
         days: u32,
-        /// The test binary or module, when tests of several share the name
+        /// Where the test lives, when several places share its name: a Rust test binary
+        /// (crate), a Go package, a pytest or Vitest file (`tests/test_calc.py`, `ex/a`)
         /// (e.g. two crates' `tests::flaky`).
         #[arg(long = "in", value_name = "FILE")]
         in_file: Option<String>,
@@ -93,7 +94,7 @@ Examples:
     /// End a quarantine: the test counts again.
     #[command(after_help = "\
 Example:
-  prova quarantine remove calc::flaky_clock")]
+  prova quarantine remove tests::flaky_clock")]
     Remove {
         /// The quarantined test's name, or a substring that matches one.
         #[arg(add = ArgValueCompleter::new(complete_quarantined))]
@@ -126,7 +127,7 @@ Examples:
   prova run -- make test                     any command; history starts now
   prova run unit --until first-failure       back at the first failure, a slow test or a stall (30s budget)
   prova run unit --until done                the result (waits up to 9m, then prints `next:`)
-  prova run unit --select calc::divides      rerun one test (the suite's `select` template)
+  prova run unit --select tests::divides     rerun one test (the suite's `select` template)
   prova run unit --repeat 10                 is it flaky? each test's pass/fail tally
   prova run unit --detach                    start, print the run id, return; then `prova wait`")]
     Run {
@@ -280,8 +281,9 @@ Examples:
     /// History and flake statistics of tests matching a name.
     #[command(after_help = "\
 Examples:
-  prova history calc::divides           one test: outcomes, code versions, size, flakiness
+  prova history tests::divides          one test: outcomes, code versions, size, flakiness
   prova history divides --suite unit    only runs of one suite
+  prova history tests::flaky --in geo   the test of that name in one binary, package or file
   prova history \"\"                      every test prova knows")]
     History {
         /// Substring of the test's full name.
@@ -290,6 +292,10 @@ Examples:
         /// Only runs of this suite.
         #[arg(long, add = ArgValueCompleter::new(complete_suites))]
         suite: Option<String>,
+        /// Only the test of this place: a Rust test binary (crate), a Go
+        /// package, a pytest or Vitest file.
+        #[arg(long = "in", value_name = "PLACE")]
+        in_place: Option<String>,
         /// How many of the latest runs to look at.
         #[arg(long, value_name = "RUNS", default_value_t = 50)]
         window: usize,
@@ -350,11 +356,11 @@ Examples:
     /// Set known-flaky tests aside from the verdict, in the open.
     #[command(after_help = "\
 Examples:
-  prova quarantine add calc::flaky_clock --reason \"clock tick, issue 42\"
-  prova quarantine add calc::flaky_clock --reason \"still flaky\" --days 30
+  prova quarantine add tests::flaky_clock --reason \"clock tick, issue 42\"
+  prova quarantine add tests::flaky_clock --reason \"still flaky\" --days 30
   prova quarantine list           what is set aside now, and until when
   prova quarantine list --all     including removed ones
-  prova quarantine remove calc::flaky_clock
+  prova quarantine remove tests::flaky_clock
 
 A quarantined test still runs and keeps its history. If it is the only thing
 that fails, the run passes; every summary lists it. A quarantine expires.
@@ -1500,14 +1506,26 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 extra_env: cfg.env.clone(),
             },
         )?;
-        let finished: Vec<(String, Outcome)> = store
-            .events_after(&s.run, 0)?
+        // A live result the result file replaced, and a test's later
+        // attempts, are one test (round 17: a failing test counted twice).
+        let events = store.events_after(&s.run, 0)?;
+        let replaced: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                prova_core::model::EventKind::TestSuperseded { test, .. } => Some(test.unique()),
+                _ => None,
+            })
+            .collect();
+        let mut counted = std::collections::BTreeSet::new();
+        let finished: Vec<(String, Outcome)> = events
             .into_iter()
             .filter_map(|e| match e.kind {
                 // A test the filter skipped did not run: Vitest `-t` and
                 // others report the rest as skipped (round 7).
                 prova_core::model::EventKind::TestFinished { test, outcome, .. }
-                    if outcome != Outcome::Skipped =>
+                    if outcome != Outcome::Skipped
+                        && !replaced.contains(&test.unique())
+                        && counted.insert(test.unique()) =>
                 {
                     Some((test.display(), outcome))
                 }
@@ -2084,7 +2102,44 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             days,
             in_file,
         } => {
-            let found = analysis::find_tests(store, &test, None)?;
+            let mut found = analysis::find_tests(store, &test, None)?;
+            // `--in` names the place in the framework's own form: a Rust
+            // test binary, a Go package, a pytest or Vitest file.
+            if let Some(w) = in_file.as_deref() {
+                let mut places = std::collections::BTreeSet::new();
+                let before = found.len();
+                let place_of = |t: &(String, String, String)| {
+                    analysis::place_of_test(store, &t.0)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                for t in &found {
+                    let (file, path) = place_of(t);
+                    places.extend(file.or(path.first().cloned()));
+                }
+                analysis::retain_in_place(&mut found, w, place_of);
+                if found.is_empty() && before > 0 {
+                    return Err(UsageError(format!(
+                        "{test:?} is not known in {w:?}; it is in: {}",
+                        places.into_iter().collect::<Vec<_>>().join(", ")
+                    ))
+                    .into());
+                }
+            }
+            let mut places_of_names: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = Default::default();
+            for t in &found {
+                let (file, path) = analysis::place_of_test(store, &t.0)?.unwrap_or_default();
+                if let Some(p) = file
+                    .filter(|f| !f.starts_with("(package pending)"))
+                    .or(path.first().cloned())
+                {
+                    places_of_names.entry(t.1.clone()).or_default().insert(p);
+                }
+            }
             let mut names: Vec<String> = found.into_iter().map(|t| t.1).collect();
             names.sort();
             names.dedup();
@@ -2113,10 +2168,23 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                         .into());
                     }
                     many => {
+                        // Say how to pick one: by its full name, or by the
+                        // place it lives in (round 17).
+                        let listed = many
+                            .iter()
+                            .take(5)
+                            .map(|n| match places_of_names.get(n) {
+                                Some(p) if !p.is_empty() => format!(
+                                    "{n} (in {})",
+                                    p.iter().cloned().collect::<Vec<_>>().join(", ")
+                                ),
+                                _ => n.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         return Err(UsageError(format!(
-                            "{} tests match {test:?}; be more specific: {}",
+                            "{} tests match {test:?}; name one in full, or say where with --in <place>: {listed}",
                             many.len(),
-                            many.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
                         ))
                         .into());
                     }
@@ -2143,11 +2211,21 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 .into());
             }
             let files = q::files_of(store, &name)?;
+            let mut matching: Vec<&String> = files.iter().collect();
+            if let Some(w) = in_file.as_deref() {
+                analysis::retain_in_place(&mut matching, w, |x| (Some((*x).clone()), Vec::new()));
+            } else {
+                matching.clear();
+            }
             let file = match (in_file.as_deref(), files.as_slice()) {
-                (Some(f), _) if files.iter().any(|x| x == f) => Some(f.to_owned()),
+                // A name that is no Rust binary's (a Go package's test): the
+                // place already filtered the candidates and the full name
+                // says it.
+                (Some(_), []) => None,
+                (Some(_), _) if matching.len() == 1 => Some(matching[0].clone()),
                 (Some(f), _) => {
                     return Err(UsageError(format!(
-                        "{name:?} is not known in {f:?}; it is in: {}",
+                        "{name:?} is not known in {f:?}, or in more than one of its places; it is in: {}",
                         files.join(", ")
                     ))
                     .into());
@@ -2187,7 +2265,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                     };
                     println!(
                         "{}  ({}; {})",
-                        render::clean(&e.test),
+                        render::named(&e.test, e.file.as_deref()),
                         render::clean(&e.reason),
                         state
                     );
@@ -2728,11 +2806,62 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
         Cmd::History {
             test,
             suite,
+            in_place,
             window,
             json,
         } => {
             let (store, _, _) = open_here()?;
-            let found = analysis::find_tests(&store, &test, suite.as_deref())?;
+            let mut found = analysis::find_tests(&store, &test, suite.as_deref())?;
+            if let Some(w) = in_place.as_deref() {
+                let before = found.len();
+                let mut places = std::collections::BTreeSet::new();
+                let place_of = |t: &(String, String, String)| {
+                    analysis::place_of_test(&store, &t.0)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                };
+                for t in &found {
+                    let (file, path) = place_of(t);
+                    places.extend(file.or(path.first().cloned()));
+                }
+                analysis::retain_in_place(&mut found, w, place_of);
+                if found.is_empty() && before > 0 {
+                    return Err(UsageError(format!(
+                        "no test matching {test:?} in {w:?}; it is in: {}",
+                        places.into_iter().collect::<Vec<_>>().join(", ")
+                    ))
+                    .into());
+                }
+            }
+            // One name in several places (two crates' `tests::flaky`) is
+            // several tests: each one's history, with its place.
+            if in_place.is_none() {
+                let mut by_place: std::collections::BTreeMap<String, Vec<_>> = Default::default();
+                for t in found
+                    .iter()
+                    .filter(|t| t.1 == test || found.iter().all(|f| f.1 == t.1))
+                {
+                    if let Some((Some(file), _)) = analysis::place_of_test(&store, &t.0)?
+                        && !file.starts_with("(package pending)")
+                    {
+                        by_place.entry(file).or_default().push(t.clone());
+                    }
+                }
+                if by_place.len() > 1 {
+                    for (i, group) in by_place.values().enumerate() {
+                        if i > 0 {
+                            println!();
+                        }
+                        let id = analysis::most_recent(&store, group)?;
+                        match analysis::stats(&store, &id, window)? {
+                            Some(s) => render::test_stats(&s, json),
+                            None => bail!("test disappeared"),
+                        }
+                    }
+                    return Ok(exit::PASSED);
+                }
+            }
             // Exact names win over partial ones (round 10: 16 matches for a
             // name that is exact in every suite, next to an old renamed one).
             let found: Vec<_> = {
@@ -2766,10 +2895,15 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     // One line per name, its suites together: a name listed
                     // once per suite read as tests no name could tell apart
                     // (round 15).
-                    let mut by_name: std::collections::BTreeMap<&str, Vec<&str>> =
+                    let names = analysis::Names::new(&store);
+                    let mut by_name: std::collections::BTreeMap<String, Vec<&str>> =
                         Default::default();
-                    for (_, display, suite) in &found {
-                        by_name.entry(display).or_default().push(suite);
+                    for (id, display, suite) in &found {
+                        let file = analysis::place_of_test(&store, id)?.and_then(|p| p.0);
+                        by_name
+                            .entry(names.name(display, file.as_deref()))
+                            .or_default()
+                            .push(suite);
                     }
                     // An empty name asks for the list (as the help says).
                     if test.is_empty() {
@@ -2814,7 +2948,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                             "{:20} {:5.1}% fail  {}",
                             k.name,
                             t.failure_rate * 100.0,
-                            render::clean(&t.display)
+                            render::named(&t.display, t.place.as_deref())
                         );
                     }
                 }
@@ -2843,17 +2977,17 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
                 println!("fail%   retry-passes  same-code flips  test");
                 for s in &list {
-                    let q = if prova_core::quarantine::covers(&quarantined, &s.display).is_some() {
-                        "  (quarantined)"
-                    } else {
-                        ""
-                    };
+                    let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
+                        let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
+                        prova_core::quarantine::covers_key(&quarantined, &key).is_some()
+                    });
+                    let q = if covered { "  (quarantined)" } else { "" };
                     println!(
                         "{:5.1}%  {:12}  {:15}  {}{q}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
-                        render::clean(&s.display)
+                        render::named(&s.display, s.place.as_deref())
                     );
                 }
             }
@@ -2970,7 +3104,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let store = Store::open_dir(&root, &dir)?;
             let row = store.run(&run)?;
             let spec: RunSpec = serde_json::from_value(row.spec)?;
-            let mut observer = prova_adapters::observer_for(&spec, &root);
+            let mut observer = prova_adapters::observer_for(&spec, &root, Path::new(&row.cwd));
             engine::supervise(&store, &run, observer.as_mut())?;
             Ok(exit::PASSED)
         }
@@ -3062,7 +3196,9 @@ fn repeat_runs(
         for e in store.events_after(&id, 0)? {
             match e.kind {
                 prova_core::model::EventKind::TestFinished { test, outcome, .. } => {
-                    results.push((test.unique(), test.display(), outcome));
+                    // Two binaries' tests of one name are two tests.
+                    let named = analysis::Names::new(store).name(&test.display(), test.place());
+                    results.push((test.unique(), named, outcome));
                 }
                 prova_core::model::EventKind::TestSuperseded { test, .. } => {
                     gone.insert(test.unique());
@@ -3083,10 +3219,20 @@ fn repeat_runs(
             }
         }
         for q in &s.quarantined {
-            quarantined.insert(q.test.clone());
+            quarantined.insert(match &q.place {
+                Some(p) => format!("{} ({p})", q.test),
+                None => q.test.clone(),
+            });
         }
         if !json {
-            let failing: Vec<&str> = s.failures.iter().map(|f| f.test.as_str()).collect();
+            let failing: Vec<String> = s
+                .failures
+                .iter()
+                .map(|f| match &f.place {
+                    Some(p) => format!("{} ({p})", f.test),
+                    None => f.test.clone(),
+                })
+                .collect();
             // A pass that set a quarantined failure aside says so (round 14).
             let set_aside: Vec<&str> = s
                 .quarantined

@@ -24,6 +24,12 @@ pub struct Recognizers {
     /// The Go module of the run's directory (go.mod), for packages printed
     /// as `.`.
     pub go_module: Option<String>,
+    /// The run's working directory: pytest names tests from its rootdir,
+    /// prova from here (ADR 0031 section 2).
+    pub cwd: Option<std::path::PathBuf>,
+    /// Where pytest's rootdir lies below the working directory
+    /// (`sub2` for `rootdir: <cwd>/sub2`): put before its ids.
+    pytest_prefix: Option<String>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -155,6 +161,12 @@ pub struct Recognizers {
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
     pytest_in_failures: bool,
+    /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
+    /// then `× fails`): the open ones, by indentation.
+    vitest_suites: Vec<(usize, String)>,
+    /// Test classes Surefire's class lines named in full (`-- in
+    /// calc.CalcTest`): its summary names them without the package.
+    surefire_classes: Vec<String>,
     pytest_blocks: Vec<(String, Vec<String>)>,
     /// Test files (Jest `Test Suites:`, Vitest `Test Files`) the framework's
     /// own summary says failed. Such a file can fail without any test of it
@@ -1020,6 +1032,9 @@ impl Recognizers {
         } else if !line.starts_with('{') && !line.starts_with("?   \t") {
             self.go_segment_line(line);
         }
+        if let Some(root) = line.strip_prefix("rootdir: ") {
+            self.pytest_rootdir(root);
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -1072,6 +1087,33 @@ impl Recognizers {
         out
     }
 
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header: when the
+    /// rootdir lies below the working directory, ids are read from there.
+    fn pytest_rootdir(&mut self, header: &str) {
+        let Some(cwd) = &self.cwd else {
+            return;
+        };
+        let dir = header.split(", ").next().unwrap_or(header).trim();
+        self.pytest_prefix = std::path::Path::new(dir)
+            .strip_prefix(cwd)
+            .ok()
+            .map(|rel| rel.to_string_lossy().trim_matches('/').to_owned())
+            .filter(|rel| !rel.is_empty());
+    }
+
+    /// Where pytest's rootdir lies below the working directory, if it does.
+    pub fn pytest_prefix(&self) -> Option<&str> {
+        self.pytest_prefix.as_deref()
+    }
+
+    /// A pytest node id as prova names it, from the working directory.
+    fn pytest_key(&self, id: &str) -> TestKey {
+        match &self.pytest_prefix {
+            Some(p) if id.contains("::") || id.ends_with(".py") => pytest_key(&format!("{p}/{id}")),
+            _ => pytest_key(id),
+        }
+    }
+
     /// The start of an unfinished output line. A pytest `-v` line shows the
     /// test's id, then its outcome once it ends: an id followed by a space
     /// and nothing else is a test running now (round 15: a stall named the
@@ -1106,7 +1148,7 @@ impl Recognizers {
         if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
             return out;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if self
             .pytest_text_pass
             .as_ref()
@@ -1666,7 +1708,7 @@ impl Recognizers {
             return;
         };
         lift(&mut self.level, Level::Native);
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         let outcome = match (when, result) {
             ("setup", "passed") => return self.started(key, out),
             ("setup", "failed") => Outcome::Errored,
@@ -1783,7 +1825,7 @@ impl Recognizers {
             "skipped" => Outcome::Skipped,
             _ => return,
         };
-        let parent = pytest_key(id);
+        let parent = self.pytest_key(id);
         let label = if label.trim().is_empty() {
             // No context to tell subtests apart: by order within the
             // parent, so none is merged into another or into the parent.
@@ -2083,7 +2125,7 @@ impl Recognizers {
             let start = left[..at].rfind(' ').map_or(0, |i| i + 1);
             let id = left[start..].trim();
             let label = left[..start].trim();
-            let key = pytest_key(id);
+            let key = self.pytest_key(id);
             let (key, sub) = if sub {
                 (pytest_subtest(key, label), true)
             } else {
@@ -2166,11 +2208,11 @@ impl Recognizers {
         if matches!(word, "SUBPASS" | "SUBFAIL" | "SUBSKIP")
             && let Some((parent, label)) = id.rsplit_once(" [")
         {
-            let key = pytest_subtest(pytest_key(parent.trim()), &format!("[{label}"));
+            let key = pytest_subtest(self.pytest_key(parent.trim()), &format!("[{label}"));
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if word == "RERUN" {
             let n = self.reruns.get(&key.unique()).copied().unwrap_or(0) + 1;
             self.reruns.insert(key.unique(), n);
@@ -2308,12 +2350,38 @@ impl Recognizers {
             && !rest.contains(" > ")
         {
             self.vitest_file = Some(f.trim().to_owned());
+            self.vitest_suites.clear();
             return true;
         }
+        let indent = line.len() - t.len();
+        self.vitest_suites.retain(|(i, _)| *i < indent);
         if t.starts_with("❯ ") {
+            // A suite of the default reporter's tree: `suite (2)`.
+            if self.vitest_file.is_some()
+                && let Some((name, count)) = rest.rsplit_once(" (")
+                && count.trim_end().ends_with(')')
+                && count
+                    .trim_end()
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+                && !name.contains(" > ")
+            {
+                self.vitest_suites.push((indent, name.trim().to_owned()));
+                return true;
+            }
             return false;
         }
         let mut parts: Vec<String> = rest.split(" > ").map(|p| p.trim().to_owned()).collect();
+        // `× fails` under `❯ suite` and `❯ inner`: the whole name, as the
+        // verbose reporter and the stream give it (round 17: the short one
+        // split history and let two describes' `works` collide).
+        if parts.len() == 1 && !self.vitest_suites.is_empty() {
+            let mut full: Vec<String> = self.vitest_suites.iter().map(|(_, n)| n.clone()).collect();
+            full.append(&mut parts);
+            parts = full;
+        }
         let file = if parts.len() > 1 && is_file(&parts[0]) {
             Some(parts.remove(0))
         } else if parts.len() > 1 || self.vitest_file.is_some() {
@@ -2353,8 +2421,29 @@ impl Recognizers {
     ///   `[ERROR]   CalcTest.io \u{bb} IO disk full`.
     /// The result files may name only some of the classes (a fork that
     /// died, a partial report): what the console names counts too.
+    /// The class as the XML will name it: Surefire's summary prints the
+    /// simple name, the class lines before it the package too. Only a
+    /// class that one full name ends with is qualified.
+    fn surefire_class(&self, class: &str) -> String {
+        let mut found = self
+            .surefire_classes
+            .iter()
+            .filter(|c| c.as_str() == class || c.ends_with(&format!(".{class}")));
+        match (found.next(), found.next()) {
+            (Some(c), None) => c.clone(),
+            _ => class.to_owned(),
+        }
+    }
+
     fn surefire(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let line = line.trim_end();
+        if let Some((_, class)) = line.rsplit_once(" -- in ")
+            && !class.is_empty()
+            && !class.contains(char::is_whitespace)
+            && !self.surefire_classes.iter().any(|c| c == class)
+        {
+            self.surefire_classes.push(class.to_owned());
+        }
         let Some(body) = line
             .strip_prefix("[ERROR] ")
             .or_else(|| line.strip_prefix("[WARNING] "))
@@ -2414,7 +2503,7 @@ impl Recognizers {
                 && class_ok(method)
             {
                 self.surefire_rerun = Some((
-                    TestKey::new(vec![class.to_owned()], method),
+                    TestKey::new(vec![self.surefire_class(class)], method),
                     section,
                     Vec::new(),
                 ));
@@ -2449,7 +2538,7 @@ impl Recognizers {
             Outcome::Failed
         };
         self.result(
-            TestKey::new(vec![class.to_owned()], method),
+            TestKey::new(vec![self.surefire_class(class)], method),
             outcome,
             None,
             Some(msg.to_owned()).filter(|m| !m.is_empty()),
@@ -3256,12 +3345,24 @@ fn nextest_status(line: &str) -> Option<(&str, &str, &str, &str)> {
     Some((status, dur.trim(), binary, test))
 }
 
-/// Rust test binaries are named by target (ADR 0018): nextest's binary id
-/// keeps its last segment (`calc::calc` and `calc` give `calc`,
-/// `prova-cli::live` gives `live`, `crate::bin/tool` gives `tool`).
+/// Rust test binaries are named by crate and target (ADR 0018, 0031): the
+/// crate's own binary is `calc` (`calc::calc` too), another target of it
+/// `calc::live`, a bin `calc::tool`. The crate stays in the name: two
+/// crates' `it` integration tests are two binaries, whatever order they ran
+/// in (round 17).
 fn nextest_binary(id: &str) -> String {
-    let last = id.rsplit("::").next().unwrap_or(id);
-    last.trim_start_matches("bin/").replace('-', "_")
+    let id = id.replace('-', "_");
+    match id.rsplit_once("::") {
+        Some((krate, target)) => {
+            let target = target.trim_start_matches("bin/");
+            if krate == target {
+                krate.to_owned()
+            } else {
+                format!("{krate}::{target}")
+            }
+        }
+        None => id,
+    }
 }
 
 /// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
@@ -3957,8 +4058,12 @@ mod tests {
             cargo_binary("tests/live.rs (target/debug/deps/live-0123abcd)"),
             "live"
         );
-        assert_eq!(nextest_binary("prova-cli::live"), "live");
-        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova");
+        assert_eq!(nextest_binary("prova-cli::live"), "prova_cli::live");
+        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova_cli::prova");
+        assert_eq!(nextest_binary("calc::calc"), "calc");
+        assert_eq!(nextest_binary("calc"), "calc");
+        // Two crates' integration tests of one name are two binaries.
+        assert_ne!(nextest_binary("alpha::it"), nextest_binary("beta::it"));
     }
 
     /// Round 5: in quiet mode libtest's 60 s warning followed the progress
@@ -4216,6 +4321,30 @@ mod tests {
         assert_eq!(message.as_deref(), Some("expected 16 to be 4"));
     }
 
+    /// Round 17: the default reporter prints suites as a tree and a test
+    /// under its own short name; the verbose reporter and the stream give
+    /// the whole name. One test, one name (real Vitest 5.1.1 output).
+    #[test]
+    fn vitest_default_reporter_tree_gives_the_whole_name() {
+        let (_, ev) = feed(
+            " ❯ src/c/y.test.js (2 tests | 1 failed) 4ms\n   ❯ suite (2)\n     ❯ inner (2)\n       × fails 3ms\n         → expected '1' to be undefined\n       ✓ works 0ms\n   ❯ other (1)\n     ✓ works 1ms\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                (
+                    "src/c/y.test.js::suite > inner > fails".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "src/c/y.test.js::suite > inner > works".into(),
+                    Outcome::Passed
+                ),
+                ("src/c/y.test.js::other > works".into(), Outcome::Passed),
+            ]
+        );
+    }
+
     #[test]
     fn same_names_in_different_test_binaries_stay_apart() {
         let (r, ev) = feed(
@@ -4271,6 +4400,26 @@ mod tests {
         );
         assert_eq!(finished(&ev).len(), 2);
         assert_eq!(r.total(), 2, "the skipped test seen by name counts");
+    }
+
+    /// Round 17 (java-maven): the live FAIL line said `CalcTest::flakyClock`
+    /// (the summary's simple class name) where the XML says
+    /// `calc.CalcTest::flakyClock`: the class lines before it carry the
+    /// package (real Surefire 3.5.2 output).
+    #[test]
+    fn surefire_summary_names_the_package_the_class_lines_gave() {
+        let (_, ev) = feed(concat!(
+            "[INFO] Running calc.CalcTest\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.040 s <<< FAILURE! -- in calc.CalcTest\n",
+            "[INFO] Results:\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   CalcTest.flakyClock:21 clock tick landed on a bad boundary\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![("calc.CalcTest::flakyClock".into(), Outcome::Failed)]
+        );
     }
 
     #[test]

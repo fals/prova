@@ -1888,9 +1888,10 @@ fn observe_child(
     if outcome == Outcome::Failed
         && reason.is_none()
         && !failing.is_empty()
-        && failing
+        && outcomes
             .iter()
-            .all(|d| crate::quarantine::covers(&quarantine, d).is_some())
+            .filter(|(_, o)| o.is_failure())
+            .all(|(k, _)| crate::quarantine::covers_key(&quarantine, k).is_some())
     {
         // Which of ADR 0028's conditions did not hold (round 15: refused
         // with no word of why).
@@ -1909,8 +1910,7 @@ fn observe_child(
             })
             .collect();
         let verified_other = outcomes.iter().any(|(k, o)| {
-            *o == Outcome::Passed
-                && crate::quarantine::covers(&quarantine, key_display(k)).is_none()
+            *o == Outcome::Passed && crate::quarantine::covers_key(&quarantine, k).is_none()
         });
         reason = Some(if !errored.is_empty() {
             format!(
@@ -2248,16 +2248,7 @@ fn missing_since(
     Ok(Some((prev, missing, earlier.len())))
 }
 
-/// A name recorded bare (`TestX`, from text output that named no package)
-/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
-/// test: the same name, or one is the other behind a `::` or `/`.
-fn same_test_name(a: &str, b: &str) -> bool {
-    let tail = |long: &str, short: &str| {
-        long.strip_suffix(short)
-            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
-    };
-    a == b || tail(a, b) || tail(b, a)
-}
+use crate::analysis::same_test_name;
 
 /// The display name of a lifecycle key (`file<US>name`).
 fn key_display(key: &str) -> &str {
@@ -2890,6 +2881,10 @@ pub enum WaitReason {
 #[derive(Debug, Clone, Serialize)]
 pub struct Failure {
     pub test: String,
+    /// The test binary, when another test of the same name lives elsewhere
+    /// (ADR 0031 section 2): `FAIL tests::flaky (geo)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     /// `failed` or `errored` (errored includes a test that never finished).
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3026,6 +3021,9 @@ pub struct Summary {
 #[derive(Debug, Clone, Serialize)]
 pub struct QuarantinedTest {
     pub test: String,
+    /// The test binary of an `--in` quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     /// `passed`, `failed`, `errored`, `skipped`, `not run`, or `not
     /// reported` (no per-test results, or the run was cut short).
     pub result: String,
@@ -3140,7 +3138,7 @@ pub fn wait(
                 if let Some(reason) = matches(until, &e.kind) {
                     if reason == WaitReason::Failure
                         && let EventKind::TestFinished { test, .. } = &e.kind
-                        && crate::quarantine::covers(&quarantine, &test.display()).is_some()
+                        && crate::quarantine::covers_key(&quarantine, &test.unique()).is_some()
                     {
                         continue;
                     }
@@ -3436,7 +3434,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     parents_before_subtests(&mut failing);
     // Quarantined tests are listed apart, with their result (ADR 0027).
     let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
-    failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
+    failing.retain(|f| crate::quarantine::covers_key(&quarantine, &f.0.unique()).is_none());
     // Did the same suite (same selection) pass on exactly this code before?
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
@@ -3471,8 +3469,15 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             kept.get(&key.display())
                 .and_then(|t| message_from_output(t))
         });
+        let shared = finals
+            .values()
+            .any(|f| f.0.display() == key.display() && f.0.unique() != key.unique())
+            || crate::quarantine::files_of(store, &key.display())
+                .map(|f| f.len() > 1)
+                .unwrap_or(false);
         failures.push(Failure {
             test: key.display(),
+            place: key.place().filter(|_| shared).map(str::to_owned),
             outcome: *outcome,
             message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
@@ -3507,6 +3512,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             let result = finals
                 .values()
                 .filter(|f| f.0.display() == *name)
+                .filter(|f| match (f.0.place(), &q.file) {
+                    (Some(p), Some(q)) => p == q,
+                    _ => true,
+                })
                 .map(|f| f.1.as_str().to_owned())
                 .next();
             // A selection that did not include it says nothing of it
@@ -3528,6 +3537,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             }
             quarantined.push(QuarantinedTest {
                 test: name.clone(),
+                place: q.file.clone(),
                 result: result
                     .unwrap_or_else(|| if blind { "not reported" } else { "not run" }.to_owned()),
                 reason: q.reason.clone(),
@@ -4048,6 +4058,7 @@ mod quarantine_tests {
                         expires_ms: 1,
                         removed_ms: None,
                         file: None,
+                        ambiguous: false,
                     },
                 )
             })
