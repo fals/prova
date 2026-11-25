@@ -1350,6 +1350,8 @@ fn upsert_section(root: &Path, path: &Path, create: bool) -> Result<Section> {
 /// (`^TestAdd$`), Maven's `Class#method` with `*` and `+` (round 8), .NET's
 /// `FullyQualifiedName~Name`, or a plain substring.
 fn filter_matches(filter: &str, test: &str) -> bool {
+    // A pytest node id names the test the way prova prints it, dotted.
+    let filter = &prova_core::config::pytest_prova_name(filter);
     let f = filter
         .trim()
         .trim_start_matches("FullyQualifiedName~")
@@ -1396,23 +1398,10 @@ fn run_to_end(store: &Store, req: &NewRunRequest) -> Result<Summary> {
 /// (`./dev`, `./dev "dotnet test"`, `nix develop -c`): the most frequent
 /// over the recent runs, argv or a suite's shell command, the newest first
 /// among equals (round 16: the newest run alone lost it).
-fn earlier_wrapper(store: &Store) -> Option<prova_adapters::adopt::Wrapper> {
+fn earlier_wrapper(store: &Store, root: &Path) -> Option<prova_adapters::adopt::Wrapper> {
     let mut seen: Vec<(prova_adapters::adopt::Wrapper, usize)> = Vec::new();
     for r in store.recent_runs(300).ok()? {
-        let found = match (
-            r.spec["command"]["argv"].as_array(),
-            r.spec["command"]["shell"].as_str(),
-        ) {
-            (Some(argv), _) => {
-                let argv: Vec<String> = argv
-                    .iter()
-                    .filter_map(|w| w.as_str().map(str::to_owned))
-                    .collect();
-                prova_adapters::adopt::wrapper_form(&argv)
-            }
-            (None, Some(cmd)) => prova_adapters::adopt::wrapper_of_shell(cmd),
-            _ => None,
-        };
+        let found = learnable_wrapper(&r.spec["command"], Path::new(&r.cwd), root);
         if let Some(w) = found {
             match seen.iter_mut().find(|(x, _)| *x == w) {
                 Some((_, n)) => *n += 1,
@@ -1425,6 +1414,59 @@ fn earlier_wrapper(store: &Store) -> Option<prova_adapters::adopt::Wrapper> {
         .rev()
         .max_by_key(|(_, n)| *n)
         .map(|(w, _)| w)
+}
+
+/// The wrapper an earlier run's command shows, if adopt may propose it. The
+/// run itself may be anything (`./dev make test`), but the wrapper must be
+/// one a quarantine would trust in front of a runner (ADR 0034 §1: a script
+/// that does more than exec the runner, like `./ci.sh "pytest && lint"`, is
+/// not), and its program must exist (round 18: `./ci.sh` was proposed after
+/// it was deleted). A command that is not a runner call behind the wrapper
+/// (`./dev "cd sub && pytest"`) shows no wrapper at all.
+fn learnable_wrapper(
+    command: &serde_json::Value,
+    cwd: &Path,
+    root: &Path,
+) -> Option<prova_adapters::adopt::Wrapper> {
+    let (spec, found) = match (command["argv"].as_array(), command["shell"].as_str()) {
+        (Some(argv), _) => {
+            let argv: Vec<String> = argv
+                .iter()
+                .filter_map(|w| w.as_str().map(str::to_owned))
+                .collect();
+            let found = prova_adapters::adopt::wrapper_form(&argv);
+            (config::CommandSpec::Argv(argv), found)
+        }
+        (None, Some(cmd)) => (
+            config::CommandSpec::Shell(cmd.to_owned()),
+            prova_adapters::adopt::wrapper_of_shell(cmd),
+        ),
+        _ => return None,
+    };
+    let found = found?;
+    // The whole command given as one argument must itself be one call.
+    if found.quoted {
+        prova_core::runner_call::check(&spec, cwd).ok()?;
+    }
+    let mut probe: Vec<String> = found.prefix.split_whitespace().map(str::to_owned).collect();
+    // A script takes the command as one argument; a program takes words.
+    if found.quoted || probe.len() == 1 {
+        probe.push("python3 -m pytest -q".to_owned());
+    } else {
+        probe.extend(["python3", "-m", "pytest", "-q"].map(str::to_owned));
+    }
+    prova_core::runner_call::check(&config::CommandSpec::Argv(probe), cwd).ok()?;
+    let program = found.prefix.split_whitespace().next()?;
+    program_exists(program, root).then_some(found)
+}
+
+/// Whether `program` can start: a path that is a file, or a name on PATH.
+fn program_exists(program: &str, root: &Path) -> bool {
+    if program.contains('/') {
+        return root.join(program).is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(program).is_file()))
 }
 
 /// What the framework named in a filter's syntax, for the framework the
@@ -1483,6 +1525,14 @@ fn run_failure_cause(s: &Summary) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// pytest's own complaint about a `-k` expression it cannot parse.
+fn rejected_k_expression(lines: &[&String]) -> Option<String> {
+    lines
+        .iter()
+        .find(|l| l.contains("Wrong expression passed to '-k'"))
+        .map(|l| render::clean(l.trim()))
 }
 
 /// A line in which a framework says it ran no test (Surefire, pytest, Jest,
@@ -1571,7 +1621,16 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                     || l.contains("file or directory not found")
             })
             .map(|l| render::clean(l.trim()));
-        let (ok, why) = if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
+        let (ok, why) = if let (Some(line), true) =
+            (rejected_k_expression(&lines), tests.is_empty())
+        {
+            (
+                false,
+                format!(
+                    "pytest rejected the filter {filter:?} as a `-k` expression ({line}). `-k` takes a plain substring; select one test or case by its node id (tests/test_x.py::test_name[case]) in a select template with `-k {{filter}}`: prova passes a node id to pytest without the `-k`"
+                ),
+            )
+        } else if let (Some(line), true) = (&nothing_matched, tests.is_empty()) {
             let split = engine::split_filter_fragment(&filter, &lines);
             (
                 false,
@@ -1677,7 +1736,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
         return Ok(if ok { exit::PASSED } else { exit::FAILED });
     }
     let mut p = prova_adapters::adopt::propose(&root);
-    if let Some(wrapper) = earlier_wrapper(&store) {
+    if let Some(wrapper) = earlier_wrapper(&store, &root) {
         prova_adapters::adopt::apply_wrapper_form(&mut p, &wrapper);
     }
     let toml = prova_adapters::adopt::to_toml(&p);
@@ -3689,10 +3748,52 @@ mod filter_tests {
         ));
         assert!(filter_matches("calc.CalcTest.divides", t));
     }
+
+    /// Round 18: pytest's node id did not match prova's dotted name.
+    #[test]
+    fn a_pytest_node_id_matches_its_prova_name() {
+        assert!(filter_matches(
+            "tests/test_calc.py::test_add",
+            "tests.test_calc::test_add"
+        ));
+        assert!(!filter_matches(
+            "tests/test_calc.py::test_add",
+            "tests.test_calc::test_sub"
+        ));
+        let l = "ERROR: Wrong expression passed to '-k': a[b: unbalanced".to_owned();
+        assert!(super::rejected_k_expression(&[&l]).is_some());
+        assert!(super::rejected_k_expression(&[]).is_none());
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Round 18: adopt proposed `./ci.sh` from ad-hoc runs after it was gone.
+    #[test]
+    fn a_wrapper_is_learned_only_from_one_runner_call_of_a_program_that_exists() {
+        let d = std::env::temp_dir().join(format!("prova-learn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("dev"),
+            "#!/bin/sh\nexec docker run --rm img sh -c \"$*\"\n",
+        )
+        .unwrap();
+        let learn =
+            |a: &[&str]| super::learnable_wrapper(&serde_json::json!({ "argv": a }), &d, &d);
+        // One exec of a container client: learned.
+        assert!(learn(&["./dev", "python3 -m pytest -q"]).is_some());
+        // (A script that does more than exec its runner is refused by
+        // `runner_call::check`, ADR 0034 §1: no wrapper is learned from it.)
+        // Gone: never proposed.
+        assert!(learn(&["./gone.sh", "python3 -m pytest -q"]).is_none());
+        // A chained ad-hoc command.
+        assert!(learn(&["./dev", "cd sub && python3 -m pytest -q"]).is_none());
+        assert!(learn(&["./dev", "python3 -m pytest -q && lint"]).is_none());
+        // A wrapper in front of words is learned from any command behind it.
+        assert!(learn(&["./dev", "make", "test"]).is_some());
+    }
+
     #[test]
     fn usage_exit_code_matches_clap() {
         assert_eq!(super::exit::USAGE, 2);

@@ -52,6 +52,8 @@ const NEXTEST_JSON: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest ru
 /// nextest does not run doctests (round 9: a failing doctest gave a clean
 /// PASS while `make test` failed): a crate with a library runs them after.
 const NEXTEST_JSON_DOC: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc || exit 1; exit $s";
+/// The same for a workspace: every member's doctests.
+const NEXTEST_JSON_DOC_WORKSPACE: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final; s=$?; cargo test --doc --workspace || exit 1; exit $s";
 const NEXTEST_JSON_SELECT: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1 --success-output final {filter}";
 
 /// `cargo nextest --version` output, if nextest is installed.
@@ -107,6 +109,37 @@ fn any_file_with_ext(root: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the Cargo project has a library to doctest, and whether it is a
+/// workspace: a package with `src/lib.rs`, or a workspace one of whose
+/// members has it (`members` as written, or a `dir/*` glob).
+fn rust_libraries(root: &Path) -> (bool, bool) {
+    let manifest = read(root, "Cargo.toml");
+    let workspace = manifest.lines().any(|l| l.trim() == "[workspace]");
+    let mut lib = root.join("src/lib.rs").exists();
+    if !workspace {
+        return (lib, false);
+    }
+    let members = manifest
+        .split_once("members")
+        .and_then(|(_, rest)| rest.split_once('['))
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .unwrap_or_default();
+    for m in members.split('"').skip(1).step_by(2) {
+        match m.strip_suffix("/*") {
+            Some(dir) => {
+                if let Ok(entries) = std::fs::read_dir(root.join(dir)) {
+                    lib |= entries
+                        .flatten()
+                        .any(|e| e.path().join("src/lib.rs").exists());
+                }
+            }
+            None => lib |= root.join(m).join("src/lib.rs").exists(),
+        }
+    }
+    (lib, true)
+}
+
 /// Installed tool versions `prova adopt` asks about (replaced in tests).
 type Probe = fn(&Path) -> Option<String>;
 
@@ -116,11 +149,15 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         let nextest = nextest(root);
         out.push(match nextest.as_deref().filter(|v| nextest_has_libtest_json(v)) {
             Some(v) => {
-                let lib = root.join("src/lib.rs").exists();
+                let (lib, workspace) = rust_libraries(root);
                 Framework {
                     language: "rust",
                     base: "cargo test",
-                    run: if lib { NEXTEST_JSON_DOC } else { NEXTEST_JSON },
+                    run: match (lib, workspace) {
+                        (false, _) => NEXTEST_JSON,
+                        (true, false) => NEXTEST_JSON_DOC,
+                        (true, true) => NEXTEST_JSON_DOC_WORKSPACE,
+                    },
                     select: NEXTEST_JSON_SELECT,
                     why: format!(
                         "Cargo.toml and {v}; its libtest JSON stream is read live (native; experimental format pinned to 0.1){}",
@@ -434,9 +471,22 @@ pub fn apply_wrapper_form(p: &mut Proposal, w: &Wrapper) {
             format!("{wrapper} {cmd}")
         }
     };
+    // A script of the project (`./dev`) re-splits its words with `$*`: a
+    // filter with spaces would arrive in pieces, so its select takes the
+    // command as one quoted argument (round 18).
+    let script = !w.quoted && (wrapper.starts_with("./") || wrapper.starts_with('/'));
+    let wrap_select = |cmd: &str| match cmd.strip_prefix(wrapper) {
+        Some(rest) if script && !cmd.starts_with(&format!("{wrapper} \"")) => {
+            quote(rest.trim_start())
+        }
+        _ => wrap(cmd),
+    };
     for s in &mut p.suites {
         s.run = wrap(&s.run);
-        s.select = s.select.as_deref().map(wrap);
+        s.select = s.select.as_deref().map(|c| {
+            let wrapped = wrap(c);
+            wrap_select(&wrapped)
+        });
     }
     p.existing = p.existing.as_deref().map(wrap);
     p.wrapped = true;
@@ -885,6 +935,43 @@ mod tests {
         assert!(p.suites[0].why.contains("doctests"));
     }
 
+    /// Round 18: a workspace dropped the doctest step of a single crate.
+    #[test]
+    fn a_rust_workspace_runs_its_doctests_after_nextest() {
+        let d = dir(
+            "ws-doctests",
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nresolver = \"3\"\nmembers = [\"calc\", \"crates/*\"]\n",
+                ),
+                ("calc/Cargo.toml", "[package]\nname = \"calc\""),
+                ("calc/src/lib.rs", ""),
+                ("crates/app/Cargo.toml", "[package]\nname = \"app\""),
+                ("crates/app/src/main.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(
+            p.suites[0]
+                .run
+                .ends_with("cargo test --doc --workspace || exit 1; exit $s"),
+            "{}",
+            p.suites[0].run
+        );
+        // Binaries only: nothing to doctest, and `cargo test --doc` would fail.
+        let d = dir(
+            "ws-bins",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+                ("crates/app/Cargo.toml", "[package]\nname = \"app\""),
+                ("crates/app/src/main.rs", ""),
+            ],
+        );
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert_eq!(p.suites[0].run, NEXTEST_JSON);
+    }
+
     /// Round 9: a suite whose `select` loads prova's Vitest reporter must get
     /// the injection, even when `run` is the project's own `npm test`.
     #[test]
@@ -1062,6 +1149,22 @@ mod tests {
         assert!(!w.quoted);
         assert_eq!(wrapper_of_shell("cd x && make test"), None);
         assert_eq!(wrapper_of_shell("FOO=1 cargo test"), None);
+    }
+
+    /// Round 18: `./dev python3 -m pytest -k {filter}` was proposed although
+    /// `./dev` re-splits its words with `$*`: the select takes the quoted form.
+    #[test]
+    fn a_script_wrapper_gets_a_quoted_select() {
+        let d = dir("py-script-wrap", &[("pytest.ini", "[pytest]")]);
+        let mut p = propose(&d);
+        apply_wrapper(&mut p, "./dev");
+        let sel = p.suites[0].select.as_deref().unwrap();
+        assert_eq!(sel, "./dev \"python3 -m pytest -v -rfE -k {filter}\"");
+        // A program wrapper takes its words as they are.
+        let mut p = propose(&d);
+        apply_wrapper(&mut p, "docker compose run web");
+        let sel = p.suites[0].select.as_deref().unwrap();
+        assert!(sel.starts_with("docker compose run web python3"), "{sel}");
     }
 
     #[test]

@@ -32,7 +32,8 @@ description: Gives the cargo test and cargo-nextest settings that let prova see 
   same way.
 - nextest does not run doctests. For a crate with a library, `prova adopt`
   adds `cargo test --doc` after nextest in the same suite, so a failing
-  doctest fails the run.
+  doctest fails the run. A workspace gets `cargo test --doc --workspace` when
+  any member has a library.
 - nextest runs each test in its own process and counts exit code 0 as a
   pass. The adopted suite adds `--success-output final`, so prova sees each
   passing test's own output: one whose libtest never reports a result (it
