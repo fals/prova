@@ -531,3 +531,208 @@ fn go_lean_spec_experiment() {
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
 }
+
+// ------------------------------------------------- containers (ADR 0035 §3)
+
+/// A copy of python-make with a `./dev` wrapper that runs its argument in
+/// the python image, as projects do (`exec docker run ... sh -c "$*"`).
+/// Dropping it kills every container of this image that mounts the copy,
+/// and nothing else.
+struct DevWorld {
+    dir: PathBuf,
+    tag: String,
+}
+
+impl DevWorld {
+    fn new(name: &str) -> DevWorld {
+        let tag = image("python");
+        let d = copy_fixture_as("python-make", &format!("python-make-{name}"))
+            .canonicalize()
+            .unwrap();
+        let id = |flag: &str| {
+            let o = Command::new("id").arg(flag).output().unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_owned()
+        };
+        let script = format!(
+            "#!/bin/sh\nexec docker run --rm --user {}:{} -e HOME=/tmp -e HANG -v \"$PWD\":/w -w /w {tag} sh -c \"$*\"\n",
+            id("-u"),
+            id("-g")
+        );
+        std::fs::write(d.join("dev"), script).unwrap();
+        assert!(
+            Command::new("chmod")
+                .args(["755", d.join("dev").to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let w = DevWorld { dir: d, tag };
+        assert!(
+            w.containers().is_empty(),
+            "stale containers: {:?}",
+            w.containers()
+        );
+        w
+    }
+
+    /// Running containers of the image that mount this copy.
+    fn containers(&self) -> Vec<String> {
+        let o = docker(&[
+            "ps",
+            "-q",
+            "--filter",
+            &format!("ancestor={}", self.tag),
+            "--filter",
+            &format!("volume={}", self.dir.display()),
+        ]);
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn prova(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        host(&self.dir, args, env)
+    }
+
+    /// Starts `./dev "python -m pytest -v"` detached with the test hanging.
+    fn start_hanging(&self) -> String {
+        let o = self.prova(
+            &[
+                "run",
+                "--detach",
+                "--json",
+                "--stall-after",
+                "5s",
+                "--",
+                "./dev",
+                "python -m pytest -v",
+            ],
+            &[("HANG", "1")],
+        );
+        json_last_line(&o)["run"].as_str().unwrap().to_owned()
+    }
+
+    fn wait_stall(&self, run: &str) {
+        let w = self.prova(
+            &[
+                "wait",
+                run,
+                "--until",
+                "stall",
+                "--max-wait",
+                "120s",
+                "--json",
+            ],
+            &[],
+        );
+        assert_eq!(
+            json_last_line(&w)["reason"],
+            "stall",
+            "{}",
+            String::from_utf8_lossy(&w.stdout)
+        );
+    }
+
+    fn cancel_and_wait(&self, run: &str) -> serde_json::Value {
+        assert!(self.prova(&["cancel", run], &[]).status.success());
+        json_last_line(&self.prova(
+            &[
+                "wait",
+                run,
+                "--until",
+                "done",
+                "--max-wait",
+                "60s",
+                "--json",
+            ],
+            &[],
+        ))
+    }
+}
+
+impl Drop for DevWorld {
+    fn drop(&mut self) {
+        for c in self.containers() {
+            docker(&["kill", &c]);
+        }
+    }
+}
+
+/// Round 18 (blocker): `prova cancel` missed the run's container behind a
+/// wrapper that quotes its command (`sh -c "$*"`), so a hung suite kept a
+/// container running after the cancel. Large: only a real docker shows the
+/// words docker keeps for the container's command.
+#[test]
+#[ignore = "large: needs docker (the cancel must find a container started by a wrapper script)"]
+fn cancel_stops_the_container_a_quoting_wrapper_started() {
+    let w = DevWorld::new("wrapper-cancel");
+    let run = w.start_hanging();
+    w.wait_stall(&run);
+    assert_eq!(w.containers().len(), 1, "the run's container is up");
+    let s = w.cancel_and_wait(&run);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(
+        w.containers().is_empty(),
+        "container left running after cancel: {:?}\n{s}",
+        w.containers()
+    );
+}
+
+/// Round 18 (blocker): with two runs of one directory live, a cancel of one
+/// killed the other's container. Now it names the candidates and kills none;
+/// the other run keeps running until it is cancelled too.
+#[test]
+#[ignore = "large: needs docker (two live runs of one directory, one container each)"]
+fn cancel_does_not_kill_the_container_of_another_live_run() {
+    let w = DevWorld::new("wrapper-two-runs");
+    let a = w.start_hanging();
+    w.wait_stall(&a);
+    let b = w.start_hanging();
+    w.wait_stall(&b);
+    assert_eq!(w.containers().len(), 2, "one container per run");
+    let s = w.cancel_and_wait(&b);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        w.containers().len(),
+        2,
+        "cancelling one run killed a container another live run could own: {s}"
+    );
+    let other = json_last_line(&w.prova(&["status", &a, "--json"], &[]));
+    assert_eq!(other["status"], "running", "{other}");
+    // The other run is cancelled too; the guard removes what is left.
+    let s = w.cancel_and_wait(&a);
+    assert_eq!(s["status"], "cancelled", "{s}");
+}
+
+/// Round 18: the first `--until first-failure` wait through a container
+/// client announced 30 s and waited 65. A wrapper hides the client from the
+/// command line, so the wait says when it learns of the container and how
+/// long it will really take. The suite is quiet: no failure, no slow-test event.
+#[test]
+#[ignore = "large: needs docker; takes about 65 s (a container stall is called after 60 s)"]
+fn the_first_wait_through_a_wrapper_says_how_long_it_really_is() {
+    let w = DevWorld::new("wrapper-announce");
+    let o = w.prova(
+        &[
+            "run",
+            "--until",
+            "first-failure",
+            "--",
+            "./dev",
+            "sleep 600",
+        ],
+        &[("HANG", "1")],
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("up to 1m05s in all"),
+        "the wait never said it would last 1m05s in all:\n{err}\n{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let _ = w.prova(&["cancel", "last"], &[]);
+    w.prova(
+        &["wait", "last", "--until", "done", "--max-wait", "60s"],
+        &[],
+    );
+}

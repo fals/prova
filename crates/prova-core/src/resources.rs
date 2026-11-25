@@ -148,6 +148,14 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
     (!viewer).then_some(client)
 }
 
+/// Whether the client's command runs a process inside a container that
+/// is already there (`docker exec`, `kubectl exec`): that container is not
+/// the run's, only the process is.
+pub fn container_client_execs(cmdline: &str) -> bool {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    words.iter().take(4).any(|w| *w == "exec")
+}
+
 /// Whether the client's command line starts a container (`docker run`),
 /// the only kind whose container this run can name.
 pub fn container_client_runs(cmdline: &str) -> bool {
@@ -221,7 +229,17 @@ fn client_output(client: &str, args: &[&str], secs: u64) -> Option<String> {
 /// (`2026-11-24T10:00:00.123456789Z`).
 fn rfc3339_ms(t: &str) -> Option<u64> {
     let (date, time) = t.split_once('T')?;
-    let time = time.trim_end_matches('Z');
+    // A zone other than UTC (`+01:00`, `-0500`) shifts the clock reading.
+    let (time, offset_min) = match time.find(['+', '-']) {
+        Some(at) => {
+            let (clock, zone) = time.split_at(at);
+            let digits: String = zone[1..].chars().filter(char::is_ascii_digit).collect();
+            let (h, m) = (digits.get(..2)?, digits.get(2..4).unwrap_or("00"));
+            let mins = h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()?;
+            (clock, if &zone[..1] == "-" { -mins } else { mins })
+        }
+        None => (time.trim_end_matches('Z'), 0),
+    };
     let mut d = date.split('-').map(|n| n.parse::<i64>().ok());
     let (y, m, day) = (d.next()??, d.next()??, d.next()??);
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
@@ -235,9 +253,10 @@ fn rfc3339_ms(t: &str) -> Option<u64> {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days)
+    let local = u64::try_from(days)
         .ok()
-        .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+        .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)?;
+    local.checked_add_signed(-offset_min * 60_000)
 }
 
 /// The host directories the client's own `-v`/`--volume`/`--mount`
@@ -313,16 +332,32 @@ fn client_command_after<'a>(cmdline: &'a str, image: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
+/// A running container that could be the run's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Shortest id form (12 characters).
+    pub id: String,
+    /// Another live run of the same directory started before the container
+    /// was created, so it could own it as well (ADR 0035 §3): nothing here
+    /// says whose it is.
+    pub contested: bool,
+    /// What matched, for the note.
+    pub matched: String,
+}
+
 /// Which of the inspected containers are the run's own: created after the
 /// run started; mounting every directory the client's own `-v`/`--mount`
 /// arguments name (when it named none, mounting the run's directory or a
 /// parent of it); and running the client's command when it gave one.
+/// `rivals` are the start times (ms) of the other live runs of this
+/// directory.
 pub fn select_run_containers(
     all: &[serde_json::Value],
     cmdline: &str,
     cwd: &str,
     started_ms: u64,
-) -> Vec<String> {
+    rivals: &[u64],
+) -> Vec<Candidate> {
     let named = client_mount_sources(cmdline, cwd);
     let cwd = std::path::Path::new(cwd);
     all.iter()
@@ -367,17 +402,45 @@ pub fn select_run_containers(
                     .flatten()
                     .filter_map(|a| a.as_str().map(str::to_owned)),
             );
-            ran.iter().map(String::as_str).eq(wanted.iter().copied())
+            // The client's words were split on spaces: an argument with
+            // spaces (`sh -c "mvn -q test"`) is several words there, one
+            // in the container, so compare the joined text.
+            ran.join(" ") == wanted.join(" ")
         })
-        .filter_map(|c| c["Id"].as_str())
-        .map(|id| id.chars().take(12).collect())
+        .filter_map(|c| {
+            let id = c["Id"].as_str()?;
+            let created = c["Created"].as_str().and_then(rfc3339_ms)?;
+            let matched = if named.is_empty() {
+                format!("it mounts the run's directory `{}`", cwd.display())
+            } else {
+                format!(
+                    "it mounts {}",
+                    named
+                        .iter()
+                        .map(|n| format!("`{}`", n.display()))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                )
+            };
+            Some(Candidate {
+                id: id.chars().take(12).collect(),
+                contested: rivals.iter().any(|r| *r <= created),
+                matched,
+            })
+        })
         .collect()
 }
 
 /// Running containers that look like the run's own, when its client was
 /// given no `--name` or `--cidfile` (see `select_run_containers`).
 /// Bounded: a client that hangs yields nothing. Ids, shortest form.
-pub fn containers_of_run(client: &str, cmdline: &str, cwd: &str, started_ms: u64) -> Vec<String> {
+pub fn containers_of_run(
+    client: &str,
+    cmdline: &str,
+    cwd: &str,
+    started_ms: u64,
+    rivals: &[u64],
+) -> Vec<Candidate> {
     let Some(ids) = client_output(client, &["ps", "-q"], 3) else {
         return Vec::new();
     };
@@ -393,7 +456,7 @@ pub fn containers_of_run(client: &str, cmdline: &str, cwd: &str, started_ms: u64
     let Ok(serde_json::Value::Array(all)) = serde_json::from_str::<serde_json::Value>(&json) else {
         return Vec::new();
     };
-    select_run_containers(&all, cmdline, cwd, started_ms)
+    select_run_containers(&all, cmdline, cwd, started_ms, rivals)
 }
 
 /// Kills a container by name or id with its client; true when it did.
@@ -946,8 +1009,24 @@ mod container_tests {
 
 #[cfg(test)]
 mod container_choice_tests {
-    use super::select_run_containers as pick;
+    use super::Candidate;
     use serde_json::json;
+
+    fn pick(all: &[serde_json::Value], cmd: &str, cwd: &str, started: u64) -> Vec<String> {
+        super::select_run_containers(all, cmd, cwd, started, &[])
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    fn pick_with(
+        all: &[serde_json::Value],
+        cmd: &str,
+        started: u64,
+        rivals: &[u64],
+    ) -> Vec<Candidate> {
+        super::select_run_containers(all, cmd, "/w", started, rivals)
+    }
 
     fn c(id: &str, created: &str, mounts: &[&str]) -> serde_json::Value {
         let ms: Vec<_> = mounts
@@ -1017,5 +1096,55 @@ mod container_choice_tests {
         b["Args"] = json!(["999"]);
         let got = pick(&[a, b], "docker run --rm -v /w:/w img sh -c unit", "/w", 0);
         assert_eq!(got, vec![short("aaa")]);
+    }
+
+    #[test]
+    fn a_wrapper_that_quotes_its_command_still_matches() {
+        // Round 18: `./dev` runs `docker run ... img sh -c "$*"`; the
+        // process list shows `sh -c mvn -q test` (spaces, not arguments),
+        // the container has Args ["-c", "mvn -q test"].
+        let mut a = c("aaa", "2999-01-01T00:00:00Z", &["/w"]);
+        a["Config"] = json!({"Image":"img"});
+        a["Path"] = json!("sh");
+        a["Args"] = json!(["-c", "mvn -q test"]);
+        let got = pick(
+            &[a],
+            "docker run --rm -e HANG -v /w:/w -w /w img sh -c mvn -q test",
+            "/w",
+            0,
+        );
+        assert_eq!(got, vec![short("aaa")]);
+    }
+
+    #[test]
+    fn docker_times_with_a_zone_are_read_in_that_zone() {
+        use super::rfc3339_ms as t;
+        assert_eq!(t("2026-11-25T11:50:10+01:00"), t("2026-11-25T10:50:10Z"));
+        assert_eq!(t("2026-11-25T05:50:10-0500"), t("2026-11-25T10:50:10Z"));
+    }
+
+    #[test]
+    fn a_container_another_live_run_could_own_is_contested() {
+        // Probe B7: runs A (started 1000) and B (started 2000) in one
+        // directory; A's container, created at 3000, is also a candidate
+        // for B's cancel. B's own container does not exist yet.
+        let all = vec![c("a", "1970-01-01T00:00:03Z", &["/w"])];
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[1000]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contested);
+        // No other live run: the container is the run's.
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[]);
+        assert!(!got[0].contested);
+        // A run that started after the container was created cannot own it.
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[4000]);
+        assert!(!got[0].contested);
+    }
+
+    #[test]
+    fn the_note_says_what_matched() {
+        let all = vec![c("a", "2999-01-01T00:00:00Z", &["/w/g"])];
+        let got = pick_with(&all, "docker run --mount src=../w/g,dst=/g img t", 0, &[]);
+        assert!(got[0].matched.contains("/w/g"), "{}", got[0].matched);
+        assert!(got[0].matched.starts_with("it mounts"));
     }
 }

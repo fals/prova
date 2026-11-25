@@ -817,6 +817,35 @@ fn the_verdict_comes_after_the_output_excerpt() {
     );
 }
 
+/// Round 18: `prova status` printed the output excerpt before the line that
+/// says which run it is. Medium: a real run, then `status`.
+#[test]
+fn status_names_the_run_before_its_output_excerpt() {
+    let d = workspace("status-header");
+    let o = prova(
+        &d,
+        &[
+            "run",
+            "--until",
+            "done",
+            "--",
+            "sh",
+            "-c",
+            "echo 'error: linker failed'; exit 2",
+        ],
+    );
+    let id = stdout(&o)
+        .lines()
+        .find_map(|l| l.strip_prefix("run "))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .to_owned();
+    let out = stdout(&prova(&d, &["status", &id]));
+    let excerpt = out.find("output (last").expect(&out);
+    let header = out.find("run ").expect(&out);
+    assert!(header < excerpt, "{out}");
+}
+
 /// Round 12 count audit: a name-based subtest rule took JUnit's `x/y`
 /// (a display or parameterized name) for a subtest of `x` and hid its
 /// failure among "subtests". Only recognizers flag subtests. Medium: a
@@ -1343,6 +1372,158 @@ fn cancel_warns_when_the_container_cannot_be_attributed() {
         text.contains("does not stop its container") && text.contains("docker ps"),
         "{text}"
     );
+}
+
+/// Probe B7 (round 18): runs A and B in one directory, a container created
+/// after both started: cancelling B must not kill what may be A's. Medium:
+/// needs two live supervisors and the fake client.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_does_not_kill_a_container_another_live_run_could_own() {
+    let d = workspace("cancel-container-rival");
+    let (path, killed) = fake_docker(&d);
+    let cwd = d.canonicalize().unwrap();
+    std::fs::write(d.join("ps.out"), "aaa111bbb222\n").unwrap();
+    std::fs::write(
+        d.join("inspect.json"),
+        format!(
+            r#"[{{"Id":"aaa111bbb222ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}]"#,
+            cwd.display()
+        ),
+    )
+    .unwrap();
+    let start = || {
+        let o = Command::new(PROVA)
+            .args([
+                "run", "--detach", "--json", "--", "docker", "run", "--rm", "img", "t",
+            ])
+            .current_dir(&d)
+            .env("PROVA_HOME", home_of(&d))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        json(&o)["run"].as_str().unwrap().to_owned()
+    };
+    let a = start();
+    let b = start();
+    let _ga = CancelOnDrop(&d, a.clone());
+    let _gb = CancelOnDrop(&d, b.clone());
+    for id in [&a, &b] {
+        for _ in 0..40 {
+            let w = json(&prova(&d, &["wait", id, "--max-wait", "500ms", "--json"]));
+            if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
+                break;
+            }
+        }
+    }
+    assert!(prova(&d, &["cancel", &b]).status.success());
+    let s = json(&prova(
+        &d,
+        &["wait", &b, "--until", "done", "--max-wait", "20s", "--json"],
+    ));
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(!killed.exists(), "killed another run's container: {s}");
+    let text = s.to_string();
+    assert!(
+        text.contains("another live run") && text.contains("docker kill aaa111bbb222"),
+        "{text}"
+    );
+}
+
+/// Round 18: `--until first-failure` through a container client announced
+/// 30 s and waited 65. The announcement now says 1m05s. Medium: a real
+/// `prova run` process and the fake client.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_first_wait_announces_its_real_length() {
+    use std::io::BufRead;
+    let d = workspace("container-announce");
+    let (path, _killed) = fake_docker(&d);
+    let mut child = Command::new(PROVA)
+        .args([
+            "run",
+            "--until",
+            "first-failure",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            "pv-announce",
+            "img",
+            "t",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", &path)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let id = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _guard = CancelOnDrop(&d, id.clone());
+    // Running (the client started) before the guard cancels: bounded waits.
+    for _ in 0..40 {
+        let w = json(&prova(&d, &["wait", &id, "--max-wait", "500ms", "--json"]));
+        if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+    }
+    assert!(
+        line.contains("waiting up to 1m05s for the first failure"),
+        "{line}"
+    );
+}
+
+/// Round 18 N8: `docker exec` runs a process in a container that is not the
+/// run's; the warning must not tell to stop that container.
+#[cfg(target_os = "linux")]
+#[test]
+fn cancel_through_docker_exec_does_not_blame_the_container() {
+    let d = workspace("cancel-container-exec");
+    let (path, killed) = fake_docker(&d);
+    let o = Command::new(PROVA)
+        .args([
+            "run", "--detach", "--json", "--", "docker", "exec", "dev", "t",
+        ])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let id = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(&d, id.clone());
+    for _ in 0..40 {
+        let w = json(&prova(&d, &["wait", &id, "--max-wait", "500ms", "--json"]));
+        if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+    }
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    let s = json(&prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "done",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
+    ));
+    assert!(!killed.exists(), "{s}");
+    let text = s.to_string();
+    assert!(
+        text.contains("docker exec") && text.contains("may still run inside that container"),
+        "{text}"
+    );
+    assert!(!text.contains("check `docker ps` and stop it"), "{text}");
 }
 
 /// Round 15: a selected Vitest run listed another file's import error next

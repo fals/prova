@@ -1,6 +1,6 @@
 # 0035: Places come from the repository; history compares like with like; containers are claimed once; experiments close runner configs
 
-Status: Accepted (2026-11-25). Amends [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) §2 and §4, [0033](0033-places-are-checked-on-disk-and-quarantines-keep-them.md), and [0032](0032-revalidation-replicates-and-the-oracle-leaves-nothing-behind.md) §1.
+Status: Accepted (2026-11-25). Amends [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) §2 and §4, [0033](0033-places-are-checked-on-disk-and-quarantines-keep-them.md), and [0032](0032-revalidation-replicates-and-the-oracle-leaves-nothing-behind.md) §1 and §2.
 
 ## Context
 
@@ -46,14 +46,19 @@ that [0034](0034-a-quarantine-never-turns-a-failed-run-green.md) settled:
    before it was created and has not ended); otherwise prova names the
    candidates and kills none. A run through a container client announces
    its longer first wait (65 s) and never waits past what it announced.
-4. **Experiments.** A revalidation of the current best that is void because
-   the workload's output drifted withdraws the accept as a failed one does.
-   Runner configuration (`.npmrc`, `.yarnrc*`, `.cargo/config*`,
-   `rust-toolchain*`, `go.env`, `pip.conf`, `sitecustomize.py`,
+4. **Experiments.** A revalidation of the current best that is void for
+   the candidate's own doing withdraws the accept as a failed one does: its
+   metric moved 2x or more against its earlier comparisons while the
+   baseline's did not, it changed tracked files during a trial, or it left
+   processes behind. A void that is not the candidate's (both arms shifted
+   alike, load imbalance, a stopped arm, an oracle infrastructure error)
+   keeps the accept and says the revalidation was inconclusive. Runner
+   configuration (`.npmrc`, `.yarnrc*`, `.cargo/config*`, `rust-toolchain`,
+   `rust-toolchain.toml`, `go.env`, `pip.conf`, `sitecustomize.py`,
    `usercustomize.py`) and compiled modules (`*.pyc`, `__pycache__/`) are
    harness files. The over-1000x warning compares with the original
-   baseline, not only the current best. Files a trial leaves in its private
-   `/tmp` are reported.
+   baseline, not only the current best. Files a candidate's trials leave in
+   their private `/tmp` that the baseline's do not are reported.
 
 ## Consequences
 
