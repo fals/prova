@@ -164,6 +164,9 @@ pub struct Recognizers {
     /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
     /// then `× fails`): the open ones, by indentation.
     vitest_suites: Vec<(usize, String)>,
+    /// A `FAIL  file > test` line was read: the next line is its message
+    /// (the dot reporter prints no other per-test line).
+    vitest_fail_msg: bool,
     /// Test classes Surefire's class lines named in full (`-- in
     /// calc.CalcTest`): its summary names them without the package.
     surefire_classes: Vec<String>,
@@ -1005,6 +1008,20 @@ impl Recognizers {
         if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
             self.unhandled_block = true;
             self.unhandled_lines = Some(Vec::new());
+            return out;
+        }
+        if std::mem::take(&mut self.vitest_fail_msg)
+            && let Some(EventKind::TestFinished { message, .. }) = self.vitest_pending.as_mut()
+            && !line.trim().is_empty()
+        {
+            *message = Some(line.trim().to_owned());
+            if self.vitest_stream {
+                let mut held = std::mem::take(&mut self.held_text_events);
+                self.flush_vitest(&mut held);
+                self.held_text_events = held;
+            } else {
+                self.flush_vitest(&mut out);
+            }
             return out;
         }
         if self.dotnet_message.is_some() {
@@ -2336,6 +2353,31 @@ impl Recognizers {
             );
             return true;
         }
+        // "FAIL  src/a.test.ts > group > name": the failures section of every
+        // reporter. The dot reporter prints nothing else per test; the others
+        // already reported the test, and a repeat is ignored.
+        if !self.vitest_stream
+            && let Some(r) = t.strip_prefix("FAIL ")
+            && let Some((f, name)) = r.trim().split_once(" > ")
+            && is_js_file(f.trim())
+            && !name.trim().is_empty()
+        {
+            let key = TestKey::new(vec![f.trim().to_owned()], name.trim());
+            let mut held = Vec::new();
+            self.finished(
+                key,
+                Outcome::Failed,
+                None,
+                None,
+                Level::Recognized,
+                &mut held,
+            );
+            if let Some(e) = held.pop() {
+                self.vitest_pending = Some(e);
+                self.vitest_fail_msg = true;
+            }
+            return true;
+        }
         let (outcome, rest) = if let Some(r) = t.strip_prefix("✓ ") {
             (Outcome::Passed, r)
         } else if let Some(r) = t.strip_prefix("× ").or_else(|| t.strip_prefix("✗ ")) {
@@ -2716,7 +2758,18 @@ impl Recognizers {
             duration = Some(ms.round() as u64);
             name = n.trim_end().to_owned();
         }
-        // " todo" tests print as "✎ todo name".
+        // Jest writes its own status word before the name: `○ skipped name`,
+        // `✎ todo name`. It is not part of the test's name.
+        let word = match m {
+            '○' => "skipped ",
+            '✎' => "todo ",
+            _ => "",
+        };
+        if !word.is_empty()
+            && let Some(n) = name.strip_prefix(word)
+        {
+            name = n.trim_start().to_owned();
+        }
         let mut parts: Vec<String> = self.jest.stack.iter().map(|(_, n)| n.clone()).collect();
         parts.push(name);
         let key = TestKey::new(vec![file], parts.join(" > "));
@@ -4779,7 +4832,7 @@ mod tests {
             "    \u{2713} adds (2 ms)\n",
             "    nested\n",
             "      \u{2713} deep\n",
-            "    \u{25cb} skipped test\n",
+            "    \u{25cb} skipped works\n",
             "\n",
             " FAIL  src/x.test.ts (5.2 s)\n",
             "  calc\n",
@@ -4803,7 +4856,7 @@ mod tests {
                     Outcome::Passed
                 ),
                 (
-                    "src/a.test.js::calc > skipped test".into(),
+                    "src/a.test.js::calc > works".into(),
                     Outcome::Skipped
                 ),
                 ("src/x.test.ts::calc > subtracts".into(), Outcome::Passed),
@@ -6474,5 +6527,91 @@ mod round15_fw_tests {
     fn vitest_errors_count_is_remembered() {
         let (r, _) = feed_all("     Errors  2 errors\n");
         assert_eq!(r.unhandled_errors, 2);
+    }
+}
+
+/// Round 17 (#92): per-test results from output that named none, checked on
+/// output captured from the real tools (`testdata/`).
+#[cfg(test)]
+mod issue92_tests {
+    use super::*;
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let mut r = Recognizers::default();
+        let mut all = Vec::new();
+        for l in input.lines() {
+            all.extend(r.line(l));
+        }
+        all.extend(r.finish());
+        (r, all)
+    }
+
+    fn results(ev: &[EventKind]) -> Vec<(String, Outcome)> {
+        let mut v: Vec<(String, Outcome)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, outcome, .. } => Some((test.display(), *outcome)),
+                _ => None,
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn message_of(ev: &[EventKind], name: &str) -> Option<String> {
+        ev.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                message: Some(m),
+                ..
+            } if test.display() == name => Some(m.clone()),
+            _ => None,
+        })
+    }
+
+    /// Jest 29 `--verbose`, as printed: Jest itself writes `skipped` and
+    /// `todo` before the name of those tests; the test's name is without it.
+    #[test]
+    fn jest29_verbose_names_every_test_without_jests_status_word() {
+        let (r, ev) = feed_all(include_str!("../testdata/jest29-verbose.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/b.test.js::plain".into(), Outcome::Passed),
+                ("src/calc.test.js::calc > adds".into(), Outcome::Passed),
+                ("src/calc.test.js::calc > divides".into(), Outcome::Failed),
+                ("src/calc.test.js::calc > later".into(), Outcome::Skipped),
+                (
+                    "src/calc.test.js::calc > nested > deep".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "src/calc.test.js::calc > skipped one".into(),
+                    Outcome::Skipped
+                ),
+            ]
+        );
+        assert_eq!(r.total(), 6);
+    }
+
+    /// Vitest `--reporter=dot` prints a dot per test and the failures in
+    /// full after: `FAIL  file > describe > test`, then the message.
+    #[test]
+    fn vitest_dot_reporter_fail_lines_are_read() {
+        let (_, ev) = feed_all(include_str!("../testdata/vitest3-dot-fail.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/bad.test.ts::grp > bad one".into(), Outcome::Failed),
+                (
+                    "src/calc.test.ts::calc > flaky clock".into(),
+                    Outcome::Failed
+                ),
+            ]
+        );
+        assert!(
+            message_of(&ev, "src/bad.test.ts::grp > bad one")
+                .is_some_and(|m| m.contains("expected 1 to be 2")),
+        );
     }
 }

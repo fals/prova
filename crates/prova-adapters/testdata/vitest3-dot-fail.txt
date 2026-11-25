@@ -1,0 +1,44 @@
+
+ RUN  v3.2.4 /tmp/claude-1000/-home-fals-Projects-toe/28288bbe-d650-4569-9413-a9ad916aae1d/scratchpad/g/vt
+
+·x-········x··
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/bad.test.ts > grp > bad one
+AssertionError: expected 1 to be 2 // Object.is equality
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 2[39m
+[31m+ 1[39m
+
+ ❯ src/bad.test.ts:4:35
+      2| describe("grp", () => {
+      3|   it("ok one", () => {});
+      4|   it("bad one", () => { expect(1).toBe(2); });
+       |                                   ^
+      5|   it.skip("skip one", () => {});
+      6| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/calc.test.ts > calc > flaky clock
+AssertionError: clock tick landed on a bad boundary: expected +0 not to be +0 // Object.is equality
+ ❯ src/calc.test.ts:15:67
+     13|   it("flaky clock", () => {
+     14|     const micros = Math.floor(performance.now() * 1000);
+     15|     expect(micros % 3, "clock tick landed on a bad boundary").not.toBe…
+       |                                                                   ^
+     16|   });
+     17| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  2 failed | 1 passed (3)
+      Tests  2 failed | 11 passed | 1 skipped (14)
+   Start at  10:58:49
+   Duration  1.77s (transform 70ms, setup 0ms, collect 79ms, tests 1.52s, environment 0ms, prepare 252ms)
+
