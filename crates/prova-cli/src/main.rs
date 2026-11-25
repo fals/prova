@@ -2873,12 +2873,11 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
                 println!("fail%   retry-passes  same-code flips  test");
                 for s in &list {
-                    let key = format!("{}\u{1f}{}", s.place.as_deref().unwrap_or(""), s.display);
-                    let q = if prova_core::quarantine::covers_key(&quarantined, &key).is_some() {
-                        "  (quarantined)"
-                    } else {
-                        ""
-                    };
+                    let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
+                        let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
+                        prova_core::quarantine::covers_key(&quarantined, &key).is_some()
+                    });
+                    let q = if covered { "  (quarantined)" } else { "" };
                     println!(
                         "{:5.1}%  {:12}  {:15}  {}{q}",
                         s.failure_rate * 100.0,

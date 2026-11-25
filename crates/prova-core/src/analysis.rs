@@ -39,6 +39,10 @@ pub struct TestStats {
     pub suite: String,
     /// Every suite that ran this test (its history is shared, ADR 0018).
     pub suites: Vec<String>,
+    /// Other names of the same test (a Go test recorded bare and
+    /// package-qualified): a quarantine of either covers it.
+    #[serde(skip)]
+    pub aliases: Vec<String>,
     pub runs: usize,
     pub failures: usize,
     pub failure_rate: f64,
@@ -66,6 +70,17 @@ pub struct TestStats {
     pub last_passed: Option<(String, String)>,
     /// Newest first.
     pub recent: Vec<TestRun>,
+}
+
+/// A name recorded bare (`TestX`, from text output that named no package)
+/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
+/// test: the same name, or one is the other behind a `::` or `/`.
+pub fn same_test_name(a: &str, b: &str) -> bool {
+    let tail = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
+    };
+    a == b || tail(a, b) || tail(b, a)
 }
 
 /// Names tests with their place where several places hold one name
@@ -462,6 +477,7 @@ fn stats_with(
         place,
         suite,
         suites,
+        aliases: Vec::new(),
         runs: counted.len(),
         failures,
         failure_rate: if counted.is_empty() {
@@ -566,12 +582,23 @@ pub fn flaky_as_of(
     for id in ids {
         if let Some(s) = stats_with(store, &id, window, as_of)?
             && s.flaky
-            && !out.iter().any(|o| {
-                o.display == s.display
-                    && o.place == s.place
-                    && o.recent.first().map(|r| &r.run) == s.recent.first().map(|r| &r.run)
-            })
         {
+            // One test seen as a bare and as a qualified name is one row
+            // (its history is shared): the qualified name shows.
+            if let Some(o) = out
+                .iter_mut()
+                .find(|o| o.place == s.place && same_test_name(&o.display, &s.display))
+            {
+                if o.display != s.display {
+                    if s.display.len() > o.display.len() {
+                        let old = std::mem::replace(&mut o.display, s.display.clone());
+                        o.aliases.push(old);
+                    } else {
+                        o.aliases.push(s.display.clone());
+                    }
+                }
+                continue;
+            }
             out.push(s);
         }
     }
@@ -1009,6 +1036,98 @@ pub fn failure_context(store: &Store, test_id: &str, run: &str) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TestKey;
+
+    /// A store with one finished run per `(code, [(key, outcome)])`.
+    fn store_with(runs: &[(&str, Vec<(TestKey, Outcome)>)]) -> Store {
+        use crate::model::{EVENT_VERSION, Event, EventKind, Status};
+        let d = std::env::temp_dir().join(format!(
+            "prova-analysis-{}-{}",
+            std::process::id(),
+            crate::ids::new_run_id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let s = Store::open_dir(&d, &d.join(".prova")).unwrap();
+        let v = serde_json::json!({});
+        for (i, (code, results)) in runs.iter().enumerate() {
+            let id = format!("r{i}");
+            let ts = 10 + i as u64 * 10;
+            s.create_run(&crate::store::NewRun {
+                id: &id,
+                suite: "s",
+                spec: &v,
+                cwd: "/",
+                code,
+                env: &v,
+                machine: &v,
+                origin: &v,
+                created_ms: ts,
+            })
+            .unwrap();
+            s.mark_started(&id, 1, ts + 1).unwrap();
+            let mut events = vec![Event {
+                v: EVENT_VERSION,
+                run: id.clone(),
+                seq: 1,
+                ts_ms: ts + 1,
+                kind: EventKind::RunStarted { pid: 1 },
+            }];
+            for (n, (key, outcome)) in results.iter().enumerate() {
+                events.push(Event {
+                    v: EVENT_VERSION,
+                    run: id.clone(),
+                    seq: 2 + n as u64,
+                    ts_ms: ts + 2,
+                    kind: EventKind::TestFinished {
+                        test: key.clone(),
+                        attempt: 1,
+                        outcome: *outcome,
+                        duration_ms: Some(5),
+                        message: None,
+                        source: crate::model::Level::Recognized,
+                        subtest: false,
+                    },
+                });
+            }
+            s.append_events(&events).unwrap();
+            s.finish_run(
+                &id,
+                100,
+                ts + 5,
+                Status::Finished,
+                Some(Outcome::Passed),
+                Some(0),
+                None,
+                vec![],
+                None,
+            )
+            .unwrap();
+        }
+        s
+    }
+
+    /// Round 17: `prova flaky` listed a Go test twice, once under the bare
+    /// name the text output gave and once under its package.
+    #[test]
+    fn a_test_recorded_bare_and_qualified_is_one_flaky_row() {
+        let bare = TestKey::new(vec![], "TestFlakyClock");
+        let full = TestKey::new(vec!["example.com/calc".into()], "TestFlakyClock");
+        let s = store_with(&[
+            ("tree:a", vec![(bare.clone(), Outcome::Failed)]),
+            ("tree:a", vec![(bare, Outcome::Passed)]),
+            ("tree:a", vec![(full.clone(), Outcome::Failed)]),
+            ("tree:a", vec![(full, Outcome::Passed)]),
+        ]);
+        let f = flaky(&s, None, 50).unwrap();
+        assert_eq!(
+            f.len(),
+            1,
+            "{:?}",
+            f.iter().map(|t| &t.display).collect::<Vec<_>>()
+        );
+        assert_eq!(f[0].display, "example.com/calc::TestFlakyClock");
+        assert_eq!(f[0].aliases, ["TestFlakyClock"]);
+    }
 
     #[test]
     fn nearest_rank_percentiles() {

@@ -2140,16 +2140,7 @@ fn missing_since(
     Ok(Some((prev, missing, earlier.len())))
 }
 
-/// A name recorded bare (`TestX`, from text output that named no package)
-/// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
-/// test: the same name, or one is the other behind a `::` or `/`.
-fn same_test_name(a: &str, b: &str) -> bool {
-    let tail = |long: &str, short: &str| {
-        long.strip_suffix(short)
-            .is_some_and(|head| head.ends_with("::") || head.ends_with('/'))
-    };
-    a == b || tail(a, b) || tail(b, a)
-}
+use crate::analysis::same_test_name;
 
 /// The display name of a lifecycle key (`file<US>name`).
 fn key_display(key: &str) -> &str {
