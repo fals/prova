@@ -1,0 +1,10 @@
+   Compiling crash v0.1.0 (/tmp/claude-1000/-home-fals-Projects-toe/28288bbe-d650-4569-9413-a9ad916aae1d/scratchpad/g/crash)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/crash-13c7f3b4a2d242ba)
+
+running 3 tests
+test tests::a_fine ... ok
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/tmp/claude-1000/-home-fals-Projects-toe/28288bbe-d650-4569-9413-a9ad916aae1d/scratchpad/g/crash/target/debug/deps/crash-13c7f3b4a2d242ba` (signal: 6, SIGABRT: process abort signal)

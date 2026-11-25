@@ -104,6 +104,8 @@ pub struct Recognizers {
     /// libtest's `running N tests` with how many results followed: a
     /// binary that stops before its `test result:` summary died mid-run.
     libtest_running: Option<(u64, u64)>,
+    /// The last `test x ... ` line that has no result yet.
+    libtest_text_open: Option<TestKey>,
     /// Test binaries that stopped early: "after K of N tests".
     pub harness_stopped: Vec<String>,
     /// Text results held while an injected stream is expected.
@@ -933,12 +935,13 @@ impl Recognizers {
                 .and_then(|n| n.parse::<u64>().ok())
                 .filter(|_| t.ends_with(" tests") || t.ends_with(" test"))
             {
-                self.close_libtest_running();
+                self.close_libtest_running(&mut out);
                 if n > 0 {
                     self.libtest_running = Some((n, 0));
                 }
             } else if t.starts_with("test result:") {
                 self.libtest_running = None;
+                self.libtest_text_open = None;
             } else if t.starts_with("test ")
                 && (t.ends_with(" ok") || t.contains(" ... FAILED") || t.contains(" ... ignored"))
                 && let Some((_, seen)) = self.libtest_running.as_mut()
@@ -2017,6 +2020,16 @@ impl Recognizers {
         let Some(rest) = line.strip_prefix("test ") else {
             return false;
         };
+        // `test x ... ` and nothing after: libtest runs tests one at a time
+        // (`--test-threads=1`) and has not said how this one ended.
+        if let Some(name) = rest.trim_end().strip_suffix(" ...")
+            && self.libtest_running.is_some()
+        {
+            let name = name.trim();
+            let name = name.strip_suffix(" - should panic").unwrap_or(name);
+            self.libtest_text_open = Some(self.libtest_key(name));
+            return true;
+        }
         if let Some((name, status)) = rest.rsplit_once(" ... ") {
             let outcome = match status.trim() {
                 "ok" => Outcome::Passed,
@@ -2950,12 +2963,35 @@ impl Recognizers {
 
     /// nextest's human status lines, printed live (ADR 0018):
     /// `PASS [   0.004s] (1/5) calc tests::adds`, `SLOW [> 60.000s] ...`.
-    fn close_libtest_running(&mut self) {
+    fn close_libtest_running(&mut self, out: &mut Vec<EventKind>) {
+        let open = self.libtest_text_open.take();
         if let Some((n, seen)) = self.libtest_running.take()
             && seen < n
         {
+            // `test x ... ` with no result is the test that was running
+            // (`--test-threads=1`); in parallel libtest prints a test only
+            // when it ends, so the text cannot say which one it was.
+            let hint = match open {
+                Some(key) => {
+                    let name = key.display();
+                    self.finished(
+                        key,
+                        Outcome::Errored,
+                        None,
+                        Some(
+                            "the test binary ended while this test was running (a crash, an abort or an exit); it has no result"
+                                .to_owned(),
+                        ),
+                        Level::Recognized,
+                        out,
+                    );
+                    format!("; it was running {name}")
+                }
+                None => "; run with `-- --test-threads=1` to name the test that was running"
+                    .to_owned(),
+            };
             self.harness_stopped.push(format!(
-                "a test binary stopped after {seen} of {n} tests, before its summary"
+                "a test binary stopped after {seen} of {n} tests, before its summary{hint}"
             ));
         }
     }
@@ -3154,7 +3190,7 @@ impl Recognizers {
             }
         }
         self.close_pass_output();
-        self.close_libtest_running();
+        self.close_libtest_running(&mut gts);
         self.close_libtest_block();
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
@@ -6613,5 +6649,58 @@ mod issue92_tests {
             message_of(&ev, "src/bad.test.ts::grp > bad one")
                 .is_some_and(|m| m.contains("expected 1 to be 2")),
         );
+    }
+
+    /// libtest text, `cargo test -- --test-threads=1`, real output of a test
+    /// that calls `std::process::abort()`: the binary prints `test x ... `,
+    /// never the result. That test is the one that was running.
+    #[test]
+    fn libtest_crash_names_the_test_that_was_running() {
+        let (r, ev) = feed_all(include_str!("../testdata/libtest-crash-serial.txt"));
+        let got = results(&ev);
+        assert_eq!(
+            got.iter().map(|(n, o)| (n.as_str(), *o)).collect::<Vec<_>>(),
+            vec![
+                ("tests::a_fine", Outcome::Passed),
+                ("tests::b_crashes", Outcome::Errored),
+            ],
+            "{got:?}"
+        );
+        assert!(
+            message_of(&ev, "tests::b_crashes")
+                .is_some_and(|m| m.contains("ended while this test was running")),
+            "{:?}",
+            message_of(&ev, "tests::b_crashes")
+        );
+        assert_eq!(r.harness_stopped.len(), 1);
+    }
+
+    /// Run in parallel, libtest prints no line for a test until it ends: the
+    /// crash cannot be pinned on one test, and the note says how to find it.
+    #[test]
+    fn libtest_crash_in_parallel_says_how_to_name_the_test() {
+        let (r, ev) = feed_all(include_str!("../testdata/libtest-crash-parallel.txt"));
+        assert_eq!(results(&ev).len(), 1, "{:?}", results(&ev));
+        assert!(
+            r.harness_stopped[0].contains("--test-threads=1"),
+            "{:?}",
+            r.harness_stopped
+        );
+    }
+
+    /// Surefire with `-DdisableXmlReport=true` (real 3.5.2 output): the text
+    /// names only the failing tests, in full in the `<<< FAILURE!` lines and
+    /// shortened in the summary; passes are not printed at all.
+    #[test]
+    fn surefire_without_xml_names_failures_with_their_package() {
+        let (r, ev) = feed_all(include_str!("../testdata/surefire-3.5.2-no-xml.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("calc.CalcTest::adds".into(), Outcome::Failed),
+                ("calc.CalcTest::divides".into(), Outcome::Errored),
+            ]
+        );
+        assert_eq!((r.total(), r.failed_reported()), (10, 2));
     }
 }
