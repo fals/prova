@@ -12,9 +12,8 @@ use std::process::{Command, Output};
 
 const PROVA: &str = env!("CARGO_BIN_EXE_prova");
 
-/// A script named `go` that prints what the scripted command printed: a
-/// quarantine sets aside only the failures of one runner call (ADR 0031), so
-/// the command is `./rc/go test`.
+/// A script named `go` that prints what the scripted command printed; the
+/// command is `./rc/go test`.
 fn fake_go(d: &Path, script: &str) {
     std::fs::create_dir_all(d.join("rc")).unwrap();
     std::fs::write(d.join("rc/go"), format!("#!/bin/sh\n{script}\n")).unwrap();
@@ -169,7 +168,15 @@ fn go_count_failure_next_to_a_quarantined_one_fails_the_run() {
     let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(o.status.code(), Some(1), "{s}");
     assert_eq!(s["outcome"], "failed", "{s}");
-    assert_eq!(failing(&s), vec!["example.com/q::TestQueue"], "{s}");
+    // Both listed; only TestQ is the known, quarantined one (ADR 0034).
+    let known: Vec<&str> = s["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["quarantined"] != true)
+        .filter_map(|f| f["test"].as_str())
+        .collect();
+    assert_eq!(known, vec!["example.com/q::TestQueue"], "{s}");
 }
 
 /// Round 15: a panic in the package's own output, outside any test, next to

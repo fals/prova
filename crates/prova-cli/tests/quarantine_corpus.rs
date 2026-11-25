@@ -62,8 +62,7 @@ fn text(o: &Output) -> String {
     )
 }
 
-/// A script named like the capture's test runner that prints the capture
-/// (a quarantine sets aside only the failures of one runner call, ADR 0031),
+/// A script named like the capture's test runner that prints the capture,
 /// and the command that runs it.
 fn runner(d: &Path, tag: &str, capture: &str, body: &str) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;

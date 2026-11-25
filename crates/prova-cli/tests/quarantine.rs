@@ -36,8 +36,7 @@ fn workspace(name: &str) -> PathBuf {
     d
 }
 
-/// A command that qualifies for a quarantine (ADR 0031 §1): one test-runner
-/// call. A script named like the runner stands in for it and prints what the
+/// A script named like the test runner stands in for it and prints what the
 /// scripted command printed.
 fn runner(d: &Path, key: &str, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -550,10 +549,6 @@ fn repeat_names_what_failed_when_only_a_quarantined_test_did() {
         !out.contains("no failing test shown"),
         "a quarantined test failed: {out}"
     );
-    assert!(
-        out.contains("run(s) failed although only quarantined test(s) failed"),
-        "{out}"
-    );
 }
 
 /// Round 17: a quarantined test was "not run" when quiet output (pytest -q)
@@ -654,7 +649,63 @@ fn a_quarantine_never_turns_a_failed_run_green() {
         "{out}"
     );
     assert!(out.contains("quarantined: calc::x failed (clock"), "{out}");
+    // Failures first: the quarantined failure is in the FAIL list, marked.
+    assert!(out.contains("FAIL calc::x (quarantined)"), "{out}");
     // History keeps the failure: a quarantine hides nothing from it.
     let h = text(&prova(&d, &["history", "calc::x"]));
     assert!(h.contains("fail"), "{h}");
+}
+
+/// ADR 0034 (0027 §5): the one thing a quarantine changes is that a
+/// first-failure wait does not wake for a failure already known; it wakes
+/// for the next failure that is not quarantined. A medium test: a detached
+/// run and two waits through the CLI.
+#[test]
+fn a_first_failure_wait_does_not_wake_for_a_quarantined_failure() {
+    let d = workspace("wait-known");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    put(
+        &d,
+        format!(
+            "[suite.later]\nrun = {:?}\n",
+            format!(
+                "{BUSY} echo 'test calc::x ... FAILED'; i=0; while [ ! -f go ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; echo 'test calc::y ... FAILED'; echo 'test result: FAILED. 0 passed; 2 failed'; exit 101"
+            )
+        ),
+    );
+    let o = prova(&d, &["run", "later", "--detach", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = v["run"].as_str().unwrap().to_owned();
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "2s",
+            "--json",
+        ],
+    );
+    let s: serde_json::Value = serde_json::from_slice(&w.stdout).unwrap();
+    // The wait ran out (reason `running`); it did not wake for calc::x.
+    assert_eq!(s["reason"], "running", "not woken by calc::x: {s}");
+    std::fs::write(d.join("go"), "").unwrap();
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
+    );
+    let s: serde_json::Value = serde_json::from_slice(&w.stdout).unwrap();
+    assert!(s.to_string().contains("calc::y"), "woken by calc::y: {s}");
+    let _ = prova(&d, &["cancel", &id]);
 }

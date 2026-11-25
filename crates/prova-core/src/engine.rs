@@ -1347,7 +1347,7 @@ fn observe_child(
             ));
         }
     }
-    // Tests set aside by hand, as they were when this run was created (0027).
+    // Tests quarantined by hand, as they were when this run was created (0027).
     let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
     if spec.expects_tests() && status == Status::Finished {
@@ -1772,8 +1772,7 @@ fn observe_child(
             stmt.query_map(rusqlite::params![run], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        // A quarantined test's own crash is set aside with it (round 14),
-        // and a retried test's panic on its first try is its own (round 16:
+        // A retried test's panic on its first try is its own (round 16:
         // a nextest retry that passed was "an error outside any failing
         // test").
         let own_crashes: Vec<String> = rerun_all.clone();
@@ -2360,9 +2359,10 @@ fn line_before_make_stop(tail: &VecDeque<String>, error: &str) -> Option<String>
         .map(str::to_owned)
 }
 
-/// The first crash-like line of the output that no quarantined failing
-/// test accounts for: it names one of them, or it is part of one's own
-/// output or failure message. With no quarantined failure, the first crash.
+/// The first crash-like line of the output that none of `tests` (the
+/// tests that passed on a retry) accounts for: it names one of them, or it
+/// is part of one's own output or failure message. With none, the first
+/// crash.
 fn unexplained_crash(
     store: &Store,
     run: &str,
@@ -2471,7 +2471,7 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
     }
     left.sort();
     Ok(Some(format!(
-        "{} known flaky test(s) did not run: {}{}; leaving a flaky test out of the command hides it (set it aside in the open: prova quarantine add <test> --reason ...)",
+        "{} known flaky test(s) did not run: {}{}; leaving a flaky test out of the command hides it: run it, and fix it (a quarantine marks it in the open but does not clear this warning)",
         left.len(),
         left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
         if left.len() > 5 { ", ..." } else { "" }
@@ -2524,6 +2524,10 @@ pub struct Failure {
     /// (ADR 0031 section 2): `FAIL tests::flaky (geo)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// A known failure: the test is quarantined. Listed all the same; it
+    /// fails the run like any other (ADR 0034).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quarantined: bool,
     /// `failed` or `errored` (errored includes a test that never finished).
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2647,7 +2651,7 @@ pub struct Summary {
     /// History of the same suite, filled in by the caller when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<serde_json::Value>,
-    /// Tests set aside by `prova quarantine` that this run touched or could
+    /// Tests quarantined by `prova quarantine` that this run touched or could
     /// have run, with their result here (ADR 0027): never hidden.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub quarantined: Vec<QuarantinedTest>,
@@ -2905,8 +2909,8 @@ pub fn unverified_runs(
     Ok(out)
 }
 
-/// Known flaky tests (as of the run) that passed in a finished run, apart
-/// from quarantined ones: such a pass proves little (round 7). Read from the
+/// Known flaky tests (as of the run) that passed in a finished run,
+/// quarantined ones included (ADR 0034): such a pass proves little (round 7). Read from the
 /// store alone; it once took a full summary of the run, whose history took
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
@@ -3059,10 +3063,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
     parents_before_subtests(&mut failing);
-    // Quarantined tests are listed apart, with their result (ADR 0027).
+    // Quarantined tests are also listed apart, with their result (ADR 0027).
     let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
-    // A subtest first seen after its parent's quarantine is news, not set
-    // aside with it (round 17: refused, but no FAIL line named it).
     let first_seen = |d: &str| -> Option<u64> {
         store
             .conn()
@@ -3075,14 +3077,17 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             .flatten()
             .map(|v| v as u64)
     };
-    failing.retain(|f| {
-        let display = f.0.display();
-        match crate::quarantine::covers_key(&quarantine, &f.0.unique()) {
-            None => true,
-            Some(p) if p.test == display => false,
-            Some(p) => first_seen(&display).is_none_or(|t| t >= p.created_ms),
+    // Quarantined failures stay in the list, marked: failures come first,
+    // known or not (ADR 0034). A subtest first seen after its parent's
+    // quarantine is news, not the parent's known failure (round 17).
+    let is_quarantined = |key: &TestKey| {
+        let display = key.display();
+        match crate::quarantine::covers_key(&quarantine, &key.unique()) {
+            None => false,
+            Some(p) if p.test == display => true,
+            Some(p) => first_seen(&display).is_some_and(|t| t < p.created_ms),
         }
-    });
+    };
     // Did the same suite (same selection) pass on exactly this code before?
     let selection = serde_json::from_value::<RunSpec>(row.spec.clone())
         .ok()
@@ -3126,6 +3131,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         failures.push(Failure {
             test: key.display(),
             place: key.place().filter(|_| shared).map(str::to_owned),
+            quarantined: is_quarantined(key),
             outcome: *outcome,
             message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
@@ -3174,7 +3180,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .map(|f| f.1.as_str().to_owned())
                 .next()
                 // A test of that name whose directory could not be told is
-                // not set aside: say what it did (round 17 follow-up: it
+                // not the quarantined one: say what it did (round 17: it
                 // read "not seen").
                 .or_else(|| {
                     finals
@@ -3216,7 +3222,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 expires_ms: q.expires_ms,
             });
         }
-        // A quarantine that ran out is no longer set aside: say so.
+        // A quarantine that ran out no longer marks its test: say so.
         for q in crate::quarantine::expired_at(store, row.created_ms)?
             .into_iter()
             .filter(|_| !live)
@@ -3526,8 +3532,8 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         .filter(|r| {
             r.status == Status::Finished
                 && r.outcome == Some(Outcome::Passed)
-                // A pass that set a quarantined failure aside is no "last
-                // green" (round 15).
+                // A pass recorded before ADR 0034 with a quarantined failure
+                // set aside is no "last green" (round 15).
                 && r.exit_code == Some(0)
                 && !thin.contains(&r.id)
         })
@@ -3610,8 +3616,8 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
             "code": last.code,
         },
         "unverified_passes": unverified_passes,
-        // Passes that set a quarantined failure aside: no "last green", but
-        // passes all the same (round 16: "none of them passed").
+        // Passes recorded before ADR 0034 with a quarantined failure set
+        // aside: no "last green", but passes all the same (round 16).
         "set_aside_passes": prev
             .iter()
             .filter(|r| {

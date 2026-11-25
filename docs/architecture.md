@@ -253,12 +253,14 @@ also shows the test's size and why. A run that leaves a known-flaky test out
 (an exclude filter, a narrower suite sharing tests with the one that ran it)
 warns that it did not run and is unverified.
 
-`prova quarantine add <test> --reason ...` sets a known-flaky test aside
-([ADR 0027](adr/0027-quarantine-and-slow-tests.md)): stored with the history
-(never in the project), expiring after 14 days by default (90 at most). The
-test still runs and keeps its history. If it is the only failure, the run
-passes and is verified for the rest; every summary lists it with its result,
-reason and expiry. A finished run also names, on one line, its slowest tests
+`prova quarantine add <test> --reason ...` marks a known-flaky test
+([ADR 0027](adr/0027-quarantine-and-slow-tests.md),
+[0034](adr/0034-a-quarantine-never-turns-a-failed-run-green.md)): stored with
+the history (never in the project), expiring after 14 days by default (90 at
+most). The test still runs and keeps its history; every summary lists it with
+its result, reason and expiry, and its failure is marked `(quarantined)`. A
+quarantine never turns a failed run green or makes a pass look verified:
+when every failing test is quarantined the run says so and still fails. A finished run also names, on one line, its slowest tests
 of 1 s or more.
 
 ## Experiments
@@ -446,7 +448,7 @@ These are stable interfaces; changing them is a breaking change.
 | `prova cancel <run>` | stop the process group |
 | `prova status [<run>] [--all]`, `prova output <run> [--tail N] [--test <name>]`, `prova events <run> [--after <seq>] [--follow]` | inspect |
 | `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes`, `prova slowest [-n N]` | memory |
-| `prova quarantine add <test> --reason <text> [--days N]` / `list` / `remove <test>` | set known-flaky tests aside, in the open |
+| `prova quarantine add <test> --reason <text> [--days N]` / `list` / `remove <test>` | mark known-flaky tests, in the open (their failures still fail the run) |
 | `prova forget <run> --reason <text>` | take a run out of every test's history |
 | `prova exp new [--change <glob>] [--change-only] [--allow-network] ...` | declare an experiment |
 | `prova exp protocol\|candidate\|cancel\|list\|log\|metrics\|best\|revalidate\|wait\|status` | experiments |

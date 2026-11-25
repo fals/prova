@@ -41,6 +41,8 @@ fn headline(s: &Summary) -> String {
             }
             // "PASSED ... exit 100" read as a contradiction (round 14).
             (Status::Finished, Some(Outcome::Passed)) if s.exit_code.is_some_and(|c| c != 0) => {
+                // Only runs recorded before ADR 0034 (a quarantine never
+                // passes a run now).
                 "PASSED (quarantined failures set aside)".into()
             }
             (Status::Finished, Some(Outcome::Passed)) => "PASSED".into(),
@@ -192,15 +194,11 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         match &f.message {
             Some(m) => println!(
                 "  {tag} {}{}: {}",
-                named(&f.test, f.place.as_deref()),
+                failure_name(f),
                 context(f),
                 clean(&first_lines(m, 3))
             ),
-            None => println!(
-                "  {tag} {}{}",
-                named(&f.test, f.place.as_deref()),
-                context(f)
-            ),
+            None => println!("  {tag} {}{}", failure_name(f), context(f)),
         }
     }
     if let Some(ms) = s.stalled_ms {
@@ -345,6 +343,17 @@ pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
 }
 
 /// A test's name with its place when names collide: `tests::flaky (geo)`.
+/// A failure's name as listed: its place when shared, and `(quarantined)`
+/// when it is a known failure (ADR 0034).
+fn failure_name(f: &prova_core::engine::Failure) -> String {
+    let name = named(&f.test, f.place.as_deref());
+    if f.quarantined {
+        format!("{name} (quarantined)")
+    } else {
+        name
+    }
+}
+
 pub fn named(test: &str, place: Option<&str>) -> String {
     match place {
         Some(p) => format!("{} ({})", clean(test), clean(p)),
@@ -770,7 +779,7 @@ fn failure_tag(outcome: Outcome, message: Option<&str>) -> &'static str {
 /// The live line of each failure not shown yet.
 pub fn progress_failures(s: &Summary, reported: &mut std::collections::BTreeSet<String>) {
     for f in &s.failures {
-        let name = named(&f.test, f.place.as_deref());
+        let name = failure_name(f);
         if reported.insert(name.clone()) {
             eprintln!(
                 "{} {}{}",
@@ -823,8 +832,8 @@ pub fn runs(rows: &[RunRow], unverified: &std::collections::BTreeSet<String>, js
         // A thin pass is not a plain "passed" in the list either (round 9).
         let outcome = match r.outcome {
             Some(Outcome::Passed) if unverified.contains(&r.id) => "passed?",
-            // Passed although the command failed: only quarantined tests
-            // failed, set aside (round 14: listed as a plain "passed").
+            // Passed although the command failed: recorded before ADR 0034,
+            // when quarantined failures were set aside (round 14).
             Some(Outcome::Passed) if r.exit_code.is_some_and(|c| c != 0) => "passed*",
             // A cancelled or killed run has no test outcome of its own:
             // "cancelled errored" read as a test error (round 13).
@@ -1116,6 +1125,7 @@ mod label_tests {
 
     fn label_after(seen_before: usize, flaky: bool, passes_before: usize) -> String {
         super::context(&Failure {
+            quarantined: false,
             test: "t".into(),
             place: None,
             outcome: prova_core::model::Outcome::Failed,
@@ -1163,6 +1173,7 @@ mod label_tests {
         );
         assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
+            quarantined: false,
             test: "t".into(),
             place: None,
             outcome: prova_core::model::Outcome::Failed,
@@ -1184,6 +1195,7 @@ mod label_tests {
         assert_eq!(first, " [first time seen: no history yet]");
         first.clear();
         let never = super::context(&Failure {
+            quarantined: false,
             test: "t".into(),
             place: None,
             outcome: prova_core::model::Outcome::Failed,

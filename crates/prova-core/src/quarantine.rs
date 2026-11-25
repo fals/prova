@@ -1,4 +1,5 @@
-//! Quarantine: known-flaky tests set aside from the verdict, in the open
+//! Quarantine: known-flaky tests marked in the open. A quarantine never
+//! changes a verdict (ADR 0034): it names known failures.
 //! (ADR 0027). Stored per repository; never edits the user's project.
 
 use std::collections::BTreeMap;
@@ -22,12 +23,12 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_ms: Option<u64>,
     /// The test's file (binary, module) when its name alone is shared by
-    /// tests of several: only that one is set aside.
+    /// tests of several: only that one is quarantined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// Set when the store knows the name in other places too: a result of
     /// unknown place (quiet `cargo test` names no binary) cannot be told
-    /// from the other places' and is not set aside by it.
+    /// from the other places' and is not covered by it.
     #[serde(skip)]
     pub ambiguous: bool,
 }
@@ -137,7 +138,7 @@ pub fn expired_at(store: &Store, ts: u64) -> Result<Vec<Entry>> {
         .collect())
 }
 
-/// The quarantine that sets `display` aside: its own, or its parent test's
+/// The quarantine that covers `display`: its own, or its parent test's
 /// (a Go subtest `TestX/case` follows `TestX`).
 pub fn covers<'a>(q: &'a BTreeMap<String, Entry>, display: &str) -> Option<&'a Entry> {
     let of_name = |name: &str| q.values().find(|e| e.test == name);
@@ -153,7 +154,7 @@ pub fn names_test(q: &BTreeMap<String, Entry>, display: &str) -> bool {
     q.values().any(|e| e.test == display)
 }
 
-/// The quarantine that sets aside the test with lifecycle key `unique`
+/// The quarantine that covers the test with lifecycle key `unique`
 /// (`file<US>display`): as `covers`, and of the same file when the
 /// quarantine names one. A name can be quarantined in several places.
 pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'a Entry> {
@@ -252,7 +253,7 @@ mod tests {
         assert!(covers_key(&q, "calc\u{1f}t").is_some());
     }
 
-    /// Round 17: a name quarantined in two places sets aside each place's
+    /// Round 17: a name quarantined in two places covers each place's
     /// test, and no third.
     #[test]
     fn a_name_quarantined_in_two_places_covers_each_of_them() {

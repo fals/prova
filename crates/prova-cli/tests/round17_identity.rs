@@ -68,8 +68,7 @@ fn nextest(calc: &str, geo: &str) -> String {
     )
 }
 
-/// Each suite runs a fake `cargo` printing nextest's output: one
-/// test-runner call, which a quarantine needs (ADR 0031).
+/// Each suite runs a fake `cargo` printing nextest's output.
 fn two_crates(d: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut toml = String::new();
