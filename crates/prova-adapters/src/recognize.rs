@@ -145,6 +145,10 @@ pub struct Recognizers {
     /// pytest verbose text: a passing line held one line, for the same
     /// reason (pytest prints the teardown error as a second line).
     pytest_text_pass: Option<(String, TestKey)>,
+    /// pytest counts a test that errored in teardown once more than the
+    /// test itself (a pass or a failure plus an error): unique key -> the
+    /// test had failed before the error. Tests, not report lines.
+    pytest_doubles: BTreeMap<String, bool>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
@@ -508,6 +512,10 @@ impl Recognizers {
                 other.name = format!("{} (second result)", key.name);
                 return self.result(other, outcome, duration_ms, message, level, subtest, out);
             }
+            // pytest: a failure and then its own teardown error.
+            if before.is_failure() && *before != Outcome::Errored && outcome == Outcome::Errored {
+                self.pytest_doubles.entry(d.clone()).or_insert(true);
+            }
             // Already reported: a pytest summary line, or (libtest, level
             // Recognized with a binary known) the same binary run again.
             if self.libtest_binary.is_some() && key.file == self.libtest_binary {
@@ -842,10 +850,21 @@ impl Recognizers {
         }
     }
 
+    /// Tests that errored in teardown after a failure, and after a pass:
+    /// pytest counts each of them twice.
+    pub fn teardown_doubles(&self) -> (u64, u64) {
+        let failed = self.pytest_doubles.values().filter(|f| **f).count() as u64;
+        (failed, self.pytest_doubles.len() as u64 - failed)
+    }
+
     /// Failures the framework reported (structured streams win over text).
     pub fn failed_reported(&self) -> u64 {
         self.structured_failed
-            .unwrap_or(self.reported_failed.saturating_sub(self.go_recovered))
+            .unwrap_or(
+            self.reported_failed
+                .saturating_sub(self.go_recovered)
+                .saturating_sub(self.teardown_doubles().0),
+        )
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
@@ -1676,6 +1695,9 @@ impl Recognizers {
         };
         // A teardown error on a passed call: the one test errored.
         if when == "teardown" {
+            if self.pytest_call_pass.as_ref().is_some_and(|(h, _, _)| h == id) {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
+            }
             self.pytest_call_pass = None;
         }
         let longrepr = &v["longrepr"];
@@ -1980,6 +2002,7 @@ impl Recognizers {
                 .strip_prefix(id.as_str())
                 .is_some_and(|r| r.trim_start().starts_with("ERROR"));
             if errored {
+                self.pytest_doubles.entry(hkey.unique()).or_insert(false);
                 self.finished(hkey, Outcome::Errored, None, None, Level::Recognized, out);
                 return true;
             }
@@ -2067,6 +2090,7 @@ impl Recognizers {
             if outcome == Outcome::Errored
                 && matches!(self.seen.get(&key.unique()), Some((_, Outcome::Passed)))
             {
+                self.pytest_doubles.entry(key.unique()).or_insert(false);
                 self.attempt_result(key, 2, outcome, None, msg, Level::Recognized, out);
                 return true;
             }
@@ -2744,7 +2768,8 @@ impl Recognizers {
 
     /// Tests the framework says it ran.
     pub fn total(&self) -> u64 {
-        self.structured_total.unwrap_or(self.reported_total)
+        self.structured_total
+            .unwrap_or(self.reported_total.saturating_sub(self.pytest_doubles.len() as u64))
     }
 
     // ------------------------------------------------------------- nextest
@@ -4405,6 +4430,41 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n.contains("second result"))
         );
+    }
+
+    /// Round 17: pytest counts a test that failed and also errored in
+    /// teardown twice ("1 failed, 3 passed, 2 errors" for four tests). The
+    /// counts prova compares are of tests, not report lines.
+    #[test]
+    fn pytest_counts_tests_not_report_lines() {
+        let (r, _) = feed_all(
+            "tests/t.py::test_a FAILED   [ 25%]\ntests/t.py::test_a ERROR   [ 25%]\n\
+             tests/t.py::test_b PASSED   [ 50%]\ntests/t.py::test_b ERROR   [ 50%]\n\
+             tests/t.py::test_c PASSED   [ 75%]\n\
+             tests/t.py::test_d PASSED   [100%]\n\
+             FAILED tests/t.py::test_a - assert 0\nERROR tests/t.py::test_a - teardown\n\
+             ERROR tests/t.py::test_b - teardown\n\
+             === 1 failed, 3 passed, 2 errors in 0.1s ===",
+        );
+        assert_eq!((r.total(), r.failed_reported()), (4, 2));
+        assert_eq!(r.teardown_doubles(), (1, 1));
+    }
+
+    #[test]
+    fn pytest_reportlog_teardown_double_is_counted_once() {
+        let a = "tests/t.py::test_a";
+        let b = "tests/t.py::test_b";
+        let lines = [
+            report(a, "setup", "passed"),
+            report(a, "call", "failed"),
+            report(a, "teardown", "failed"),
+            report(b, "setup", "passed"),
+            report(b, "call", "passed"),
+            report(b, "teardown", "failed"),
+            "=== 1 failed, 1 passed, 2 errors in 0.1s ===".to_owned(),
+        ];
+        let (r, _) = feed_all(&lines.join("\n"));
+        assert_eq!((r.total(), r.failed_reported()), (2, 2));
     }
 
     #[test]

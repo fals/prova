@@ -1541,6 +1541,9 @@ fn observe_child(
             && sup.container.is_none()
             && sup.cpu_start.is_some()
             && process::children_ticks() == sup.cpu_start
+            // A framework that printed its own totals ran: a warm build's
+            // tests can finish inside one clock tick (round 17).
+            && sup.framework_total.unwrap_or(0) == 0
         {
             let passed: i64 = store.conn().query_row(
                 "SELECT COUNT(*) FROM attempts WHERE run_id = ?1 AND outcome = 'passed'",

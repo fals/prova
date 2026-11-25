@@ -394,6 +394,26 @@ impl Observer for Ladder {
             .count() as u64;
         let seen =
             (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
+        let (failed_td, passed_td) = self.live.teardown_doubles();
+        if failed_td + passed_td > 0 {
+            // pytest counts such a test twice in its summary; prova counts
+            // tests (round 17).
+            let part = |n: u64, what: &str| {
+                (n > 0).then(|| {
+                    format!(
+                        "{n} test{} {what} and also errored in teardown",
+                        if n == 1 { "" } else { "s" }
+                    )
+                })
+            };
+            let parts: Vec<String> = [part(failed_td, "failed"), part(passed_td, "passed")]
+                .into_iter()
+                .flatten()
+                .collect();
+            report.events.push(EventKind::RunNote {
+                message: format!("{} (pytest counts each twice)", parts.join("; ")),
+            });
+        }
         if self.live.summary_seen {
             report.events.push(EventKind::RunTotals {
                 tests: self.live.total(),
