@@ -50,10 +50,13 @@ module runLifecycle {
   // failures are quarantined tests that plainly failed (not errored, not
   // cut off), that finished with no contradiction and a test-failure exit
   // code, passes without them. Anything else keeps the verdict.
+  // ADR 0031: only when the command is one test-runner call (`runnerOnly`,
+  // fixed with the command when the run is created): a step before, after
+  // or between runner calls, or one the failure skipped, is out of sight.
   pure val QUARANTINED = Set("b")
   pure def withQuarantine(v: Verdict, s: Status, code: int, out: str -> Outcome,
-                          contra: bool, q: Set[str]): Verdict =
-    if (v == Fail and s == Finished and not(contra)
+                          contra: bool, runnerOnly: bool, q: Set[str]): Verdict =
+    if (v == Fail and s == Finished and not(contra) and runnerOnly
         and code != 0 and code != 126 and code != 127
         and out.keys().exists(t => out.get(t) == Failed or out.get(t) == Errored)
         and out.keys().forall(t =>
@@ -295,8 +298,8 @@ module runLifecycle {
   // A quarantine never hides anything but its own tests' plain failures:
   // a pass it grants has a finished run, no contradiction, every other
   // test passed or skipped, and no quarantined test errored.
-  val quarantineHidesOnlyItsOwn =
-    withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Pass
+  val quarantineHidesOnlyItsOwn = Set(true, false).forall(runnerOnly =>
+    withQuarantine(verdict, status, exitCode, outcomes, contradiction, runnerOnly, QUARANTINED) == Pass
       implies all {
         status == Finished,
         not(contradiction),
@@ -304,10 +307,12 @@ module runLifecycle {
         outcomes.keys().forall(t =>
           (outcomes.get(t) != Failed and outcomes.get(t) != Errored)
           or (QUARANTINED.contains(t) and outcomes.get(t) == Failed)),
-        // A pass the quarantine granted verified some other test.
+        // A pass the quarantine granted verified some other test, and the
+        // command was one test-runner call (ADR 0031).
         verdict != Pass implies
           outcomes.keys().exists(t => outcomes.get(t) == Passed and not(QUARANTINED.contains(t))),
-      }
+        verdict != Pass implies runnerOnly,
+      })
 
   // A command that could not start is not a test failure.
   val couldNotStartIsAnError =
@@ -393,7 +398,10 @@ module runLifecycle {
       .then(exited(1)).then(end(Finished))
       .then(all {
         assert(verdict == Fail),
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Pass),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Pass),
+        // ADR 0031: the same failure under a command that does more than
+        // run the tests (make, a script, a chain) is not set aside.
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, false, QUARANTINED) == Fail),
         assert(safety),
         late("a", Passed),
       })
@@ -404,7 +412,7 @@ module runLifecycle {
       .then(testStarted("b")).then(testFinished("b", Failed))
       .then(exited(1)).then(end(Finished))
       .then(all {
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Fail),
         late("a", Passed),
       })
 
@@ -413,7 +421,7 @@ module runLifecycle {
     init.then(start).then(testStarted("b")).then(testFinished("b", Failed))
       .then(exited(1)).then(end(Finished))
       .then(all {
-        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, QUARANTINED) == Fail),
+        assert(withQuarantine(verdict, status, exitCode, outcomes, contradiction, true, QUARANTINED) == Fail),
         late("b", Failed),
       })
 
