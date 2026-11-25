@@ -225,7 +225,9 @@ mod tests {
     #[test]
     fn a_subtest_follows_its_parent() {
         let mut q = BTreeMap::new();
-        q.insert("TestX".to_owned(), e(0, 10, None));
+        let mut x = e(0, 10, None);
+        x.test = "TestX".into();
+        q.insert(key_of("TestX", None), x);
         assert!(covers(&q, "TestX").is_some());
         assert!(covers(&q, "TestX/case/deep").is_some());
         assert!(covers(&q, "TestXY").is_none());

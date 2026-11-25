@@ -3650,7 +3650,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         let quiet = row.status == Status::Finished
             && framework.is_some_and(|(t, _)| t > 0)
             && !finals.values().any(|f| f.1 == Outcome::Passed);
-        for (name, q) in &quarantine {
+        for q in quarantine.values() {
+            let name = &q.test;
             // A quarantined subtest is listed by its own result (round 14:
             // "not run" for a subtest that ran and failed).
             let result = finals
