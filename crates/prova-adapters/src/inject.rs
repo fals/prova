@@ -74,10 +74,15 @@ pub const RECIPES: &[Recipe] = &[
                 ),
             ]
         },
-        files: &[(
-            "prova-vitest-reporter.mjs",
-            include_str!("vitest-reporter.mjs"),
-        )],
+        files: &[
+            (
+                "prova-vitest-reporter.mjs",
+                include_str!("vitest-reporter.mjs"),
+            ),
+            // Added to the project's setupFiles by the reporter: starts and
+            // results written from inside the worker (see its header).
+            ("prova-vitest-setup.mjs", include_str!("vitest-setup.mjs")),
+        ],
         stream: Some("vitest.jsonl"),
         report: None,
     },
@@ -218,6 +223,10 @@ mod tests {
             "set, not appended"
         );
         assert_eq!(files(&v)[0].0, "prova-vitest-reporter.mjs");
+        // The worker hooks sit next to the reporter, which adds them to the
+        // project's setupFiles (Vitest's worker loses updates, #92).
+        assert_eq!(files(&v)[1].0, "prova-vitest-setup.mjs");
+        assert!(files(&v)[1].1.contains("beforeEach"));
         assert_eq!(streams(&v), vec!["vitest.jsonl"]);
     }
 }

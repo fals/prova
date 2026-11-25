@@ -104,6 +104,8 @@ pub struct Recognizers {
     /// libtest's `running N tests` with how many results followed: a
     /// binary that stops before its `test result:` summary died mid-run.
     libtest_running: Option<(u64, u64)>,
+    /// The last `test x ... ` line that has no result yet.
+    libtest_text_open: Option<TestKey>,
     /// Test binaries that stopped early: "after K of N tests".
     pub harness_stopped: Vec<String>,
     /// Text results held while an injected stream is expected.
@@ -164,6 +166,9 @@ pub struct Recognizers {
     /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
     /// then `× fails`): the open ones, by indentation.
     vitest_suites: Vec<(usize, String)>,
+    /// A `FAIL  file > test` line was read: the next line is its message
+    /// (the dot reporter prints no other per-test line).
+    vitest_fail_msg: bool,
     /// Test classes Surefire's class lines named in full (`-- in
     /// calc.CalcTest`): its summary names them without the package.
     surefire_classes: Vec<String>,
@@ -930,12 +935,13 @@ impl Recognizers {
                 .and_then(|n| n.parse::<u64>().ok())
                 .filter(|_| t.ends_with(" tests") || t.ends_with(" test"))
             {
-                self.close_libtest_running();
+                self.close_libtest_running(&mut out);
                 if n > 0 {
                     self.libtest_running = Some((n, 0));
                 }
             } else if t.starts_with("test result:") {
                 self.libtest_running = None;
+                self.libtest_text_open = None;
             } else if t.starts_with("test ")
                 && (t.ends_with(" ok") || t.contains(" ... FAILED") || t.contains(" ... ignored"))
                 && let Some((_, seen)) = self.libtest_running.as_mut()
@@ -1005,6 +1011,20 @@ impl Recognizers {
         if !self.unhandled_block && line.contains("Unhandled Errors") && line.contains('\u{23af}') {
             self.unhandled_block = true;
             self.unhandled_lines = Some(Vec::new());
+            return out;
+        }
+        if std::mem::take(&mut self.vitest_fail_msg)
+            && let Some(EventKind::TestFinished { message, .. }) = self.vitest_pending.as_mut()
+            && !line.trim().is_empty()
+        {
+            *message = Some(line.trim().to_owned());
+            if self.vitest_stream {
+                let mut held = std::mem::take(&mut self.held_text_events);
+                self.flush_vitest(&mut held);
+                self.held_text_events = held;
+            } else {
+                self.flush_vitest(&mut out);
+            }
             return out;
         }
         if self.dotnet_message.is_some() {
@@ -2000,6 +2020,16 @@ impl Recognizers {
         let Some(rest) = line.strip_prefix("test ") else {
             return false;
         };
+        // `test x ... ` and nothing after: libtest runs tests one at a time
+        // (`--test-threads=1`) and has not said how this one ended.
+        if let Some(name) = rest.trim_end().strip_suffix(" ...")
+            && self.libtest_running.is_some()
+        {
+            let name = name.trim();
+            let name = name.strip_suffix(" - should panic").unwrap_or(name);
+            self.libtest_text_open = Some(self.libtest_key(name));
+            return true;
+        }
         if let Some((name, status)) = rest.rsplit_once(" ... ") {
             let outcome = match status.trim() {
                 "ok" => Outcome::Passed,
@@ -2334,6 +2364,31 @@ impl Recognizers {
                 Level::Recognized,
                 out,
             );
+            return true;
+        }
+        // "FAIL  src/a.test.ts > group > name": the failures section of every
+        // reporter. The dot reporter prints nothing else per test; the others
+        // already reported the test, and a repeat is ignored.
+        if !self.vitest_stream
+            && let Some(r) = t.strip_prefix("FAIL ")
+            && let Some((f, name)) = r.trim().split_once(" > ")
+            && is_js_file(f.trim())
+            && !name.trim().is_empty()
+        {
+            let key = TestKey::new(vec![f.trim().to_owned()], name.trim());
+            let mut held = Vec::new();
+            self.finished(
+                key,
+                Outcome::Failed,
+                None,
+                None,
+                Level::Recognized,
+                &mut held,
+            );
+            if let Some(e) = held.pop() {
+                self.vitest_pending = Some(e);
+                self.vitest_fail_msg = true;
+            }
             return true;
         }
         let (outcome, rest) = if let Some(r) = t.strip_prefix("✓ ") {
@@ -2716,7 +2771,18 @@ impl Recognizers {
             duration = Some(ms.round() as u64);
             name = n.trim_end().to_owned();
         }
-        // " todo" tests print as "✎ todo name".
+        // Jest writes its own status word before the name: `○ skipped name`,
+        // `✎ todo name`. It is not part of the test's name.
+        let word = match m {
+            '○' => "skipped ",
+            '✎' => "todo ",
+            _ => "",
+        };
+        if !word.is_empty()
+            && let Some(n) = name.strip_prefix(word)
+        {
+            name = n.trim_start().to_owned();
+        }
         let mut parts: Vec<String> = self.jest.stack.iter().map(|(_, n)| n.clone()).collect();
         parts.push(name);
         let key = TestKey::new(vec![file], parts.join(" > "));
@@ -2897,12 +2963,36 @@ impl Recognizers {
 
     /// nextest's human status lines, printed live (ADR 0018):
     /// `PASS [   0.004s] (1/5) calc tests::adds`, `SLOW [> 60.000s] ...`.
-    fn close_libtest_running(&mut self) {
+    fn close_libtest_running(&mut self, out: &mut Vec<EventKind>) {
+        let open = self.libtest_text_open.take();
         if let Some((n, seen)) = self.libtest_running.take()
             && seen < n
         {
+            // `test x ... ` with no result is the test that was running
+            // (`--test-threads=1`); in parallel libtest prints a test only
+            // when it ends, so the text cannot say which one it was.
+            let hint = match open {
+                Some(key) => {
+                    let name = key.display();
+                    self.finished(
+                        key,
+                        Outcome::Errored,
+                        None,
+                        Some(
+                            "the test binary ended while this test was running (a crash, an abort or an exit); it has no result"
+                                .to_owned(),
+                        ),
+                        Level::Recognized,
+                        out,
+                    );
+                    format!("; it was running {name}")
+                }
+                None => {
+                    "; run with `-- --test-threads=1` to name the test that was running".to_owned()
+                }
+            };
             self.harness_stopped.push(format!(
-                "a test binary stopped after {seen} of {n} tests, before its summary"
+                "a test binary stopped after {seen} of {n} tests, before its summary{hint}"
             ));
         }
     }
@@ -3101,7 +3191,7 @@ impl Recognizers {
             }
         }
         self.close_pass_output();
-        self.close_libtest_running();
+        self.close_libtest_running(&mut gts);
         self.close_libtest_block();
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
@@ -4820,7 +4910,7 @@ mod tests {
             "    \u{2713} adds (2 ms)\n",
             "    nested\n",
             "      \u{2713} deep\n",
-            "    \u{25cb} skipped test\n",
+            "    \u{25cb} skipped works\n",
             "\n",
             " FAIL  src/x.test.ts (5.2 s)\n",
             "  calc\n",
@@ -4843,10 +4933,7 @@ mod tests {
                     "src/a.test.js::calc > nested > deep".into(),
                     Outcome::Passed
                 ),
-                (
-                    "src/a.test.js::calc > skipped test".into(),
-                    Outcome::Skipped
-                ),
+                ("src/a.test.js::calc > works".into(), Outcome::Skipped),
                 ("src/x.test.ts::calc > subtracts".into(), Outcome::Passed),
                 ("src/x.test.ts::calc > flaky clock".into(), Outcome::Failed),
             ]
@@ -6515,5 +6602,146 @@ mod round15_fw_tests {
     fn vitest_errors_count_is_remembered() {
         let (r, _) = feed_all("     Errors  2 errors\n");
         assert_eq!(r.unhandled_errors, 2);
+    }
+}
+
+/// Round 17 (#92): per-test results from output that named none, checked on
+/// output captured from the real tools (`testdata/`).
+#[cfg(test)]
+mod issue92_tests {
+    use super::*;
+
+    fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
+        let mut r = Recognizers::default();
+        let mut all = Vec::new();
+        for l in input.lines() {
+            all.extend(r.line(l));
+        }
+        all.extend(r.finish());
+        (r, all)
+    }
+
+    fn results(ev: &[EventKind]) -> Vec<(String, Outcome)> {
+        let mut v: Vec<(String, Outcome)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished { test, outcome, .. } => Some((test.display(), *outcome)),
+                _ => None,
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn message_of(ev: &[EventKind], name: &str) -> Option<String> {
+        ev.iter().find_map(|e| match e {
+            EventKind::TestFinished {
+                test,
+                message: Some(m),
+                ..
+            } if test.display() == name => Some(m.clone()),
+            _ => None,
+        })
+    }
+
+    /// Jest 29 `--verbose`, as printed: Jest itself writes `skipped` and
+    /// `todo` before the name of those tests; the test's name is without it.
+    #[test]
+    fn jest29_verbose_names_every_test_without_jests_status_word() {
+        let (r, ev) = feed_all(include_str!("../testdata/jest29-verbose.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/b.test.js::plain".into(), Outcome::Passed),
+                ("src/calc.test.js::calc > adds".into(), Outcome::Passed),
+                ("src/calc.test.js::calc > divides".into(), Outcome::Failed),
+                ("src/calc.test.js::calc > later".into(), Outcome::Skipped),
+                (
+                    "src/calc.test.js::calc > nested > deep".into(),
+                    Outcome::Passed
+                ),
+                (
+                    "src/calc.test.js::calc > skipped one".into(),
+                    Outcome::Skipped
+                ),
+            ]
+        );
+        assert_eq!(r.total(), 6);
+    }
+
+    /// Vitest `--reporter=dot` prints a dot per test and the failures in
+    /// full after: `FAIL  file > describe > test`, then the message.
+    #[test]
+    fn vitest_dot_reporter_fail_lines_are_read() {
+        let (_, ev) = feed_all(include_str!("../testdata/vitest3-dot-fail.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("src/bad.test.ts::grp > bad one".into(), Outcome::Failed),
+                (
+                    "src/calc.test.ts::calc > flaky clock".into(),
+                    Outcome::Failed
+                ),
+            ]
+        );
+        assert!(
+            message_of(&ev, "src/bad.test.ts::grp > bad one")
+                .is_some_and(|m| m.contains("expected 1 to be 2")),
+        );
+    }
+
+    /// libtest text, `cargo test -- --test-threads=1`, real output of a test
+    /// that calls `std::process::abort()`: the binary prints `test x ... `,
+    /// never the result. That test is the one that was running.
+    #[test]
+    fn libtest_crash_names_the_test_that_was_running() {
+        let (r, ev) = feed_all(include_str!("../testdata/libtest-crash-serial.txt"));
+        let got = results(&ev);
+        assert_eq!(
+            got.iter()
+                .map(|(n, o)| (n.as_str(), *o))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tests::a_fine", Outcome::Passed),
+                ("tests::b_crashes", Outcome::Errored),
+            ],
+            "{got:?}"
+        );
+        assert!(
+            message_of(&ev, "tests::b_crashes")
+                .is_some_and(|m| m.contains("ended while this test was running")),
+            "{:?}",
+            message_of(&ev, "tests::b_crashes")
+        );
+        assert_eq!(r.harness_stopped.len(), 1);
+    }
+
+    /// Run in parallel, libtest prints no line for a test until it ends: the
+    /// crash cannot be pinned on one test, and the note says how to find it.
+    #[test]
+    fn libtest_crash_in_parallel_says_how_to_name_the_test() {
+        let (r, ev) = feed_all(include_str!("../testdata/libtest-crash-parallel.txt"));
+        assert_eq!(results(&ev).len(), 1, "{:?}", results(&ev));
+        assert!(
+            r.harness_stopped[0].contains("--test-threads=1"),
+            "{:?}",
+            r.harness_stopped
+        );
+    }
+
+    /// Surefire with `-DdisableXmlReport=true` (real 3.5.2 output): the text
+    /// names only the failing tests, in full in the `<<< FAILURE!` lines and
+    /// shortened in the summary; passes are not printed at all.
+    #[test]
+    fn surefire_without_xml_names_failures_with_their_package() {
+        let (r, ev) = feed_all(include_str!("../testdata/surefire-3.5.2-no-xml.txt"));
+        assert_eq!(
+            results(&ev),
+            vec![
+                ("calc.CalcTest::adds".into(), Outcome::Failed),
+                ("calc.CalcTest::divides".into(), Outcome::Errored),
+            ]
+        );
+        assert_eq!((r.total(), r.failed_reported()), (10, 2));
     }
 }
