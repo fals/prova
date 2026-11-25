@@ -444,8 +444,18 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         s.flips_on_same_code,
         if s.flaky { "  => FLAKY" } else { "" }
     );
+    if s.failing_now {
+        println!("failing now: more failures in a row than its flakiness explains");
+    }
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
-        println!("duration p50 {p50}ms  p95 {p95}ms");
+        let show = |ms: u64| {
+            if ms == 0 {
+                "<1ms".to_owned()
+            } else {
+                format!("{ms}ms")
+            }
+        };
+        println!("duration p50 {}  p95 {}", show(p50), show(p95));
     } else if s.runs > 0 {
         println!("duration unknown: no run recorded one");
     }

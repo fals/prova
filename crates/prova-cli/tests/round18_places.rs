@@ -356,6 +356,142 @@ fn r18_sizes_names_the_unknown() {
     assert!(s.contains("m::t0") && s.contains("unknown"), "{s}");
 }
 
+/// Round 18 (go NIT 2): a Go test that took 0.00s read "duration unknown";
+/// 0 ms is a duration. Why medium: stored runs.
+#[test]
+fn r18_zero_milliseconds_is_a_duration() {
+    let d = workspace("zeroms");
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestQuick' '--- PASS: TestQuick (0.00s)' 'PASS' 'ok  \tex/a\t0.01s'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    let h = text(&prova(&d, &["history", "TestQuick"]));
+    assert!(!h.contains("duration unknown"), "{h}");
+    assert!(h.contains("p50 <1ms"), "{h}");
+}
+
+/// Round 18 (go NIT 1): a parent counted fewer runs than its subtest: the
+/// run that selected only the subtest was skipped even where the parent
+/// failed. Only a pass there is no evidence about the parent.
+#[test]
+fn r18_a_subtest_selection_run_still_counts_the_parents_failure() {
+    let d = workspace("subsel");
+    std::fs::write(
+        d.join("t.sh"),
+        format!(
+            "{BUSY}\nprintf '%s\\n' '=== RUN   TestP' '=== RUN   TestP/a' '    --- FAIL: TestP/a (0.00s)' '--- FAIL: TestP (0.00s)' 'FAIL' 'FAIL\tex/a\t0.01s'\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.s]\nrun = \"sh t.sh\"\nselect = \"sh t.sh {filter}\"\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "s"]);
+    prova(&d, &["run", "s", "--select", "TestP/a"]);
+    let h = text(&prova(&d, &["history", "TestP"]));
+    assert!(h.contains("2 runs with a result"), "{h}");
+}
+
+/// Round 18 (probe M4): after one `-count=2` fail-then-pass and failures
+/// that run on, `prova flaky` and `prova history` must agree.
+#[test]
+fn r18_flaky_and_history_agree_when_failures_run_on() {
+    let d = workspace("agree");
+    let go =
+        |lines: &str| format!("{BUSY} printf '%s\\n' {lines} 'FAIL' 'FAIL\tex/a\t0.01s'; exit 1");
+    let mixed = go(
+        "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- PASS: TestM (0.00s)'",
+    );
+    let fail = go(
+        "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- FAIL: TestM (0.00s)'",
+    );
+    prova(&d, &["run", "--", "sh", "-c", &mixed]);
+    for n in 0..6 {
+        prova(&d, &["run", "--", "sh", "-c", &fail]);
+        let h = text(&prova(&d, &["history", "TestM"]));
+        let f = text(&prova(&d, &["flaky"]));
+        assert_eq!(
+            h.contains("=> FLAKY"),
+            f.contains("TestM"),
+            "after {n} more failures: history says\n{h}\nflaky says\n{f}"
+        );
+        if n == 5 {
+            assert!(h.contains("failing now"), "{h}");
+        }
+    }
+}
+
+/// Round 18 (rust-make 3179c700): a quiet run cut short named a test of
+/// unknown place; both crates' quarantines then read "failed". Neither ran.
+#[test]
+fn r18_a_failure_of_unknown_place_is_no_quarantined_place_failing() {
+    let d = workspace("stalledplaces");
+    let nextest = format!(
+        "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        PASS [   0.004s] calc tests::flaky_clock' '        PASS [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 2 tests run'"
+    );
+    let quiet = format!("{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED'; exit 101");
+    prova(&d, &["run", "--", "sh", "-c", &nextest]);
+    for p in ["calc", "geo"] {
+        let o = prova(
+            &d,
+            &[
+                "quarantine",
+                "add",
+                "tests::flaky_clock",
+                "--in",
+                p,
+                "--reason",
+                "r",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let o = text(&prova(&d, &["run", "--", "sh", "-c", &quiet]));
+    assert!(o.contains("FAIL tests::flaky_clock"), "{o}");
+    assert!(
+        !o.contains("(calc) failed") && !o.contains("(geo) failed"),
+        "{o}"
+    );
+}
+
+/// Round 18 (probe M1): pytest through a container client with `-w
+/// /w/tests/b` named `test_x::test_flaky` for the tests of `tests/a` and
+/// `tests/b` alike. The rootdir the output prints is the container's path:
+/// the client's `-v host:container` mount maps it under the repository.
+#[test]
+fn r18_pytest_in_a_container_workdir_is_placed_by_the_mount() {
+    let d = workspace("pycontainer");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(d.join("tests").join(sub)).unwrap();
+        std::fs::write(d.join("tests").join(sub).join("test_x.py"), "").unwrap();
+    }
+    let run = |sub: &str| {
+        format!(
+            "{BUSY} : docker run --rm -v {d}:/w -w /w/tests/{sub} img pytest -v; printf '%s\\n' 'rootdir: /w/tests/{sub}' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1",
+            d = d.display()
+        )
+    };
+    let a = text(&prova(&d, &["run", "--", "sh", "-c", &run("a")]));
+    assert!(a.contains("FAIL tests.a.test_x::test_flaky"), "{a}");
+    let b = text(&prova(&d, &["run", "--", "sh", "-c", &run("b")]));
+    assert!(b.contains("FAIL tests.b.test_x::test_flaky"), "{b}");
+    assert!(b.contains("first time seen") && !b.contains("FLAKY"), "{b}");
+}
+
+/// Round 18 (ts-vitest): "no history yet" for a budget, though the test has
+/// runs, meant no duration history.
+#[test]
+fn r18_budget_label_says_duration_history() {
+    assert!(
+        prova_core::model::BudgetFrom::Default
+            .describe()
+            .contains("no duration history yet")
+    );
+}
+
 /// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
 /// the tests the second did not print as "removed". Why medium: two stored
 /// runs of two suites.

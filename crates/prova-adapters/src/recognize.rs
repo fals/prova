@@ -1216,6 +1216,14 @@ impl Recognizers {
                     .ok()
                     .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
             };
+            // Through a container client the directory pytest ran in is the
+            // container's: the client's mount maps it under the repository.
+            if let Some(dir) = self.container_dir()
+                && has(&dir)
+                && let Some(p) = rel(&dir)
+            {
+                return PytestDir::Prefix(p);
+            }
             let moved: Vec<String> = self
                 .command
                 .as_deref()
@@ -1255,6 +1263,75 @@ impl Recognizers {
                     .unwrap_or_default(),
             )
         })
+    }
+
+    /// The host directory a container client's `-w`/pytest's rootdir names:
+    /// the container path under one of the `-v host:container` mounts (or
+    /// `--mount src=..,dst=..`) of the command.
+    fn container_dir(&self) -> Option<std::path::PathBuf> {
+        let cwd = self.cwd.as_ref()?;
+        let cmd = self.command.as_deref()?;
+        let words: Vec<&str> = cmd
+            .split(|c: char| c.is_whitespace() || c == '\'')
+            .filter(|w| !w.is_empty())
+            .collect();
+        let host_of = |h: &str| {
+            let h = h
+                .replace("${PWD}", &cwd.to_string_lossy())
+                .replace("$PWD", &cwd.to_string_lossy())
+                .replace("$(pwd)", &cwd.to_string_lossy());
+            let p = std::path::PathBuf::from(&h);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        };
+        let mut mounts: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let mut workdir: Option<String> = None;
+        for (i, w) in words.iter().enumerate() {
+            let next = words.get(i + 1).copied();
+            match *w {
+                "-v" | "--volume" => {
+                    if let Some((h, rest)) = next.and_then(|n| n.split_once(':')) {
+                        let c = rest.split(':').next().unwrap_or(rest);
+                        mounts.push((host_of(h), c.to_owned()));
+                    }
+                }
+                "-w" | "--workdir" => workdir = next.map(str::to_owned),
+                "--mount" => {
+                    let kv = |k: &[&str]| {
+                        next?.split(',').find_map(|p| {
+                            let (a, b) = p.split_once('=')?;
+                            k.contains(&a).then(|| b.to_owned())
+                        })
+                    };
+                    if let (Some(h), Some(c)) = (kv(&["src", "source"]), kv(&["dst", "target"])) {
+                        mounts.push((host_of(&h), c));
+                    }
+                }
+                other => {
+                    if let Some(v) = other
+                        .strip_prefix("--workdir=")
+                        .or_else(|| other.strip_prefix("-w="))
+                    {
+                        workdir = Some(v.to_owned());
+                    }
+                }
+            }
+        }
+        let at = self
+            .pytest_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or(workdir)?;
+        mounts
+            .iter()
+            .filter(|(_, c)| {
+                let c = c.trim_end_matches('/');
+                at == c || at.starts_with(&format!("{c}/"))
+            })
+            .max_by_key(|(_, c)| c.len())
+            .map(|(h, c)| {
+                let rest = at[c.trim_end_matches('/').len()..].trim_start_matches('/');
+                h.join(rest)
+            })
     }
 
     /// Whether Vitest's root lies below the working directory.
