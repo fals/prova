@@ -18,6 +18,11 @@ pub struct TestRun {
     pub attempts: u32,
     /// Failed at least once, then passed, in the same run.
     pub passed_on_retry: bool,
+    /// Passed in one execution and failed in a later one of the same run
+    /// (`go test -count=N`: a failure in any fails the test, 0029): flaky
+    /// evidence from a run that failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub passed_and_failed: bool,
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -174,6 +179,7 @@ fn test_runs_scoped(
         .map(|d| leaf(&d));
     let mut out: Vec<TestRun> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
+    let mut had_pass_run = false;
     for row in rows {
         let (run, code, created, attempt, outcome, dur, msg, fp, env, selection, row_test) = row?;
         if let (Some(sel), Some(this)) = (&selection, &this)
@@ -197,6 +203,8 @@ fn test_runs_scoped(
                 let earlier_failed = last.outcome.is_failure();
                 last.attempts = attempt as u32;
                 last.passed_on_retry |= earlier_failed && outcome == Outcome::Passed;
+                had_pass_run |= last.outcome == Outcome::Passed;
+                last.passed_and_failed = had_pass_run && outcome == Outcome::Failed;
                 last.outcome = outcome;
                 last.duration_ms = dur.map(|d| d as u64);
                 if outcome.is_failure() {
@@ -209,6 +217,7 @@ fn test_runs_scoped(
                 }
             }
             _ => {
+                had_pass_run = outcome == Outcome::Passed;
                 ids.push(row_test);
                 out.push(TestRun {
                     run,
@@ -217,6 +226,7 @@ fn test_runs_scoped(
                     outcome,
                     attempts: attempt as u32,
                     passed_on_retry: false,
+                    passed_and_failed: false,
                     duration_ms: dur.map(|d| d as u64),
                     message: if outcome.is_failure() { msg } else { None },
                     fingerprint: fp,
@@ -321,10 +331,12 @@ fn stats_scoped(
     // "the same code" (round 12: a fix in a project without git was
     // called a flaky flip).
     for r in counted.iter().filter(|r| r.code != "nogit") {
-        by_code
-            .entry((r.code.as_str(), env_key(r)))
-            .or_default()
-            .insert(r.outcome.is_failure());
+        let e = by_code.entry((r.code.as_str(), env_key(r))).or_default();
+        e.insert(r.outcome.is_failure());
+        // Passed and failed within the one run: both results on this code.
+        if r.passed_and_failed {
+            e.insert(false);
+        }
     }
     // Code versions, not (code, environment) pairs: one code that flipped
     // in two environments is one (round 14: "2 code version(s)" for one).
@@ -352,6 +364,7 @@ fn stats_scoped(
         }
     }
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
+    let mixed = recent.iter().filter(|r| r.passed_and_failed).count();
     // A test that failed its last 3 runs in a row is failing now, whatever
     // its past: "known flaky" must not hide a real break (round 9: an
     // environment-dependent test, once flipped, was dismissed for good).
@@ -380,8 +393,9 @@ fn stats_scoped(
     // And on enough history for the rate to mean something: one earlier
     // pass and three failures is a thin record (round 15: "failing now",
     // then it passed again).
-    let failing_now =
-        streak >= needed && counted.len() >= FAILING_NOW_MIN_RUNS && (retry > 0 || flips > 0);
+    let failing_now = streak >= needed
+        && counted.len() >= FAILING_NOW_MIN_RUNS
+        && (retry > 0 || flips > 0 || mixed > 0);
     let mut durations: Vec<u64> = recent
         .iter()
         .filter(|r| r.outcome == Outcome::Passed)
@@ -412,7 +426,7 @@ fn stats_scoped(
         transitions,
         passed_on_retry: retry,
         flips_on_same_code: flips,
-        flaky: (retry > 0 || flips > 0) && !failing_now,
+        flaky: (retry > 0 || flips > 0 || mixed > 0) && !failing_now,
         env_dependent: env_dependent.into_iter().take(5).collect(),
         failing_now,
         size: observed_size(store, test_id)?,

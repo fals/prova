@@ -105,3 +105,19 @@ fn history_keeps_the_failure_message_and_does_not_invent_a_duration() {
     let ok = text(&prova(&d, &["history", "test_ok"]));
     assert!(!ok.contains("p50 0ms"), "{ok}");
 }
+
+/// Go `-count=4` (pass, fail, pass, fail) in one run: four attempts, and a
+/// test that both passed and failed is flaky evidence (ADR 0029 section 2).
+#[test]
+fn go_count_repeats_that_passed_and_failed_are_flaky_with_all_attempts() {
+    let d = workspace("gocount");
+    let run = "printf '=== RUN   TestC\\n--- PASS: TestC (0.00s)\\n=== RUN   TestC\\n    c_test.go:9: lost\\n--- FAIL: TestC (0.00s)\\n=== RUN   TestC\\n--- PASS: TestC (0.00s)\\n=== RUN   TestC\\n    c_test.go:9: lost\\n--- FAIL: TestC (0.00s)\\nFAIL\\nFAIL\\texample.com/c\\t0.01s\\n'; exit 1";
+    suite(
+        &d,
+        &format!("[suite.default]\nrun = {:?}\n", format!("{WORK}{run}")),
+    );
+    let out = text(&prova(&d, &["run", "default"]));
+    assert!(out.contains("FLAKY"), "{out}");
+    let h = text(&prova(&d, &["history", "TestC"]));
+    assert!(h.contains("(4 attempts)"), "{h}");
+}

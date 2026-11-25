@@ -182,6 +182,9 @@ pub struct Recognizers {
     go_full_pkgs: Vec<String>,
     /// Executions of each test so far (`-count=N`, reruns): its attempts.
     go_attempts: BTreeMap<String, u32>,
+    /// The message of the latest failure of each Go test: a later iteration
+    /// that passes records the failure standing, with it.
+    go_failure_msg: BTreeMap<String, Option<String>>,
     /// Tests that failed and passed on a rerun: failures a summary counted.
     go_recovered: u64,
     /// Packages in which a test failed.
@@ -5101,29 +5104,50 @@ impl Recognizers {
         }
         let Some((_, before)) = self.seen.get(&d).cloned().filter(|_| !self.holding) else {
             if !self.holding {
+                if outcome.is_failure() {
+                    self.go_failure_msg.insert(d.clone(), message.clone());
+                }
                 self.go_attempts.insert(d, 1);
             }
             return self.result(key, outcome, duration_ms, message, level, subtest, out);
         };
         self.repeats += 1;
+        // Every execution is an attempt: the number counts them all, even
+        // the ones that change nothing (round 17: `-count=4` showed 3).
+        let n = self.go_attempts.entry(d.clone()).or_insert(1);
+        *n += 1;
+        let attempt = *n;
         if !before.is_failure() && !outcome.is_failure() {
             return;
         }
-        if before.is_failure() && !outcome.is_failure() {
+        let (outcome, message) = if before.is_failure() && !outcome.is_failure() {
             if !retry {
-                // A later iteration passing does not undo the failure.
-                return;
+                // A later iteration passing does not undo the failure: it is
+                // recorded as the failure standing, with its message.
+                let kept = self.go_failure_msg.get(&d).cloned().flatten();
+                (before, kept)
+            } else {
+                self.go_recovered += 1;
+                (outcome, message)
             }
-            self.go_recovered += 1;
+        } else {
+            (outcome, message)
+        };
+        if outcome.is_failure() {
+            self.go_failure_msg
+                .entry(d.clone())
+                .and_modify(|m| {
+                    if message.is_some() {
+                        m.clone_from(&message);
+                    }
+                })
+                .or_insert_with(|| message.clone());
         }
         if outcome.is_failure()
             && let Some(m) = &message
         {
             self.failure_fallback.push((key.clone(), m.clone()));
         }
-        let n = self.go_attempts.entry(d.clone()).or_insert(1);
-        *n += 1;
-        let attempt = *n;
         self.seen_keys.insert(d.clone(), key.clone());
         self.seen.insert(d, (key.display(), outcome));
         out.push(EventKind::TestFinished {
@@ -5561,7 +5585,8 @@ mod go_tests {
         let s = settled(&ev);
         assert_eq!(
             one(&s, "example.com/m/r::TestRace"),
-            vec![Outcome::Passed, Outcome::Failed]
+            vec![Outcome::Passed, Outcome::Failed, Outcome::Failed],
+            "three executions, three attempts: the last pass leaves the failure standing"
         );
         assert_eq!(s.len(), 1, "no phantom test, no package error: {s:?}");
     }
@@ -5574,7 +5599,10 @@ mod go_tests {
             "FAIL\nFAIL\texample.com/f\t0.01s\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "example.com/f::TestF"), vec![Outcome::Failed]);
+        assert_eq!(
+            one(&s, "example.com/f::TestF"),
+            vec![Outcome::Failed, Outcome::Failed]
+        );
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(r.failed_reported(), 0, "no stale totals");
     }
@@ -5610,8 +5638,31 @@ mod go_tests {
             "\n",
         ));
         let s = settled(&ev);
-        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed]);
+        assert_eq!(one(&s, "p::TestF"), vec![Outcome::Failed, Outcome::Failed]);
         assert_eq!(s.len(), 1, "{s:?}");
+    }
+
+    /// Round 17: `-count=4` (pass, fail, pass, fail) is four attempts, and
+    /// the pass and the failure of one run are both in them.
+    #[test]
+    fn go_count_four_counts_four_attempts() {
+        let (_, ev) = feed_all(concat!(
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "=== RUN   TestC\n--- PASS: TestC (0.00s)\n",
+            "=== RUN   TestC\n    c_test.go:9: lost\n--- FAIL: TestC (0.00s)\n",
+            "FAIL\nFAIL\texample.com/c\t0.01s\n",
+        ));
+        let s = settled(&ev);
+        assert_eq!(
+            one(&s, "example.com/c::TestC"),
+            vec![
+                Outcome::Passed,
+                Outcome::Failed,
+                Outcome::Failed,
+                Outcome::Failed
+            ]
+        );
     }
 
     /// A panic outside any test fails the package even when a test of it
