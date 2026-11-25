@@ -3631,7 +3631,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
-                .next();
+                .next()
+                // A test of that name whose directory could not be told is
+                // not set aside: say what it did (round 17 follow-up: it
+                // read "not seen").
+                .or_else(|| {
+                    finals
+                        .values()
+                        .find(|f| f.0.display() == *name && f.0.place_unknown())
+                        .map(|f| format!("{} in an unknown directory: not set aside", f.1.as_str()))
+                });
             // A selection that did not include it says nothing of it
             // (round 15: "not run" on every --select run).
             if (live || selection.is_some()) && result.is_none() {

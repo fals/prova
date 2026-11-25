@@ -315,6 +315,13 @@ fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
     assert!(out.contains("cannot tell which test is which"), "{out}");
     assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
     assert!(!out.contains("test_flaky failed (r"), "{out}");
+    // The quarantine line says what happened to it, not "not seen".
+    assert!(
+        out.contains(
+            "tests.test_calc::test_flaky failed in an unknown directory: not set aside (r"
+        ),
+        "{out}"
+    );
 }
 
 /// Vitest names files from its root, which its `RUN` header prints: from a
