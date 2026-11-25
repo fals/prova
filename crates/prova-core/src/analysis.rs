@@ -62,6 +62,43 @@ pub struct TestStats {
     pub last_passed: Option<(String, String)>,
     /// Newest first.
     pub recent: Vec<TestRun>,
+    /// Runs cut short (cancelled, killed, stalled out) while this test was
+    /// running: it is no result, but it may be why (round 17: a hung test
+    /// showed "0 runs"). Newest first, at most 10.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cut_short: Vec<CutShortRun>,
+}
+
+/// A run that ended before a test did.
+#[derive(Debug, Clone, Serialize)]
+pub struct CutShortRun {
+    pub run: String,
+    pub code: String,
+    pub status: String,
+}
+
+/// The runs cut short in which the test (by name) was running.
+fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT DISTINCT r.id, r.code, r.status, r.created_ms
+           FROM attempts a JOIN runs r ON r.id = a.run_id
+          WHERE a.test_id IN (SELECT t2.id FROM tests t1 JOIN tests t2 ON t2.display = t1.display
+                               WHERE t1.id = ?1)
+            AND a.outcome = 'errored' AND r.status <> 'finished'
+            AND a.message LIKE 'test did not finish before the run ended%'
+            AND r.id NOT IN (SELECT run_id FROM forgotten)
+          ORDER BY r.created_ms DESC LIMIT 10",
+    )?;
+    let rows = stmt
+        .query_map(params![test_id], |r| {
+            Ok(CutShortRun {
+                run: r.get(0)?,
+                code: r.get(1)?,
+                status: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 /// Nearest-rank percentile of a sorted slice.
@@ -366,6 +403,7 @@ fn stats_with(
         p95_ms: percentile(&durations, 95.0),
         last_passed,
         recent,
+        cut_short: cut_short_runs(store, test_id)?,
     }))
 }
 

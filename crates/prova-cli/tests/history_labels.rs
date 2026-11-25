@@ -343,6 +343,36 @@ fn a_test_killed_by_the_cancel_is_unfinished_not_failed() {
     );
 }
 
+/// Round 17: `prova history TestHang` said "0 runs with a result" though the
+/// test was the one running when two runs were cut short. History names the
+/// cut-short runs in which the test was running (ADR 0031 §4).
+#[test]
+fn history_names_the_cut_short_runs_in_which_a_test_was_running() {
+    let d = workspace("history-cut-short");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.go]\nrun = \"echo '=== RUN   TestHang'; sleep 30 & wait\"\n",
+    )
+    .unwrap();
+    let id = text(&prova(&d, &["run", "go", "--detach"]))
+        .trim()
+        .to_owned();
+    prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "2s"],
+    );
+    assert!(prova(&d, &["cancel", &id]).status.success());
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+    let h = text(&prova(&d, &["history", "TestHang"]));
+    assert!(
+        h.contains("cut short") && h.contains(&id[..8.min(id.len())]),
+        "{h}"
+    );
+    let j = text(&prova(&d, &["history", "TestHang", "--json"]));
+    let j: serde_json::Value = serde_json::from_str(&j).unwrap();
+    assert_eq!(j["cut_short"][0]["run"], id.as_str(), "{j}");
+}
+
 /// Round 8: result files arrive only at the end, so a hung xUnit/JUnit run
 /// named no test; the tests of the last passing run that never reported
 /// are the suspects.

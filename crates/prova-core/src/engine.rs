@@ -2051,6 +2051,23 @@ fn missing_since_last_pass(
     missing_since(store, run, suite, current, true)
 }
 
+/// Go prints each package's test output only when the package ends, when
+/// several packages are tested (`go test ./...`, text mode): a stalled run
+/// with no test event may be that, not a hang. None for a native stream
+/// (`-json`), or a command that names one package.
+fn go_buffering_note(command: &str) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let at = words.windows(2).position(|w| w == ["go", "test"])?;
+    let args = &words[at + 2..];
+    if args.iter().any(|a| a.starts_with("-json")) || !args.iter().any(|a| a.contains("...")) {
+        return None;
+    }
+    Some(
+        "go buffers each package's test output until the package ends when it tests several packages, so this may be a slow package and not a hang: use `go test -json ./...` (prova reads that stream live, test by test), or `prova adopt` for a suite that does"
+            .to_owned(),
+    )
+}
+
 /// The suspects of a hung run as text, in the order of the last finished
 /// run (the hung test is usually the first that never reported; round 17:
 /// an alphabetical list cut at 8 hid it). A list cut short says how many it
@@ -3515,6 +3532,15 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             });
         }
     }
+    // Go buffers a package's text output until the package ends.
+    if !row.status.is_terminal()
+        && stalled_ms.is_some()
+        && running.is_empty()
+        && counts.results() == 0
+        && let Some(n) = go_buffering_note(&command)
+    {
+        notes.push(n);
+    }
     // A selection with spaces that a wrapper split into words (round 16:
     // `./dev` re-splits `$*`; `prova adopt --verify` said so, `run` did not).
     if let Some(sel) = &selection
@@ -3966,6 +3992,19 @@ mod quarantine_tests {
 
 #[cfg(test)]
 mod narrow_tests {
+    /// Round 17 (go-make): `go test -v ./...` over several packages prints
+    /// nothing until each package ends; a stall with no test event is that,
+    /// not an opaque run.
+    #[test]
+    fn go_text_output_stalled_with_no_tests_says_go_buffers_per_package() {
+        let n = super::go_buffering_note("make test");
+        assert!(n.is_none());
+        let n = super::go_buffering_note("go test -v ./...").unwrap_or_default();
+        assert!(n.contains("buffers") && n.contains("go test -json"), "{n}");
+        assert!(super::go_buffering_note("go test -json ./...").is_none());
+        assert!(super::go_buffering_note("go test -v ./pkg").is_none());
+    }
+
     /// Round 13 (Java): the hang note listed the last run's tests in
     /// alphabetical order, none of them in the class Surefire was running.
     #[test]
