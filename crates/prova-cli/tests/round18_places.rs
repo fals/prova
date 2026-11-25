@@ -1,4 +1,4 @@
-//! Medium tests for ADR 0034 sections 2 and 3 (usability round 18): a test's
+//! Medium tests for ADR 0035 sections 1 and 2 (usability round 18): a test's
 //! place comes from the repository, and history compares like with like.
 //! Real runs are needed: names come from a command's output and are compared
 //! with the store's history across runs started in different directories.
@@ -178,12 +178,14 @@ fn r18_go_json_count_with_a_late_pass_is_flaky_in_history() {
     );
 }
 
-/// Round 18 (probe M3): a pass with a quarantined failure set aside
-/// (`passed*`) made another place's real failure "likely FLAKY: suite
-/// passed on this exact code before". Why medium: needs a quarantine, a
-/// stored run and the same code across runs.
+/// Round 18 (probe M3): a run whose only failure was a quarantined one
+/// counted as a pass on this exact code and made another place's real
+/// failure "likely FLAKY: suite passed on this exact code before". A
+/// quarantine never turns a failed run green (ADR 0034), so such a run is
+/// no pass on this code. Why medium: needs a quarantine, a stored run and
+/// the same code across runs.
 #[test]
-fn r18_a_pass_that_set_a_failure_aside_is_not_a_pass_on_this_exact_code() {
+fn r18_a_failed_run_with_only_quarantined_failures_is_not_a_pass_on_this_code() {
     use std::os::unix::fs::PermissionsExt;
     let d = workspace("setaside");
     let out = PathBuf::from(format!("{}.out", d.display()));
@@ -224,15 +226,59 @@ fn r18_a_pass_that_set_a_failure_aside_is_not_a_pass_on_this_exact_code() {
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    // calc fails again: set aside, the run passes (exit 100, outcome passed).
+    // calc fails again, quarantined: the run still fails.
     let o = prova(&d, &["run", "s"]);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert_ne!(o.status.code(), Some(0), "{}", text(&o));
     // geo's own failure of another test.
     std::fs::write(out.join("out.txt"), nextest("PASS", "FAIL")).unwrap();
     let o = prova(&d, &["run", "s"]);
     let o = text(&o);
     assert!(o.contains("FAIL tests::real_bug"), "{o}");
     assert!(!o.contains("likely FLAKY"), "{o}");
+}
+
+/// Round 18 (go-make MAJOR 1): `--repeat` over `go test -json -count=4`
+/// whose test failed three times and passed once in every run said "failed
+/// every time ... broken, not flaky" for it, though the same stream says
+/// FLAKY in history. The pass of a later iteration counts in the tally. Why
+/// medium: needs `--repeat` over a real stored run.
+#[test]
+fn r18_repeat_over_go_json_count_tallies_the_late_pass() {
+    let d = workspace("gojsonrepeat");
+    let mut events = String::new();
+    for a in ["fail", "fail", "fail", "pass"] {
+        events.push_str(&format!(
+            "{{\"Action\":\"run\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\"}}\n{{\"Action\":\"{a}\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\",\"Elapsed\":0.01}}\n"
+        ));
+    }
+    events.push_str("{\"Action\":\"fail\",\"Package\":\"ex/a\",\"Elapsed\":0.1}\n");
+    std::fs::write(d.join("ev.json"), events).unwrap();
+    let cmd = format!("{BUSY} cat ev.json; exit 1");
+    let o = text(&prova(
+        &d,
+        &["run", "--repeat", "2", "--", "sh", "-c", &cmd],
+    ));
+    assert!(
+        o.contains("FLAKY ex::TestFlaky") || o.contains("FLAKY ex/a::TestFlaky"),
+        "{o}"
+    );
+    assert!(!o.contains("failed every time"), "{o}");
+    assert!(!o.contains("broken, not flaky"), "{o}");
+}
+
+/// Round 18 (rust NIT): `slowest` cut its list without saying so. Why
+/// medium: needs stored durations.
+#[test]
+fn r18_slowest_says_how_many_it_cut() {
+    let d = workspace("slowestmore");
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' '    Starting 3 tests across 1 binary' '        PASS [   0.300s] calc tests::t1' '        PASS [   0.200s] calc tests::t2' '        PASS [   0.100s] calc tests::t3' '     Summary [   0.600s] 3 tests run: 3 passed, 0 skipped'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let all = text(&prova(&d, &["slowest", "-n", "10"]));
+    assert!(!all.contains("more"), "{all}");
+    let one = text(&prova(&d, &["slowest", "-n", "1"]));
+    assert!(one.contains("... and 2 more"), "{one}");
 }
 
 /// Round 18 (rust M2, go MINOR 3): `history <name>` hid the other tests the

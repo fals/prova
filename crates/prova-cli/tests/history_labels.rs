@@ -675,7 +675,7 @@ fn a_failure_that_depends_on_the_environment_is_not_flaky() {
     )
     .unwrap();
     // Two passes: one is too little history to call a failure
-    // environment-dependent (ADR 0034 section 3).
+    // environment-dependent (ADR 0035 section 2).
     prova(&d, &["run", "t"]);
     prova(&d, &["run", "t"]);
     let o = Command::new(PROVA)

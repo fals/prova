@@ -3100,7 +3100,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // run's unfinished tests say nothing about the code (ADR 0018).
     // Only a verified pass is evidence the suite can pass on this code
     // (round 11: an echoed pass made a real failure "likely flaky").
-    // Like with like (ADR 0034 section 3): a pass that set quarantined
+    // Like with like (ADR 0035 section 2): a pass that set quarantined
     // failures aside (exit code not 0) did not pass on this code, and a
     // pass is evidence about a test only if that run ran the test.
     let passes_on_same_code: Vec<String> = if row.status == Status::Finished {
@@ -3204,7 +3204,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
                     // A result of unknown place is not that place's when
-                    // the name is shared (ADR 0034 section 2).
+                    // the name is shared (ADR 0035 section 1).
                     (None, Some(_)) => !q.ambiguous,
                     _ => true,
                 })

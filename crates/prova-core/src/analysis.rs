@@ -118,8 +118,8 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
 /// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another).
 /// A name recorded bare (Go text with no package, quiet `cargo test` with no
 /// crate) is the qualified one only when the name belongs to one place: a
-/// name shared by several places is never matched to one of them (ADR 0034
-/// section 2).
+/// name shared by several places is never matched to one of them (ADR 0035
+/// section 1).
 const SAME_TEST_ON: &str = "(t2.display = t1.display
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '')
                         OR ((t1.file IS NULL OR t2.file IS NULL)
@@ -637,7 +637,7 @@ fn stats_scoped(
     // variables that differ between a pass and a failure.
     let mut env_dependent: BTreeSet<String> = BTreeSet::new();
     // One earlier pass is too little to call a failure environment-
-    // dependent (ADR 0034 section 3): the pass may be anything else.
+    // dependent (ADR 0035 section 2): the pass may be anything else.
     let mut env_passes: BTreeSet<&str> = BTreeSet::new();
     if flips == 0 {
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {

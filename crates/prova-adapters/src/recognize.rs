@@ -28,7 +28,7 @@ pub struct Recognizers {
     /// prova from here (ADR 0031 section 2).
     pub cwd: Option<std::path::PathBuf>,
     /// The repository root: names are read relative to it, whatever
-    /// directory the run started in (ADR 0034 section 2).
+    /// directory the run started in (ADR 0035 section 1).
     pub repo_root: Option<std::path::PathBuf>,
     /// pytest's rootdir as its header printed it (`-q` prints none).
     pytest_root: Option<std::path::PathBuf>,
@@ -2643,7 +2643,7 @@ impl Recognizers {
             && is_js_file(f.trim())
             && !name.trim().is_empty()
         {
-            let key = TestKey::new(vec![f.trim().to_owned()], name.trim());
+            let key = TestKey::new(vec![self.vitest_path(f.trim())], name.trim());
             let mut held = Vec::new();
             self.finished(
                 key,
@@ -3419,7 +3419,7 @@ impl Recognizers {
     /// The failure block of a libtest test is over. A test whose place was
     /// unknown (`cargo test --quiet` prints no `Running` line) is told by
     /// the path its panic message names: that place replaces the unknown one
-    /// (ADR 0034 section 2), so another crate's test of the same name never
+    /// (ADR 0035 section 1), so another crate's test of the same name never
     /// lends its history.
     fn close_libtest_block(&mut self, out: &mut Vec<EventKind>) {
         let Some((mut key, lines)) = self.libtest_block.take() else {
@@ -5017,6 +5017,37 @@ mod tests {
                 ("calc.CalcTest$Division::exact".into(), Outcome::Failed),
                 ("calc.CalcTest::divides".into(), Outcome::Failed),
             ]
+        );
+    }
+
+    /// Round 18 (ts BLOCKER, found by the real-Vitest large test): started
+    /// in `packages/b`, the verbose reporter names the file `src/...` in its
+    /// lines and again in the failures section after them. Both name it from
+    /// the repository root: one failure, not two.
+    #[test]
+    fn vitest_failures_section_names_the_file_from_the_repository_root() {
+        let mut r = Recognizers::default();
+        r.set_places(
+            std::path::Path::new("/w/packages/b"),
+            std::path::Path::new("/w"),
+        );
+        let mut ev = Vec::new();
+        for l in [
+            " RUN  v3.2.4 /w/packages/b",
+            " × src/calc.test.ts > adds 3ms",
+            "      → expected +0 to be 1 // Object.is equality",
+            " FAIL  src/calc.test.ts > adds",
+            "AssertionError: expected +0 to be 1 // Object.is equality",
+        ] {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        assert_eq!(
+            finished(&ev),
+            vec![(
+                "packages/b/src/calc.test.ts::adds".to_owned(),
+                Outcome::Failed
+            )]
         );
     }
 
