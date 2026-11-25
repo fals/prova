@@ -1080,6 +1080,10 @@ pub struct RunDiff {
     pub removed: Vec<String>,
     /// (test, base ms, head ms) where head is >50% and >100ms slower.
     pub slower: Vec<(String, u64, u64)>,
+    /// The runs are of different suites or levels: a test one did not
+    /// print is not one the other dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// A run's final outcome per test, by name and place (two binaries' tests
@@ -1141,6 +1145,20 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
         }
     }
     d.removed = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
+    let (rb, rh) = (store.run(base)?, store.run(head)?);
+    let mut why = Vec::new();
+    if rb.suite != rh.suite {
+        why.push(format!("different suites ({}, {})", rb.suite, rh.suite));
+    }
+    if rb.level != rh.level {
+        why.push("different levels of detail".to_owned());
+    }
+    if !why.is_empty() {
+        d.warning = Some(format!(
+            "the runs are of {}: a test one did not print shows as added or not visible, not as removed",
+            why.join(" and ")
+        ));
+    }
     if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
         let names = Names::new(store);
         let known: Vec<String> = flaky(store, None, 50)?

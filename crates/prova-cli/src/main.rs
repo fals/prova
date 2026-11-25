@@ -3124,13 +3124,18 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 println!("{}", serde_json::to_string(&d)?);
             } else {
                 println!("diff {} -> {}", d.base, d.head);
+                if let Some(w) = &d.warning {
+                    println!("warning: {w}");
+                }
                 for (label, v) in [
                     ("newly failing", &d.newly_failing),
                     ("fixed", &d.fixed),
                     ("still failing", &d.still_failing),
                     ("changed, but known flaky", &d.flaky),
                     ("added", &d.added),
-                    ("removed", &d.removed),
+                    // Not "removed": a reporter may print fewer tests (Vitest
+                    // collapses passing files), a suite may be another one.
+                    ("not visible in this run", &d.removed),
                 ] {
                     if !v.is_empty() {
                         println!("{label} ({}):", v.len());
