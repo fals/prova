@@ -237,20 +237,36 @@ pub fn place_matches(wanted: &str, file: Option<&str>, path: &[String]) -> bool 
 /// it (`a` for `ex/a`), 0 not it. `tests/test_calc.py` is the same place as
 /// `tests.test_calc`, and only the end of `sub2.tests.test_calc`.
 pub fn place_rank(wanted: &str, file: Option<&str>, path: &[String]) -> u8 {
-    let Some(place) = file
-        .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
-        .or(path.first().map(String::as_str))
-    else {
+    let Some(place) = place_label(file, path) else {
         return 0;
     };
-    let (w, p) = (place_form(wanted), place_form(place));
+    let (w, p) = (place_form(wanted), place_form(&place));
     if w.is_empty() {
         0
     } else if w == p {
         2
     } else {
-        u8::from(p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+        // A crate names its integration tests (`calc` for `calc::it`).
+        u8::from(
+            p.ends_with(&format!(".{w}"))
+                || w.ends_with(&format!(".{p}"))
+                || p.starts_with(&format!("{w}::")),
+        )
     }
+}
+
+/// The place `--in` names for a stored test: its binary (Rust), else the
+/// package, module or file at the head of its name (Go, pytest, Vitest). A
+/// Rust module path (`tests`) is no place: a test with no binary and a bare
+/// first part has none.
+pub fn place_label(file: Option<&str>, path: &[String]) -> Option<String> {
+    file.filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+        .map(str::to_owned)
+        .or_else(|| {
+            path.first()
+                .filter(|p| p.contains(['/', '.']))
+                .map(|p| p.to_owned())
+        })
 }
 
 /// Keeps what `--in wanted` names: the tests of the exact place when there
