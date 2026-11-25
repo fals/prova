@@ -401,12 +401,14 @@ fn r18_repeat_over_go_json_count_tallies_the_late_pass() {
 }
 
 /// Round 18 (rust NIT): `slowest` cut its list without saying so. Why
-/// medium: needs stored durations.
+/// medium: needs stored durations. The durations fit inside the command's
+/// own run time: results faster than the run are not recorded (CI's fast
+/// runner made 0.6 s of printed durations impossible).
 #[test]
 fn r18_slowest_says_how_many_it_cut() {
     let d = workspace("slowestmore");
     let cmd = format!(
-        "{BUSY} printf '%s\\n' '    Starting 3 tests across 1 binary' '        PASS [   0.300s] calc tests::t1' '        PASS [   0.200s] calc tests::t2' '        PASS [   0.100s] calc tests::t3' '     Summary [   0.600s] 3 tests run: 3 passed, 0 skipped'"
+        "{BUSY} printf '%s\\n' '    Starting 3 tests across 1 binary' '        PASS [   0.003s] calc tests::t1' '        PASS [   0.002s] calc tests::t2' '        PASS [   0.001s] calc tests::t3' '     Summary [   0.006s] 3 tests run: 3 passed, 0 skipped'"
     );
     prova(&d, &["run", "--", "sh", "-c", &cmd]);
     let all = text(&prova(&d, &["slowest", "-n", "10"]));
