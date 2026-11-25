@@ -1494,14 +1494,26 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 extra_env: cfg.env.clone(),
             },
         )?;
-        let tests: Vec<String> = store
-            .events_after(&s.run, 0)?
+        // A live result the result file replaced, and a test's later
+        // attempts, are one test (round 17: a failing test counted twice).
+        let events = store.events_after(&s.run, 0)?;
+        let replaced: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                prova_core::model::EventKind::TestSuperseded { test, .. } => Some(test.unique()),
+                _ => None,
+            })
+            .collect();
+        let mut counted = std::collections::BTreeSet::new();
+        let tests: Vec<String> = events
             .into_iter()
             .filter_map(|e| match e.kind {
                 // A test the filter skipped did not run: Vitest `-t` and
                 // others report the rest as skipped (round 7).
                 prova_core::model::EventKind::TestFinished { test, outcome, .. }
-                    if outcome != Outcome::Skipped =>
+                    if outcome != Outcome::Skipped
+                        && !replaced.contains(&test.unique())
+                        && counted.insert(test.unique()) =>
                 {
                     Some(test.display())
                 }
@@ -2042,14 +2054,17 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             if let Some(w) = in_file.as_deref() {
                 let mut places = std::collections::BTreeSet::new();
                 let before = found.len();
-                found.retain(|t| {
-                    let (file, path) = analysis::place_of_test(store, &t.0)
+                let place_of = |t: &(String, String, String)| {
+                    analysis::place_of_test(store, &t.0)
                         .ok()
                         .flatten()
-                        .unwrap_or_default();
-                    places.extend(file.clone().or(path.first().cloned()));
-                    analysis::place_matches(w, file.as_deref(), &path)
-                });
+                        .unwrap_or_default()
+                };
+                for t in &found {
+                    let (file, path) = place_of(t);
+                    places.extend(file.or(path.first().cloned()));
+                }
+                analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {
                     return Err(UsageError(format!(
                         "{test:?} is not known in {w:?}; it is in: {}",
@@ -2142,13 +2157,12 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 .into());
             }
             let files = q::files_of(store, &name)?;
-            let matching: Vec<&String> = match in_file.as_deref() {
-                Some(w) => files
-                    .iter()
-                    .filter(|x| analysis::place_matches(w, Some(x), &[]))
-                    .collect(),
-                None => Vec::new(),
-            };
+            let mut matching: Vec<&String> = files.iter().collect();
+            if let Some(w) = in_file.as_deref() {
+                analysis::retain_in_place(&mut matching, w, |x| (Some((*x).clone()), Vec::new()));
+            } else {
+                matching.clear();
+            }
             let file = match (in_file.as_deref(), files.as_slice()) {
                 // A name that is no Rust binary's (a Go package's test): the
                 // place already filtered the candidates and the full name
@@ -2725,14 +2739,17 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             if let Some(w) = in_place.as_deref() {
                 let before = found.len();
                 let mut places = std::collections::BTreeSet::new();
-                found.retain(|t| {
-                    let (file, path) = analysis::place_of_test(&store, &t.0)
+                let place_of = |t: &(String, String, String)| {
+                    analysis::place_of_test(&store, &t.0)
                         .ok()
                         .flatten()
-                        .unwrap_or_default();
-                    places.extend(file.clone().or(path.first().cloned()));
-                    analysis::place_matches(w, file.as_deref(), &path)
-                });
+                        .unwrap_or_default()
+                };
+                for t in &found {
+                    let (file, path) = place_of(t);
+                    places.extend(file.or(path.first().cloned()));
+                }
+                analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {
                     return Err(UsageError(format!(
                         "no test matching {test:?} in {w:?}; it is in: {}",

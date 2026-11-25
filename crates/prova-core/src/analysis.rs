@@ -164,14 +164,50 @@ fn place_form(s: &str) -> String {
 /// its test binary (Rust), else its package, module or file (the first part
 /// of its name). Whole parts: `a` is `ex/a` but not `ex/data`.
 pub fn place_matches(wanted: &str, file: Option<&str>, path: &[String]) -> bool {
+    place_rank(wanted, file, path) > 0
+}
+
+/// How well `wanted` names a test's place: 2 the same place, 1 the end of
+/// it (`a` for `ex/a`), 0 not it. `tests/test_calc.py` is the same place as
+/// `tests.test_calc`, and only the end of `sub2.tests.test_calc`.
+pub fn place_rank(wanted: &str, file: Option<&str>, path: &[String]) -> u8 {
     let Some(place) = file
         .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
         .or(path.first().map(String::as_str))
     else {
-        return false;
+        return 0;
     };
     let (w, p) = (place_form(wanted), place_form(place));
-    !w.is_empty() && (w == p || p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+    if w.is_empty() {
+        0
+    } else if w == p {
+        2
+    } else {
+        u8::from(p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+    }
+}
+
+/// Keeps what `--in wanted` names: the tests of the exact place when there
+/// are any, else those of a place it ends. `place` gives a test's file and
+/// name path.
+pub fn retain_in_place<T>(
+    items: &mut Vec<T>,
+    wanted: &str,
+    place: impl Fn(&T) -> (Option<String>, Vec<String>),
+) {
+    let ranks: Vec<u8> = items
+        .iter()
+        .map(|t| {
+            let (file, path) = place(t);
+            place_rank(wanted, file.as_deref(), &path)
+        })
+        .collect();
+    let best = ranks.iter().copied().max().unwrap_or(0);
+    let mut i = 0;
+    items.retain(|_| {
+        i += 1;
+        best > 0 && ranks[i - 1] == best
+    });
 }
 
 /// The place of a stored test, as `--in` names it: its binary, else the

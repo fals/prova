@@ -203,6 +203,107 @@ fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     );
 }
 
+/// Round 17 (java-maven): the live line and the XML record of one failing
+/// test were two tests in `adopt --verify`: "1 tests ran that do not match"
+/// for the full name, "2 matching test(s) ran" for `Class#method`.
+#[test]
+fn verify_counts_one_failing_test_once_whatever_the_filter_form() {
+    let d = workspace("verify");
+    std::fs::write(
+        d.join("t.sh"),
+        format!(
+            "{BUSY}\nprintf '%s\\n' '[INFO] Running calc.CalcTest' '[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.04 s <<< FAILURE! -- in calc.CalcTest' '[INFO] Results:' '[ERROR] Failures: ' '[ERROR]   CalcTest.divides:12 expected 4' '[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0'\ncat > report.xml <<'XML'\n<testsuite name=\"calc.CalcTest\" tests=\"1\" failures=\"1\"><testcase classname=\"calc.CalcTest\" name=\"divides\" time=\"0.01\"><failure message=\"expected 4\">trace</failure></testcase></testsuite>\nXML\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.default]\nrun = \"sh t.sh\"\nselect = \"sh t.sh {filter}\"\nresults = [\"report.xml\"]\n",
+    )
+    .unwrap();
+    for filter in ["calc.CalcTest::divides", "CalcTest#divides"] {
+        let o = prova(
+            &d,
+            &["adopt", "--verify", "default", "--filter", filter, "--json"],
+        );
+        let j: serde_json::Value =
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&o)));
+        assert_eq!(j["verified"], true, "{filter}: {j}");
+        assert_eq!(j["tests"].as_array().unwrap().len(), 1, "{filter}: {j}");
+    }
+}
+
+/// Round 17 (probe M2): `quarantine add --in` worked only for Rust
+/// binaries; Go, pytest and Vitest said "be more specific" without a word
+/// of `--in`. Each framework's own form of the place picks the test.
+#[test]
+fn quarantine_in_takes_the_place_in_each_frameworks_form() {
+    // (name of the shared test, command output, [(--in form, quarantined name)])
+    let cases: [(&str, &str, &[(&str, &str)]); 3] = [
+        (
+            "TestFlaky",
+            "printf '%s\\n' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok  \t ex/a\t0.01s' '=== RUN   TestFlaky' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\tex/b\t0.01s'; exit 1",
+            &[
+                ("a", "ex/a::TestFlaky"),
+                ("ex/a", "ex/a::TestFlaky"),
+                ("./a", "ex/a::TestFlaky"),
+                ("ex/b", "ex/b::TestFlaky"),
+            ],
+        ),
+        (
+            "test_flaky",
+            "printf '%s\\n' 'rootdir: /x' 'tests/test_calc.py::test_flaky PASSED [ 50%]' 'sub/tests/test_calc.py::test_flaky FAILED [100%]' '' '=== 1 failed, 1 passed in 0.01s ==='; exit 1",
+            &[
+                ("tests/test_calc.py", "tests.test_calc::test_flaky"),
+                ("tests.test_calc", "tests.test_calc::test_flaky"),
+                ("sub/tests/test_calc.py", "sub.tests.test_calc::test_flaky"),
+            ],
+        ),
+        (
+            "works",
+            "printf '%s\\n' ' ✓ src/a/x.test.js > works 1ms' ' ✓ src/b/x.test.js > works 1ms' '' ' Test Files  2 passed (2)' '      Tests  2 passed (2)'",
+            &[
+                ("src/a/x.test.js", "src/a/x.test.js::works"),
+                ("src/b/x.test.js", "src/b/x.test.js::works"),
+            ],
+        ),
+    ];
+    for (i, (name, script, forms)) in cases.into_iter().enumerate() {
+        let d = workspace(&format!("in{i}"));
+        let o = prova(&d, &["run", "--", "sh", "-c", &format!("{BUSY} {script}")]);
+        let out = text(&o);
+        let o = prova(&d, &["quarantine", "add", name, "--reason", "r"]);
+        let t = text(&o);
+        assert_eq!(o.status.code(), Some(2), "{name}: {t}\n{out}");
+        assert!(t.contains("--in") && t.contains("2 tests match"), "{t}");
+        for (form, quarantined) in forms {
+            let o = prova(
+                &d,
+                &["quarantine", "add", name, "--in", form, "--reason", "r"],
+            );
+            let t = text(&o);
+            assert_eq!(o.status.code(), Some(0), "--in {form}: {t}");
+            assert!(
+                t.contains(&format!("quarantined {quarantined} ")),
+                "--in {form}: {t}"
+            );
+        }
+        let o = prova(
+            &d,
+            &[
+                "quarantine",
+                "add",
+                name,
+                "--in",
+                "nowhere",
+                "--reason",
+                "r",
+            ],
+        );
+        assert!(text(&o).contains("is not known in"), "{}", text(&o));
+    }
+}
+
 /// The id of the run a `prova run` printed.
 fn run_id(o: &Output) -> String {
     text(o)
