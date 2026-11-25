@@ -594,7 +594,7 @@ fn go_verbose_failures_count_once_under_their_package() {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
         out.contains("FAIL example.com/m::TestF (quarantined): failed every time")
             && !out.contains("FAIL TestF"),
@@ -803,6 +803,40 @@ fn a_package_with_testmain_cannot_set_a_failure_aside() {
         s.to_string().contains("defines TestMain"),
         "must say why: {s}"
     );
+}
+
+/// Round 18: with the package in a subdirectory and `TestMain` in a file of
+/// its own (real `go test -v` output), the check found no package and the
+/// failure was set aside.
+#[test]
+fn testmain_in_a_subpackage_file_refuses_a_quarantine() {
+    let d = workspace("q-testmain-sub");
+    let script = format!(
+        "{WORK}printf '%s\\n' '=== RUN   TestOk' '--- PASS: TestOk (0.00s)' '=== RUN   TestFlaky' '    a_test.go:5: flaky boom' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m/a\t0.001s' 'FAIL'; exit 1"
+    );
+    fake_go(&d, &script);
+    std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
+    std::fs::create_dir_all(d.join("a")).unwrap();
+    std::fs::write(
+        d.join("a/main_test.go"),
+        "package a\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(m.Run())\n}\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "--", "./rc/go", "test"]);
+    prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "example.com/m/a::TestFlaky",
+            "--reason",
+            "clock",
+        ],
+    );
+    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["outcome"], "failed", "TestMain: {s}");
+    assert!(s.to_string().contains("defines TestMain"), "{s}");
 }
 
 /// Round 16: gotestsum prints a subpackage relative to the module

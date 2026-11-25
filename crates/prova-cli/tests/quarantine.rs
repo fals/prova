@@ -165,6 +165,8 @@ fn a_quarantined_test_that_fails_does_not_fail_the_run_and_is_listed() {
         out.contains("PASSED") && !out.contains("unverified"),
         "verified for the rest: {out}"
     );
+    // Round 18: the failed count includes the set-aside failure, and says so.
+    assert!(out.contains("1 failed (1 quarantined)"), "{out}");
     assert!(
         out.contains("quarantined")
             && out.contains("calc::x")
@@ -211,6 +213,7 @@ fn another_failure_next_to_a_quarantined_one_still_fails_the_run() {
     let out = text(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(out.contains("FAIL calc::z"), "{out}");
+    assert!(out.contains("2 failed (1 quarantined)"), "{out}");
 }
 
 #[test]
@@ -880,8 +883,14 @@ fn a_quarantine_is_refused_unless_the_command_is_one_runner_call() {
         assert_eq!(o.status.code(), Some(1), "{cmd}: {out}");
         assert!(out.contains(why), "{cmd}: {out}");
         assert!(
-            out.contains("calc::x") && out.contains("a suite whose command is the runner alone"),
+            out.contains("calc::x")
+                && (out.contains("a suite whose command is the runner alone")
+                    || out.contains("`prova run ")),
             "{cmd}: {out}"
+        );
+        assert!(
+            !out.contains("ADR 00"),
+            "no decision numbers for users: {cmd}: {out}"
         );
     }
     // The runner called directly, alone or through a wrapper, qualifies.
@@ -906,7 +915,8 @@ fn repeat_says_a_quarantined_test_that_failed_every_time_is_broken() {
     std::fs::write(d.join("state"), "fail").unwrap();
     let o = prova(&d, &["run", "make", "--repeat", "3"]);
     let out = text(&o);
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    // Round 18: broken is not green; the exit code says so.
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
         out.contains("calc::x (quarantined): failed every time")
             && out.contains("broken, not flaky"),
@@ -1018,4 +1028,132 @@ fn repeat_does_not_call_a_skipped_test_passed() {
         out.contains("calc::s") && out.contains("skipped in every run"),
         "{out}"
     );
+}
+
+/// ADR 0034 section 1 (round 18): a runner told to stop at its first failure
+/// (`go test -failfast`, `pytest -x`) never runs the tests after the
+/// quarantined one; the pass must not hide them. A medium test: the history
+/// of an earlier full pass is in the store.
+#[test]
+fn a_quarantined_failure_is_not_set_aside_when_known_tests_did_not_report() {
+    let d = workspace("complete");
+    let script = format!(
+        "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
+         pass) echo 'test calc::x ... ok'; echo 'test calc::y ... ok' ;; \
+         stop) echo 'test calc::x ... FAILED'; exit 101 ;; \
+         all) echo 'test calc::x ... FAILED'; echo 'test calc::y ... ok'; exit 101 ;; \
+         esac"
+    );
+    put(&d, format!("[suite.make]\nrun = {script:?}\n"));
+    run(&d, "make", "pass");
+    run(&d, "make", "all");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    // Everything reported: set aside.
+    let o = run(&d, "make", "all");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // calc::y never reported: the run fails and names it.
+    let o = run(&d, "make", "stop");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("calc::y") && out.contains("did not report") && out.contains("fail-fast"),
+        "{out}"
+    );
+}
+
+/// Round 18: under make the refusal said "no other test passed" (quiet
+/// output) instead of the real reason, and did not name the suite of
+/// `prova.toml` that calls the runner directly.
+#[test]
+fn a_quarantine_refused_under_make_says_make_and_names_the_direct_suite() {
+    let d = workspace("make-reason");
+    let direct = runner(&d, "direct", &full());
+    std::fs::write(
+        d.join("Makefile"),
+        "test:\n\t@echo 'test calc::x ... FAILED'; exit 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        format!("[suite.default]\nrun = {direct:?}\n\n[suite.make]\nrun = \"make test\"\n"),
+    )
+    .unwrap();
+    run(&d, "default", "pass");
+    run(&d, "default", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "make", "fail");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("runs make"), "{out}");
+    assert!(out.contains("prova run default"), "{out}");
+    assert!(!out.contains("no other test passed"), "{out}");
+    assert!(!out.contains("ADR 00"), "{out}");
+}
+
+/// Round 18: a chained suite (`pytest; compileall broken`) said only that it
+/// chains; the other step's own error line was never named, and `--repeat`
+/// blamed the quarantined test alone.
+#[test]
+fn a_chained_step_that_failed_is_named_and_repeat_does_not_blame_the_quarantine() {
+    let d = workspace("chain-reason");
+    let direct = runner(&d, "direct", &full());
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.default]\nrun = {direct:?}\n\n[suite.ci]\nrun = {:?}\n",
+            format!("{direct}; echo 'SyntaxError: invalid syntax'; exit 1")
+        ),
+    )
+    .unwrap();
+    run(&d, "default", "pass");
+    run(&d, "default", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "ci", "fail");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("chains steps with `;`"), "{out}");
+    let detail = out.lines().find(|l| l.starts_with("detail:")).unwrap_or("");
+    assert!(
+        detail.contains("SyntaxError: invalid syntax"),
+        "the detail must name the other step's error: {out}"
+    );
+    let out = text(&prova(&d, &["run", "ci", "--repeat", "2"]));
+    assert!(
+        !out.contains("failed although only quarantined test(s) failed"),
+        "another step failed: {out}"
+    );
+    assert!(out.contains("SyntaxError"), "{out}");
+}
+
+/// Round 18: the example in the refusal advice was `go test ./...` in every
+/// project; it is the project's own runner now.
+#[test]
+fn the_refusal_advice_suits_the_projects_runner() {
+    let d = workspace("advice-runner");
+    std::fs::write(d.join("pom.xml"), "<project/>").unwrap();
+    let inner = runner(&d, "inner", &full());
+    std::fs::write(d.join("Makefile"), format!("test:\n\t{inner}\n")).unwrap();
+    std::fs::write(d.join("prova.toml"), "[suite.make]\nrun = \"make test\"\n").unwrap();
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let out = text(&run(&d, "make", "fail"));
+    assert!(out.contains("mvn test"), "{out}");
+    assert!(!out.contains("`go test"), "{out}");
+}
+
+/// Round 18: `--repeat` over quiet output (a `go test` that prints only
+/// package lines) said "no test ran" and asked whether the selection matched,
+/// with no selection given; and a cached replay was noted only by `status`.
+#[test]
+fn repeat_over_quiet_output_says_tests_are_not_visible() {
+    let d = workspace("repeat-quiet-go");
+    let body = format!("{BUSY} printf 'ok  \\texample.com/m\\t(cached)\\n'");
+    put(&d, format!("[suite.q]\nrun = {body:?}\n"));
+    let o = prova(&d, &["run", "q", "--repeat", "2"]);
+    let out = text(&o);
+    assert!(out.contains("not visible"), "{out}");
+    assert!(!out.contains("ran no test"), "{out}");
+    assert!(!out.contains("selection match"), "{out}");
+    assert!(out.contains("replayed cached"), "{out}");
 }

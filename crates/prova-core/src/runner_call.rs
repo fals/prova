@@ -50,8 +50,34 @@ pub fn check(command: &CommandSpec, cwd: &Path) -> Result<RunnerCall, String> {
 }
 
 fn analyze_shell(script: &str, cwd: &Path, depth: usize) -> Result<RunnerCall, String> {
+    // `cd /w && pytest -v`: moving to the directory is no other step.
+    if let Some((dir, rest)) = leading_cd(script) {
+        let next = if Path::new(dir).is_absolute() || dir.starts_with(['~', '$']) {
+            cwd.to_path_buf()
+        } else {
+            cwd.join(dir)
+        };
+        return analyze_shell(rest, &next, depth + 1);
+    }
     let words = shell_words(script)?;
     analyze(&words, cwd, depth)
+}
+
+/// `cd <dir> && <rest>`: the directory (a plain word) and the rest.
+fn leading_cd(script: &str) -> Option<(&str, &str)> {
+    let s = script.trim_start().strip_prefix("cd")?;
+    if !s.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let s = s.trim_start();
+    let end = s.find(char::is_whitespace)?;
+    let (dir, after) = s.split_at(end);
+    let plain = !dir.is_empty()
+        && dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./~$".contains(c));
+    let rest = after.trim_start().strip_prefix("&&")?;
+    (plain && !rest.trim().is_empty()).then_some((dir, rest.trim_start()))
 }
 
 /// Splits one shell command line into words, refusing anything that joins
@@ -269,7 +295,24 @@ fn analyze(words: &[String], cwd: &Path, depth: usize) -> Result<RunnerCall, Str
                 let rest = skip_options(rest, &["-u", "--unset", "-C", "--chdir", "-S"]);
                 w = rest;
             }
-            Some("exec" | "time") => w = &w[1..],
+            Some("exec" | "time" | "nohup" | "command") => w = &w[1..],
+            // `timeout 60 go test`: the duration is the wrapper's own.
+            Some("timeout") => {
+                let rest = skip_options(&w[1..], &["-s", "--signal", "-k", "--kill-after"]);
+                w = rest.get(1..).unwrap_or(&[]);
+            }
+            Some("nice") => {
+                let rest = skip_options(&w[1..], &["-n", "--adjustment"]);
+                w = rest;
+            }
+            Some("ionice") => {
+                let rest = skip_options(&w[1..], &["-c", "--class", "-n", "--classdata"]);
+                w = rest;
+            }
+            Some("stdbuf") => {
+                let rest = skip_options(&w[1..], &["-i", "-o", "-e"]);
+                w = rest;
+            }
             _ => break,
         }
     }
@@ -459,16 +502,124 @@ fn analyze(words: &[String], cwd: &Path, depth: usize) -> Result<RunnerCall, Str
             }
         }
         _ => {
-            // A script given the command as its one quoted argument:
-            // `./dev "go test ./..."`.
-            if rest.len() == 1 && rest[0].split_whitespace().count() > 1 {
-                return analyze_shell(&rest[0], cwd, depth + 1);
+            // A script given the command as its argument (`./dev "go test
+            // ./..."`) qualifies only when it does nothing but `exec` a
+            // runner or a container client with them (round 18: a script
+            // that ran a lint step after the runner was trusted).
+            if prog.contains('/') && !rest.is_empty() {
+                wrapper_script(&cwd.join(prog), prog)
+                    .map_err(|why| format!("`{whole}` runs the script `{prog}`: {why}"))?;
+                if rest.len() == 1 && rest[0].split_whitespace().count() > 1 {
+                    return analyze_shell(&rest[0], cwd, depth + 1);
+                }
+                return analyze(rest, cwd, depth + 1);
             }
             Err(format!(
                 "`{whole}` runs `{prog}`, which is not a known test runner"
             ))
         }
     }
+}
+
+/// Whether the script at `path` does nothing but `exec` a test runner or a
+/// container client with the script's own arguments (`"$@"`, `"$*"`,
+/// `"$1"`). Comments, blank lines, `set` options and plain variable
+/// assignments are ignored.
+fn wrapper_script(path: &Path, name: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|_| "it could not be read, so what it runs is not known".to_owned())?;
+    // A line ending in a backslash goes on.
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = String::new();
+    for l in text.lines() {
+        let t = l.trim();
+        match t.strip_suffix('\\') {
+            Some(head) => {
+                open.push_str(head);
+                open.push(' ');
+            }
+            None => {
+                open.push_str(t);
+                lines.push(std::mem::take(&mut open));
+            }
+        }
+    }
+    let mut statements: Vec<&str> = Vec::new();
+    for l in &lines {
+        let t = l.trim();
+        if t.is_empty()
+            || t.starts_with('#')
+            || t == "set"
+            || t.starts_with("set -")
+            || t.starts_with("set +")
+        {
+            continue;
+        }
+        let assignment = t.strip_prefix("export ").unwrap_or(t);
+        if is_assignment(assignment.split_whitespace().next().unwrap_or(""))
+            && assignment.split_whitespace().count() == 1
+            && !assignment.contains(['`', ';', '|', '&', '('])
+        {
+            continue;
+        }
+        statements.push(t);
+    }
+    let [one] = statements.as_slice() else {
+        return Err(format!(
+            "{name} does more than run its argument ({} steps): a quarantine sees one runner call only",
+            statements.len().max(1)
+        ));
+    };
+    let Some(call) = one.strip_prefix("exec ") else {
+        return Err(format!(
+            "{name} does not end in one `exec` of the runner: a step after it would be out of sight"
+        ));
+    };
+    let words = shell_words(call).map_err(|e| format!("{name}: {e}"))?;
+    let words: Vec<String> = words.into_iter().skip_while(|w| is_assignment(w)).collect();
+    let prog = words.first().map_or("", |w| w.as_str());
+    let arg_ref = |w: &str| matches!(w, "$@" | "$*" | "$1" | "${@}" | "${*}" | "${1}");
+    let known = matches!(
+        base(prog),
+        "docker" | "podman" | "docker-compose" | "podman-compose"
+    ) || arg_ref(prog)
+        || is_known_runner(base(prog));
+    if !known {
+        return Err(format!(
+            "{name} execs `{prog}`, which is not a known test runner or container client"
+        ));
+    }
+    if !words.iter().any(|w| arg_ref(w)) {
+        return Err(format!(
+            "{name} does not pass its arguments to what it runs (no \"$@\", \"$*\" or \"$1\" on its own)"
+        ));
+    }
+    Ok(())
+}
+
+fn is_known_runner(name: &str) -> bool {
+    matches!(
+        name,
+        "go" | "gotestsum"
+            | "cargo"
+            | "pytest"
+            | "py.test"
+            | "python"
+            | "python3"
+            | "vitest"
+            | "jest"
+            | "mvn"
+            | "mvnw"
+            | "gradle"
+            | "gradlew"
+            | "dotnet"
+            | "npx"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "uv"
+            | "poetry"
+    )
 }
 
 fn call(runner: Runner, words: &[String]) -> RunnerCall {
@@ -654,7 +805,9 @@ fn shell_quote(a: &str) -> String {
     }
 }
 
-/// Vitest with coverage: the flag, or a config that sets thresholds.
+/// Vitest with coverage: the flag, or a config (the default ones, or the
+/// one `--config`/`-c` names, with the modules they import) that sets
+/// thresholds. What this misses, Vitest's own `Coverage enabled` line shows.
 fn vitest_coverage(words: &[String], cwd: &Path) -> bool {
     if words
         .iter()
@@ -662,21 +815,143 @@ fn vitest_coverage(words: &[String], cwd: &Path) -> bool {
     {
         return true;
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     for stem in ["vitest.config", "vite.config", "vitest.workspace"] {
         for ext in ["ts", "js", "mjs", "cjs", "mts", "cts"] {
-            names.push(format!("{stem}.{ext}"));
+            files.push(cwd.join(format!("{stem}.{ext}")));
         }
     }
-    names.iter().any(|n| {
-        std::fs::read_to_string(cwd.join(n)).is_ok_and(|t| {
-            t.contains("thresholds")
-                || (t.contains("coverage")
-                    && ["lines:", "statements:", "branches:", "functions:"]
-                        .iter()
-                        .any(|k| t.contains(k)))
-        })
-    })
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        let value = match w {
+            "--config" | "-c" | "--workspace" => {
+                i += 1;
+                words.get(i).map(String::as_str)
+            }
+            _ => w
+                .strip_prefix("--config=")
+                .or_else(|| w.strip_prefix("--workspace=")),
+        };
+        if let Some(v) = value {
+            files.push(cwd.join(v));
+        }
+        i += 1;
+    }
+    // The files, then what each imports by a relative path (three levels,
+    // twenty files: a config is small).
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut queue: Vec<(PathBuf, usize)> = files.into_iter().map(|f| (f, 0)).collect();
+    while let Some((file, depth)) = queue.pop() {
+        if seen.contains(&file) || seen.len() >= 20 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        seen.push(file.clone());
+        if text.contains("thresholds")
+            || (text.contains("coverage")
+                && ["lines:", "statements:", "branches:", "functions:"]
+                    .iter()
+                    .any(|k| text.contains(k)))
+        {
+            return true;
+        }
+        if depth < 3 {
+            let dir = file.parent().unwrap_or(cwd);
+            for spec in relative_imports(&text) {
+                for cand in import_candidates(&dir.join(spec)) {
+                    queue.push((cand, depth + 1));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The relative module paths a JS/TS source imports (`from './x'`,
+/// `import('./x')`, `require('./x')`).
+fn relative_imports(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for marker in ["from ", "import(", "require(", "import "] {
+        let mut rest = text;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let r = rest.trim_start();
+            let Some(q) = r.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+                continue;
+            };
+            let body = &r[1..];
+            if let Some(end) = body.find(q) {
+                let spec = &body[..end];
+                if spec.starts_with('.') {
+                    out.push(spec);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The files a relative import may mean.
+fn import_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut out = vec![base.to_path_buf()];
+    for ext in ["ts", "js", "mjs", "cjs", "mts", "cts", "json"] {
+        out.push(PathBuf::from(format!("{}.{ext}", base.display())));
+        out.push(base.join(format!("index.{ext}")));
+    }
+    out
+}
+
+/// A runner call that suits the project the command runs in, for advice: from
+/// the command's own words, else from the project's files.
+pub fn runner_example(command: &CommandSpec, cwd: &Path) -> Option<&'static str> {
+    let text = command.display();
+    let has = |w: &str| {
+        text.split(|c: char| !c.is_alphanumeric() && c != '.')
+            .any(|t| t == w)
+    };
+    let file = |n: &str| cwd.join(n).exists();
+    let pkg = std::fs::read_to_string(cwd.join("package.json")).unwrap_or_default();
+    if has("go") || has("gotestsum") || file("go.mod") {
+        Some("go test -v ./...")
+    } else if has("cargo") || has("nextest") || file("Cargo.toml") {
+        Some("cargo test")
+    } else if has("pytest")
+        || has("python")
+        || has("python3")
+        || file("pyproject.toml")
+        || file("pytest.ini")
+        || file("setup.cfg")
+        || file("tox.ini")
+    {
+        Some("python3 -m pytest -v")
+    } else if has("vitest") || pkg.contains("\"vitest\"") {
+        Some("npx vitest run")
+    } else if has("jest") || pkg.contains("\"jest\"") {
+        Some("npx jest")
+    } else if has("mvn") || has("mvnw") || file("pom.xml") {
+        Some("mvn test")
+    } else if has("gradle") || has("gradlew") || file("build.gradle") || file("build.gradle.kts") {
+        Some("gradle test")
+    } else if has("dotnet") {
+        Some("dotnet test")
+    } else {
+        None
+    }
+}
+
+/// The Go package a test's lifecycle key belongs to: its file part when
+/// the key has one, else the package in its display name
+/// (`example.com/m/a::TestX`; round 18: a Go test's key has no file, so the
+/// `TestMain` check looked at no package at all).
+pub fn go_package_of_key(key: &str) -> Option<&str> {
+    let (file, display) = key.rsplit_once('\u{1f}').unwrap_or(("", key));
+    if !file.is_empty() && !file.starts_with('(') {
+        return Some(file);
+    }
+    display.split_once("::").map(|(pkg, _)| pkg)
 }
 
 /// The module path of the nearest go.mod at or above `cwd`, and its directory.
@@ -770,7 +1045,17 @@ mod tests {
             "sh -c 'go test ./...'",
             "bash -c \"cargo test\"",
             "bash -lc 'go test ./...'",
-            "./dev \"go test ./...\"",
+            "timeout 60 go test ./...",
+            "timeout -k 5 --signal=INT 1m cargo test",
+            "nice go test ./...",
+            "nice -n 10 pytest -q",
+            "stdbuf -oL go test ./...",
+            "stdbuf -o L -e0 go test ./...",
+            "env VAR=x go test ./...",
+            "cd sub && go test ./...",
+            "cd /w && pytest -v",
+            "docker run --rm img sh -c 'cd /w && pytest -v'",
+            "docker run --rm -v $PWD:/w -w /w img sh -c \"cd /w && python3 -m pytest -q\"",
             "docker run --rm -v $PWD:/w -w /w golang:1.22 go test ./...",
             "docker exec -it dev go test ./...",
             "docker compose run --rm app pytest",
@@ -784,7 +1069,6 @@ mod tests {
 
     #[test]
     fn argv_wrappers_qualify() {
-        assert!(argv(&["./dev", "go test ./..."]).is_ok());
         assert!(argv(&["sh", "-c", "pytest -q"]).is_ok());
         assert!(argv(&["go", "test", "./..."]).is_ok());
         assert!(argv(&["docker", "run", "--rm", "img", "pytest"]).is_ok());
@@ -804,7 +1088,11 @@ mod tests {
         assert!(why("go test $(go list ./...)").contains("substitution"));
         assert!(why("go test `go list`").contains("substitution"));
         assert!(why("./ci.sh").contains("not a known test runner"));
-        assert!(why("./dev test").contains("not a known test runner"));
+        assert!(why("./dev test").contains("runs the script `./dev`"));
+        assert!(why("timeout 60 make test").contains("runs make"));
+        assert!(why("cd sub && go vet ./... && go test ./...").contains("&&"));
+        assert!(why("cd sub ; go test ./...").contains("`;`"));
+        assert!(why("cd sub && ./ci.sh").contains("not a known test runner"));
         assert!(why("sh -c 'go vet ./... && go test ./...'").contains("&&"));
         assert!(why("sh script.sh").contains("shell script"));
         assert!(why("mvn verify").contains("verify"));
@@ -826,6 +1114,19 @@ mod tests {
         assert!(sh("go test -run 'A|B' ./...").is_ok());
         assert!(sh("go test -run \"A&&B\" ./...").is_ok());
         assert!(sh("mvn test > out.txt").is_ok());
+    }
+
+    #[test]
+    fn a_go_tests_package_comes_from_its_key_or_name() {
+        assert_eq!(
+            go_package_of_key("\u{1f}example.com/m/a::TestX/sub"),
+            Some("example.com/m/a")
+        );
+        assert_eq!(
+            go_package_of_key("example.com/m\u{1f}TestX"),
+            Some("example.com/m")
+        );
+        assert_eq!(go_package_of_key("\u{1f}TestBare"), None);
     }
 
     #[test]

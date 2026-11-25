@@ -1,0 +1,31 @@
+   Compiling geo v0.1.0 (/w/geo)
+   Compiling calc v0.1.0 (/w/calc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/calc-1cd44e4e967ddba4)
+
+running 2 tests
+test tests::flaky_clock ... ok
+test tests::adds ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/geo-c48a5e913ed4b726)
+
+running 2 tests
+test tests::areas ... ok
+test tests::squares ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests calc
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests geo
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -238,6 +238,8 @@ struct Supervisor<'a> {
     framework_total: Option<u64>,
     /// The framework's own count of failures, when it printed one.
     framework_failed: Option<u64>,
+    /// Vitest's own `Coverage enabled with v8` line, when it printed one.
+    coverage_line: Option<String>,
     /// Text of an unfinished line already written to the spool, per stream.
     partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
@@ -906,6 +908,11 @@ impl Supervisor<'_> {
             .write_all(line.strip_prefix(shown.as_str()).unwrap_or(line).as_bytes());
         self.distiller.push(line);
         let trimmed = line.trim_end();
+        if self.coverage_line.is_none()
+            && trimmed.trim_start().starts_with("Coverage enabled with ")
+        {
+            self.coverage_line = Some(trimmed.trim().to_owned());
+        }
         if !trimmed.is_empty() {
             if self.tail.len() == TAIL_LINES {
                 self.tail.pop_front();
@@ -960,6 +967,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         partial: Default::default(),
         framework_total: None,
         framework_failed: None,
+        coverage_line: None,
         cpu_start: None,
         pgid: 0,
         sizes: BTreeMap::new(),
@@ -1775,9 +1783,29 @@ fn observe_child(
         .map(|(k, o)| (k.clone(), *o))
         .collect();
     let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
+    let advice = quarantine_advice(
+        store.root(),
+        Path::new(&sup.run_cwd),
+        &spec.command,
+        &sup.suite,
+    );
     if let Some(names) = &set_aside {
-        if let Some(why) = runner_refusal(&spec.command, Path::new(&sup.run_cwd), &outcomes, names)
-        {
+        if let Some(why) = runner_refusal(
+            &spec.command,
+            Path::new(&sup.run_cwd),
+            &outcomes,
+            names,
+            sup.coverage_line.as_deref(),
+            &advice,
+        ) {
+            // What else went wrong, in the output's own words (round 18: a
+            // chained step's SyntaxError was never named).
+            let mut why = why;
+            if let Some(more) = other_step_error(store, run, sup, names, &report.test_outputs)? {
+                why.push_str(&format!("; {more}"));
+            }
+            contradictions.push(why);
+        } else if let Some(why) = unreported_refusal(store, run, sup, spec, &outcomes, names)? {
             contradictions.push(why);
         } else if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -1960,10 +1988,26 @@ fn observe_child(
         let verified_other = outcomes.iter().any(|(k, o)| {
             *o == Outcome::Passed && crate::quarantine::covers_key(&quarantine, k).is_none()
         });
+        // Not one runner call (make, a chain): that is the reason, whatever
+        // the output shows (round 18: "no other test passed" under make).
+        let not_one_call = crate::runner_call::check(&spec.command, Path::new(&sup.run_cwd)).err();
+        let more = match &not_one_call {
+            Some(_) => {
+                let own: Vec<String> = failing.iter().map(|s| (*s).to_owned()).collect();
+                other_step_error(store, run, sup, &own, &report.test_outputs)?
+            }
+            None => None,
+        };
         reason = Some(if !errored.is_empty() {
             format!(
                 "quarantined test(s) errored, not plainly failed ({}): a quarantine sets aside failures, not errors",
                 errored.join(", ")
+            )
+        } else if let Some(why) = not_one_call {
+            format!(
+                "only quarantined test(s) failed ({}), but a quarantine cannot set them aside: {why}. {advice}{}",
+                failing.join(", "),
+                more.map(|m| format!("; {m}")).unwrap_or_default()
             )
         } else if !new_subtests.is_empty() {
             format!(
@@ -2569,6 +2613,49 @@ fn summary_of_failures(t: &str) -> bool {
     false
 }
 
+/// An exception line (`SyntaxError: invalid syntax`) of the output.
+fn exception_line(line: &str) -> bool {
+    let t = line.trim();
+    t.split_once(':').is_some_and(|(head, _)| {
+        !head.contains(char::is_whitespace)
+            && (head.ends_with("Error") || head.ends_with("Exception"))
+    })
+}
+
+/// What else went wrong in a run whose command is more than one runner
+/// call: the first exception line of the output that is not a quarantined
+/// test's own (round 18: a chained `compileall`'s SyntaxError was never
+/// named), else what `unaccounted_error` finds.
+fn other_step_error(
+    store: &Store,
+    run: &str,
+    sup: &Supervisor<'_>,
+    quarantined: &[String],
+    outputs: &[(TestKey, String)],
+) -> Result<Option<String>> {
+    let own: Vec<&String> = outputs
+        .iter()
+        .filter(|(k, _)| quarantined.contains(&k.display()))
+        .map(|(_, o)| o)
+        .collect();
+    if let Some(line) = sup.tail.iter().find(|l| {
+        let t = l.trim();
+        !t.starts_with("E ")
+            && !t.starts_with("FAILED")
+            && exception_line(t)
+            && !own.iter().any(|o| o.contains(t))
+    }) {
+        return Ok(Some(format!(
+            "the output also shows an error that is not a test's: {}",
+            line.trim().chars().take(160).collect::<String>()
+        )));
+    }
+    Ok(
+        unaccounted_error(store, run, &sup.distiller, quarantined, outputs)?
+            .map(|m| format!("and {m}")),
+    )
+}
+
 /// The first error-looking line of the output that the quarantined
 /// failing tests do not account for, as the reason a quarantine cannot
 /// set the run aside (ADR 0029): it names one of them (as a whole name),
@@ -2676,6 +2763,39 @@ fn unaccounted_error(
     }))
 }
 
+/// What to do when a quarantine cannot set a failure aside because the
+/// command is not one test-runner call: a suite of `prova.toml` that is one
+/// (named), else an example for the project's own runner.
+fn quarantine_advice(root: &Path, cwd: &Path, command: &CommandSpec, suite: &str) -> String {
+    let direct: Vec<String> = crate::config::load(root)
+        .map(|c| {
+            c.suite
+                .iter()
+                .filter(|(n, s)| {
+                    n.as_str() != suite
+                        && crate::runner_call::check(&CommandSpec::Shell(s.run.clone()), cwd)
+                            .is_ok()
+                })
+                .map(|(n, _)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let head = "A quarantine sets aside the failures of one test-runner call only";
+    let name = direct
+        .iter()
+        .find(|n| n.as_str() == "default")
+        .or(direct.first());
+    if let Some(n) = name {
+        return format!("{head}: `prova run {n}` runs the tests that way");
+    }
+    match crate::runner_call::runner_example(command, cwd) {
+        Some(ex) => format!(
+            "{head}: run the tests in a suite whose command is the runner alone (for example `{ex}`)"
+        ),
+        None => format!("{head}: run the tests in a suite whose command is the runner alone"),
+    }
+}
+
 /// Why a quarantine cannot set the failures aside although only they
 /// failed: the command is not one test-runner call, or the runner skips a
 /// check once a test fails (ADR 0031 §1). `None` when it can.
@@ -2684,19 +2804,28 @@ fn runner_refusal(
     cwd: &Path,
     outcomes: &BTreeMap<String, Outcome>,
     names: &[String],
+    coverage_line: Option<&str>,
+    advice: &str,
 ) -> Option<String> {
     let listed = names.join(", ");
     let call = match crate::runner_call::check(command, cwd) {
         Ok(c) => c,
         Err(why) => {
             return Some(format!(
-                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. A quarantine sets aside only the failures of one test-runner call (ADR 0031); run them in a suite whose command is the runner alone (for example `go test ./...`)"
+                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. {advice}"
             ));
         }
     };
+    // Vitest says so itself, whatever turned coverage on (a config another
+    // module builds, `--config` naming another file).
+    if let Some(line) = coverage_line {
+        return Some(format!(
+            "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: Vitest printed \"{line}\", and it skips the coverage thresholds once a test fails. Run the tests without coverage"
+        ));
+    }
     if call.runner == crate::runner_call::Runner::Go {
         for (key, o) in outcomes {
-            let Some((pkg, _)) = key.rsplit_once('\u{1f}') else {
+            let Some(pkg) = crate::runner_call::go_package_of_key(key) else {
                 continue;
             };
             if o.is_failure() && crate::runner_call::go_package_has_testmain(pkg, cwd) {
@@ -2707,6 +2836,59 @@ fn runner_refusal(
         }
     }
     None
+}
+
+/// ADR 0034 section 1: a quarantined failure is set aside only if every test
+/// the suite's last full passing run reported has a result in this run, and
+/// without such a run the framework's own count equals the tests prova saw.
+/// A runner that stopped early (a fail-fast option, a crashed test binary)
+/// leaves tests out; they are named. `None` when everything reported or a
+/// selection (not a full run) makes the question moot.
+fn unreported_refusal(
+    store: &Store,
+    run: &str,
+    sup: &Supervisor<'_>,
+    spec: &RunSpec,
+    outcomes: &BTreeMap<String, Outcome>,
+    names: &[String],
+) -> Result<Option<String>> {
+    if spec.selection.is_some() {
+        return Ok(None);
+    }
+    let listed = names.join(", ");
+    let head =
+        format!("quarantined test(s) failed ({listed}), but a quarantine cannot set them aside");
+    // Skipped tests reported too: a result is a result.
+    let current: Vec<String> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+        stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    match missing_since_last_pass(store, run, &sup.suite, &current)? {
+        Some((prev, missing, _)) if !missing.is_empty() => {
+            let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
+            Ok(Some(format!(
+                "{head}: {} test(s) of the last passing run {prev} did not report in this run: {}{}. The runner stopped before them (a fail-fast option such as `-failfast` or `-x`, or a crashed or skipped test binary?), so a failure there would be hidden; run the whole suite to the end",
+                missing.len(),
+                shown.join(", "),
+                if missing.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            )))
+        }
+        Some(_) => Ok(None),
+        None => Ok(match sup.framework_total {
+            Some(t) if t > outcomes.len() as u64 => Some(format!(
+                "{head}: the framework counted {t} test(s) but prova saw {} (no earlier full passing run to compare with): the runner may have stopped early (a fail-fast option?)",
+                outcomes.len()
+            )),
+            _ => None,
+        }),
+    }
 }
 
 /// Whether `line` is a compiler, vet or linter diagnostic of the project's

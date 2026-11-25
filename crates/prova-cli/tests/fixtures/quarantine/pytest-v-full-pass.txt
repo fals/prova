@@ -1,0 +1,13 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.18, pytest-8.3.4, pluggy-1.7.0 -- /usr/local/bin/python3
+benchmark: 5.1.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /w
+plugins: reportlog-0.4.0, benchmark-5.1.0
+collecting ... collected 4 items
+
+tests/test_calc.py::test_add PASSED                                      [ 25%]
+tests/test_calc.py::test_flaky_clock PASSED                              [ 50%]
+tests/test_calc.py::test_div PASSED                                      [ 75%]
+tests/test_calc.py::test_slow_integration PASSED                         [100%]
+
+============================== 4 passed in 0.01s ===============================

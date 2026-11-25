@@ -425,3 +425,124 @@ fn a_nextest_retry_that_passed_is_not_an_error_outside_a_test() {
     assert_eq!(o.status.code(), Some(0), "{t}");
     assert!(!t.contains("outside any failing test"), "{t}");
 }
+
+/// Round 18: a runner that stops at the first failure (`go test -failfast`,
+/// plain `cargo test` after a failed test binary) never runs the tests after
+/// the quarantined one; the pass would hide whatever they check. Real
+/// captures of the same tests: all passing, the flaky one failing with
+/// everything run, and the flaky one failing with the runner stopped. A
+/// medium test: it needs the store's history of the full passing run and the
+/// CLI end to end.
+fn stopped_runner_is_not_a_pass(
+    tag: &str,
+    (pass, fail, stop): (&str, &str, &str),
+    flaky: &str,
+    unreported: &str,
+) {
+    let dir = fixture_dir();
+    let d = workspace(tag);
+    let argv = runner(
+        &d,
+        "ff",
+        pass,
+        &format!("{BUSY} cat \"$(cat cap)\"; exit \"$(cat code)\""),
+    );
+    let set = |name: &str| {
+        std::fs::write(
+            d.join("cap"),
+            dir.join(format!("{name}.txt")).display().to_string(),
+        )
+        .unwrap();
+        std::fs::copy(dir.join(format!("{name}.code")), d.join("code")).unwrap();
+    };
+    set(pass);
+    let o = run_argv(&d, &[], &argv);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    set(fail);
+    let learn = run_argv(&d, &["--json"], &argv);
+    let json: serde_json::Value = serde_json::from_slice(&learn.stdout).unwrap();
+    let name = json["failures"][0]["test"].as_str().unwrap().to_owned();
+    assert!(name.contains(flaky), "{name}");
+    prova(&d, &["quarantine", "add", &name, "--reason", "clock"]);
+    let o = run_argv(&d, &[], &argv);
+    assert_eq!(o.status.code(), Some(0), "all reported: {}", text(&o));
+    set(stop);
+    let o = run_argv(&d, &[], &argv);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(!passed(&t), "{t}");
+    assert!(
+        t.contains(unreported) && t.contains("did not report"),
+        "{t}"
+    );
+}
+
+/// The go-make fixture with its bugs fixed and the flaky test failing on demand.
+#[test]
+fn go_failfast_stopping_at_a_quarantined_failure_is_not_a_pass() {
+    stopped_runner_is_not_a_pass(
+        "go-failfast",
+        (
+            "go-test-v-full-pass",
+            "go-test-v-full-fail",
+            "go-test-v-failfast",
+        ),
+        "TestFlakyClock",
+        "TestSlowIntegration",
+    );
+}
+
+/// `pytest -v -x` in the `prova-fixture-python` image: stops after the flaky
+/// test, so test_div and test_slow_integration never ran.
+#[test]
+fn pytest_x_stopping_at_a_quarantined_failure_is_not_a_pass() {
+    stopped_runner_is_not_a_pass(
+        "pytest-x",
+        (
+            "pytest-v-full-pass",
+            "pytest-v-full-fail",
+            "pytest-v-maxfail",
+        ),
+        "test_flaky_clock",
+        "test_div",
+    );
+}
+
+/// A two-crate workspace: calc's test binary fails, geo's never runs.
+#[test]
+fn cargo_stopping_after_a_failed_binary_is_not_a_pass() {
+    stopped_runner_is_not_a_pass(
+        "cargo-stops",
+        (
+            "cargo-test-ws-full-pass",
+            "cargo-test-ws-full-fail",
+            "cargo-test-ws-stops",
+        ),
+        "flaky_clock",
+        "areas",
+    );
+}
+
+/// Round 18: Vitest skips its coverage thresholds once a test fails. Coverage
+/// switched on in an imported module or another `--config` is out of reach of
+/// a syntactic check, but Vitest says it in its own header (real capture,
+/// 3.2.4): `Coverage enabled with v8`.
+#[test]
+fn vitest_saying_coverage_is_enabled_refuses_a_quarantine() {
+    let dir = fixture_dir();
+    let d = workspace("vitest-coverage-line");
+    let script = format!(
+        "{BUSY} cat {}; exit 1",
+        dir.join("vitest-coverage.txt").display()
+    );
+    let argv = runner(&d, "cov", "vitest-coverage", &script);
+    let learn = run_argv(&d, &["--json"], &argv);
+    let json: serde_json::Value = serde_json::from_slice(&learn.stdout).unwrap();
+    let flaky = json["failures"][0]["test"].as_str().unwrap().to_owned();
+    prova(&d, &["quarantine", "add", &flaky, "--reason", "clock"]);
+    let o = run_argv(&d, &[], &argv);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(!passed(&t), "{t}");
+    assert!(t.contains("Coverage enabled"), "{t}");
+}

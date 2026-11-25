@@ -49,13 +49,29 @@ Contents: [Failure history](#failure-history) ·
   must be the runner alone (`go test ./...`, `cargo nextest run`, `pytest`,
   `vitest run`, `mvn test`, `dotnet test`, ...), optionally behind `sh -c`,
   `docker run`/`exec`, `npx`, `uv run`, `npm test` (read through
-  package.json) or a script given the command as one quoted argument. A
-  `make` target, a script, or a chain (`&&`, `;`, `|`) fails the run
+  package.json), `timeout`, `nice`, `env` or `stdbuf` in front, a `cd <dir>
+  &&` before the runner inside a shell, or a wrapper script given the
+  command as its argument (`./dev "go test ./..."`). A wrapper script
+  qualifies only when its body, ignoring comments, blank lines, `set`
+  options and plain variable assignments, is one `exec` of a runner or a
+  container client with the script's own arguments (`"$@"`, `"$*"`,
+  `"$1"`): one that runs a lint step after the runner is refused. A
+  `make` target, another script, or a chain (`&&`, `;`, `|`) fails the run
   while the quarantined test fails, and `detail:` says what made it so:
   another step could have failed or been skipped, and prova cannot see it.
   The fix is a second suite whose command is the runner itself, next to the
-  full one. Vitest with coverage thresholds and a Go package with
-  `TestMain` are refused too (the runner skips a check once a test fails).
+  full one (`detail:` names such a suite of prova.toml when there is one).
+  **Every test the last full passing run reported must report again**
+  (passed, failed or skipped): a runner told to stop at its first failure
+  (`go test -failfast`, `pytest -x` or `--maxfail`, plain `cargo test`
+  after a failed test binary, `--workspace` too) never ran the tests after
+  the quarantined one, so the run fails and `detail:` names the tests that
+  did not report. With no earlier full pass the framework's own count must
+  equal the tests prova saw. Run the whole suite to the end (`cargo test
+  --no-fail-fast`, no `-x`). Vitest with coverage thresholds (also set in
+  an imported module or another `--config`; Vitest's own `Coverage enabled`
+  line counts) and a Go package with `TestMain` (whichever file defines it)
+  are refused too (the runner skips a check once a test fails).
   Within one runner call, every error line of the output must be its
   own (in its section, naming it, or the runner's summary of failures), so
   another failure, an error, a framework count above its failures, or a run
@@ -70,7 +86,8 @@ Contents: [Failure history](#failure-history) ·
   failed fails. A quarantine lives in this machine's prova store, not in
   the repository: CI and teammates do not see it. Do not quarantine a test
   that fails every time now; that is a real failure (`--repeat` says "broken,
-  not flaky" when a quarantined test failed in every run).
+  not flaky" and exits 1 when a quarantined test failed in every run). The
+  tests line counts a set-aside failure as `2 failed (1 quarantined)`.
 - `slow tests: a 1.5s, b 1.1s (prova slowest)`: the slowest tests of this run
   (1 s or more). `prova slowest [--suite S] [-n N]` lists p50 and p95 from
   history, worst first.
