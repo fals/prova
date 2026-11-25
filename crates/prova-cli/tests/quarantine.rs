@@ -1019,3 +1019,34 @@ fn repeat_does_not_call_a_skipped_test_passed() {
         "{out}"
     );
 }
+
+/// ADR 0034 section 1 (round 18): a runner told to stop at its first failure
+/// (`go test -failfast`, `pytest -x`) never runs the tests after the
+/// quarantined one; the pass must not hide them. A medium test: the history
+/// of an earlier full pass is in the store.
+#[test]
+fn a_quarantined_failure_is_not_set_aside_when_known_tests_did_not_report() {
+    let d = workspace("complete");
+    let script = format!(
+        "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
+         pass) echo 'test calc::x ... ok'; echo 'test calc::y ... ok' ;; \
+         stop) echo 'test calc::x ... FAILED'; exit 101 ;; \
+         all) echo 'test calc::x ... FAILED'; echo 'test calc::y ... ok'; exit 101 ;; \
+         esac"
+    );
+    put(&d, format!("[suite.make]\nrun = {script:?}\n"));
+    run(&d, "make", "pass");
+    run(&d, "make", "all");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    // Everything reported: set aside.
+    let o = run(&d, "make", "all");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // calc::y never reported: the run fails and names it.
+    let o = run(&d, "make", "stop");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("calc::y") && out.contains("did not report") && out.contains("fail-fast"),
+        "{out}"
+    );
+}

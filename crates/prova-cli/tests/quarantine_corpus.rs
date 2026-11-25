@@ -425,3 +425,27 @@ fn a_nextest_retry_that_passed_is_not_an_error_outside_a_test() {
     assert_eq!(o.status.code(), Some(0), "{t}");
     assert!(!t.contains("outside any failing test"), "{t}");
 }
+
+/// Round 18: Vitest skips its coverage thresholds once a test fails. Coverage
+/// switched on in an imported module or another `--config` is out of reach of
+/// a syntactic check, but Vitest says it in its own header (real capture,
+/// 3.2.4): `Coverage enabled with v8`.
+#[test]
+fn vitest_saying_coverage_is_enabled_refuses_a_quarantine() {
+    let dir = fixture_dir();
+    let d = workspace("vitest-coverage-line");
+    let script = format!(
+        "{BUSY} cat {}; exit 1",
+        dir.join("vitest-coverage.txt").display()
+    );
+    let argv = runner(&d, "cov", "vitest-coverage", &script);
+    let learn = run_argv(&d, &["--json"], &argv);
+    let json: serde_json::Value = serde_json::from_slice(&learn.stdout).unwrap();
+    let flaky = json["failures"][0]["test"].as_str().unwrap().to_owned();
+    prova(&d, &["quarantine", "add", &flaky, "--reason", "clock"]);
+    let o = run_argv(&d, &[], &argv);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(!passed(&t), "{t}");
+    assert!(t.contains("Coverage enabled"), "{t}");
+}

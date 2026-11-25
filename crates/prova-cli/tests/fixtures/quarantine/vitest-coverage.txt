@@ -1,0 +1,43 @@
+
+ RUN  v3.2.4 /w/ts
+      Coverage enabled with v8
+
+ ✓ src/special.test.ts > group price $x > case a/b: 1+2 1ms
+ ✓ src/special.test.ts > group price $x > case 100% $HOME 'q': 2+2 0ms
+ ✓ src/special.test.ts > group price $x > case "dq" & $(rm) `x`: 1+1 0ms
+ ✓ src/special.test.ts > group say "hi" / it's > case a/b: 1+2 0ms
+ ✓ src/special.test.ts > group say "hi" / it's > case 100% $HOME 'q': 2+2 0ms
+ ✓ src/special.test.ts > group say "hi" / it's > case "dq" & $(rm) `x`: 1+1 0ms
+ × src/flaky.test.ts > flaky clock 5ms
+   → expected true to be false // Object.is equality
+ ✓ src/calc.test.ts > calc > adds 1ms
+ ✓ src/calc.test.ts > calc > divides 0ms
+ ✓ src/calc.test.ts > calc > flaky clock 0ms
+ ✓ src/calc.test.ts > calc > slow integration 2ms
+ ✓ src/calc.test.ts > calc > hangs when asked 0ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/flaky.test.ts > flaky clock
+AssertionError: expected true to be false // Object.is equality
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- false[39m
+[31m+ true[39m
+
+ ❯ src/flaky.test.ts:2:42
+      1| import { expect, test } from "vitest";
+      2| test("flaky clock", () => { expect(true).toBe(false); });
+       |                                          ^
+      3| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 2 passed (3)
+      Tests  1 failed | 11 passed (12)
+   Start at  13:44:10
+   Duration  1.85s (transform 46ms, setup 0ms, collect 53ms, tests 1.51s, environment 0ms, prepare 294ms)
+

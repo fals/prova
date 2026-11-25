@@ -63,6 +63,40 @@ fn vitest_coverage_thresholds_in_a_config_are_refused() {
     assert!(run("vitest run", &dir).is_ok());
 }
 
+/// Round 18: thresholds set in a module the config imports, or in the
+/// config `--config`/`-c` names, were not seen.
+#[test]
+fn vitest_coverage_in_an_imported_or_named_config_is_refused() {
+    let dir = tmp("vitest-import");
+    std::fs::write(
+        dir.join("vitest.config.ts"),
+        "import { cov } from './cov';\nexport default { test: { coverage: cov } }",
+    )
+    .unwrap();
+    std::fs::write(dir.join("cov.ts"), "export const cov = { enabled: false }").unwrap();
+    assert!(run("vitest run", &dir).is_ok());
+    std::fs::write(
+        dir.join("cov.ts"),
+        "export const cov = { thresholds: { lines: 90 } }",
+    )
+    .unwrap();
+    let e = run("vitest run", &dir).unwrap_err();
+    assert!(e.contains("coverage"), "{e}");
+
+    let dir = tmp("vitest-named");
+    std::fs::write(dir.join("vitest.config.ts"), "export default {}").unwrap();
+    std::fs::write(
+        dir.join("strict.config.mjs"),
+        "export default { test: { coverage: { thresholds: { lines: 90 } } } }",
+    )
+    .unwrap();
+    assert!(run("vitest run", &dir).is_ok());
+    assert!(run("vitest run --config strict.config.mjs", &dir).is_err());
+    assert!(run("vitest run -c strict.config.mjs", &dir).is_err());
+    assert!(run("vitest run --config=strict.config.mjs", &dir).is_err());
+    assert!(run("npx vitest run --config ./strict.config.mjs", &dir).is_err());
+}
+
 #[test]
 fn go_testmain_is_found_through_the_module_path() {
     let p = tmp("gomod");

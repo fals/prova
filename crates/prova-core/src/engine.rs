@@ -238,6 +238,8 @@ struct Supervisor<'a> {
     framework_total: Option<u64>,
     /// The framework's own count of failures, when it printed one.
     framework_failed: Option<u64>,
+    /// Vitest's own `Coverage enabled with v8` line, when it printed one.
+    coverage_line: Option<String>,
     /// Text of an unfinished line already written to the spool, per stream.
     partial: [String; 2],
     /// The run is being cancelled or killed: a test that "fails" now was
@@ -859,6 +861,11 @@ impl Supervisor<'_> {
             .write_all(line.strip_prefix(shown.as_str()).unwrap_or(line).as_bytes());
         self.distiller.push(line);
         let trimmed = line.trim_end();
+        if self.coverage_line.is_none()
+            && trimmed.trim_start().starts_with("Coverage enabled with ")
+        {
+            self.coverage_line = Some(trimmed.trim().to_owned());
+        }
         if !trimmed.is_empty() {
             if self.tail.len() == TAIL_LINES {
                 self.tail.pop_front();
@@ -913,6 +920,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         partial: Default::default(),
         framework_total: None,
         framework_failed: None,
+        coverage_line: None,
         cpu_start: None,
         pgid: 0,
         sizes: BTreeMap::new(),
@@ -1723,8 +1731,15 @@ fn observe_child(
         .collect();
     let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
     if let Some(names) = &set_aside {
-        if let Some(why) = runner_refusal(&spec.command, Path::new(&sup.run_cwd), &outcomes, names)
-        {
+        if let Some(why) = runner_refusal(
+            &spec.command,
+            Path::new(&sup.run_cwd),
+            &outcomes,
+            names,
+            sup.coverage_line.as_deref(),
+        ) {
+            contradictions.push(why);
+        } else if let Some(why) = unreported_refusal(store, run, &sup, spec, &outcomes, names)? {
             contradictions.push(why);
         } else if let Some(n) = sup.framework_failed
             && n > names.len() as u64
@@ -2631,6 +2646,7 @@ fn runner_refusal(
     cwd: &Path,
     outcomes: &BTreeMap<String, Outcome>,
     names: &[String],
+    coverage_line: Option<&str>,
 ) -> Option<String> {
     let listed = names.join(", ");
     let call = match crate::runner_call::check(command, cwd) {
@@ -2641,9 +2657,16 @@ fn runner_refusal(
             ));
         }
     };
+    // Vitest says so itself, whatever turned coverage on (a config another
+    // module builds, `--config` naming another file).
+    if let Some(line) = coverage_line {
+        return Some(format!(
+            "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: Vitest printed \"{line}\", and it skips the coverage thresholds once a test fails. Run the tests without coverage"
+        ));
+    }
     if call.runner == crate::runner_call::Runner::Go {
         for (key, o) in outcomes {
-            let Some((pkg, _)) = key.rsplit_once('\u{1f}') else {
+            let Some(pkg) = crate::runner_call::go_package_of_key(key) else {
                 continue;
             };
             if o.is_failure() && crate::runner_call::go_package_has_testmain(pkg, cwd) {
@@ -2654,6 +2677,59 @@ fn runner_refusal(
         }
     }
     None
+}
+
+/// ADR 0034 section 1: a quarantined failure is set aside only if every test
+/// the suite's last full passing run reported has a result in this run, and
+/// without such a run the framework's own count equals the tests prova saw.
+/// A runner that stopped early (a fail-fast option, a crashed test binary)
+/// leaves tests out; they are named. `None` when everything reported or a
+/// selection (not a full run) makes the question moot.
+fn unreported_refusal(
+    store: &Store,
+    run: &str,
+    sup: &Supervisor<'_>,
+    spec: &RunSpec,
+    outcomes: &BTreeMap<String, Outcome>,
+    names: &[String],
+) -> Result<Option<String>> {
+    if spec.selection.is_some() {
+        return Ok(None);
+    }
+    let listed = names.join(", ");
+    let head =
+        format!("quarantined test(s) failed ({listed}), but a quarantine cannot set them aside");
+    // Skipped tests reported too: a result is a result.
+    let current: Vec<String> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT DISTINCT test_id FROM attempts WHERE run_id = ?1")?;
+        stmt.query_map(rusqlite::params![run], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    match missing_since_last_pass(store, run, &sup.suite, &current)? {
+        Some((prev, missing, _)) if !missing.is_empty() => {
+            let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
+            Ok(Some(format!(
+                "{head}: {} test(s) of the last passing run {prev} did not report in this run: {}{}. The runner stopped before them (a fail-fast option such as `-failfast` or `-x`, or a crashed or skipped test binary?), so a failure there would be hidden; run the whole suite to the end",
+                missing.len(),
+                shown.join(", "),
+                if missing.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            )))
+        }
+        Some(_) => Ok(None),
+        None => Ok(match sup.framework_total {
+            Some(t) if t > outcomes.len() as u64 => Some(format!(
+                "{head}: the framework counted {t} test(s) but prova saw {} (no earlier full passing run to compare with): the runner may have stopped early (a fail-fast option?)",
+                outcomes.len()
+            )),
+            _ => None,
+        }),
+    }
 }
 
 /// Whether `line` is a compiler, vet or linter diagnostic of the project's

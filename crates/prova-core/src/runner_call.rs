@@ -654,7 +654,9 @@ fn shell_quote(a: &str) -> String {
     }
 }
 
-/// Vitest with coverage: the flag, or a config that sets thresholds.
+/// Vitest with coverage: the flag, or a config (the default ones, or the
+/// one `--config`/`-c` names, with the modules they import) that sets
+/// thresholds. What this misses, Vitest's own `Coverage enabled` line shows.
 fn vitest_coverage(words: &[String], cwd: &Path) -> bool {
     if words
         .iter()
@@ -662,21 +664,105 @@ fn vitest_coverage(words: &[String], cwd: &Path) -> bool {
     {
         return true;
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     for stem in ["vitest.config", "vite.config", "vitest.workspace"] {
         for ext in ["ts", "js", "mjs", "cjs", "mts", "cts"] {
-            names.push(format!("{stem}.{ext}"));
+            files.push(cwd.join(format!("{stem}.{ext}")));
         }
     }
-    names.iter().any(|n| {
-        std::fs::read_to_string(cwd.join(n)).is_ok_and(|t| {
-            t.contains("thresholds")
-                || (t.contains("coverage")
-                    && ["lines:", "statements:", "branches:", "functions:"]
-                        .iter()
-                        .any(|k| t.contains(k)))
-        })
-    })
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        let value = match w {
+            "--config" | "-c" | "--workspace" => {
+                i += 1;
+                words.get(i).map(String::as_str)
+            }
+            _ => w
+                .strip_prefix("--config=")
+                .or_else(|| w.strip_prefix("--workspace=")),
+        };
+        if let Some(v) = value {
+            files.push(cwd.join(v));
+        }
+        i += 1;
+    }
+    // The files, then what each imports by a relative path (three levels,
+    // twenty files: a config is small).
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut queue: Vec<(PathBuf, usize)> = files.into_iter().map(|f| (f, 0)).collect();
+    while let Some((file, depth)) = queue.pop() {
+        if seen.contains(&file) || seen.len() >= 20 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        seen.push(file.clone());
+        if text.contains("thresholds")
+            || (text.contains("coverage")
+                && ["lines:", "statements:", "branches:", "functions:"]
+                    .iter()
+                    .any(|k| text.contains(k)))
+        {
+            return true;
+        }
+        if depth < 3 {
+            let dir = file.parent().unwrap_or(cwd);
+            for spec in relative_imports(&text) {
+                for cand in import_candidates(&dir.join(spec)) {
+                    queue.push((cand, depth + 1));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The relative module paths a JS/TS source imports (`from './x'`,
+/// `import('./x')`, `require('./x')`).
+fn relative_imports(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for marker in ["from ", "import(", "require(", "import "] {
+        let mut rest = text;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let r = rest.trim_start();
+            let Some(q) = r.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+                continue;
+            };
+            let body = &r[1..];
+            if let Some(end) = body.find(q) {
+                let spec = &body[..end];
+                if spec.starts_with('.') {
+                    out.push(spec);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The files a relative import may mean.
+fn import_candidates(base: &Path) -> Vec<PathBuf> {
+    let mut out = vec![base.to_path_buf()];
+    for ext in ["ts", "js", "mjs", "cjs", "mts", "cts", "json"] {
+        out.push(PathBuf::from(format!("{}.{ext}", base.display())));
+        out.push(base.join(format!("index.{ext}")));
+    }
+    out
+}
+
+/// The Go package a test's lifecycle key belongs to: its file part when
+/// the key has one, else the package in its display name
+/// (`example.com/m/a::TestX`; round 18: a Go test's key has no file, so the
+/// `TestMain` check looked at no package at all).
+pub fn go_package_of_key(key: &str) -> Option<&str> {
+    let (file, display) = key.rsplit_once('\u{1f}').unwrap_or(("", key));
+    if !file.is_empty() && !file.starts_with('(') {
+        return Some(file);
+    }
+    display.split_once("::").map(|(pkg, _)| pkg)
 }
 
 /// The module path of the nearest go.mod at or above `cwd`, and its directory.
@@ -826,6 +912,19 @@ mod tests {
         assert!(sh("go test -run 'A|B' ./...").is_ok());
         assert!(sh("go test -run \"A&&B\" ./...").is_ok());
         assert!(sh("mvn test > out.txt").is_ok());
+    }
+
+    #[test]
+    fn a_go_tests_package_comes_from_its_key_or_name() {
+        assert_eq!(
+            go_package_of_key("\u{1f}example.com/m/a::TestX/sub"),
+            Some("example.com/m/a")
+        );
+        assert_eq!(
+            go_package_of_key("example.com/m\u{1f}TestX"),
+            Some("example.com/m")
+        );
+        assert_eq!(go_package_of_key("\u{1f}TestBare"), None);
     }
 
     #[test]
