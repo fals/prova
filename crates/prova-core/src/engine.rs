@@ -1738,14 +1738,9 @@ fn observe_child(
                 "the command was killed (exit {}): a quarantine sets aside test failures, not a killed run",
                 exit_code.unwrap_or(0)
             ));
-        } else if let Some(why) = unaccounted_error(
-            store,
-            run,
-            &sup.distiller,
-            names,
-            &report.test_outputs,
-            &spec.command.display(),
-        )? {
+        } else if let Some(why) =
+            unaccounted_error(store, run, &sup.distiller, names, &report.test_outputs)?
+        {
             contradictions.push(why);
         }
     }
@@ -2448,9 +2443,8 @@ fn printed_names(display: &str) -> Vec<String> {
 
 /// A test runner's own summary of failing tests that says nothing more
 /// than the failures seen: counts of failures with no error, the bare
-/// `FAIL` lines, a package's result, Maven's and make's wrap-up of a
-/// failed test step.
-fn summary_of_failures(t: &str, command: &str) -> bool {
+/// `FAIL` lines, a package's result, Maven's wrap-up of a failed test step.
+fn summary_of_failures(t: &str) -> bool {
     let lower = t.to_lowercase();
     let no_errors =
         !lower.contains("error") || lower.contains("errors: 0") || lower.contains(" 0 error");
@@ -2516,37 +2510,6 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
                 && (r.contains("surefire") || r.contains("failsafe"))
                 && r.contains("There are test failures"));
     }
-    // make's line for the target the suite runs (`make test`).
-    if let Some(rest) = t
-        .strip_prefix("make: *** [")
-        .or_else(|| t.split_once("]: *** [").map(|(_, r)| r))
-        && let Some((target, _)) = rest.split_once(']')
-    {
-        let target = target.rsplit(':').next().unwrap_or(target).trim();
-        return !target.is_empty() && make_names_target(command, target);
-    }
-    false
-}
-
-/// Whether `command` runs `make` with `target` among its goals: a word
-/// after a `make` word, up to the end of that command (`;`, `&&`, `|`).
-/// A word of a script that merely spells the target (a `case` pattern
-/// `lint)`) is not the suite running it.
-fn make_names_target(command: &str, target: &str) -> bool {
-    let mut in_make = false;
-    for word in command.split_whitespace() {
-        let w = word.trim_matches(['"', '\'', '(', ')']);
-        let ends = w.ends_with([';', '&', '|']) || matches!(w, "&&" | "||" | "|");
-        let w = w.trim_matches([';', '&', '|']);
-        if in_make && !w.starts_with('-') && w == target {
-            return true;
-        }
-        if w == "make" || w.ends_with("/make") {
-            in_make = true;
-        } else if ends {
-            in_make = false;
-        }
-    }
     false
 }
 
@@ -2561,7 +2524,6 @@ fn unaccounted_error(
     distiller: &crate::output::Distiller,
     quarantined: &[String],
     outputs: &[(TestKey, String)],
-    command: &str,
 ) -> Result<Option<String>> {
     let (lines, overflow) = distiller.error_lines();
     if overflow {
@@ -2588,10 +2550,7 @@ fn unaccounted_error(
     // printed after it (a linter, a smoke check, a coverage gate) failed or
     // passed in words prova cannot tell from the quarantined failure.
     let (after, after_overflow) = distiller.after_summary();
-    if let Some((n, line)) = after
-        .iter()
-        .find(|(_, l)| !wrapper_line(l, command, &names))
-    {
+    if let Some((n, line)) = after.iter().find(|(_, l)| !wrapper_line(l, &names)) {
         return Ok(Some(format!(
             "the command printed more after the tests' summary (line {n}: {}): another step ran, and its result cannot be told apart from the quarantined failure",
             line.chars().take(160).collect::<String>()
@@ -2651,11 +2610,7 @@ fn unaccounted_error(
         let own_event = libtest_event_of(t, quarantined);
         let accounted = !gate
             && !rerun_again
-            && (in_own_section
-                || by_name
-                || own_line
-                || own_event
-                || summary_of_failures(t, command));
+            && (in_own_section || by_name || own_line || own_event || summary_of_failures(t));
         (!accounted).then(|| {
             format!(
                 "the output shows an error outside the quarantined test(s) (line {n}): {}",
@@ -2795,15 +2750,12 @@ fn failed_count(line: &str) -> Option<u64> {
 }
 
 /// A line after the runner's summary that belongs to the test command's own
-/// wrap-up: the runner's summary of failures, make's line for the suite's
-/// target, a runner's timing lines, npm's report of its test script, a line
+/// wrap-up: the runner's summary of failures, a runner's timing lines, npm's report of its test script, a line
 /// of the quarantined test's own (without a crash).
-fn wrapper_line(t: &str, command: &str, names: &[String]) -> bool {
+fn wrapper_line(t: &str, names: &[String]) -> bool {
     let t = t.trim();
     let info = t.strip_prefix("[INFO]").map(str::trim);
-    summary_of_failures(t, command)
-        || (t.starts_with("make")
-            && (t.contains("Entering directory") || t.contains("Leaving directory")))
+    summary_of_failures(t)
         || t.starts_with("Start at ")
         || t.starts_with("Duration ")
         || t.starts_with("Snapshots:")
@@ -4131,21 +4083,6 @@ mod quarantine_tests {
     use super::*;
     use crate::quarantine::Entry;
 
-    /// Round 16: make's line for a target is the runner's own only when the
-    /// suite's command runs that target, not when a script spells the word.
-    #[test]
-    fn make_failing_a_target_the_command_runs_is_a_summary_and_no_other_is() {
-        let line = "make: *** [Makefile:2: test] Error 2";
-        let lint = "make: *** [Makefile:5: lint] Error 1";
-        let script = "sh -c : make test; case $s in lint) echo x ;; esac";
-        assert!(summary_of_failures(line, script));
-        assert!(!summary_of_failures(lint, script));
-        assert!(summary_of_failures(lint, "make test lint"));
-        assert!(summary_of_failures(line, "make -C sub test && echo done"));
-        assert!(!summary_of_failures(lint, "make test && lint"));
-        assert!(!summary_of_failures(lint, "make test; lint"));
-    }
-
     /// Round 16: wrap-up lines after a runner's summary, and counts.
     #[test]
     fn only_the_commands_own_wrap_up_may_follow_the_summary() {
@@ -4154,21 +4091,19 @@ mod quarantine_tests {
             "error: test run failed",
             "error: 1 target failed:",
             "`--lib`",
-            "make[1]: Leaving directory '/w'",
             "Start at  20:41:15",
             "npm error Lifecycle script `test` failed",
             "FAIL [   0.004s] (4/5) calc tests::flaky",
         ] {
-            assert!(wrapper_line(t, "make test", &names), "{t}");
+            assert!(wrapper_line(t, &names), "{t}");
         }
         for t in [
             "smoke: GET /health returned 503",
             "Found 1 error.",
             "error: 2 targets failed:",
             "Segmentation fault (core dumped) ./bin/tests::flaky",
-            "make[1]: *** [Makefile:6: lint] Error 1",
         ] {
-            assert!(!wrapper_line(t, "make test", &names), "{t}");
+            assert!(!wrapper_line(t, &names), "{t}");
         }
         assert_eq!(
             failed_count("Test Suites: 2 failed, 1 passed, 3 total"),
@@ -4188,14 +4123,14 @@ mod quarantine_tests {
             "[ERROR] Failures: ",
             "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0",
         ] {
-            assert!(summary_of_failures(t, "mvn test"), "{t}");
+            assert!(summary_of_failures(t), "{t}");
         }
         for t in [
             "[ERROR] See you at /w/src/Other.java:[3,5] ';' expected",
             "[ERROR] COMPILATION ERROR :",
             "[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 0",
         ] {
-            assert!(!summary_of_failures(t, "mvn test"), "{t}");
+            assert!(!summary_of_failures(t), "{t}");
         }
     }
 
