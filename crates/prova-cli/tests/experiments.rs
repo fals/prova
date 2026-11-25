@@ -1087,6 +1087,8 @@ fn exp_run_accepts_max_wait_and_hands_over_the_wait() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(out.contains("next: prova exp wait e --max-wait"), "{out}");
+    // Round 18: the timed-out wait printed `next:` twice.
+    assert_eq!(out.matches("next:").count(), 1, "{out}");
     assert!(prova(&d, &["exp", "cancel", "e"]).status.success());
 }
 
@@ -1419,5 +1421,193 @@ fn a_candidate_cannot_plant_files_during_the_oracle_for_the_trials() {
     assert_eq!(
         r["comparison"]["result"]["primary"]["candidate_median"], 100.0,
         "the trials must measure the code, not the planted file: {r}"
+    );
+}
+
+/// A repository whose candidate (the file `cand`) cuts the workload's steps
+/// from 100 to 40 while `KNOB` is set: accepted as `c1` on the first run.
+/// `SLOW` triples both arms (a throttled machine); `REWRITE_CAND` and
+/// `REWRITE_BASE` make that arm's workload rewrite a tracked file.
+fn knob_accepted(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nv=100\nif [ -f cand ] && [ -n \"$KNOB\" ]; then v=40; fi\nif [ -n \"$SLOW\" ]; then v=$((v*3)); fi\nif { [ -n \"$REWRITE_CAND\" ] && [ -f cand ]; } || { [ -n \"$REWRITE_BASE\" ] && [ ! -f cand ]; }; then chmod u+w table 2>/dev/null; echo 2 >> table; fi\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$v}\"\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("table"), "1\n").unwrap();
+    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("cand"), "x").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova_env(
+        &d,
+        &["exp", "run", "e", "--json"],
+        &[("KNOB", "1")],
+    ));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    assert_eq!(r["best"], "c1", "{r}");
+    d
+}
+
+fn prova_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut c = Command::new(PROVA);
+    c.args(args)
+        .current_dir(dir)
+        .env("PROVA_HOME", home_of(dir));
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.output().unwrap()
+}
+
+/// ADR 0035 section 4 (round 18 B8): a candidate that is fast only under a
+/// condition of the first run was accepted; the revalidation measured the
+/// ordinary result, the candidate's own median moved 2.5x while the
+/// baseline's did not, and the accept survived. A drift that is the
+/// candidate's own withdraws the accept.
+/// Medium: needs a repository, the binary and two comparisons.
+#[test]
+fn a_void_revalidation_withdraws_the_accept() {
+    let d = knob_accepted("voidrv");
+    let v = json(&prova(&d, &["exp", "revalidate", "e", "--json"]));
+    assert_eq!(v["comparison"]["status"], "failed", "{v}");
+    assert_eq!(
+        v["best"], "baseline",
+        "a void revalidation must withdraw the accept: {v}"
+    );
+    assert!(v.to_string().contains("withdrawn"), "{v}");
+}
+
+/// Noise must never withdraw a real accept: a machine that got 3x slower
+/// for both arms moves both medians alike (the candidate/baseline ratio is
+/// the same), so the revalidation is inconclusive and the accept stands.
+#[test]
+fn a_slower_machine_for_both_arms_keeps_the_accept() {
+    let d = knob_accepted("slowrv");
+    let v = json(&prova_env(
+        &d,
+        &["exp", "revalidate", "e", "--json"],
+        &[("KNOB", "1"), ("SLOW", "1")],
+    ));
+    assert_eq!(v["best"], "c1", "noise must not withdraw the accept: {v}");
+    assert!(v.to_string().contains("inconclusive"), "{v}");
+}
+
+/// Only the candidate's own offence withdraws its accept: a baseline trial
+/// that rewrites tracked files leaves the revalidation inconclusive.
+#[test]
+fn a_baseline_that_tampers_in_a_revalidation_keeps_the_accept() {
+    let d = knob_accepted("tamperbase");
+    let v = json(&prova_env(
+        &d,
+        &["exp", "revalidate", "e", "--json"],
+        &[("KNOB", "1"), ("REWRITE_BASE", "1")],
+    ));
+    assert_eq!(v["best"], "c1", "{v}");
+    assert!(v.to_string().contains("inconclusive"), "{v}");
+}
+
+/// A workload that rewrites tracked files during the revalidation is the
+/// candidate's own misbehaviour: the accept is withdrawn.
+#[test]
+fn tampering_in_a_revalidation_withdraws_the_accept() {
+    let d = knob_accepted("tamperrv");
+    let v = json(&prova_env(
+        &d,
+        &["exp", "revalidate", "e", "--json"],
+        &[("KNOB", "1"), ("REWRITE_CAND", "1")],
+    ));
+    assert_eq!(v["best"], "baseline", "{v}");
+    assert!(v.to_string().contains("changed tracked files"), "{v}");
+}
+
+/// ADR 0035 section 4 (round 18 M1): a candidate that keeps results in
+/// /tmp between iterations measured its cache. The trial's private /tmp is
+/// looked at when the trial ends and the verdict says what was left there.
+/// Medium: needs bubblewrap, a repository and the binary.
+#[test]
+fn files_a_trial_leaves_in_its_private_tmp_are_reported() {
+    if !prova_core::experiment::sandbox_available() {
+        eprintln!("skipped: no bubblewrap here, /tmp is not private");
+        return;
+    }
+    let d = std::env::temp_dir().join(format!("prova-exp-tmpleft-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nif [ -f cand ]; then echo cached > /tmp/results-cache; fi\nsleep $(cat delay)\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":100}\"\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("delay"), "0.01").unwrap();
+    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::write(d.join("cand"), "x").unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    let caveats = r["comparison"]["result"]["caveats"].to_string();
+    assert!(
+        caveats.contains("wrote files outside the checkout, in its private /tmp")
+            && caveats.contains("results-cache"),
+        "{r}"
     );
 }

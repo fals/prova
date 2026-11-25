@@ -41,7 +41,8 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// not get a new code identity after every test run.
 const CACHES: &[&str] = &[
     ":(exclude,glob)**/__pycache__/**",
-    ":(exclude,glob)**/*.pyc",
+    // Bytecode is a cache only inside __pycache__ (above): a `json.pyc` next
+    // to the sources imports as a module and is code (ADR 0035 section 4).
     ":(exclude,glob)**/.pytest_cache/**",
     ":(exclude,glob)**/.mypy_cache/**",
     ":(exclude,glob)**/.ruff_cache/**",

@@ -101,13 +101,21 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     let dur = format_duration(std::time::Duration::from_millis(s.elapsed_ms));
     // The command's own output first, prova's verdict last: what is read
     // last is what prova concluded (passed, failed, history, next).
+    // `status` and `cancel` name the run first (round 18): there is no wait
+    // whose result the excerpt precedes.
+    let header = format!("run {}  suite {}  `{}`", s.run, s.suite, s.command);
+    if until.is_none() {
+        println!("{header}");
+    }
     if !s.output_tail.is_empty() {
         println!("output (last {} lines):", s.output_tail.len());
         for l in &s.output_tail {
             println!("  | {}", clean(l));
         }
     }
-    println!("run {}  suite {}  `{}`", s.run, s.suite, s.command);
+    if until.is_some() {
+        println!("{header}");
+    }
     let mut line = format!("{}  {dur}", headline(s));
     if let Some(c) = s.exit_code {
         line.push_str(&format!("  exit {c}"));
@@ -600,6 +608,12 @@ fn next(s: &Summary, until: Option<prova_core::engine::Until>) -> String {
         WaitReason::Running => format!("prova wait {} --after {}", s.run, s.last_seq),
         // Every failure so far is a known flaky test: there is nothing to
         // fix yet; keep watching for a real one (round 8).
+        // A stalled run is hung, whatever failed before: nothing to keep
+        // watching (round 18).
+        WaitReason::Failure if s.stalled_ms.is_some() => format!(
+            "prova cancel {}  (or `prova wait {} --after {}` if it is expected)",
+            s.run, s.run, s.last_seq
+        ),
         WaitReason::Failure if all_known_flaky(s) => format!(
             "only known flaky test(s) failed so far: `prova wait {} --after {}` to keep watching for a real failure",
             s.run, s.last_seq
@@ -918,6 +932,16 @@ pub fn exp_progress(r: &prova_core::experiment::Report) {
 }
 
 pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
+    experiment_with_next(r, json, None);
+}
+
+/// `experiment`, with the `next:` of a comparison that is still running
+/// replaced (a timed-out foreground wait hands over its own budget).
+pub fn experiment_with_next(
+    r: &prova_core::experiment::Report,
+    json: bool,
+    running_next: Option<String>,
+) {
     if json {
         println!("{}", serde_json::to_string(r).unwrap_or_default());
         return;
@@ -1021,7 +1045,9 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             }
         }
         let next = match (c.status.as_str(), c.verdict.as_deref()) {
-            ("running", _) => format!("prova exp wait {}", r.experiment),
+            ("running", _) => running_next
+                .clone()
+                .unwrap_or_else(|| format!("prova exp wait {}", r.experiment)),
             // A revalidation: the best, again, against the original baseline.
             ("decided", Some("accept"))
                 if c.baseline == "baseline"
@@ -1316,6 +1342,19 @@ mod live_tests {
             quarantined: vec![],
             slowest: vec![],
         }
+    }
+
+    /// Round 18: a stalled run that had also failed a known flaky test was
+    /// told "only known flaky test(s) failed so far ... keep watching": the
+    /// stall comes first, the run is hung.
+    #[test]
+    fn a_stalled_run_is_never_told_to_keep_watching_for_flaky_failures() {
+        let mut s = summary(3, 1, &[]);
+        s.reason = WaitReason::Failure;
+        s.stalled_ms = Some(20_000);
+        let n = super::next(&s, None);
+        assert!(n.starts_with("prova cancel r"), "{n}");
+        assert!(!n.contains("flaky"), "{n}");
     }
 
     #[test]

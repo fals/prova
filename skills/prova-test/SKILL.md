@@ -14,7 +14,7 @@ needs attention.
 1. One command per intent. Start the run and wait for what you need:
 
    ```sh
-   prova run <suite> --until first-failure   # returns on the first failure, a slow test, a stall, or the end (30 s budget)
+   prova run <suite> --until first-failure   # returns on the first failure, a slow test, a stall, or the end (30 s budget; 65 s when the command is a container client such as docker run, and the line it prints says so)
    prova run <suite> --until done            # the result (budget 9 min, under a tool call's usual limit)
    ```
 

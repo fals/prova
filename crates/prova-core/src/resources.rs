@@ -148,6 +148,29 @@ pub fn container_client(cmdline: &str) -> Option<&'static str> {
     (!viewer).then_some(client)
 }
 
+/// Whether the client's command runs a process inside a container that
+/// is already there (`docker exec`, `kubectl exec`): that container is not
+/// the run's, only the process is.
+pub fn container_client_execs(cmdline: &str) -> bool {
+    let words: Vec<&str> = cmdline.split(' ').collect();
+    // The subcommand follows the client, as in `container_client`: an
+    // `exec` further on is the container's own command (`docker run img exec`).
+    let Some(at) = words.iter().take(2).position(|w| {
+        matches!(
+            w.rsplit('/').next(),
+            Some("docker" | "podman" | "nerdctl" | "kubectl")
+        )
+    }) else {
+        return false;
+    };
+    words[at + 1..]
+        .iter()
+        .copied()
+        .filter(|w| !w.starts_with('-'))
+        .find(|w| *w != "compose" && *w != "container")
+        == Some("exec")
+}
+
 /// Whether the client's command line starts a container (`docker run`),
 /// the only kind whose container this run can name.
 pub fn container_client_runs(cmdline: &str) -> bool {
@@ -221,7 +244,17 @@ fn client_output(client: &str, args: &[&str], secs: u64) -> Option<String> {
 /// (`2026-11-24T10:00:00.123456789Z`).
 fn rfc3339_ms(t: &str) -> Option<u64> {
     let (date, time) = t.split_once('T')?;
-    let time = time.trim_end_matches('Z');
+    // A zone other than UTC (`+01:00`, `-0500`) shifts the clock reading.
+    let (time, offset_min) = match time.find(['+', '-']) {
+        Some(at) => {
+            let (clock, zone) = time.split_at(at);
+            let digits: String = zone[1..].chars().filter(char::is_ascii_digit).collect();
+            let (h, m) = (digits.get(..2)?, digits.get(2..4).unwrap_or("00"));
+            let mins = h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()?;
+            (clock, if &zone[..1] == "-" { -mins } else { mins })
+        }
+        None => (time.trim_end_matches('Z'), 0),
+    };
     let mut d = date.split('-').map(|n| n.parse::<i64>().ok());
     let (y, m, day) = (d.next()??, d.next()??, d.next()??);
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
@@ -235,9 +268,10 @@ fn rfc3339_ms(t: &str) -> Option<u64> {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days)
+    let local = u64::try_from(days)
         .ok()
-        .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+        .map(|d| ((d * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)?;
+    local.checked_add_signed(-offset_min * 60_000)
 }
 
 /// The host directories the client's own `-v`/`--volume`/`--mount`
@@ -313,52 +347,100 @@ fn client_command_after<'a>(cmdline: &'a str, image: &str) -> Vec<&'a str> {
         .unwrap_or_default()
 }
 
-/// Which of the inspected containers are the run's own: created after the
-/// run started; mounting every directory the client's own `-v`/`--mount`
-/// arguments name (when it named none, mounting the run's directory or a
-/// parent of it); and running the client's command when it gave one.
-pub fn select_run_containers(
-    all: &[serde_json::Value],
+/// A running container that could be the run's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Shortest id form (12 characters).
+    pub id: String,
+    /// Live container runs of the same directory that could own it as well
+    /// (ADR 0035 §3): they started before it was created and have no
+    /// container of their own created earlier. Empty: it is this run's.
+    pub rivals: Vec<String>,
+    /// What matched, for the note.
+    pub matched: String,
+}
+
+impl Candidate {
+    pub fn contested(&self) -> bool {
+        !self.rivals.is_empty()
+    }
+}
+
+/// Another live run of the run's directory that goes through a container
+/// client and so may own a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rival {
+    pub run: String,
+    /// Start time (ms).
+    pub started_ms: u64,
+    /// Its own client command line when known; None when only the note
+    /// "the tests ran through" says it has a client (a wrapper): the run's
+    /// own command line stands in for it.
+    pub cmdline: Option<String>,
+}
+
+/// Whether the inspected container could be the one `cmdline` started in
+/// `cwd` at `started_ms`, and what matched. Created after the run started;
+/// of the client's image; mounting every directory the client's own
+/// `-v`/`--mount` arguments name (when it named none, mounting the run's
+/// directory or a parent of it); and running the client's command when it
+/// gave one, as the whole command or its end (an image's entrypoint comes
+/// first).
+fn could_be_of(
+    c: &serde_json::Value,
     cmdline: &str,
-    cwd: &str,
+    cwd: &std::path::Path,
     started_ms: u64,
-) -> Vec<String> {
-    let named = client_mount_sources(cmdline, cwd);
-    let cwd = std::path::Path::new(cwd);
-    all.iter()
-        .filter(|c| {
-            let created = c["Created"].as_str().and_then(rfc3339_ms);
-            created.is_some_and(|t| t >= started_ms)
+) -> Option<String> {
+    let created = c["Created"].as_str().and_then(rfc3339_ms)?;
+    if created < started_ms {
+        return None;
+    }
+    let named = client_mount_sources(cmdline, &cwd.to_string_lossy());
+    let sources: Vec<std::path::PathBuf> = c["Mounts"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .filter(|m| m["Type"].as_str().is_none_or(|t| t == "bind"))
+                .filter_map(|m| m["Source"].as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| normalize(std::path::Path::new(s)))
+                .collect()
         })
-        .filter(|c| {
-            let sources: Vec<std::path::PathBuf> = c["Mounts"]
-                .as_array()
-                .map(|ms| {
-                    ms.iter()
-                        .filter(|m| m["Type"].as_str().is_none_or(|t| t == "bind"))
-                        .filter_map(|m| m["Source"].as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| normalize(std::path::Path::new(s)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if named.is_empty() {
-                sources.iter().any(|s| cwd.starts_with(s))
-            } else {
-                named.iter().all(|n| sources.iter().any(|s| s == n))
-            }
-        })
-        .filter(|c| {
-            let Some(image) = c["Config"]["Image"].as_str() else {
-                return true;
-            };
-            let wanted = client_command_after(cmdline, image);
-            if wanted.is_empty() {
-                return true;
-            }
-            let Some(path) = c["Path"].as_str() else {
-                return true;
-            };
+        .unwrap_or_default();
+    let matched = if named.is_empty() {
+        let holder = sources.iter().find(|s| cwd.starts_with(s))?;
+        if holder == cwd {
+            format!("it mounts the run's directory `{}`", cwd.display())
+        } else {
+            format!(
+                "it mounts `{}`, a parent of the run's directory `{}`",
+                holder.display(),
+                cwd.display()
+            )
+        }
+    } else {
+        if !named.iter().all(|n| sources.iter().any(|s| s == n)) {
+            return None;
+        }
+        format!(
+            "it mounts {}",
+            named
+                .iter()
+                .map(|n| format!("`{}`", n.display()))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )
+    };
+    if let Some(image) = c["Config"]["Image"].as_str() {
+        // The client's image is the container's: a dev container that
+        // happens to mount a parent directory is not the run's.
+        let words: Vec<&str> = cmdline.split(' ').collect();
+        if !words.contains(&image) {
+            return None;
+        }
+        let wanted = client_command_after(cmdline, image);
+        if let (false, Some(path)) = (wanted.is_empty(), c["Path"].as_str()) {
             let mut ran = vec![path.to_owned()];
             ran.extend(
                 c["Args"]
@@ -367,17 +449,71 @@ pub fn select_run_containers(
                     .flatten()
                     .filter_map(|a| a.as_str().map(str::to_owned)),
             );
-            ran.iter().map(String::as_str).eq(wanted.iter().copied())
+            // The client's words were split on spaces: an argument with
+            // spaces (`sh -c "mvn -q test"`) is several words there, one
+            // in the container, so compare the joined text.
+            let (ran, wanted) = (ran.join(" "), wanted.join(" "));
+            if ran != wanted && !ran.ends_with(&format!(" {wanted}")) {
+                return None;
+            }
+        }
+    }
+    Some(matched)
+}
+
+/// Which of the inspected containers are the run's own (see `could_be_of`).
+/// `rivals` are the other live container runs of this directory: a container
+/// one of them could own too is contested, unless that run already has a
+/// container of its own created before it.
+pub fn select_run_containers(
+    all: &[serde_json::Value],
+    cmdline: &str,
+    cwd: &str,
+    started_ms: u64,
+    rivals: &[Rival],
+) -> Vec<Candidate> {
+    let cwd = std::path::Path::new(cwd);
+    all.iter()
+        .filter_map(|c| {
+            let matched = could_be_of(c, cmdline, cwd, started_ms)?;
+            let id = c["Id"].as_str()?;
+            let created = c["Created"].as_str().and_then(rfc3339_ms)?;
+            let contesting = rivals
+                .iter()
+                .filter(|r| r.started_ms <= created)
+                .filter(|r| {
+                    let theirs = r.cmdline.as_deref().unwrap_or(cmdline);
+                    // A container created before this one that is the
+                    // rival's: this one is not.
+                    !all.iter().any(|o| {
+                        o["Created"]
+                            .as_str()
+                            .and_then(rfc3339_ms)
+                            .is_some_and(|t| t < created)
+                            && could_be_of(o, theirs, cwd, r.started_ms).is_some()
+                    })
+                })
+                .map(|r| r.run.clone())
+                .collect();
+            Some(Candidate {
+                id: id.chars().take(12).collect(),
+                rivals: contesting,
+                matched,
+            })
         })
-        .filter_map(|c| c["Id"].as_str())
-        .map(|id| id.chars().take(12).collect())
         .collect()
 }
 
 /// Running containers that look like the run's own, when its client was
 /// given no `--name` or `--cidfile` (see `select_run_containers`).
 /// Bounded: a client that hangs yields nothing. Ids, shortest form.
-pub fn containers_of_run(client: &str, cmdline: &str, cwd: &str, started_ms: u64) -> Vec<String> {
+pub fn containers_of_run(
+    client: &str,
+    cmdline: &str,
+    cwd: &str,
+    started_ms: u64,
+    rivals: &[Rival],
+) -> Vec<Candidate> {
     let Some(ids) = client_output(client, &["ps", "-q"], 3) else {
         return Vec::new();
     };
@@ -393,7 +529,7 @@ pub fn containers_of_run(client: &str, cmdline: &str, cwd: &str, started_ms: u64
     let Ok(serde_json::Value::Array(all)) = serde_json::from_str::<serde_json::Value>(&json) else {
         return Vec::new();
     };
-    select_run_containers(&all, cmdline, cwd, started_ms)
+    select_run_containers(&all, cmdline, cwd, started_ms, rivals)
 }
 
 /// Kills a container by name or id with its client; true when it did.
@@ -946,8 +1082,33 @@ mod container_tests {
 
 #[cfg(test)]
 mod container_choice_tests {
-    use super::select_run_containers as pick;
+    use super::{Candidate, Rival};
     use serde_json::json;
+
+    fn pick(all: &[serde_json::Value], cmd: &str, cwd: &str, started: u64) -> Vec<String> {
+        super::select_run_containers(all, cmd, cwd, started, &[])
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    fn pick_with(
+        all: &[serde_json::Value],
+        cmd: &str,
+        started: u64,
+        rivals: &[u64],
+    ) -> Vec<Candidate> {
+        let rivals: Vec<Rival> = rivals
+            .iter()
+            .enumerate()
+            .map(|(i, ms)| Rival {
+                run: format!("rival{i}"),
+                started_ms: *ms,
+                cmdline: None,
+            })
+            .collect();
+        super::select_run_containers(all, cmd, "/w", started, &rivals)
+    }
 
     fn c(id: &str, created: &str, mounts: &[&str]) -> serde_json::Value {
         let ms: Vec<_> = mounts
@@ -1017,5 +1178,109 @@ mod container_choice_tests {
         b["Args"] = json!(["999"]);
         let got = pick(&[a, b], "docker run --rm -v /w:/w img sh -c unit", "/w", 0);
         assert_eq!(got, vec![short("aaa")]);
+    }
+
+    #[test]
+    fn a_wrapper_that_quotes_its_command_still_matches() {
+        // Round 18: `./dev` runs `docker run ... img sh -c "$*"`; the
+        // process list shows `sh -c mvn -q test` (spaces, not arguments),
+        // the container has Args ["-c", "mvn -q test"].
+        let mut a = c("aaa", "2999-01-01T00:00:00Z", &["/w"]);
+        a["Config"] = json!({"Image":"img"});
+        a["Path"] = json!("sh");
+        a["Args"] = json!(["-c", "mvn -q test"]);
+        let got = pick(
+            &[a],
+            "docker run --rm -e HANG -v /w:/w -w /w img sh -c mvn -q test",
+            "/w",
+            0,
+        );
+        assert_eq!(got, vec![short("aaa")]);
+    }
+
+    #[test]
+    fn docker_times_with_a_zone_are_read_in_that_zone() {
+        use super::rfc3339_ms as t;
+        assert_eq!(t("2026-11-25T11:50:10+01:00"), t("2026-11-25T10:50:10Z"));
+        assert_eq!(t("2026-11-25T05:50:10-0500"), t("2026-11-25T10:50:10Z"));
+    }
+
+    #[test]
+    fn a_container_another_live_run_could_own_is_contested() {
+        // Probe B7: runs A (started 1000) and B (started 2000) in one
+        // directory; A's container, created at 3000, is also a candidate
+        // for B's cancel. B's own container does not exist yet.
+        let all = vec![c("a", "1970-01-01T00:00:03Z", &["/w"])];
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[1000]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contested());
+        assert_eq!(got[0].rivals, vec!["rival0".to_owned()]);
+        // No other live run: the container is the run's.
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[]);
+        assert!(!got[0].contested());
+        // A run that started after the container was created cannot own it.
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2000, &[4000]);
+        assert!(!got[0].contested());
+    }
+
+    #[test]
+    fn a_rival_that_already_has_its_own_container_does_not_contest_a_later_one() {
+        // A (started 1000) has its container (created 2000); B (started
+        // 2500) has its own, created at 3000: not A's.
+        let all = vec![
+            c("a", "1970-01-01T00:00:02Z", &["/w"]),
+            c("b", "1970-01-01T00:00:03Z", &["/w"]),
+        ];
+        let got = pick_with(&all, "docker run -v /w:/w img t", 2500, &[1000]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, short("b"));
+        assert!(!got[0].contested());
+    }
+
+    #[test]
+    fn a_container_of_another_image_is_not_the_runs() {
+        // A dev container that mounts the parent directory.
+        let mut dev = c("dev", "2999-01-01T00:00:00Z", &["/"]);
+        dev["Config"] = json!({"Image":"dev-shell"});
+        let mut mine = c("mine", "2999-01-01T00:00:01Z", &["/w"]);
+        mine["Config"] = json!({"Image":"img"});
+        let got = pick(&[dev, mine], "docker run --rm img t", "/w", 0);
+        assert_eq!(got, vec![short("mine")]);
+    }
+
+    #[test]
+    fn the_note_names_the_source_that_matched() {
+        let mut a = c("a", "2999-01-01T00:00:00Z", &["/"]);
+        a["Config"] = json!({"Image":"img"});
+        let got = pick_with(&[a], "docker run --rm img t", 0, &[]);
+        assert!(got[0].matched.contains("a parent"), "{}", got[0].matched);
+        assert!(got[0].matched.contains("`/`"), "{}", got[0].matched);
+    }
+
+    #[test]
+    fn an_image_with_an_entrypoint_still_matches_the_clients_command() {
+        let mut a = c("a", "2999-01-01T00:00:00Z", &["/w"]);
+        a["Config"] = json!({"Image":"img"});
+        a["Path"] = json!("/entry.sh");
+        a["Args"] = json!(["pytest", "-q"]);
+        let got = pick(&[a], "docker run --rm -v /w:/w img pytest -q", "/w", 0);
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn an_exec_is_found_at_the_subcommand_not_anywhere() {
+        use super::container_client_execs as e;
+        assert!(e("docker exec box pytest"));
+        assert!(e("kubectl exec pod -- pytest"));
+        assert!(!e("docker run --rm img exec ./tests"));
+        assert!(!e("docker run --rm img sh -c exec"));
+    }
+
+    #[test]
+    fn the_note_says_what_matched() {
+        let all = vec![c("a", "2999-01-01T00:00:00Z", &["/w/g"])];
+        let got = pick_with(&all, "docker run --mount src=../w/g,dst=/g img t", 0, &[]);
+        assert!(got[0].matched.contains("/w/g"), "{}", got[0].matched);
+        assert!(got[0].matched.starts_with("it mounts"));
     }
 }

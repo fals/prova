@@ -938,6 +938,9 @@ struct TrialResult {
     foreign_ms: f64,
     /// CPU (ms) the trial's own processes used.
     own_ms: f64,
+    /// Files the workload left in its private /tmp (relative paths): what it
+    /// wrote outside the checkout and could read back in a later iteration.
+    tmp_left: Vec<String>,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -1001,7 +1004,21 @@ fn run_trial(
     count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
-    let mut cmd = sandboxed(dir, &p.command[0], &p.command[1..], p.allow_network);
+    // The trial's private /tmp is a host directory, so what is left in it
+    // can be seen afterwards (ADR 0035 section 4). The guard removes it on
+    // every way out of this function.
+    let tmp = sandbox_available()
+        .then(|| pycache_dir(dir).join(format!("tmp-{}", crate::ids::new_run_id())))
+        .filter(|t| private_dir(t).is_ok())
+        .map(TrialTmp);
+    let mut cmd = sandboxed_in(
+        dir,
+        &p.command[0],
+        &p.command[1..],
+        p.allow_network,
+        None,
+        tmp.as_ref().map(|t| t.0.as_path()),
+    );
     cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1028,6 +1045,7 @@ fn run_trial(
                 leaked: vec![],
                 foreign_ms: 0.0,
                 own_ms: 0.0,
+                tmp_left: vec![],
             });
         }
     };
@@ -1108,6 +1126,12 @@ fn run_trial(
         log.write_all(&e)?;
         text.push_str(&String::from_utf8_lossy(&e));
     }
+    let tmp_left = tmp.as_ref().map_or_else(Vec::new, |t| files_under(&t.0));
+    if let Some(t) = tmp
+        && let Err(e) = t.remove()
+    {
+        writeln!(log, "prova: could not remove the trial's private /tmp: {e}")?;
+    }
     let metrics = parse(&text);
     let primary_lines = count(&text)
         .into_iter()
@@ -1121,7 +1145,168 @@ fn run_trial(
         leaked,
         foreign_ms,
         own_ms: cpu_after.1.saturating_sub(cpu_before.1) as f64 * 10.0,
+        tmp_left,
     })
+}
+
+/// A trial's private /tmp on the host: removed when the trial ends, and on
+/// every early return (a drop guard), whatever permissions the workload left.
+struct TrialTmp(PathBuf);
+
+impl TrialTmp {
+    /// Removes it, reporting a failure.
+    fn remove(&self) -> std::result::Result<(), String> {
+        remove_tree(&self.0)
+    }
+}
+
+impl Drop for TrialTmp {
+    fn drop(&mut self) {
+        if let Err(e) = remove_tree(&self.0) {
+            eprintln!("prova: could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// Removes a directory tree even when the workload made parts of it
+/// read-only (a Go module cache, a read-only unpacked archive).
+fn remove_tree(root: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fn writable(d: &Path) {
+        let Ok(m) = std::fs::symlink_metadata(d) else {
+            return;
+        };
+        if !m.is_dir() {
+            return;
+        }
+        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                writable(&e.path());
+            }
+        }
+    }
+    writable(root);
+    match std::fs::remove_dir_all(root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// What the candidate's trials left in their private /tmp that the
+/// baseline's did not, when it matters: files written outside the checkout
+/// can be read back by the next iteration. What both arms leave (a JVM's
+/// hsperfdata, pytest's directory) is the tools', and is not reported;
+/// full relative paths are compared with digit runs normalised.
+fn tmp_caveat(left: &[Vec<String>; 2]) -> Option<String> {
+    // Digit runs (pids, numbered directories) are normalised; nothing else.
+    let norm = |p: &String| -> String {
+        let mut out = String::new();
+        let mut digits = false;
+        for ch in p.chars() {
+            if ch.is_ascii_digit() {
+                if !digits {
+                    out.push('#');
+                }
+                digits = true;
+            } else {
+                digits = false;
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let theirs: std::collections::BTreeSet<String> = left[0].iter().map(norm).collect();
+    let only: Vec<String> = left[1]
+        .iter()
+        .filter(|p| !theirs.contains(&norm(p)))
+        .cloned()
+        .collect();
+    if only.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = only.iter().take(3).map(String::as_str).collect();
+    Some(format!(
+        "a trial wrote files outside the checkout, in its private /tmp: the candidate's trials left {} file(s) (e.g. {}) that the baseline's did not; a workload that keeps results there and reads them back in the next iteration measures its cache, not its code: read the candidate's diff",
+        only.len(),
+        names.join(", ")
+    ))
+}
+
+/// For an ACCEPT against something other than the original baseline: the
+/// over-1000x warning again, against the original baseline's earlier
+/// measurements of the same metric.
+fn against_original(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    metric: &str,
+    result: &serde_json::Value,
+) -> Result<Option<String>> {
+    let base: String = store.conn().query_row(
+        "SELECT baseline FROM comparisons WHERE id = ?1",
+        params![comparison],
+        |r| r.get(0),
+    )?;
+    if base == "baseline" {
+        return Ok(None);
+    }
+    let Some(cand) = result["primary"]["candidate_median"].as_f64() else {
+        return Ok(None);
+    };
+    let mut stmt = store.conn().prepare(
+        "SELECT s.value FROM samples s
+           JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
+           JOIN comparisons c ON c.id = s.comparison
+          WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
+            AND t.warmup = 0 AND t.state = 'complete'
+            AND ((t.arm = 'baseline' AND c.baseline = 'baseline')
+              OR (t.arm = 'candidate' AND c.candidate = 'baseline'))",
+    )?;
+    let before: Vec<f64> = stmt
+        .query_map(params![exp, comparison, metric], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if before.len() < 5 {
+        return Ok(None);
+    }
+    let orig = stats::median(&before);
+    Ok(((orig > 0.0 && cand > 0.0 && (orig / cand).max(cand / orig) >= 1000.0)
+        || (orig == 0.0) != (cand == 0.0))
+        .then(|| {
+            format!(
+                "warning: against the original baseline this is {} -> {}: a change this large is rarely real: check that the workload still does the same work (no caching across iterations, same input) and that the numbers come from the benchmark, not from the code",
+                short(orig),
+                short(cand)
+            )
+        }))
+}
+
+/// Regular files below a directory (relative paths, sorted, at most 1000).
+fn files_under(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() {
+                todo.push(e.path());
+            } else if out.len() < 1000 {
+                out.push(
+                    e.path()
+                        .strip_prefix(root)
+                        .unwrap_or(&e.path())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn fingerprint() -> String {
@@ -1269,6 +1454,9 @@ fn work_comparison(
     // Primary-metric lines per trial, per arm; and the first leaked process.
     let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
+    // Files each arm's measured trials left in their private /tmp (the most
+    // any one trial left).
+    let tmp_files: std::cell::RefCell<[Vec<String>; 2]> = Default::default();
     // CPU other processes used per trial, per arm, with the trial's wall time.
     let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     // The trial's own CPU, with its wall time: a process stopped from
@@ -1292,6 +1480,10 @@ fn work_comparison(
             lines.borrow_mut()[i].push(r.primary_lines);
             foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
             own.borrow_mut()[i].push((r.own_ms, r.wall_ms));
+            let mut t = tmp_files.borrow_mut();
+            if r.tmp_left.len() > t[i].len() {
+                t[i] = r.tmp_left.clone();
+            }
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1389,18 +1581,8 @@ fn work_comparison(
             .map(|o| o.lines().map(str::to_owned).collect())
             .unwrap_or_default();
         let outside = out_of_scope(p, &changed);
-        if let Some(first) = outside.first() {
-            let why = if p.scope_only {
-                format!(
-                    "candidate changes {} file(s) outside the protocol's --change-only scope, e.g. {first}",
-                    outside.len()
-                )
-            } else {
-                format!(
-                    "candidate changes {} file(s) that decide the verdict (tests, benchmarks, build and runner files), e.g. {first}; if the change needs them, allow them with `--change <path>` (`prova exp protocol` before the first trial, or a new experiment)",
-                    outside.len()
-                )
-            };
+        if !outside.is_empty() {
+            let why = out_of_scope_why(p, &outside);
             let result = serde_json::json!({
                 "reason": format!("candidate is out of scope: {why}"),
                 "specification": "violated",
@@ -1443,7 +1625,7 @@ fn work_comparison(
                     // Nothing was measured or judged: not a verdict on
                     // either arm.
                     let reason = why.replace("<experiment>", &exp);
-                    return end_failed(store, &exp, comparison, &cand_name, &reason);
+                    return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
                 }
                 SpecFail::Violated(why) => why.replace("<experiment>", &exp),
             };
@@ -1451,7 +1633,7 @@ fn work_comparison(
                 let reason = format!(
                     "baseline violates the specification: {why}; measure only implementations that satisfy it"
                 );
-                return end_failed(store, &exp, comparison, &cand_name, &reason);
+                return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
             }
             c.reject_violation();
             let result = serde_json::json!({
@@ -1472,10 +1654,17 @@ fn work_comparison(
     for _ in 0..p.warmup {
         for arm in [Arm::Baseline, Arm::Candidate] {
             if !run_one(arm, true)? {
-                let why = leaked.borrow().clone().map_or_else(
+                let left = leaked.borrow().clone();
+                let why = left.clone().map_or_else(
                     || format!("{} warmup trial failed", arm.as_str()),
                     |l| format!("{l} after it ended; it would disturb the other arm's trials (`prova exp log {exp}`)"),
                 );
+                // Leftover processes are the candidate's own doing (a
+                // revalidation of the accept does not hold); a plain failure
+                // is not.
+                if left.is_some() {
+                    return end_offence(store, &exp, comparison, &cand_name, arm, &why);
+                }
                 return end_failed(store, &exp, comparison, &cand_name, &why);
             }
         }
@@ -1488,7 +1677,8 @@ fn work_comparison(
             }
             let Some(arm) = c.next_arm() else { break };
             if !run_one(arm, false)? {
-                let reason = leaked.borrow().clone().map_or_else(
+                let left = leaked.borrow().clone();
+                let reason = left.clone().map_or_else(
                     || {
                         format!(
                             "{} trial {} failed (exit != 0; `prova exp log {exp} {}`)",
@@ -1504,6 +1694,9 @@ fn work_comparison(
                         )
                     },
                 );
+                if left.is_some() {
+                    return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
+                }
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
             if let Some(where_) = tampered() {
@@ -1511,7 +1704,7 @@ fn work_comparison(
                     "trial {} changed tracked files in the {where_}: a workload must not rewrite code or data; the comparison is void",
                     counter.get()
                 );
-                return end_failed(store, &exp, comparison, &cand_name, &reason);
+                return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
             }
             c.trial(&fingerprint_of(store, comparison, counter.get())?);
         }
@@ -1523,7 +1716,7 @@ fn work_comparison(
             let o = own.borrow();
             load_imbalance(&f[0], &f[1]).or_else(|| stopped_arm(&o[0], &o[1]))
         } {
-            return end_failed(store, &exp, comparison, &cand_name, &reason);
+            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
         }
         // Each arm against its own earlier measurements: a variant whose
         // median moved 2x or more since its earlier comparisons was disturbed
@@ -1537,7 +1730,11 @@ fn work_comparison(
             [&arms[0].0, &arms[1].0],
             [&base_name_for(store, comparison)?, &cand_name],
         )? {
-            return end_failed(store, &exp, comparison, &cand_name, &reason);
+            let (reason, own) = reason;
+            if own {
+                return end_void(store, &exp, comparison, &cand_name, &reason);
+            }
+            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
         }
         // Each arm's workload must report the metric as often per trial as
         // the other: extra lines are forged output (a candidate's code can
@@ -1561,7 +1758,7 @@ fn work_comparison(
                     "the candidate's workload reported {} {}x per trial, the baseline's {b}x: extra lines are forged output, missing ones a changed workload (or a unit the reader does not know); the comparison is void{see}",
                     p.metric, c
                 );
-                return end_failed(store, &exp, comparison, &cand_name, &reason);
+                return end_void(store, &exp, comparison, &cand_name, &reason);
             }
         }
         let (outcome, result) = evaluate(store, &e, comparison)?;
@@ -1607,6 +1804,20 @@ fn work_comparison(
                     "{others} other experiment(s) measured {} on this baseline: across them one lucky ACCEPT is likelier",
                     p.metric
                 ));
+            }
+        }
+        if let Some(c) = tmp_caveat(&tmp_files.borrow()) {
+            caveats.push(c);
+        }
+        // A win this large against the original baseline is as suspect as
+        // one against the best (ADR 0035 section 4: a cache in /tmp took a
+        // candidate from 152x over the best to 4100x over the baseline).
+        if verdict == Verdict::Accept
+            && let Some(w) = against_original(store, &exp, comparison, &p.metric, &result)?
+        {
+            let reason = result["reason"].as_str().unwrap_or("").to_owned();
+            if !reason.contains("a change this large is rarely real") {
+                result["reason"] = serde_json::json!(format!("{reason}; {w}"));
             }
         }
         if !process::MACHINE_COUNTERS {
@@ -1692,6 +1903,18 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/sitecustomize.py",
     "**/usercustomize.py",
     "**/*.pth",
+    // Runner configuration: names the program a tool runs instead of the
+    // one the workload asked for, and compiled modules import as source
+    // (ADR 0035 section 4, round 18)
+    "**/.npmrc",
+    "**/.yarnrc*",
+    "**/.cargo/config*",
+    "**/rust-toolchain",
+    "**/rust-toolchain.toml",
+    "**/go.env",
+    "**/pip.conf",
+    "**/*.pyc",
+    "**/__pycache__/**",
     "**/pyproject.toml",
     "**/setup.cfg",
     "**/tox.ini",
@@ -1912,7 +2135,10 @@ fn harness_file(path: &str) -> bool {
     // Only at the top of the checkout, where `python -m` and pytest put it
     // first on sys.path; `pkg/types.py` shadows nothing.
     let module = match path.split('/').collect::<Vec<_>>().as_slice() {
-        [file] => file.strip_suffix(".py").unwrap_or(""),
+        [file] => file
+            .strip_suffix(".py")
+            .or_else(|| file.strip_suffix(".pyc"))
+            .unwrap_or(""),
         [dir, "__init__.py"] => dir,
         _ => return false,
     };
@@ -1943,6 +2169,38 @@ pub fn glob_match(glob: &str, path: &str) -> bool {
     let g: Vec<&str> = glob.split('/').collect();
     let p: Vec<&str> = path.split('/').collect();
     go(&g, &p)
+}
+
+/// Why a candidate that changed `outside` is rejected unmeasured. A file the
+/// protocol froze with `--spec` is never offered for `--change`: the
+/// specification cannot move (ADR 0035 section 4).
+fn out_of_scope_why(p: &Protocol, outside: &[String]) -> String {
+    let first = outside.first().map_or("", String::as_str);
+    if p.scope_only {
+        return format!(
+            "candidate changes {} file(s) outside the protocol's --change-only scope, e.g. {first}",
+            outside.len()
+        );
+    }
+    let frozen: Vec<&str> = outside
+        .iter()
+        .filter(|f| p.specs.iter().any(|s| s.path == **f))
+        .map(String::as_str)
+        .collect();
+    let head = format!(
+        "candidate changes {} file(s) that decide the verdict (tests, benchmarks, build and runner files), e.g. {first}",
+        outside.len()
+    );
+    if frozen.is_empty() {
+        format!(
+            "{head}; if the change needs them, allow them with `--change <path>` (`prova exp protocol` before the first trial, or a new experiment)"
+        )
+    } else {
+        format!(
+            "{head}; {} is frozen as the specification and cannot be allowed: the candidate must satisfy it, not change it",
+            frozen.join(", ")
+        )
+    }
 }
 
 /// Files the candidate changed that the protocol does not let it change.
@@ -2102,7 +2360,7 @@ fn overlay_available() -> bool {
 /// must write; its own process namespace, which dies with prova. The other
 /// arm's checkout, prova's store and the user's files cannot be changed.
 fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Command {
-    sandboxed_in(dir, program, args, network, None)
+    sandboxed_in(dir, program, args, network, None, None)
 }
 
 /// `sandboxed`, with the checkout shown through an overlay whose writes go
@@ -2115,22 +2373,19 @@ fn sandboxed_in(
     args: &[String],
     network: bool,
     overlay: Option<&Path>,
+    tmp: Option<&Path>,
 ) -> Command {
     let state = pycache_dir(dir);
     let _ = std::fs::create_dir_all(&state);
     let mut c = if sandbox_available() {
         let mut c = Command::new("bwrap");
-        c.args([
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--tmpfs",
-            "/tmp",
-        ]);
+        c.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
+        // A private /tmp: a fresh tmpfs, or a host directory of its own that
+        // the caller looks at when the command ends.
+        match tmp {
+            Some(t) => c.arg("--bind").arg(t).arg("/tmp"),
+            None => c.args(["--tmpfs", "/tmp"]),
+        };
         match overlay.filter(|_| overlay_available()) {
             Some(o) => {
                 c.arg("--bind").arg(o).arg(o);
@@ -2209,7 +2464,8 @@ fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
 }
 
 /// A variant whose median in this comparison is 2x away from its median in
-/// earlier decided comparisons of the experiment.
+/// earlier decided comparisons of the experiment: the reason, and whether
+/// the drift is the candidate's own (see `classify_drift`).
 fn drifted(
     store: &Store,
     exp: &str,
@@ -2217,8 +2473,9 @@ fn drifted(
     metric: &str,
     arms: [&Arm; 2],
     names: [&str; 2],
-) -> Result<Option<String>> {
+) -> Result<Option<(String, bool)>> {
     let (now_b, now_c) = samples(store, comparison, metric)?;
+    let mut medians: [Option<(f64, f64)>; 2] = [None, None];
     for (i, now) in [now_b, now_c].into_iter().enumerate() {
         let mut stmt = store.conn().prepare(
             "SELECT s.value FROM samples s
@@ -2235,18 +2492,58 @@ fn drifted(
             continue;
         }
         let (m0, m1) = (stats::median(&before), stats::median(&now));
-        if m0 > 0.0 && m1 > 0.0 && (m1 / m0).max(m0 / m1) >= 2.0 {
-            return Ok(Some(format!(
-                "the {} ({}) measured {} now but {} in this experiment's earlier comparisons ({:.1}x): something disturbed it or its workload changed, so the comparison is void",
-                arms[i].as_str(),
-                names[i],
+        if m0 > 0.0 && m1 > 0.0 {
+            medians[i] = Some((m0, m1));
+        }
+    }
+    Ok(classify_drift(medians[0], medians[1]).map(|d| {
+        let (m0, m1) = medians[d.arm].unwrap_or((1.0, 1.0));
+        let tail = if d.own {
+            "something disturbed it or its workload changed, so the comparison is void"
+        } else {
+            "the other arm moved alike (a loaded or throttled machine?), so the comparison says nothing about the candidate"
+        };
+        (
+            format!(
+                "the {} ({}) measured {} now but {} in this experiment's earlier comparisons ({:.1}x): {tail}",
+                arms[d.arm].as_str(),
+                names[d.arm],
                 short(m1),
                 short(m0),
                 (m1 / m0).max(m0 / m1)
-            )));
-        }
+            ),
+            d.own,
+        )
+    }))
+}
+
+struct Drift {
+    /// The arm that moved most: 0 baseline, 1 candidate.
+    arm: usize,
+    /// The drift is the candidate's own: its median moved 2x or more AND
+    /// its ratio to the baseline moved 2x or more. Both arms moving alike
+    /// (a throttled host, a cold start) is the machine, not the candidate.
+    own: bool,
+}
+
+/// Each argument: (median in earlier comparisons, median now) of one arm.
+fn classify_drift(base: Option<(f64, f64)>, cand: Option<(f64, f64)>) -> Option<Drift> {
+    let factor = |a: Option<(f64, f64)>| a.map_or(1.0, |(m0, m1)| (m1 / m0).max(m0 / m1));
+    let (fb, fc) = (factor(base), factor(cand));
+    if fb < 2.0 && fc < 2.0 {
+        return None;
     }
-    Ok(None)
+    let ratio_moved = match (base, cand) {
+        (Some((b0, b1)), Some((c0, c1))) => {
+            let (r0, r1) = (c0 / b0, c1 / b1);
+            (r1 / r0).max(r0 / r1) >= 2.0
+        }
+        _ => true,
+    };
+    Some(Drift {
+        arm: usize::from(fc > fb),
+        own: fc >= 2.0 && ratio_moved,
+    })
 }
 
 /// Whether one arm's trials sat stopped (SIGSTOP from outside, or starved)
@@ -2444,6 +2741,7 @@ fn satisfies_spec(
         &["-c".to_owned(), oracle.clone()],
         p.allow_network,
         isolated.then_some(scratch.as_path()),
+        None,
     )
     .env_remove("PROVA_HOME")
     .env("PYTHONNOUSERSITE", "1")
@@ -2778,6 +3076,120 @@ fn end_failed(
     tx.execute(
         "INSERT INTO decisions (experiment, comparison, candidate, decision, reason, created_ms) VALUES (?1, ?2, ?3, 'crash', ?4, ?5)",
         params![exp, comparison, candidate, reason, now_ms() as i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A comparison that says nothing about the candidate (the machine, an arm
+/// held back, the oracle's own infrastructure, a baseline that violates the
+/// spec). It ends failed; when it is a revalidation of the current best the
+/// accept STANDS and the reason says the revalidation was inconclusive
+/// (ADR 0035 section 4: noise never withdraws a real accept).
+fn end_inconclusive(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    candidate: &str,
+    reason: &str,
+) -> Result<()> {
+    let best: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT best FROM experiments WHERE name = ?1",
+            params![exp],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if replicated(store, exp, comparison, i64::MAX)?.is_some() && best.as_deref() == Some(candidate)
+    {
+        let reason = format!(
+            "{reason}; the revalidation is inconclusive, not about {candidate} itself: its accept stands (rerun `prova exp revalidate {exp}` on a quieter machine)"
+        );
+        return end_failed(store, exp, comparison, candidate, &reason);
+    }
+    end_failed(store, exp, comparison, candidate, reason)
+}
+
+/// An offence seen in a trial (tampering, a leaked process): the candidate's
+/// own doing only when its arm's trial committed it. The baseline's is not
+/// about the candidate: inconclusive, the accept stands.
+fn end_offence(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    candidate: &str,
+    arm: Arm,
+    reason: &str,
+) -> Result<()> {
+    if arm == Arm::Candidate {
+        end_void(store, exp, comparison, candidate, reason)
+    } else {
+        end_inconclusive(store, exp, comparison, candidate, reason)
+    }
+}
+
+/// A comparison that is void because of the candidate's own doing (it
+/// tampered with tracked files, left processes behind, forged output, or its
+/// own median moved). When it is a revalidation of the current best, the
+/// accept it should have replicated is withdrawn as a failed replication is
+/// (ADR 0032, 0035 section 4): a result that could not be reproduced does
+/// not stay accepted.
+fn end_void(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    candidate: &str,
+    reason: &str,
+) -> Result<()> {
+    let best: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT best FROM experiments WHERE name = ?1",
+            params![exp],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let orig = replicated(store, exp, comparison, i64::MAX)?;
+    let (Some(orig), Some(best)) = (orig, best) else {
+        return end_failed(store, exp, comparison, candidate, reason);
+    };
+    if best != candidate {
+        return end_failed(store, exp, comparison, candidate, reason);
+    }
+    let before: String = store.conn().query_row(
+        "SELECT baseline FROM comparisons WHERE id = ?1",
+        params![orig],
+        |r| r.get(0),
+    )?;
+    let to = if before != candidate && trusted_reference(store, exp, &before)? {
+        before
+    } else {
+        "baseline".to_owned()
+    };
+    let reason = format!(
+        "{reason}; the revalidation could not replicate the accept of {candidate}, so it is withdrawn and the best is {to} again"
+    );
+    let tx = store.conn().unchecked_transaction()?;
+    tx.execute(
+        "UPDATE comparisons SET status = 'failed', ended_ms = ?2, result = ?3 WHERE id = ?1",
+        params![
+            comparison,
+            now_ms() as i64,
+            serde_json::json!({ "reason": reason }).to_string()
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO decisions (experiment, comparison, candidate, decision, reason, created_ms) VALUES (?1, ?2, ?3, 'crash', ?4, ?5)",
+        params![exp, comparison, candidate, reason, now_ms() as i64],
+    )?;
+    tx.execute(
+        "INSERT INTO best_resets (experiment, from_best, to_best, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![exp, candidate, to, format!("revalidation {comparison} was void and did not replicate the accept"), now_ms() as i64],
+    )?;
+    tx.execute(
+        "UPDATE experiments SET best = ?2 WHERE name = ?1",
+        params![exp, to],
     )?;
     tx.commit()?;
     Ok(())
@@ -3506,6 +3918,159 @@ mod revalidation_tests {
         assert_eq!(verdict, Verdict::Accept, "{result}");
     }
 
+    /// ADR 0035 section 4: a cache in /tmp took a candidate from 152x over
+    /// the best to 4100x over the original baseline; the warning looks at both.
+    #[test]
+    fn the_implausible_win_warning_also_compares_with_the_original_baseline() {
+        let (s, _d) = fresh();
+        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
+        let c = s.conn();
+        c.execute(
+            "INSERT INTO variants (experiment, name, kind, code, params, created_ms)
+             VALUES ('e', 'c2', 'workdir', 'x', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO comparisons (id, experiment, baseline, candidate, status, created_ms)
+             VALUES ('c-2', 'e', 'c1', 'c2', 'running', 200)",
+            [],
+        )
+        .unwrap();
+        // 3 now against the best (1x), but the baseline measured about 12.
+        let near = serde_json::json!({ "primary": { "candidate_median": 3.0 } });
+        assert!(
+            against_original(&s, "e", "c-2", "t", &near)
+                .unwrap()
+                .is_none()
+        );
+        let huge = serde_json::json!({ "primary": { "candidate_median": 0.001 } });
+        let w = against_original(&s, "e", "c-2", "t", &huge)
+            .unwrap()
+            .unwrap();
+        assert!(
+            w.starts_with("warning: against the original baseline"),
+            "{w}"
+        );
+        // Against the baseline itself the comparison's own warning applies.
+        assert!(
+            against_original(&s, "e", "c-1", "t", &huge)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_spec_frozen_file_is_not_offered_for_change() {
+        let mut p = protocol();
+        p.specs = vec![SpecFile {
+            path: "spec/x.qnt".into(),
+            sha256: "0".into(),
+        }];
+        let both = out_of_scope_why(&p, &["spec/x.qnt".into(), "tests/a.rs".into()]);
+        assert!(
+            both.contains("spec/x.qnt is frozen as the specification"),
+            "{both}"
+        );
+        assert!(!both.contains("--change"), "{both}");
+        let other = out_of_scope_why(&p, &["tests/a.rs".into()]);
+        assert!(
+            other.contains("allow them with `--change <path>`"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn files_left_in_the_private_tmp_are_reported() {
+        assert!(tmp_caveat(&[vec![], vec![]]).is_none());
+        let c = tmp_caveat(&[vec![], vec!["cache/a".into(), "b".into()]]).unwrap();
+        assert!(
+            c.contains("candidate's trials left 2 file(s) (e.g. cache/a, b)"),
+            "{c}"
+        );
+        // Files both arms leave (a JVM's hsperfdata, pytest's directory) say
+        // nothing about the candidate.
+        let shared = tmp_caveat(&[
+            vec!["hsperfdata_u/11".into()],
+            vec!["hsperfdata_u/22".into()],
+        ]);
+        assert!(shared.is_none(), "{shared:?}");
+        let c = tmp_caveat(&[
+            vec!["hsperfdata_u/11".into()],
+            vec!["hsperfdata_u/22".into(), "cache/a".into()],
+        ])
+        .unwrap();
+        assert!(c.contains("left 1 file(s) (e.g. cache/a)"), "{c}");
+        // A cache under a directory the baseline also creates is reported.
+        let c = tmp_caveat(&[
+            vec![".cache/x".into(), "pytest-of-u/pytest-3/a".into()],
+            vec![
+                ".cache/x".into(),
+                ".cache/results".into(),
+                "pytest-of-u/pytest-4/a".into(),
+            ],
+        ])
+        .unwrap();
+        assert!(c.contains("left 1 file(s) (e.g. .cache/results)"), "{c}");
+    }
+
+    /// A revalidation that cannot say anything about the candidate (the
+    /// machine, an arm that was stopped) keeps the accept and says so.
+    #[test]
+    fn an_inconclusive_revalidation_keeps_the_accept() {
+        let (s, _d) = fresh();
+        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
+        comparison(&s, "rv", None, SAME);
+        end_inconclusive(&s, "e", "rv", "c1", "the load differed between the arms").unwrap();
+        assert_eq!(get(&s, "e").unwrap().best, "c1");
+        let reason: String = s
+            .conn()
+            .query_row("SELECT result FROM comparisons WHERE id = 'rv'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(reason.contains("inconclusive"), "{reason}");
+    }
+
+    /// The candidate's own misbehaviour in a revalidation withdraws it.
+    #[test]
+    fn a_void_revalidation_of_the_candidates_own_making_withdraws_the_accept() {
+        let (s, _d) = fresh();
+        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
+        comparison(&s, "rv", None, SAME);
+        end_void(&s, "e", "rv", "c1", "it left a process behind").unwrap();
+        assert_eq!(get(&s, "e").unwrap().best, "baseline");
+    }
+
+    /// Both arms moved alike: the machine, not the candidate.
+    #[test]
+    fn a_drift_of_both_arms_is_not_the_candidates_own() {
+        // (earlier median, median now) per arm.
+        let both = classify_drift(Some((10.0, 30.0)), Some((4.0, 12.0))).unwrap();
+        assert!(!both.own);
+        let cand = classify_drift(Some((10.0, 10.5)), Some((4.0, 10.0))).unwrap();
+        assert!(cand.own);
+        let base = classify_drift(Some((10.0, 25.0)), Some((4.0, 4.1))).unwrap();
+        assert!(!base.own);
+        assert!(classify_drift(Some((10.0, 12.0)), Some((4.0, 5.0))).is_none());
+    }
+
+    /// A trial's private /tmp is removed even when the workload left
+    /// read-only directories in it.
+    #[test]
+    fn a_read_only_tree_is_still_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("prova-rotree-{}", crate::ids::new_run_id()));
+        let inner = d.join("a/b");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("f"), "x").unwrap();
+        for p in [&inner, &d.join("a")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        remove_tree(&d).unwrap();
+        assert!(!d.exists());
+    }
+
     #[test]
     fn a_failed_replication_withdraws_the_accept() {
         let (s, _d) = fresh();
@@ -3551,5 +4116,35 @@ mod oracle_input_tests {
         }
         assert!(!harness_file("src/primes.rs"));
         assert!(!harness_file("src/golden_ratio.rs"));
+    }
+
+    /// ADR 0035 section 4: configuration that names the program a tool runs
+    /// and compiled modules decide the verdict too.
+    #[test]
+    fn runner_configuration_and_compiled_modules_are_harness_files() {
+        for f in [
+            ".npmrc",
+            "web/.npmrc",
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".cargo/config.toml",
+            ".cargo/config",
+            "crates/x/.cargo/config.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            "go.env",
+            "pip.conf",
+            "sitecustomize.py",
+            "usercustomize.py",
+            "json.pyc",
+            "pkg/helper.pyc",
+            "pkg/__pycache__/x.cpython-313.pyc",
+            "__pycache__/x.txt",
+        ] {
+            assert!(harness_file(f), "{f} should decide the verdict");
+        }
+        assert!(!harness_file("src/cargo_config.rs"));
+        assert!(!harness_file("docs/rust-toolchain-notes.md"));
+        assert!(!harness_file("rust-toolchain.rs"));
     }
 }

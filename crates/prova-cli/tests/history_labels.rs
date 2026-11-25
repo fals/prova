@@ -414,6 +414,71 @@ fn a_hung_run_without_live_tests_names_the_suspects() {
     );
 }
 
+/// Round 18: with nothing reported, the suspects are every test the suite
+/// has; the note says the hung test cannot be told instead of presenting
+/// the whole suite as a lead. Medium: the stall note of a real run.
+#[test]
+fn a_whole_suite_of_suspects_says_it_cannot_tell() {
+    let d = workspace("suspects-whole");
+    std::fs::write(
+        d.join("prova.toml"),
+        concat!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; ",
+            "printf '<testsuite name=\\\"s\\\"><testcase classname=\\\"s\\\" name=\\\"a\\\"/><testcase classname=\\\"s\\\" name=\\\"hangs\\\"/></testsuite>' ",
+            "> build/test-results/junit.xml\"\n",
+        ),
+    )
+    .unwrap();
+    assert!(text(&prova(&d, &["run", "j"])).contains("PASSED"));
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(
+        w.contains("cannot be told")
+            && w.contains("before any test reported")
+            && !w.contains("likely among them"),
+        "{w}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
+/// Round 18: a stalled `make` run names the project's suite that runs the
+/// runner directly, which names the hung test.
+#[test]
+fn a_stalled_make_run_names_the_direct_suite() {
+    let d = workspace("stall-make-direct");
+    std::fs::write(d.join("Makefile"), "test:\n\tsleep 30\n").unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.mk]\nrun = \"make test\"\n[suite.direct]\nrun = \"go test -json ./...\"\n",
+    )
+    .unwrap();
+    let id = text(&prova(
+        &d,
+        &["run", "mk", "--detach", "--stall-after", "1s"],
+    ))
+    .trim()
+    .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    assert!(
+        w.contains("prova run direct --until first-failure")
+            && w.contains("if it runs these tests"),
+        "{w}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
 /// Round 16: a list of suspects cut at five ended in "..." and hid the hung
 /// test. A list cut short says how many it left out.
 #[test]

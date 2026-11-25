@@ -220,6 +220,150 @@ fn rust_experiments() {
     );
 }
 
+const METRIC_MAIN: &str = r#"fn main() {
+    //PRE//
+    println!("{{\"metric\":\"steps\",\"value\":{}}}", //VAL//);
+}
+"#;
+
+fn write_main(d: &Path, pre: &str, val: &str) {
+    let src = METRIC_MAIN.replace("//PRE//", pre).replace("//VAL//", val);
+    std::fs::write(d.join("src/main.rs"), src).unwrap();
+}
+
+fn git(d: &Path, args: &[&str]) {
+    let o = Command::new("git")
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .current_dir(d)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// A throwaway cargo project (real cargo, no dependencies) whose binary
+/// prints one metric line, committed as the baseline of experiment `e`
+/// (metric `steps`, lower is better, baseline 100).
+fn cargo_experiment(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-large-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(
+        d.join("Cargo.toml"),
+        "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(d.join(".gitignore"), "target/\n.prova/\n").unwrap();
+    write_main(&d, "", "100");
+    git(&d, &["init", "-q"]);
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-qm", "base"]);
+    let o = host(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--",
+            "cargo",
+            "run",
+            "-q",
+            "--offline",
+        ],
+        &[],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    d
+}
+
+/// ADR 0035 section 4 (round 18 B9): a candidate that adds
+/// `.cargo/config.toml` with a `runner` that prints the metric forged the
+/// result. Runner configuration is a harness file: out of scope, unmeasured.
+#[test]
+#[ignore = "large: needs cargo"]
+fn cargo_runner_config_is_out_of_scope() {
+    let d = cargo_experiment("exp-runner");
+    std::fs::create_dir_all(d.join(".cargo")).unwrap();
+    std::fs::write(
+        d.join(".cargo/config.toml"),
+        r#"[target.'cfg(unix)']
+runner = ["sh", "-c", "echo '{\"metric\":\"steps\",\"value\":1}'", "x"]
+"#,
+    )
+    .unwrap();
+    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
+    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
+    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
+    assert_eq!(
+        r["comparison"]["candidate_trials"], 0,
+        "never measured: {r}"
+    );
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("out of scope") && reason.contains(".cargo/config.toml"),
+        "{reason}"
+    );
+}
+
+/// ADR 0035 section 4 (round 18 B8): a candidate fast only while an
+/// environment variable is set is accepted with it, and the revalidation
+/// without it withdraws the accept.
+#[test]
+#[ignore = "large: needs cargo"]
+fn cargo_env_dependent_speedup_is_withdrawn_on_revalidation() {
+    let d = cargo_experiment("exp-env");
+    write_main(
+        &d,
+        "let v = if std::env::var(\"KNOB\").is_ok() { 50 } else { 100 };",
+        "v",
+    );
+    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
+    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[("KNOB", "1")]));
+    assert_eq!(r["comparison"]["verdict"], "accept", "{r}");
+    assert_eq!(r["best"], "c1", "{r}");
+    let v = json_last_line(&host(&d, &["exp", "revalidate", "e", "--json"], &[]));
+    assert_eq!(v["best"], "baseline", "the accept must be withdrawn: {v}");
+    assert!(v.to_string().contains("withdrawn"), "{v}");
+}
+
+/// ADR 0035 section 4 (round 18 M1): a candidate that caches results in the
+/// temp directory between iterations gets the private-/tmp caveat.
+#[test]
+#[ignore = "large: needs cargo and bubblewrap"]
+fn cargo_results_cached_in_tmp_are_reported() {
+    if !prova_core::experiment::sandbox_available() {
+        eprintln!("skipped: no bubblewrap here, /tmp is not private");
+        return;
+    }
+    let d = cargo_experiment("exp-tmp");
+    write_main(
+        &d,
+        "std::fs::write(std::env::temp_dir().join(\"results-cache\"), \"x\").unwrap();",
+        "100",
+    );
+    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
+    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
+    let caveats = r["comparison"]["result"]["caveats"].to_string();
+    assert!(
+        caveats.contains("private /tmp") && caveats.contains("results-cache"),
+        "{r}"
+    );
+}
+
 // ------------------------------------------------------------- docker
 
 fn docker(args: &[&str]) -> Output {
@@ -530,6 +674,216 @@ fn go_lean_spec_experiment() {
 /// Isolated prova home for a test workspace, outside it (ADR 0014).
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
+}
+
+// ------------------------------------------------- containers (ADR 0035 §3)
+
+/// A copy of python-make with a `./dev` wrapper that runs its argument in
+/// the python image, as projects do (`exec docker run ... sh -c "$*"`).
+/// Dropping it kills every container of this image that mounts the copy,
+/// and nothing else.
+struct DevWorld {
+    dir: PathBuf,
+    tag: String,
+}
+
+impl DevWorld {
+    fn new(name: &str) -> DevWorld {
+        let tag = image("python");
+        let d = copy_fixture_as("python-make", &format!("python-make-{name}"))
+            .canonicalize()
+            .unwrap();
+        let id = |flag: &str| {
+            let o = Command::new("id").arg(flag).output().unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_owned()
+        };
+        let script = format!(
+            "#!/bin/sh\nexec docker run --rm --user {}:{} -e HOME=/tmp -e HANG -v \"$PWD\":/w -w /w {tag} sh -c \"$*\"\n",
+            id("-u"),
+            id("-g")
+        );
+        std::fs::write(d.join("dev"), script).unwrap();
+        assert!(
+            Command::new("chmod")
+                .args(["755", d.join("dev").to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let w = DevWorld { dir: d, tag };
+        assert!(
+            w.containers().is_empty(),
+            "stale containers: {:?}",
+            w.containers()
+        );
+        w
+    }
+
+    /// Running containers of the image that mount this copy.
+    fn containers(&self) -> Vec<String> {
+        let o = docker(&[
+            "ps",
+            "-q",
+            "--filter",
+            &format!("ancestor={}", self.tag),
+            "--filter",
+            &format!("volume={}", self.dir.display()),
+        ]);
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn prova(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        host(&self.dir, args, env)
+    }
+
+    /// Starts `./dev "python -m pytest -v"` detached with the test hanging.
+    fn start_hanging(&self) -> String {
+        let o = self.prova(
+            &[
+                "run",
+                "--detach",
+                "--json",
+                "--stall-after",
+                "5s",
+                "--",
+                "./dev",
+                "python -m pytest -v",
+            ],
+            &[("HANG", "1")],
+        );
+        json_last_line(&o)["run"].as_str().unwrap().to_owned()
+    }
+
+    fn wait_stall(&self, run: &str) {
+        let w = self.prova(
+            &[
+                "wait",
+                run,
+                "--until",
+                "stall",
+                "--max-wait",
+                "120s",
+                "--json",
+            ],
+            &[],
+        );
+        assert_eq!(
+            json_last_line(&w)["reason"],
+            "stall",
+            "{}",
+            String::from_utf8_lossy(&w.stdout)
+        );
+    }
+
+    fn cancel_and_wait(&self, run: &str) -> serde_json::Value {
+        assert!(self.prova(&["cancel", run], &[]).status.success());
+        json_last_line(&self.prova(
+            &[
+                "wait",
+                run,
+                "--until",
+                "done",
+                "--max-wait",
+                "60s",
+                "--json",
+            ],
+            &[],
+        ))
+    }
+}
+
+impl Drop for DevWorld {
+    fn drop(&mut self) {
+        for c in self.containers() {
+            docker(&["kill", &c]);
+        }
+    }
+}
+
+/// Round 18 (blocker): `prova cancel` missed the run's container behind a
+/// wrapper that quotes its command (`sh -c "$*"`), so a hung suite kept a
+/// container running after the cancel. Large: only a real docker shows the
+/// words docker keeps for the container's command.
+#[test]
+#[ignore = "large: needs docker (the cancel must find a container started by a wrapper script)"]
+fn cancel_stops_the_container_a_quoting_wrapper_started() {
+    let w = DevWorld::new("wrapper-cancel");
+    let run = w.start_hanging();
+    w.wait_stall(&run);
+    assert_eq!(w.containers().len(), 1, "the run's container is up");
+    let s = w.cancel_and_wait(&run);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(
+        w.containers().is_empty(),
+        "container left running after cancel: {:?}\n{s}",
+        w.containers()
+    );
+}
+
+/// Round 18 (blocker): with two runs of one directory live, a cancel of one
+/// killed the other's container. A cancel kills the container created for
+/// the run (the other run already has its own, created before it) and
+/// nothing else: the other run keeps running until it is cancelled too. The
+/// case where a container could be either run's (contested, kill nothing) is
+/// a race with docker's own latency and is tested in medium, with a fake client.
+#[test]
+#[ignore = "large: needs docker (two live runs of one directory, one container each)"]
+fn cancel_does_not_kill_the_container_of_another_live_run() {
+    let w = DevWorld::new("wrapper-two-runs");
+    let a = w.start_hanging();
+    w.wait_stall(&a);
+    let a_container = w.containers();
+    assert_eq!(a_container.len(), 1, "A's container");
+    let b = w.start_hanging();
+    w.wait_stall(&b);
+    assert_eq!(w.containers().len(), 2, "one container per run");
+    let s = w.cancel_and_wait(&b);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        w.containers(),
+        a_container,
+        "cancelling B must leave A's container and only it: {s}"
+    );
+    let other = json_last_line(&w.prova(&["status", &a, "--json"], &[]));
+    assert_eq!(other["status"], "running", "{other}");
+    let s = w.cancel_and_wait(&a);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(w.containers().is_empty(), "{:?}\n{s}", w.containers());
+}
+
+/// Round 18: the first `--until first-failure` wait through a container
+/// client announced 30 s and waited 65. A wrapper hides the client from the
+/// command line, so the wait says when it learns of the container and how
+/// long it will really take. The suite is quiet: no failure, no slow-test event.
+#[test]
+#[ignore = "large: needs docker; takes about 65 s (a container stall is called after 60 s)"]
+fn the_first_wait_through_a_wrapper_says_how_long_it_really_is() {
+    let w = DevWorld::new("wrapper-announce");
+    let o = w.prova(
+        &[
+            "run",
+            "--until",
+            "first-failure",
+            "--",
+            "./dev",
+            "sleep 600",
+        ],
+        &[("HANG", "1")],
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("up to 1m05s in all"),
+        "the wait never said it would last 1m05s in all:\n{err}\n{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let _ = w.prova(&["cancel", "last"], &[]);
+    w.prova(
+        &["wait", "last", "--until", "done", "--max-wait", "60s"],
+        &[],
+    );
 }
 
 // ------------------------------------------------- places (ADR 0035 section 1)
