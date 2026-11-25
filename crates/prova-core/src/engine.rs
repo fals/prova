@@ -3096,12 +3096,36 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // run's unfinished tests say nothing about the code (ADR 0018).
     // Only a verified pass is evidence the suite can pass on this code
     // (round 11: an echoed pass made a real failure "likely flaky").
-    let suite_passed_on_same_code = row.status == Status::Finished && {
+    // Like with like (ADR 0034 section 3): a pass that set quarantined
+    // failures aside (exit code not 0) did not pass on this code, and a
+    // pass is evidence about a test only if that run ran the test.
+    let passes_on_same_code: Vec<String> = if row.status == Status::Finished {
         let prev = store.suite_history(&row.suite, selection.as_deref(), row.created_ms, 200)?;
         let ids: Vec<String> = prev.iter().map(|r| r.id.clone()).collect();
         let thin = store.unverified(&ids)?;
-        prev.iter().any(|r| {
-            r.code == row.code && r.outcome == Some(Outcome::Passed) && !thin.contains(&r.id)
+        prev.iter()
+            .filter(|r| {
+                r.code == row.code
+                    && r.outcome == Some(Outcome::Passed)
+                    && r.exit_code == Some(0)
+                    && !thin.contains(&r.id)
+            })
+            .map(|r| r.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let suite_passed_ran = |display: &str| -> bool {
+        passes_on_same_code.iter().any(|r| {
+            store
+                .conn()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
+                      WHERE a.run_id = ?1 AND t.display = ?2 AND a.outcome = 'passed')",
+                    rusqlite::params![r, display],
+                    |q| q.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
         })
     };
     let mut failures = Vec::new();
@@ -3135,7 +3159,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             outcome: *outcome,
             message: message.or_else(|| crate::output::test_output_summary(store, run, &id)),
             context: crate::analysis::failure_context(store, &id, run)?.map(|mut c| {
-                c.suite_passed_on_same_code = suite_passed_on_same_code;
+                c.suite_passed_on_same_code = suite_passed_ran(&key.display());
                 c
             }),
         });
@@ -3644,8 +3668,17 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
                        AND status = 'finished' AND outcome = 'passed'
                        AND json_extract(spec, '$.selection') IS NULL
                        AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
+                       -- a suite that did not run the failing test says
+                       -- nothing about it (round 18)
+                       AND (NOT EXISTS (SELECT 1 FROM attempts fa WHERE fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored'))
+                            OR EXISTS (SELECT 1 FROM attempts pa JOIN tests pt ON pt.id = pa.test_id
+                                        JOIN tests ft ON ft.display = pt.display
+                                        JOIN attempts fa ON fa.test_id = ft.id
+                                       WHERE pa.run_id = r.id AND pa.outcome = 'passed'
+                                         AND fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored')))
+                       AND r.exit_code = 0
                      ORDER BY created_ms DESC LIMIT 1",
-                    rusqlite::params![row.code, row.suite],
+                    rusqlite::params![row.code, row.suite, row.id],
                     |r| Ok(serde_json::json!({ "run": r.get::<_, String>(0)?, "suite": r.get::<_, String>(1)? })),
                 )
                 .ok()
