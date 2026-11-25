@@ -1691,7 +1691,19 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
             bail!("nothing to write");
         }
         std::fs::write(&path, &toml)?;
+        // A short nextest slow-timeout (issue #88), only in a project that
+        // has no nextest config of its own: an existing file is the owner's.
+        let nextest_cfg = root.join(".config/nextest.toml");
+        let wrote_nextest = p.nextest_slow_timeout
+            && !nextest_cfg.exists()
+            && std::fs::create_dir_all(root.join(".config")).is_ok()
+            && std::fs::write(&nextest_cfg, prova_adapters::adopt::NEXTEST_SLOW_CONFIG).is_ok();
         if !json {
+            if wrote_nextest {
+                println!(
+                    "wrote .config/nextest.toml (slow-timeout 5s: a hung test is named while it runs)"
+                );
+            }
             let names: Vec<&str> = p.suites.iter().map(|s| s.name.as_str()).collect();
             println!("wrote prova.toml with suite(s) {}", names.join(", "));
             for n in &p.notes {

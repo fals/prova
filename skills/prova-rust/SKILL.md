@@ -22,7 +22,13 @@ description: Gives the cargo test and cargo-nextest settings that let prova see 
   it. nextest writes that JSON only when a test binary ends, so prova also
   reads nextest's own status lines (`PASS`, `FAIL`, `SLOW`) as they print:
   the first failure arrives while the run goes on, and nextest's `SLOW`
-  line makes `prova wait` return on a hung test. Nightly `cargo test -- -Z unstable-options --format json` is read the
+  line makes `prova wait` return on a hung test. nextest's default
+  `slow-timeout` is 60 s and it prints no line when a test starts, so a
+  hung test is named after a minute. Set a short period in
+  `.config/nextest.toml` (`[profile.default]` then
+  `slow-timeout = { period = "5s" }`; `prova adopt --write` writes it when
+  the file does not exist) and the hung test is named after 5 s, again every
+  5 s. Nightly `cargo test -- -Z unstable-options --format json` is read the
   same way.
 - nextest does not run doctests. For a crate with a library, `prova adopt`
   adds `cargo test --doc` after nextest in the same suite, so a failing

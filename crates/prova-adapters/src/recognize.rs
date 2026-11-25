@@ -3986,6 +3986,47 @@ mod tests {
         assert_eq!((r.total(), r.summary_seen), (0, true));
     }
 
+    /// Issue #88: with a `slow-timeout` period configured, nextest prints
+    /// SLOW lines while a test runs (real cargo-nextest 0.9.152 output,
+    /// progress counter `(───)`, repeated each period): the hung test is
+    /// named while it runs, and its start is not seen twice.
+    #[test]
+    fn nextest_slow_lines_name_a_running_test_each_period() {
+        let mut r = Recognizers::default();
+        let ev = r.line("        SLOW [>  2.000s] (───) hang t::hangs");
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, EventKind::TestStarted { .. })),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestSlow {
+                    elapsed_ms: 2000,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
+        let ev = r.line("        SLOW [>  4.000s] (───) hang t::hangs");
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestSlow {
+                    elapsed_ms: 4000,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, EventKind::TestStarted { .. })),
+            "{ev:?}"
+        );
+    }
+
     /// ADR 0018: nextest's human lines are read live; the JSON that arrives
     /// when the binary ends confirms the same tests without counting twice.
     #[test]

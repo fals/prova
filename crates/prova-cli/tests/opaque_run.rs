@@ -1428,3 +1428,38 @@ fn a_container_run_is_not_stalled_by_an_idle_process_tree() {
         stdout(&w)
     );
 }
+
+/// Issue #89: CPU used a while ago is not recent activity. A test process
+/// busy for 2 s (collection, imports) then hung in `sleep` was credited as
+/// active for the whole 5 s busy window after its last tick, so
+/// `--stall-after 2s` fired at about 9 s, not 4 s. Medium: needs a real
+/// process tree with real CPU use.
+#[test]
+fn a_stall_is_counted_from_the_last_cpu_use_not_the_busy_window() {
+    let d = workspace("stallclock");
+    let id = detach(
+        &d,
+        &["--stall-after", "2s"],
+        "perl -e '$t = time; while (time - $t < 2) {}'; echo done collecting; exec sleep 60",
+    );
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
+    );
+    assert_eq!(w.status.code(), Some(3), "stalled: {}", stdout(&w));
+    let s = json(&w);
+    let elapsed = s["elapsed_ms"].as_u64().unwrap();
+    assert!(
+        elapsed < 6500,
+        "last CPU at ~2 s, stall-after 2 s: reported at {elapsed} ms: {s}"
+    );
+    prova(&d, &["cancel", &id]);
+}
