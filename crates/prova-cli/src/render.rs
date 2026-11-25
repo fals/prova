@@ -1200,6 +1200,7 @@ mod live_tests {
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             running_for_ms: vec![],
             skipped_tests: vec![],
+            not_reported: vec![],
             selection: None,
             framework: None,
             failures: vec![],

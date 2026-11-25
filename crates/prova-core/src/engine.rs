@@ -261,6 +261,10 @@ struct Supervisor<'a> {
     /// The client's command line, to find its container when the run is
     /// stopped (round 15).
     container_cmd: Option<String>,
+    /// The note that the tests run through a container client was emitted
+    /// (once, as soon as the client is known: a wait reads it to give a
+    /// stall the time it needs, ADR 0031 §4).
+    container_noted: bool,
     /// The run's working directory and start (ms since the epoch): a
     /// container started without a name is found by what it mounts and when
     /// it was created (round 16).
@@ -662,6 +666,20 @@ impl Supervisor<'_> {
         });
     }
 
+    /// Says once that the tests run through a container client.
+    fn note_container(&mut self) {
+        if let Some(client) = self.container
+            && !self.container_noted
+        {
+            self.container_noted = true;
+            self.emit(EventKind::RunNote {
+                message: format!(
+                    "the tests ran through `{client}`: their processes and sockets are out of prova's sight, so no size is recorded for them"
+                ),
+            });
+        }
+    }
+
     /// The run is being stopped: stopping a container client does not stop
     /// its container. A container the run named (`--name`, `--cidfile`) is
     /// killed; any other is not attributable, so the run says to check.
@@ -753,6 +771,7 @@ impl Supervisor<'_> {
             if let Some((client, cmd)) = found {
                 self.container = Some(client);
                 self.container_cmd = Some(cmd);
+                self.note_container();
             }
         }
         self.known_pids.extend(u.procs.keys().copied());
@@ -910,6 +929,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         // known before any sample, however short the run (round 14 CI).
         container: crate::resources::container_client(&spec.command.display()),
         container_cmd: Some(spec.command.display()),
+        container_noted: false,
         run_cwd: row.cwd.clone(),
         run_started_ms: started_ms,
         superseded: Default::default(),
@@ -972,6 +992,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     sup.pgid = pgid;
     sup.cpu_start = process::children_ticks();
     sup.emit(EventKind::RunStarted { pid: pgid });
+    sup.note_container();
     // A parameterized case's selection that the framework can only take as
     // its whole method: all its cases run (round 15: no word of it).
     if let Some(sel) = spec.selection.as_deref() {
@@ -1231,12 +1252,8 @@ fn observe_child(
     // The test phase's size (ADR 0026 §2): what tests prova could not
     // isolate are held to. Only when the phase was sampled at least twice
     // (lines that all came at the end tell nothing about when tests ran).
-    if let Some(client) = sup.container {
-        sup.emit(EventKind::RunNote {
-            message: format!(
-                "the tests ran through `{client}`: their processes and sockets are out of prova's sight, so no size is recorded for them"
-            ),
-        });
+    if sup.container.is_some() {
+        sup.note_container();
     } else if let Some(seen) = sup.phase_seen() {
         let size = seen.size();
         let evidence = seen.evidence();
@@ -1629,7 +1646,7 @@ fn observe_child(
         {
             let lines: Vec<String> = sup.tail.iter().cloned().collect();
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let listed = list_suspects(store, &sup.suite, &suspects);
+            let listed = list_suspects(&suspects);
             let message = match class {
                 Some(c) => format!(
                     "the framework was running {c} when the run was cut short: the hung test is likely one of its {} test(s) that never reported: {listed}",
@@ -2034,42 +2051,28 @@ fn missing_since_last_pass(
     missing_since(store, run, suite, current, true)
 }
 
-/// Like `missing_since_last_pass`, from the last finished full run whatever
-/// its outcome: the suspects of a hang (round 8: a suite that never passed
-/// yet still names them).
-/// The suspects of a hung run as text, most likely first: tests that
-/// ended in an error in earlier runs of the suite (a hang is recorded as
-/// one) come before the rest, which keep their usual order. A list cut
-/// short says how many it left out (round 16: "..." hid the hung test).
-fn list_suspects(store: &Store, suite: &str, suspects: &[&String]) -> String {
+/// The suspects of a hung run as text, in the order of the last finished
+/// run (the hung test is usually the first that never reported; round 17:
+/// an alphabetical list cut at 8 hid it). A list cut short says how many it
+/// left out.
+fn list_suspects(suspects: &[&String]) -> String {
     const SHOWN: usize = 8;
-    let hurt: std::collections::BTreeSet<String> = store
-        .conn()
-        .prepare(
-            "SELECT DISTINCT t.display FROM attempts a
-               JOIN tests t ON t.id = a.test_id JOIN runs r ON r.id = a.run_id
-              WHERE r.suite = ?1 AND a.outcome = 'errored'",
-        )
-        .and_then(|mut st| {
-            st.query_map(rusqlite::params![suite], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()
-        })
-        .unwrap_or_default();
-    let mut ordered: Vec<&String> = suspects.to_vec();
-    ordered.sort_by_key(|n| !hurt.contains(n.as_str())); // stable
-    let shown: Vec<&str> = ordered.iter().take(SHOWN).map(|s| s.as_str()).collect();
+    let shown: Vec<&str> = suspects.iter().take(SHOWN).map(|s| s.as_str()).collect();
     let mut text = shown.join(", ");
-    if ordered.len() > shown.len() {
+    if suspects.len() > shown.len() {
         text.push_str(&format!(
             " (first {} of {}; {} more not listed)",
             shown.len(),
-            ordered.len(),
-            ordered.len() - shown.len()
+            suspects.len(),
+            suspects.len() - shown.len()
         ));
     }
     text
 }
 
+/// Like `missing_since_last_pass`, from the last finished full run whatever
+/// its outcome, counting the tests it skipped: the suspects of a hang
+/// (round 8: a suite that never passed yet still names them).
 fn missing_since_last_run(
     store: &Store,
     run: &str,
@@ -2111,12 +2114,16 @@ fn missing_since(
     let Some(prev) = prev else { return Ok(None) };
     let mut stmt = store.conn().prepare(
         "SELECT a.test_id, t.display FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.run_id = ?1 AND a.outcome <> 'skipped'
+         WHERE a.run_id = ?1 AND (?2 = 0 OR a.outcome <> 'skipped')
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
-         GROUP BY a.test_id ORDER BY t.display",
+         GROUP BY a.test_id ORDER BY MIN(a.rowid)",
     )?;
+    // A test the last run skipped (`TestHang` unless HANG=1) is a suspect
+    // of a hang; a removed test is not one that was skipped (ADR 0031 §4).
     let earlier: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![prev], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(rusqlite::params![prev, passed_only as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     if earlier.is_empty() {
         return Ok(None);
@@ -2789,6 +2796,11 @@ pub struct Summary {
     /// hides which (round 16).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_tests: Vec<String>,
+    /// A stalled run where no test is seen running: the tests of the last
+    /// finished run that have not reported yet, whole and in that run's
+    /// order (the text lists at most 8; ADR 0031 §4).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_reported: Vec<String>,
     /// The run's selection (`--select`), if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
@@ -3471,6 +3483,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     }
     // A stalled run where no test is seen running: name the suspects, the
     // tests of the last passing run that have not reported yet (round 8).
+    let mut not_reported: Vec<String> = Vec::new();
     if !row.status.is_terminal()
         && stalled_ms.is_some()
         && running.is_empty()
@@ -3488,7 +3501,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         {
             let lines = output_tail(store, run, 30);
             let (suspects, class) = narrow_by_running(&missing, &lines);
-            let listed = list_suspects(store, &row.suite, &suspects);
+            let listed = list_suspects(&suspects);
+            not_reported = missing.clone();
             notes.push(match class {
                 Some(c) => format!(
                     "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {listed}",
@@ -3562,6 +3576,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         // usually takes milliseconds is the hang, before any budget says so
         // (round 14).
         selection: selection.clone(),
+        not_reported,
         skipped_tests: if selection.is_none() {
             let mut v: Vec<String> = finals
                 .values()

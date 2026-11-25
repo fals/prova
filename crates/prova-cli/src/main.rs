@@ -2191,6 +2191,28 @@ fn until_name(u: UntilArg) -> &'static str {
     }
 }
 
+/// The first wait of a run through a container client, when the caller gave
+/// no --max-wait: its stall is called after 60 s (ADR 0031 §4).
+const CONTAINER_FIRST_WAIT: Duration = Duration::from_secs(65);
+
+/// How much longer a first wait of `budget` waits: the run goes through a
+/// container client (its note says so), the caller gave no --max-wait, and
+/// the wait ended running.
+fn container_wait_extension(
+    default_budget: bool,
+    reason: WaitReason,
+    notes: &[String],
+    budget: Duration,
+) -> Option<Duration> {
+    (default_budget
+        && reason == WaitReason::Running
+        && budget < CONTAINER_FIRST_WAIT
+        && notes
+            .iter()
+            .any(|n| n.starts_with("the tests ran through `")))
+    .then(|| CONTAINER_FIRST_WAIT - budget)
+}
+
 /// How long one wait may last (ADR 0019): the caller's --max-wait, else 9
 /// minutes for the result (one tool call's usual limit is 10), else 30 s.
 fn wait_budget(until: UntilArg, max_wait: Option<&str>) -> Result<std::time::Duration> {
@@ -2489,7 +2511,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                         until_name(until)
                     );
                 }
-                let s = wait_until(&store, &id, until, 0, max)?;
+                let s = wait_until(&store, &id, until, 0, max, max_wait.is_none())?;
                 render::summary_until(&s, json, Some(until.into()));
                 return Ok(exit_code(&s));
             }
@@ -2523,7 +2545,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
             let max = wait_budget(until, max_wait.as_deref())?;
-            let s = wait_until(&store, &id, until, after, max)?;
+            let s = wait_until(&store, &id, until, after, max, max_wait.is_none())?;
             render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
         }
@@ -2926,7 +2948,7 @@ fn repeat_runs(
         let id = engine::create_run(store, request)?;
         let mut child =
             engine::spawn_supervisor(store, &exe, &id).context("starting supervisor")?;
-        let s = wait_until(store, &id, UntilArg::Done, 0, left)?;
+        let s = wait_until(store, &id, UntilArg::Done, 0, left, false)?;
         let _ = child.wait();
         if s.reason != WaitReason::Done {
             if !json {
@@ -3164,9 +3186,23 @@ fn wait_until(
     until: UntilArg,
     after: u64,
     budget: Duration,
+    default_budget: bool,
 ) -> Result<Summary> {
     if matches!(until, UntilArg::FirstFailure) {
-        return Ok(engine::wait(store, id, Until::FirstFailure, after, budget)?);
+        let s = engine::wait(store, id, Until::FirstFailure, after, budget)?;
+        // A stall through a container client is called after 60 s: a first
+        // wait the caller did not size waits long enough to name it
+        // (ADR 0031 §4).
+        if let Some(more) = container_wait_extension(default_budget, s.reason, &s.notes, budget) {
+            return Ok(engine::wait(
+                store,
+                id,
+                Until::FirstFailure,
+                s.last_seq,
+                more,
+            )?);
+        }
+        return Ok(s);
     }
     let start = std::time::Instant::now();
     let mut beat = std::time::Instant::now();
@@ -3356,6 +3392,25 @@ mod tests {
     #[test]
     fn usage_exit_code_matches_clap() {
         assert_eq!(super::exit::USAGE, 2);
+    }
+
+    #[test]
+    fn a_first_wait_through_a_container_client_outlasts_its_stall() {
+        // ADR 0031 §4: a stall there is called after 60 s, and the default
+        // first wait is 30 s: the hang was never named in it.
+        use super::{WaitReason::*, container_wait_extension as ext};
+        use std::time::Duration;
+        let n = vec!["the tests ran through `docker`: out of sight".to_owned()];
+        let thirty = Duration::from_secs(30);
+        assert_eq!(
+            ext(true, Running, &n, thirty),
+            Some(Duration::from_secs(35))
+        );
+        // Not when the caller sized the wait, not for other runs, not once
+        // the wait ended for another reason.
+        assert_eq!(ext(false, Running, &n, thirty), None);
+        assert_eq!(ext(true, Running, &[], thirty), None);
+        assert_eq!(ext(true, Stall, &n, thirty), None);
     }
 }
 

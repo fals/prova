@@ -418,6 +418,60 @@ fn a_long_suspect_list_says_how_many_it_left_out() {
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
 }
 
+/// Round 17: the "not reported yet" list was alphabetical and left out the
+/// tests the last run skipped (`TestHang`, skipped unless HANG=1), so the
+/// hung test was hidden. The list follows the last run's order, counts its
+/// skipped tests, and is whole in `status --json` (ADR 0031 §4).
+#[test]
+fn the_suspects_follow_the_last_runs_order_and_include_its_skipped_tests() {
+    let d = workspace("suspects-order");
+    std::fs::write(
+        d.join("prova.toml"),
+        concat!(
+            "[suite.j]\nrun = \"[ -f hang ] && exec sleep 30; mkdir -p build/test-results; ",
+            "printf '<testsuite name=\\\"s\\\"><testcase classname=\\\"s\\\" name=\\\"zeta\\\"/><testcase classname=\\\"s\\\" name=\\\"alpha\\\"/><testcase classname=\\\"s\\\" name=\\\"hangs\\\"><skipped/></testcase></testsuite>' ",
+            "> build/test-results/junit.xml\"\n",
+        ),
+    )
+    .unwrap();
+    let first = text(&prova(&d, &["run", "j"]));
+    assert!(first.contains("PASSED"), "{first}");
+    std::fs::remove_dir_all(d.join("build")).unwrap();
+    std::fs::write(d.join("hang"), "").unwrap();
+    let id = text(&prova(&d, &["run", "j", "--detach", "--stall-after", "1s"]))
+        .trim()
+        .to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "stall", "--max-wait", "15s"],
+    ));
+    let at = |n: &str| w.find(n).unwrap_or(usize::MAX);
+    assert!(
+        at("s::zeta") < at("s::alpha") && at("s::alpha") < at("s::hangs"),
+        "{w}"
+    );
+    let j: serde_json::Value = serde_json::from_str(&text(&prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "stall",
+            "--max-wait",
+            "5s",
+            "--json",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(
+        j["not_reported"],
+        serde_json::json!(["s::zeta", "s::alpha", "s::hangs"]),
+        "{j}"
+    );
+    prova(&d, &["cancel", &id]);
+    prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
+}
+
 /// Round 9: `#[ignore]` on a test that passed in the last passing run gave
 /// a clean pass; a skipped test did not run.
 #[test]
