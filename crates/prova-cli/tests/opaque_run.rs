@@ -1471,7 +1471,8 @@ fn a_live_run_that_is_not_a_container_run_does_not_hold_back_the_cancel() {
 /// A rival container run whose argv has a word with a space
 /// (`sh -c "pytest -q"`) and whose own container exists does not contest the
 /// container of another run: the rival's command is read as words, not as
-/// the quoted text `display` prints.
+/// the quoted text `display` prints. Why medium: two live runs, a fake
+/// container client and the store, through the CLI.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_rival_with_a_quoted_word_and_its_own_container_does_not_contest() {
