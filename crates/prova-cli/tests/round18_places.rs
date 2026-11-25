@@ -340,6 +340,22 @@ fn r18_the_slow_line_names_the_crate() {
     assert!(w.contains("SLOW tests::hangs (calc)"), "{w}");
 }
 
+/// Round 18 (rust MINOR/NIT): `sizes` said "unknown 2" without naming
+/// them. Why medium: stored runs.
+#[test]
+fn r18_sizes_names_the_unknown() {
+    let d = workspace("sizesslow");
+    let mut lines = String::new();
+    for i in 0..12 {
+        lines.push_str(&format!("'test m::t{i} ... ok' "));
+    }
+    let cmd =
+        format!("{BUSY} printf '%s\\n' {lines} 'test result: ok. 12 passed; 0 failed; 0 ignored'");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let s = text(&prova(&d, &["sizes"]));
+    assert!(s.contains("m::t0") && s.contains("unknown"), "{s}");
+}
+
 /// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
 /// the tests the second did not print as "removed". Why medium: two stored
 /// runs of two suites.
