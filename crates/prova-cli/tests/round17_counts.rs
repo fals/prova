@@ -106,6 +106,25 @@ fn history_keeps_the_failure_message_and_does_not_invent_a_duration() {
     assert!(!ok.contains("p50 0ms"), "{ok}");
 }
 
+/// `make test` running `cargo test` stops at the first failing crate: the
+/// framework's count fell below the last passing run's, and prova says so.
+#[test]
+fn a_fall_in_the_frameworks_count_names_the_tests_that_did_not_run() {
+    let d = workspace("fewer");
+    let run = format!(
+        "{WORK}if [ \"$(cat state)\" = pass ]; then echo 'test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; else echo 'test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 1; fi"
+    );
+    suite(&d, &format!("[suite.default]\nrun = {run:?}\n"));
+    std::fs::write(d.join("state"), "pass").unwrap();
+    prova(&d, &["run", "default"]);
+    std::fs::write(d.join("state"), "fail").unwrap();
+    let out = text(&prova(&d, &["run", "default"]));
+    assert!(
+        out.contains("counted 5 test(s), the last passing run") && out.contains("4 did not run"),
+        "{out}"
+    );
+}
+
 /// Go `-count=4` (pass, fail, pass, fail) in one run: four attempts, and a
 /// test that both passed and failed is flaky evidence (ADR 0029 section 2).
 #[test]

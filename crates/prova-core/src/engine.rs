@@ -1368,6 +1368,7 @@ fn observe_child(
             }
         }
         if spec.selection.is_none() {
+            let warned_before = warnings.len();
             sup.flush()?; // this run's results must be in the store to compare
             // A skipped test did not run (round 9: `#[ignore]` on a test
             // that passed before gave a clean pass).
@@ -1415,6 +1416,25 @@ fn observe_child(
                             ""
                         }
                     ));
+                }
+            }
+            // No test names to compare (quiet output), but the framework's
+            // own count fell: a failing crate stops `cargo test` before the
+            // next one runs (round 17: 5 counted, 9 in the passing runs).
+            if let (Some(now), true) = (sup.framework_total, warnings.len() == warned_before)
+                && let Some((prev, before)) = last_pass_total(store, run, &sup.suite)?
+                && before > now
+            {
+                let message = format!(
+                    "the framework counted {now} test(s), the last passing run {prev} counted {before}: {} did not run (a failing crate or step can stop the command before the others)",
+                    before - now
+                );
+                // A pass that ran fewer tests is unverified; a failure shows
+                // notes, not warnings.
+                if exit_code == Some(0) {
+                    warnings.push(message);
+                } else {
+                    sup.emit(EventKind::RunNote { message });
                 }
             }
         }
@@ -2070,6 +2090,27 @@ fn list_suspects(store: &Store, suite: &str, suspects: &[&String]) -> String {
         ));
     }
     text
+}
+
+/// The suite's last passing full run before `run` and the test count its
+/// framework summary gave.
+fn last_pass_total(store: &Store, run: &str, suite: &str) -> Result<Option<(String, u64)>> {
+    use rusqlite::OptionalExtension;
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT r.id, CAST(json_extract(e.payload, '$.tests') AS INTEGER)
+               FROM runs r JOIN events e ON e.run_id = r.id AND e.kind = 'run_totals'
+              WHERE r.suite = ?1 AND r.id <> ?2 AND r.status = 'finished' AND r.outcome = 'passed'
+                AND json_extract(r.spec, '$.selection') IS NULL
+                AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
+                                 AND w.payload LIKE '%; no evidence about the tests%')
+                AND r.created_ms < (SELECT created_ms FROM runs WHERE id = ?2)
+              ORDER BY r.created_ms DESC, e.seq DESC LIMIT 1",
+            rusqlite::params![suite, run],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64)),
+        )
+        .optional()?)
 }
 
 fn missing_since_last_run(
