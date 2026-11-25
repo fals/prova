@@ -2313,7 +2313,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 // A Go test has no binary: its package heads its name.
                 analysis::retain_in_place(&mut hits, w, |e| {
                     let path = match (&e.file, e.test.rsplit_once("::")) {
-                        (None, Some((head, _))) => vec![head.to_owned()],
+                        (None, Some((head, leaf))) => vec![head.to_owned(), leaf.to_owned()],
                         _ => Vec::new(),
                     };
                     (e.file.clone(), path)

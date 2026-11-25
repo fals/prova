@@ -718,6 +718,8 @@ fn r18_a_go_root_package_without_a_slash_is_a_place() {
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["quarantine", "remove", "TestFlaky", "--in", "calc"]);
+    assert_eq!(o.status.code(), Some(0), "remove --in: {}", text(&o));
 }
 
 /// Review of PR 115 (H): a pass of crate calc's `tests::x` on this exact
