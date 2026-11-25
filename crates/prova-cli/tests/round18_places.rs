@@ -424,6 +424,63 @@ fn r18_flaky_and_history_agree_when_failures_run_on() {
     }
 }
 
+/// Round 18 (rust-make 3179c700): a quiet run cut short named a test of
+/// unknown place; both crates' quarantines then read "failed". Neither ran.
+#[test]
+fn r18_a_failure_of_unknown_place_is_no_quarantined_place_failing() {
+    let d = workspace("stalledplaces");
+    let nextest = format!(
+        "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        PASS [   0.004s] calc tests::flaky_clock' '        PASS [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 2 tests run'"
+    );
+    let quiet = format!("{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED'; exit 101");
+    prova(&d, &["run", "--", "sh", "-c", &nextest]);
+    for p in ["calc", "geo"] {
+        let o = prova(
+            &d,
+            &[
+                "quarantine",
+                "add",
+                "tests::flaky_clock",
+                "--in",
+                p,
+                "--reason",
+                "r",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let o = text(&prova(&d, &["run", "--", "sh", "-c", &quiet]));
+    assert!(o.contains("FAIL tests::flaky_clock"), "{o}");
+    assert!(
+        !o.contains("(calc) failed") && !o.contains("(geo) failed"),
+        "{o}"
+    );
+}
+
+/// Round 18 (probe M1): pytest through a container client with `-w
+/// /w/tests/b` named `test_x::test_flaky` for the tests of `tests/a` and
+/// `tests/b` alike. The rootdir the output prints is the container's path:
+/// the client's `-v host:container` mount maps it under the repository.
+#[test]
+fn r18_pytest_in_a_container_workdir_is_placed_by_the_mount() {
+    let d = workspace("pycontainer");
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(d.join("tests").join(sub)).unwrap();
+        std::fs::write(d.join("tests").join(sub).join("test_x.py"), "").unwrap();
+    }
+    let run = |sub: &str| {
+        format!(
+            "{BUSY} : docker run --rm -v {d}:/w -w /w/tests/{sub} img pytest -v; printf '%s\\n' 'rootdir: /w/tests/{sub}' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1",
+            d = d.display()
+        )
+    };
+    let a = text(&prova(&d, &["run", "--", "sh", "-c", &run("a")]));
+    assert!(a.contains("FAIL tests.a.test_x::test_flaky"), "{a}");
+    let b = text(&prova(&d, &["run", "--", "sh", "-c", &run("b")]));
+    assert!(b.contains("FAIL tests.b.test_x::test_flaky"), "{b}");
+    assert!(b.contains("first time seen") && !b.contains("FLAKY"), "{b}");
+}
+
 /// Round 18 (ts-vitest): "no history yet" for a budget, though the test has
 /// runs, meant no duration history.
 #[test]
