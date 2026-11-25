@@ -583,28 +583,13 @@ impl Supervisor<'_> {
         let id = crate::store::test_id(&self.suite, test);
         // The history is shared across suites (ADR 0018): a test this suite
         // has not recorded yet may be known from another (round 9: 60 s
-        // default in `make` while `default` knew it takes 3 ms).
-        let known = match crate::analysis::stats(self.store, &id, 20) {
-            Ok(Some(s)) => Ok(Some(s)),
-            _ => {
-                let other: Option<String> = self
-                    .store
-                    .conn()
-                    .query_row(
-                        "SELECT id FROM tests WHERE display = ?1 LIMIT 1",
-                        rusqlite::params![test.display()],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                match other {
-                    Some(o) => crate::analysis::stats(self.store, &o, 20),
-                    None => Ok(None),
-                }
-            }
-        };
-        match known {
-            Ok(Some(s)) if s.p95_ms.is_some() => (
-                Duration::from_millis((s.p95_ms.unwrap_or(0) * 3).max(1000)),
+        // default in `make` while `default` knew it takes 3 ms). Only the
+        // p95 is needed, and this runs once per test while recording: the
+        // full `stats` made a run with history cost milliseconds per test
+        // (issue 91).
+        match crate::analysis::usual_p95_ms(self.store, &id, &test.display()) {
+            Ok(Some(p95)) => (
+                Duration::from_millis((p95 * 3).max(1000)),
                 BudgetFrom::History,
             ),
             _ => (self.default_slow, BudgetFrom::Default),

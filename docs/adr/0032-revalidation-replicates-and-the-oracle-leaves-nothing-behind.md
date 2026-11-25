@@ -70,8 +70,10 @@ Three items stayed open after usability round 17.
    not yet recorded under this id is known by its name from other suites):
    `analysis::usual_p95_ms`, a bounded query, instead of `analysis::stats`.
    The cost of a result no longer grows with history. The evidence is a prova
-   experiment (frozen protocol, interleaved trials, Mann-Whitney) recorded in
-   the pull request.
+   experiment (`recording-cost`: frozen protocol, an oracle that the same 1500
+   results are recorded, interleaved trials, Mann-Whitney): ACCEPT, median
+   3239 ms to 225 ms (14.4x, p = 0.0043, comparison 3e0850cf), and again with
+   fresh trials, 3337 ms to 225 ms (14.8x, comparison 9cdfff10).
 
 ## Consequences
 
