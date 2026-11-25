@@ -277,3 +277,19 @@ fn a_pytest_stall_names_the_running_test_and_counts_the_pass() {
     assert_eq!(s["counts"]["passed"], 1, "{s}");
     assert_eq!(s["running"][0], "tests.t::test_hangs", "{s}");
 }
+
+/// Round 18 review: the printed command of an argv run is shell-quoted so
+/// it can be pasted back, in the run header as in the JSON; parsing it (the
+/// filter advice) uses the words.
+#[test]
+fn the_header_of_an_argv_run_shows_its_quoted_word() {
+    let d = workspace("quotedheader");
+    let o = prova(&d, &["run", "--", "echo", "cd sub && pytest", "it's"]);
+    let out = stdout(&o);
+    assert!(
+        out.contains(r"`echo 'cd sub && pytest' 'it'\''s'`"),
+        "{out}"
+    );
+    let o = prova(&d, &["run", "--json", "--", "echo", "cd sub && pytest"]);
+    assert_eq!(json(&o)["command"], "echo 'cd sub && pytest'");
+}

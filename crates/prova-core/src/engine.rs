@@ -995,8 +995,8 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         first_line_ms: None,
         // The command itself may be the client (`docker run ... go test`):
         // known before any sample, however short the run (round 14 CI).
-        container: crate::resources::container_client(&spec.command.display()),
-        container_cmd: Some(spec.command.display()),
+        container: crate::resources::container_client(&spec.command.raw()),
+        container_cmd: Some(spec.command.raw()),
         container_noted: false,
         run_cwd: row.cwd.clone(),
         run_started_ms: started_ms,
@@ -1024,7 +1024,15 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     let framework_filter = spec
         .selection
         .as_deref()
-        .map(|f| crate::config::framework_filter(&spec.command.display(), f))
+        .map(|f| crate::config::framework_filter(&spec.command.raw(), f))
+        .unwrap_or_default();
+    // The node id pytest takes as its own argument, if a file resolves.
+    let node = spec
+        .selection
+        .as_deref()
+        .and_then(|f| {
+            crate::config::pytest_node(&spec.command.raw(), f, std::path::Path::new(&row.cwd))
+        })
         .unwrap_or_default();
     for (k, v) in &injected {
         cmd.env(k, v);
@@ -1033,6 +1041,15 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         .env("PROVA_RUN_ID", run)
         // The selection reaches the shell only as a variable, never as text.
         .env("PROVA_FILTER", &framework_filter)
+        .env("PROVA_NODE", &node)
+        .env(
+            "PROVA_NODE_Q",
+            if node.is_empty() {
+                String::new()
+            } else {
+                crate::config::shell_single_quote(&node)
+            },
+        )
         // The same, single-quoted, for a filter inside a wrapper's quoted
         // argument (round 17).
         .env(
@@ -1069,7 +1086,7 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
     // A parameterized case's selection that the framework can only take as
     // its whole method: all its cases run (round 15: no word of it).
     if let Some(sel) = spec.selection.as_deref() {
-        let filter = crate::config::framework_filter(&spec.command.display(), sel);
+        let filter = crate::config::framework_filter(&spec.command.raw(), sel);
         if (sel.ends_with(']') || sel.ends_with(')')) && sel.contains('(') && !filter.contains('(')
         {
             sup.emit(EventKind::RunNote {
@@ -1422,6 +1439,12 @@ fn observe_child(
     // Tests quarantined by hand, as they were when this run was created (0027).
     let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
+    if status == Status::Finished
+        && observed == 0
+        && let Some(w) = surefire_report_off(&spec.command.raw())
+    {
+        warnings.push(w);
+    }
     if spec.expects_tests() && status == Status::Finished {
         // A selection that only skipped tests ran none (round 11: vitest -t
         // reports the rest as skipped; 0 passed, 5 skipped exited 0).
@@ -2391,6 +2414,16 @@ fn printed_names(display: &str) -> Vec<String> {
     out
 }
 
+/// The warning for a command that turns Surefire's XML report off: with
+/// `mvn -q` that leaves prova nothing to read (round 18).
+fn surefire_report_off(command: &str) -> Option<String> {
+    command
+        .contains("disableXmlReport=true")
+        .then(|| {
+            "Surefire's XML report is off (-DdisableXmlReport=true): prova sees no per-test result, so this pass cannot be verified; remove -DdisableXmlReport=true (or set it to false) to turn the report on".to_owned()
+        })
+}
+
 /// Whether `line` is a compiler, vet or linter diagnostic of the project's
 /// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
 fn code_diagnostic(line: &str) -> bool {
@@ -2654,7 +2687,11 @@ impl Counts {
 pub struct Summary {
     pub run: String,
     pub suite: String,
+    /// As printed: argv words shell-quoted so the line can be pasted back.
     pub command: String,
+    /// The words unquoted, for code that parses the command line.
+    #[serde(skip)]
+    pub raw_command: String,
     pub reason: WaitReason,
     pub status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3411,8 +3448,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     let explained = !failures.is_empty() && failures.iter().all(|f| f.message.is_some());
     let want_tail = reason == WaitReason::Stall
         || ((failed_run || reason == WaitReason::Failure) && !explained);
-    let command = serde_json::from_value::<RunSpec>(row.spec.clone())
-        .map(|s| s.command.display())
+    let (command, raw_command) = serde_json::from_value::<RunSpec>(row.spec.clone())
+        .map(|s| (s.command.display(), s.command.raw()))
         .unwrap_or_default();
     // A selected run's failure outside the selection: a file-level entry
     // the framework loads whatever the selection (Vitest imports every
@@ -3533,7 +3570,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         && stalled_ms.is_some()
         && running.is_empty()
         && counts.results() == 0
-        && let Some(n) = go_buffering_note(&command)
+        && let Some(n) = go_buffering_note(&raw_command)
     {
         notes.push(n);
     }
@@ -3578,6 +3615,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         run: row.id.clone(),
         suite: row.suite.clone(),
         command,
+        raw_command,
         reason,
         status: row.status,
         outcome: row.outcome,
@@ -4000,6 +4038,22 @@ mod readable_tests {
     fn mavens_wrap_up_of_a_failed_test_step_is_the_runners() {
         assert!(super::runner_failure_summary("[INFO] BUILD FAILURE"));
         assert!(!super::runner_failure_summary("[INFO] BUILD SUCCESS"));
+    }
+}
+
+#[cfg(test)]
+mod xml_report_tests {
+    use super::surefire_report_off;
+
+    /// Round 18: `-DdisableXmlReport=true` gave an opaque pass whose next
+    /// line said "act on the warnings" with none that named the cause.
+    #[test]
+    fn a_disabled_surefire_report_is_named_with_its_cure() {
+        let w = surefire_report_off("mvn -q test -DdisableXmlReport=true").unwrap();
+        assert!(w.contains("XML report is off"), "{w}");
+        assert!(w.contains("-DdisableXmlReport"), "{w}");
+        assert!(surefire_report_off("mvn -q test").is_none());
+        assert!(surefire_report_off("./dev \"mvn -q test -DdisableXmlReport=false\"").is_none());
     }
 }
 

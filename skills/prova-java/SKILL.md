@@ -18,6 +18,8 @@ description: Gives the Maven and Gradle settings that let prova see every JVM te
   is written at the end. A hung test is still caught as a stall (no CPU, no
   output); prova then names the tests of the last finished run that never
   reported, the hung one among them.
+- `-DdisableXmlReport=true` turns Surefire's XML report off: with `-q` prova
+  then sees no test at all and says so in a warning. Remove the flag.
 - Gradle may skip tests as up to date; add `--rerun-tasks` (or
   `cleanTest`) to the suite so every run really runs.
 - Keep tests that start servers, containers or databases (often the

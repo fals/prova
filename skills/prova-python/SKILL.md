@@ -24,8 +24,15 @@ Pick the first that applies:
 
 Then:
 
-- Single test: `select = "python3 -m pytest -v -rfE -k {filter}"`. `-k`
-  matches substrings of test names; node ids also work as the filter.
+- Single test: `select = "python3 -m pytest -v -rfE -k {filter}"`. A plain
+  name is a `-k` substring. For a node id (`tests/test_calc.py::test_add`,
+  `tests/test_p.py::test_add_cases[two plus $two-2-2-4]`) or the name prova
+  prints (`tests.test_calc.TestCalc::test_add`), prova keeps `-k` with the
+  test function's name and also passes the node id to pytest as its own
+  argument when the file exists, so exactly that test or case runs. If the
+  template has its own paths (`pytest tests/ -k {filter}`), those paths are
+  collected as well and `-k` alone selects. Keep `-k {filter}` in the
+  template; prova does the rest.
 - Use the project's virtualenv: `run = ".venv/bin/python -m pytest -v -rfE"`.
 - Fail fast in the fix loop: add `-x` to `select`.
 - Sizes are what a test uses, not how long it takes: a test that starts
@@ -35,7 +42,10 @@ Then:
 - Through a wrapper (`./dev`, `docker compose run`, `nix develop -c`): prova
   keeps the wrapper of your earlier runs in what `prova adopt` proposes. A
   wrapper that re-splits its arguments (`$*`) breaks a filter with spaces
-  (`test_x[negative 2/-4]`): select with a `-k` substring that has none. The
+  (`test_x[negative 2/-4]`): select with a `-k` substring that has none, or
+  run the wrapper with the whole command as one quoted argument (`./dev
+  "python3 -m pytest -v -rfE -k {filter}"`), where `{filter}` reaches the
+  inner shell as one single-quoted word; write no quotes around it. The
   wrapper must forward `PYTEST_ADDOPTS` for `inject` recipes (and a report
   file such as `pytest-junit` must be written where the container can see it:
   mount the directory); prova warns when the report never appears. Tests that
