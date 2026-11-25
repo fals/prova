@@ -971,7 +971,7 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
             let num = |k: &str| prova_core::experiment::short(p[k].as_f64().unwrap_or(f64::NAN));
             if p.is_object() {
                 println!(
-                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment's family for this metric (revalidations count), Holm)",
+                    "{}: {} median {} (MAD {}), {} median {} (MAD {}), p={:.4} ({} test; adjusted {:.4} for {} comparison(s) in this experiment's family for this metric, Holm{})",
                     p["metric"].as_str().unwrap_or(""),
                     c.baseline,
                     num("baseline_median"),
@@ -983,6 +983,10 @@ pub fn experiment(r: &prova_core::experiment::Report, json: bool) {
                     p["method"].as_str().unwrap_or(""),
                     p["p_adjusted"].as_f64().unwrap_or(f64::NAN),
                     res["comparisons_in_family"].as_u64().unwrap_or(1),
+                    // A revalidation replicates a hypothesis: no new comparison (ADR 0032).
+                    res["revalidates"].as_str().map_or(String::new(), |id| format!(
+                        "; replication of comparison {id}: its p stands in for that one, no comparison added"
+                    )),
                 );
                 let outl = p["outliers_baseline"].as_array().map_or(0, Vec::len)
                     + p["outliers_candidate"].as_array().map_or(0, Vec::len);

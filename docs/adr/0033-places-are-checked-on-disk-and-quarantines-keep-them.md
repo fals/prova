@@ -1,4 +1,4 @@
-# 0034: A test's directory is checked on disk; a quarantine is per name and place; a pass in a failed repeat is kept
+# 0033: A test's directory is checked on disk; a quarantine is per name and place; a pass in a failed repeat is kept
 
 Status: Accepted (2026-11-25). Amends [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) §2 and [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) §2.
 
