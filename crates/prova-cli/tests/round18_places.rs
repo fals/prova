@@ -260,6 +260,31 @@ fn r18_history_says_what_else_a_name_matches_and_the_exact_leaf_wins() {
     assert!(!h.contains("be more specific"), "{h}");
 }
 
+/// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
+/// the tests the second did not print as "removed". Why medium: two stored
+/// runs of two suites.
+#[test]
+fn r18_diff_of_different_suites_says_not_visible_and_warns() {
+    let d = workspace("diffsuites");
+    let one = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... ok' 'test a::t2 ... ok' 'test result: ok. 2 passed; 0 failed; 0 ignored'"
+    );
+    let two = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... ok' 'test result: ok. 1 passed; 0 failed; 0 ignored'"
+    );
+    let run_id = |o: &Output| {
+        let t = text(o);
+        let i = t.find("run ").unwrap() + 4;
+        t[i..i + 8].to_owned()
+    };
+    let a = run_id(&prova(&d, &["run", "--", "sh", "-c", &one]));
+    let b = run_id(&prova(&d, &["run", "--", "sh", "-c", &two]));
+    let o = text(&prova(&d, &["diff", &a, &b]));
+    assert!(o.contains("not visible in this run"), "{o}");
+    assert!(!o.contains("removed ("), "{o}");
+    assert!(o.contains("different suites"), "{o}");
+}
+
 /// Round 18 (ts-vitest): "environment-dependent, not flaky" from a single
 /// earlier pass. Why medium: needs two runs with different environments.
 #[test]
