@@ -428,6 +428,7 @@ impl Recognizers {
             message,
             source: Level::Native,
             subtest: false,
+            passed_in_iteration: false,
         });
     }
 
@@ -456,6 +457,7 @@ impl Recognizers {
             message,
             source: level,
             subtest: false,
+            passed_in_iteration: false,
         });
     }
 
@@ -496,6 +498,7 @@ impl Recognizers {
                 message,
                 source: level,
                 subtest,
+                passed_in_iteration: false,
             });
             return;
         }
@@ -564,6 +567,7 @@ impl Recognizers {
             message,
             source: level,
             subtest,
+            passed_in_iteration: false,
         });
     }
 
@@ -5414,10 +5418,13 @@ impl Recognizers {
         if !before.is_failure() && !outcome.is_failure() {
             return;
         }
+        let mut passed_in_iteration = false;
         let (outcome, message) = if before.is_failure() && !outcome.is_failure() {
             if !retry {
                 // A later iteration passing does not undo the failure: it is
-                // recorded as the failure standing, with its message.
+                // recorded as the failure standing, with its message, and
+                // marked as an execution that passed: flaky evidence.
+                passed_in_iteration = true;
                 let kept = self.go_failure_msg.get(&d).cloned().flatten();
                 (before, kept)
             } else {
@@ -5452,6 +5459,7 @@ impl Recognizers {
             message,
             source: level,
             subtest,
+            passed_in_iteration,
         });
     }
 
@@ -5899,6 +5907,18 @@ mod go_tests {
         );
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(r.failed_reported(), 0, "no stale totals");
+        // The pass is not lost: the second execution says it passed.
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestFinished {
+                    attempt: 2,
+                    passed_in_iteration: true,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
     }
 
     /// gotestsum `--rerun-fails` with `-v` text: the rerun is another

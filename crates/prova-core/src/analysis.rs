@@ -341,7 +341,7 @@ fn test_runs_scoped(
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection'), a.test_id
+                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -362,6 +362,7 @@ fn test_runs_scoped(
             r.get::<_, String>(8)?,
             r.get::<_, Option<String>>(9)?,
             r.get::<_, String>(10)?,
+            r.get::<_, i64>(11)? != 0,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -381,7 +382,20 @@ fn test_runs_scoped(
     let mut ids: Vec<String> = Vec::new();
     let mut had_pass_run = false;
     for row in rows {
-        let (run, code, created, attempt, outcome, dur, msg, fp, env, selection, row_test) = row?;
+        let (
+            run,
+            code,
+            created,
+            attempt,
+            outcome,
+            dur,
+            msg,
+            fp,
+            env,
+            selection,
+            row_test,
+            passed_in_iteration,
+        ) = row?;
         if let (Some(sel), Some(this)) = (&selection, &this)
             && leaf(sel).starts_with(&format!("{this}/"))
         {
@@ -403,7 +417,7 @@ fn test_runs_scoped(
                 let earlier_failed = last.outcome.is_failure();
                 last.attempts = attempt as u32;
                 last.passed_on_retry |= earlier_failed && outcome == Outcome::Passed;
-                had_pass_run |= last.outcome == Outcome::Passed;
+                had_pass_run |= last.outcome == Outcome::Passed || passed_in_iteration;
                 last.passed_and_failed = had_pass_run && outcome == Outcome::Failed;
                 last.outcome = outcome;
                 last.duration_ms = dur.map(|d| d as u64);
@@ -1228,6 +1242,7 @@ mod tests {
                         message: None,
                         source: crate::model::Level::Recognized,
                         subtest: false,
+                        passed_in_iteration: false,
                     },
                 });
             }

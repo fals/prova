@@ -2008,6 +2008,7 @@ fn observe_child(
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
             subtest: false,
+            passed_in_iteration: false,
         };
         sup.pending.push(Event {
             v: EVENT_VERSION,

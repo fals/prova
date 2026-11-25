@@ -221,6 +221,12 @@ pub enum EventKind {
         /// `TestX/case`, pytest's subtests): counted apart from tests.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         subtest: bool,
+        /// This execution passed, but the outcome recorded is the failure
+        /// of an earlier iteration of the same run, which stands (`go test
+        /// -count=N`: repeats are not retries, ADR 0029 section 2). History
+        /// reads it as a pass within a failed run: flaky evidence.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        passed_in_iteration: bool,
     },
     /// A live result whose name was ambiguous (VSTest's console names
     /// NUnit and MSTest tests by bare method) replaced by the result file's
@@ -331,6 +337,7 @@ mod tests {
                 message: Some("boom".into()),
                 source: Level::Recognized,
                 subtest: false,
+                passed_in_iteration: false,
             },
             EventKind::RunStalled {
                 idle_ms: 60_000,
