@@ -1669,7 +1669,10 @@ fn observe_child(
         .collect();
     let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
     if let Some(names) = &set_aside {
-        if let Some(n) = sup.framework_failed
+        if let Some(why) = runner_refusal(&spec.command, Path::new(&sup.run_cwd), &outcomes, names)
+        {
+            contradictions.push(why);
+        } else if let Some(n) = sup.framework_failed
             && n > names.len() as u64
         {
             contradictions.push(format!(
@@ -1747,17 +1750,6 @@ fn observe_child(
             quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
     {
         outcome = Outcome::Passed;
-        // make stopped at the failing test step: the steps after it never
-        // ran, so the pass verified nothing of them (round 16: a vet step
-        // after the tests was never seen).
-        if let Some((_, line, _)) = sup.distiller.error_lines().0.iter().find(|(_, l, _)| {
-            l.trim_start().starts_with("make: ***") || l.trim_start().starts_with("make[")
-        }) {
-            warnings.push(format!(
-                "the command stopped at the failing test step ({}): any step after it did not run",
-                line.trim()
-            ));
-        }
         sup.emit(EventKind::RunNote {
             message: format!(
                 "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
@@ -2307,6 +2299,7 @@ fn summary_of_failures(t: &str, command: &str) -> bool {
     let counts = (t.starts_with('=')
         && (lower.contains(" failed") || lower.contains("short test summary")))
         || t.starts_with("test result: FAILED.")
+        || t.starts_with(r#"{"type":"suite","event":"failed""#)
         || t.starts_with("Tests:")
         || t.starts_with("Tests ")
         || t.starts_with("Test Suites:")
@@ -2467,9 +2460,14 @@ fn unaccounted_error(
             reruns += 1;
             reruns > 1
         };
+        let own_event = libtest_event_of(t, quarantined);
         let accounted = !gate
             && !rerun_again
-            && (in_own_section || by_name || own_line || summary_of_failures(t, command));
+            && (in_own_section
+                || by_name
+                || own_line
+                || own_event
+                || summary_of_failures(t, command));
         (!accounted).then(|| {
             format!(
                 "the output shows an error outside the quarantined test(s) (line {n}): {}",
@@ -2477,6 +2475,61 @@ fn unaccounted_error(
             )
         })
     }))
+}
+
+/// Why a quarantine cannot set the failures aside although only they
+/// failed: the command is not one test-runner call, or the runner skips a
+/// check once a test fails (ADR 0031 §1). `None` when it can.
+fn runner_refusal(
+    command: &CommandSpec,
+    cwd: &Path,
+    outcomes: &BTreeMap<String, Outcome>,
+    names: &[String],
+) -> Option<String> {
+    let listed = names.join(", ");
+    let call = match crate::runner_call::check(command, cwd) {
+        Ok(c) => c,
+        Err(why) => {
+            return Some(format!(
+                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. A quarantine sets aside only the failures of one test-runner call (ADR 0031); run them in a suite whose command is the runner alone (for example `go test ./...`)"
+            ));
+        }
+    };
+    if call.runner == crate::runner_call::Runner::Go {
+        for (key, o) in outcomes {
+            let Some((pkg, _)) = key.rsplit_once('\u{1f}') else {
+                continue;
+            };
+            if o.is_failure() && crate::runner_call::go_package_has_testmain(pkg, cwd) {
+                return Some(format!(
+                    "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: package {pkg} defines TestMain, whose code after m.Run (goleak, a teardown check) may check only when every test passed. Fix the test or leave it unquarantined"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `line` is libtest's JSON event of one of the quarantined tests
+/// (`{"type":"test","event":"failed","name":"calc::calc$tests::flaky",
+/// "stdout":"... panicked ..."}`, nextest's `libtest-json`): the runner's own
+/// record of that test, whose `stdout` is the test's output (ADR 0031 §1).
+fn libtest_event_of(line: &str, quarantined: &[String]) -> bool {
+    if !line.starts_with('{') {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if v.get("type").and_then(|t| t.as_str()) != Some("test") {
+        return false;
+    }
+    let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+        return false;
+    };
+    // `crate::binary$tests::name` (nextest) or `tests::name` (libtest).
+    let test = name.rsplit('$').next().unwrap_or(name);
+    quarantined.iter().any(|q| q == test || q == name)
 }
 
 /// A line that says a process crashed, whatever it names.
@@ -2598,6 +2651,8 @@ fn runner_failure_summary(line: &str) -> bool {
         || line.starts_with("error: test failed, to rerun pass")
         // One target failed; `error: 2 targets failed:` is another's too.
         || line == "error: 1 target failed:"
+        // Maven's wrap-up of a failed test step.
+        || line == "[INFO] BUILD FAILURE"
 }
 
 /// Whether the tests of `run` share a test with any of `suites`: a suite

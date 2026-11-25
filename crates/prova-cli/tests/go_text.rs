@@ -6,6 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -737,7 +738,11 @@ fn a_quarantined_go_failure_is_no_retry() {
     let script = format!(
         "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
     );
-    prova(&d, &["run", "--", "sh", "-c", &script]);
+    // A quarantine needs one runner call (ADR 0031): a script named `go`.
+    std::fs::create_dir_all(d.join("rc")).unwrap();
+    std::fs::write(d.join("rc/go"), format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(d.join("rc/go"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    prova(&d, &["run", "--", "./rc/go", "test"]);
     prova(
         &d,
         &[
@@ -748,7 +753,7 @@ fn a_quarantined_go_failure_is_no_retry() {
             "clock",
         ],
     );
-    let o = prova(&d, &["run", "--json", "--", "sh", "-c", &script]);
+    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
     let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(s["outcome"], "passed", "{s}");
     assert!(!s.to_string().contains("passed on a retry"), "{s}");
