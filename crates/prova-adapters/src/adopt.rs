@@ -947,7 +947,10 @@ mod tests {
         ));
         assert!(p.suites[0].run.contains("--verbose"), "{:?}", p.suites[0]);
         assert!(
-            p.suites[0].select.as_deref().is_some_and(|s| s.contains("--verbose")),
+            p.suites[0]
+                .select
+                .as_deref()
+                .is_some_and(|s| s.contains("--verbose")),
             "{:?}",
             p.suites[0]
         );
@@ -958,7 +961,11 @@ mod tests {
                 r#"{"scripts":{"test":"jest"},"devDependencies":{"jest":"29"}}"#,
             )],
         ));
-        assert_eq!(p.suites[0].run, "npm test -- --verbose", "{:?}", p.suites[0]);
+        assert_eq!(
+            p.suites[0].run, "npm test -- --verbose",
+            "{:?}",
+            p.suites[0]
+        );
     }
 
     #[test]

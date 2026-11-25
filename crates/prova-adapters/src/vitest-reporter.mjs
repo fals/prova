@@ -3,8 +3,9 @@
 // shape plus a `file` field, so prova sees every test live at level 3.
 // Load it next to the default reporter:
 //   vitest run --reporter=default --reporter="$PROVA_VITEST_REPORTER"
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export default class ProvaReporter {
   onInit(vitest) {
@@ -13,6 +14,29 @@ export default class ProvaReporter {
     this.started = new Set();
     this.order = new Map(); // module id -> its tests, in run order
     this.pending = new Map(); // test id -> timer of an inferred start
+    this.addWorkerHooks(vitest);
+  }
+
+  // Vitest's worker sends its task updates through a throttle that can lose
+  // the trailing call (3.2.4): a start or an early failure then reaches this
+  // reporter only with the next update, seconds late. The setup file
+  // (prova-vitest-setup.mjs, next to this file) writes starts and results
+  // from inside the worker instead. Any other Vitest, or a failure here,
+  // leaves things as they were: the reporter's own events remain.
+  addWorkerHooks(vitest) {
+    try {
+      if (!this.out) return;
+      const setup = fileURLToPath(new URL("./prova-vitest-setup.mjs", import.meta.url));
+      if (!existsSync(setup)) return;
+      process.env.PROVA_VITEST_ROOT = this.root;
+      const configs = new Set([vitest.config, ...(vitest.projects ?? []).map((p) => p.config)]);
+      for (const config of configs) {
+        if (!config || !Array.isArray(config.setupFiles)) continue;
+        if (!config.setupFiles.includes(setup)) config.setupFiles.push(setup);
+      }
+    } catch {
+      // Not a Vitest we know: keep the reporter's events only.
+    }
   }
 
   write(event) {

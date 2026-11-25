@@ -2987,8 +2987,9 @@ impl Recognizers {
                     );
                     format!("; it was running {name}")
                 }
-                None => "; run with `-- --test-threads=1` to name the test that was running"
-                    .to_owned(),
+                None => {
+                    "; run with `-- --test-threads=1` to name the test that was running".to_owned()
+                }
             };
             self.harness_stopped.push(format!(
                 "a test binary stopped after {seen} of {n} tests, before its summary{hint}"
@@ -4891,10 +4892,7 @@ mod tests {
                     "src/a.test.js::calc > nested > deep".into(),
                     Outcome::Passed
                 ),
-                (
-                    "src/a.test.js::calc > works".into(),
-                    Outcome::Skipped
-                ),
+                ("src/a.test.js::calc > works".into(), Outcome::Skipped),
                 ("src/x.test.ts::calc > subtracts".into(), Outcome::Passed),
                 ("src/x.test.ts::calc > flaky clock".into(), Outcome::Failed),
             ]
@@ -6659,7 +6657,9 @@ mod issue92_tests {
         let (r, ev) = feed_all(include_str!("../testdata/libtest-crash-serial.txt"));
         let got = results(&ev);
         assert_eq!(
-            got.iter().map(|(n, o)| (n.as_str(), *o)).collect::<Vec<_>>(),
+            got.iter()
+                .map(|(n, o)| (n.as_str(), *o))
+                .collect::<Vec<_>>(),
             vec![
                 ("tests::a_fine", Outcome::Passed),
                 ("tests::b_crashes", Outcome::Errored),
