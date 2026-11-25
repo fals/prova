@@ -1407,11 +1407,6 @@ fn observe_child(
             if let Some((prev, missing, total)) =
                 missing_since_last_pass(store, run, &sup.suite, &current)?
             {
-                // A quarantined test left out is set aside in the open (0027).
-                let missing: Vec<String> = missing
-                    .into_iter()
-                    .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
-                    .collect();
                 // Quiet output can hide every test while the framework counted
                 // them: that is not "none ran" (round 9).
                 if current.is_empty() && observed == 0 && sup.framework_total.unwrap_or(0) == 0 {
@@ -1473,7 +1468,7 @@ fn observe_child(
     // A known-flaky test left out of the command is no pass of it (0027).
     if spec.expects_tests() && status == Status::Finished && spec.selection.is_none() {
         sup.flush()?;
-        if let Some(w) = left_out_flaky(store, run, &sup.suite, &quarantine)? {
+        if let Some(w) = left_out_flaky(store, run, &sup.suite)? {
             warnings.push(w);
         }
     }
@@ -1540,9 +1535,7 @@ fn observe_child(
             };
             let mut was_passing = Vec::new();
             for (id, display) in skipped {
-                if warnings.iter().any(|w| w.contains(&display))
-                    || crate::quarantine::covers(&quarantine, &display).is_some()
-                {
+                if warnings.iter().any(|w| w.contains(&display)) {
                     continue;
                 }
                 // Skipped here last time too: this suite does not run it (a
@@ -1721,39 +1714,6 @@ fn observe_child(
         .filter(|(k, _)| !sup.superseded.contains(*k))
         .map(|(k, o)| (k.clone(), *o))
         .collect();
-    let set_aside = quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen);
-    if let Some(names) = &set_aside {
-        if let Some(why) = runner_refusal(&spec.command, Path::new(&sup.run_cwd), &outcomes, names)
-        {
-            contradictions.push(why);
-        } else if let Some(n) = sup.framework_failed
-            && n > names.len() as u64
-        {
-            contradictions.push(format!(
-                "the framework counted {n} failure(s), more than the quarantined test(s) that failed ({}): something else failed too",
-                names.len()
-            ));
-        } else if exit_code.is_some_and(|c| c > 128) {
-            // Killed by a signal (exit 128 + n): cut short, whatever the
-            // tests said (round 15: exit 137 after a full summary passed).
-            contradictions.push(format!(
-                "the command was killed (exit {}): a quarantine sets aside test failures, not a killed run",
-                exit_code.unwrap_or(0)
-            ));
-        } else if let Some(why) =
-            unaccounted_error(store, run, &sup.distiller, names, &report.test_outputs)?
-        {
-            contradictions.push(why);
-        }
-    }
-    // Maven prints `BUILD FAILURE` whenever a test failed. With the quarantined
-    // failures set aside it says nothing more: the goal's own error lines
-    // (`Failed to execute goal ...`) are what `unaccounted_error` checks.
-    if set_aside.is_some() {
-        contradictions.retain(|c| {
-            !(c.starts_with("the build says it failed: \"") && c.ends_with("BUILD FAILURE\""))
-        });
-    }
     if let Some(code @ (126 | 127)) = exit_code {
         reason = Some(format!(
             "the command could not start (exit {code}: {}); no test ran",
@@ -1788,24 +1748,6 @@ fn observe_child(
     // Tests still open at the end become errored (spec: end closes open tests).
     let closed = sup.lifecycle.end(status).unwrap_or_default();
     let mut outcome = sup.lifecycle.verdict().unwrap_or(Outcome::Errored);
-    // Only quarantined tests failed: the run passes without them (ADR 0027
-    // §4), on top of the lifecycle's verdict, under a strict guard.
-    if outcome == Outcome::Failed
-        && status == Status::Finished
-        && closed.is_empty()
-        && contradictions.is_empty()
-        && sup.level >= Level::Recognized
-        && let Some(names) =
-            quarantined_only_failures(&outcomes, &quarantine, exit_code, &first_seen)
-    {
-        outcome = Outcome::Passed;
-        sup.emit(EventKind::RunNote {
-            message: format!(
-                "quarantined test(s) failed and are set aside: {}; the run passes without them (prova quarantine list)",
-                names.join(", ")
-            ),
-        });
-    }
     if outcome == Outcome::Failed
         && reason
             .as_deref()
@@ -1834,8 +1776,7 @@ fn observe_child(
         // and a retried test's panic on its first try is its own (round 16:
         // a nextest retry that passed was "an error outside any failing
         // test").
-        let mut own_crashes: Vec<String> = set_aside.clone().unwrap_or_default();
-        own_crashes.extend(rerun_all.iter().cloned());
+        let own_crashes: Vec<String> = rerun_all.clone();
         if let Some((line, text)) = unexplained_crash(
             store,
             run,
@@ -1851,10 +1792,6 @@ fn observe_child(
         // A test that passed only on a retry is flaky: the run passes (its
         // last attempt decides, ADR 0024) but the pass is not a green one.
         let rerun = rerun_all;
-        let rerun: Vec<String> = rerun
-            .into_iter()
-            .filter(|d| crate::quarantine::covers(&quarantine, d).is_none())
-            .collect();
         if !rerun.is_empty() {
             warnings.push(format!(
                 "{} test(s) failed, then passed on a retry: flaky, not green: {}",
@@ -1873,70 +1810,23 @@ fn observe_child(
             )
         });
     }
-    // Only quarantined tests failed, and nothing else passed: the run fails
-    // (ADR 0028 §3), and says why (round 15: no detail at all).
-    let failing: Vec<&str> = outcomes
-        .iter()
-        .filter(|(_, o)| o.is_failure())
-        .map(|(k, _)| key_display(k))
-        .collect();
+    // Every failing test is quarantined: a known failure, said as such; the
+    // run fails all the same (ADR 0034: what did not run, or ran out of
+    // sight, prints nothing, so a quarantine never passes a run).
     if outcome == Outcome::Failed
-        && reason.is_none()
-        && !failing.is_empty()
-        && outcomes
-            .iter()
-            .filter(|(_, o)| o.is_failure())
-            .all(|(k, _)| crate::quarantine::covers_key(&quarantine, k).is_some())
+        && let Some(names) = all_failures_quarantined(&outcomes, &quarantine, &first_seen)
     {
-        // Which of ADR 0028's conditions did not hold (round 15: refused
-        // with no word of why).
-        let errored: Vec<&str> = outcomes
-            .iter()
-            .filter(|(_, o)| **o == Outcome::Errored)
-            .map(|(k, _)| key_display(k))
-            .collect();
-        let new_subtests: Vec<&str> = failing
-            .iter()
-            .copied()
-            .filter(|d| {
-                !crate::quarantine::names_test(&quarantine, d)
-                    && crate::quarantine::covers(&quarantine, d)
-                        .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
-            })
-            .collect();
-        let verified_other = outcomes.iter().any(|(k, o)| {
-            *o == Outcome::Passed && crate::quarantine::covers_key(&quarantine, k).is_none()
-        });
-        reason = Some(if !errored.is_empty() {
-            format!(
-                "quarantined test(s) errored, not plainly failed ({}): a quarantine sets aside failures, not errors",
-                errored.join(", ")
-            )
-        } else if !new_subtests.is_empty() {
-            format!(
-                "subtest(s) first seen after their parent's quarantine failed ({}): a new subtest's failure is news",
-                new_subtests.join(", ")
-            )
-        } else if !verified_other {
-            // Quiet output counts passes without naming them (round 16:
-            // "no other test passed" next to "the framework counted 5").
-            match sup.framework_total {
-                Some(t) if t > failing.len() as u64 => format!(
-                    "only quarantined test(s) failed ({}); the framework counted {t} test(s), but its output names no passing test, so nothing else was verified: a suite with verbose or structured output (prova adopt) can set the failure aside",
-                    failing.join(", ")
-                ),
-                _ => format!(
-                    "only quarantined test(s) failed ({}), and no other test passed: a quarantine sets a failure aside only when something else was verified",
-                    failing.join(", ")
-                ),
-            }
+        let said = format!(
+            "every failing test is quarantined: {}; the run still fails (a quarantine never passes a run: fix the test, or leave it out of the command)",
+            names.join(", ")
+        );
+        // Another detail (Maven's `BUILD FAILURE`, a contradiction) stays
+        // the detail; this is said beside it.
+        if reason.is_none() {
+            reason = Some(said);
         } else {
-            format!(
-                "only quarantined test(s) failed ({}), but the run cannot be set aside (exit {}, or the run did not end on its own)",
-                failing.join(", "),
-                exit_code.map_or("none".to_owned(), |c| c.to_string())
-            )
-        });
+            sup.emit(EventKind::RunNote { message: said });
+        }
     }
     // A failed run's missing tests are news too: a panic or a crash that
     // stopped the rest is visible only this way (round 16: two tests a
@@ -2266,22 +2156,16 @@ fn key_display(key: &str) -> &str {
     key.rsplit('\u{1f}').next().unwrap_or(key)
 }
 
-/// The names of the failed tests when every failing test of the run is
-/// quarantined and plainly `failed` (not errored), and the command's exit
-/// code is a test failure's (not 126/127 or a signal): the quarantined
-/// failures are then the run's only problem (ADR 0027 §4). `None` otherwise.
-///
-/// A subtest is set aside by its parent's quarantine only if it was known
-/// before the quarantine (`first_seen`): a new subtest's failure is news
-/// (round 14). A parent that failed only through quarantined subtests is
-/// set aside with them (Go fails the parent of a failing subtest).
-fn quarantined_only_failures(
+/// The names of the failing tests when every one of them is quarantined
+/// (its own quarantine, or its parent's for a subtest known before the
+/// quarantine; a parent failing only through such subtests goes with
+/// them). Said in the summary; the run fails all the same (ADR 0034).
+fn all_failures_quarantined(
     outcomes: &BTreeMap<String, Outcome>,
     quarantine: &BTreeMap<String, crate::quarantine::Entry>,
-    exit_code: Option<i32>,
     first_seen: &dyn Fn(&str) -> Option<u64>,
 ) -> Option<Vec<String>> {
-    if quarantine.is_empty() || matches!(exit_code, None | Some(0 | 126 | 127)) {
+    if quarantine.is_empty() {
         return None;
     }
     let failing: Vec<&str> = outcomes
@@ -2295,13 +2179,10 @@ fn quarantined_only_failures(
             continue;
         }
         let display = key_display(key);
-        if *o != Outcome::Failed {
-            return None;
-        }
         // Of the same file, when the quarantine names one (round 16: two
         // crates' `tests::flaky`).
         let own = crate::quarantine::covers_key(quarantine, key).filter(|e| e.test == display);
-        let set_aside = match own {
+        let covered = match own {
             Some(_) => true,
             None => match crate::quarantine::covers_key(quarantine, key) {
                 Some(parent) => first_seen(display).is_some_and(|t| t < parent.created_ms),
@@ -2311,17 +2192,12 @@ fn quarantined_only_failures(
                 }
             },
         };
-        if !set_aside {
+        if !covered {
             return None;
         }
         names.push(display.to_owned());
     }
-    // A run that verified nothing else passes nothing (round 14: a
-    // selection of only the quarantined test, failing, was "PASSED").
-    let verified_other = outcomes.iter().any(|(k, o)| {
-        *o == Outcome::Passed && crate::quarantine::covers_key(quarantine, k).is_none()
-    });
-    (!names.is_empty() && verified_other).then_some(names)
+    (!names.is_empty()).then_some(names)
 }
 
 /// A bare Go subtest selection (`TestTable/x`): a test function, then a
@@ -2444,218 +2320,6 @@ fn printed_names(display: &str) -> Vec<String> {
     out
 }
 
-/// A test runner's own summary of failing tests that says nothing more
-/// than the failures seen: counts of failures with no error, the bare
-/// `FAIL` lines, a package's result, Maven's wrap-up of a failed test step.
-fn summary_of_failures(t: &str) -> bool {
-    let lower = t.to_lowercase();
-    let no_errors =
-        !lower.contains("error") || lower.contains("errors: 0") || lower.contains(" 0 error");
-    if runner_failure_summary(t)
-        || matches!(
-            t,
-            "FAIL" | "FAILED" | "failures:" | "=== Failed" | "BUILD FAILURE"
-        )
-    {
-        return true;
-    }
-    // gotestsum's package summary, `✖  pkg (1.5s)`: red because a test of
-    // it failed (round 16: every quarantined pass under gotestsum failed on
-    // it). A package's own failure is an errored `(package)` entry.
-    if let Some(rest) = t.strip_prefix('\u{2716}') {
-        let words: Vec<&str> = rest.split_whitespace().collect();
-        return match words.as_slice() {
-            [_pkg] => true,
-            [_pkg, time] => time.starts_with('(') && time.ends_with("s)"),
-            _ => false,
-        };
-    }
-    // go: `FAIL\tpkg\t0.01s` (a package's result, not a build failure).
-    if (t.starts_with("FAIL\t") || t.starts_with("FAIL "))
-        && !t.contains('[')
-        && t.split_whitespace().count() <= 3
-    {
-        return true;
-    }
-    // Counts: pytest's `=== 1 failed, 2 passed in 0.1s ===`, libtest's
-    // `test result: FAILED. ...`, Jest's and Vitest's `Tests:`/`Test
-    // Suites:`/`Test Files`, gotestsum's `DONE`, Maven's `Tests run:`,
-    // dotnet's `Failed!  - Failed:`.
-    let counts = (t.starts_with('=')
-        && (lower.contains(" failed") || lower.contains("short test summary")))
-        || t.starts_with("test result: FAILED.")
-        || t.starts_with(r#"{"type":"suite","event":"failed""#)
-        || t.starts_with("Tests:")
-        || t.starts_with("Tests ")
-        || t.starts_with("Test Suites:")
-        || t.starts_with("Test Files")
-        || t.starts_with("DONE ")
-        || t.starts_with("[ERROR] Tests run:")
-        || t.starts_with("Failed!  - Failed:")
-        || t == "Test Run Failed.";
-    if counts {
-        return no_errors;
-    }
-    // Maven's wrap-up of a failed test step.
-    if let Some(rest) = t.strip_prefix("[ERROR]") {
-        let r = rest.trim();
-        return r.is_empty()
-            || r == "Failures:"
-            || r.starts_with("-> [Help")
-            || r.starts_with("[Help ")
-            || r.starts_with("To see the full stack trace")
-            || (r.starts_with("See ") && r.ends_with(" for the individual test results."))
-            || r.starts_with("See dump files (if any exist)")
-            || r.starts_with("Re-run Maven")
-            || r.starts_with("For more information")
-            || r.starts_with("Please refer to")
-            || (r.starts_with("Failed to execute goal")
-                && (r.contains("surefire") || r.contains("failsafe"))
-                && r.contains("There are test failures"));
-    }
-    false
-}
-
-/// The first error-looking line of the output that the quarantined
-/// failing tests do not account for, as the reason a quarantine cannot
-/// set the run aside (ADR 0029): it names one of them (as a whole name),
-/// is part of one's own output or failure message, or is the runner's
-/// summary of failures. Too many error lines to check is a reason too.
-fn unaccounted_error(
-    store: &Store,
-    run: &str,
-    distiller: &crate::output::Distiller,
-    quarantined: &[String],
-    outputs: &[(TestKey, String)],
-) -> Result<Option<String>> {
-    let (lines, overflow) = distiller.error_lines();
-    if overflow {
-        return Ok(Some(
-            "the output has more error lines than prova can account for: a quarantine sets aside only failures it can explain".into(),
-        ));
-    }
-    let mut own: Vec<String> = outputs
-        .iter()
-        .filter(|(k, _)| quarantined.contains(&k.display()))
-        .map(|(_, o)| o.clone())
-        .collect();
-    let mut stmt = store.conn().prepare(
-        "SELECT a.message FROM attempts a JOIN tests t ON t.id = a.test_id
-          WHERE a.run_id = ?1 AND t.display = ?2 AND a.message IS NOT NULL",
-    )?;
-    for name in quarantined {
-        for m in stmt.query_map(rusqlite::params![run, name], |r| r.get::<_, String>(0))? {
-            own.push(m?);
-        }
-    }
-    let names: Vec<String> = quarantined.iter().flat_map(|n| printed_names(n)).collect();
-    // The runner's last summary is the end of the tests: another step that
-    // printed after it (a linter, a smoke check, a coverage gate) failed or
-    // passed in words prova cannot tell from the quarantined failure.
-    let (after, after_overflow) = distiller.after_summary();
-    if let Some((n, line)) = after.iter().find(|(_, l)| !wrapper_line(l, &names)) {
-        return Ok(Some(format!(
-            "the command printed more after the tests' summary (line {n}: {}): another step ran, and its result cannot be told apart from the quarantined failure",
-            line.chars().take(160).collect::<String>()
-        )));
-    }
-    if after_overflow {
-        return Ok(Some(
-            "the command printed too much after the tests' summary to account for it: another step ran, and its result cannot be told apart from the quarantined failure".into(),
-        ));
-    }
-    // A summary of failed files above the files that hold the quarantined
-    // failures: another file failed (Jest `Test Suites:`, Vitest `Test Files`).
-    if let Some((n, line)) = distiller.files_line()
-        && let Some(failed) = failed_count(line)
-    {
-        let mut files: Vec<&str> = quarantined
-            .iter()
-            .map(|q| q.split_once("::").map_or(q.as_str(), |(f, _)| f))
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-        if failed > files.len() as u64 {
-            return Ok(Some(format!(
-                "the framework counts {failed} failed file(s) (line {n}: {}), more than the file(s) of the quarantined test(s): another file failed",
-                line.chars().take(160).collect::<String>()
-            )));
-        }
-    }
-    let mut reruns = 0;
-    Ok(lines.iter().find_map(|(n, line, owner)| {
-        let t = line.trim();
-        // A coverage gate is never a test's: it ran after them, whichever
-        // section pytest's output put it in.
-        let gate = [
-            "Required test coverage",
-            "fail-under",
-            "coverage threshold",
-            "not met",
-        ]
-        .iter()
-        .any(|g| t.contains(g));
-        // In a quarantined test's own section (its own section header
-        // names it as a whole name too).
-        let in_own_section = owner
-            .as_deref()
-            .is_some_and(|o| names.iter().any(|q| names_word(o, q)));
-        // A crash is accounted for only by being the test's own, never by
-        // naming it: another process crashed on a test of that name.
-        let own_line = own.iter().any(|o| o.contains(t));
-        let by_name = names.iter().any(|q| names_word(t, q)) && !crash_like(t);
-        // cargo prints this once per failing target: a second one is another
-        // target's.
-        let rerun_again = t.starts_with("error: test failed, to rerun pass") && {
-            reruns += 1;
-            reruns > 1
-        };
-        let own_event = libtest_event_of(t, quarantined);
-        let accounted = !gate
-            && !rerun_again
-            && (in_own_section || by_name || own_line || own_event || summary_of_failures(t));
-        (!accounted).then(|| {
-            format!(
-                "the output shows an error outside the quarantined test(s) (line {n}): {}",
-                t.chars().take(160).collect::<String>()
-            )
-        })
-    }))
-}
-
-/// Why a quarantine cannot set the failures aside although only they
-/// failed: the command is not one test-runner call, or the runner skips a
-/// check once a test fails (ADR 0031 §1). `None` when it can.
-fn runner_refusal(
-    command: &CommandSpec,
-    cwd: &Path,
-    outcomes: &BTreeMap<String, Outcome>,
-    names: &[String],
-) -> Option<String> {
-    let listed = names.join(", ");
-    let call = match crate::runner_call::check(command, cwd) {
-        Ok(c) => c,
-        Err(why) => {
-            return Some(format!(
-                "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: {why}. A quarantine sets aside only the failures of one test-runner call (ADR 0031); run them in a suite whose command is the runner alone (for example `go test ./...`)"
-            ));
-        }
-    };
-    if call.runner == crate::runner_call::Runner::Go {
-        for (key, o) in outcomes {
-            let Some((pkg, _)) = key.rsplit_once('\u{1f}') else {
-                continue;
-            };
-            if o.is_failure() && crate::runner_call::go_package_has_testmain(pkg, cwd) {
-                return Some(format!(
-                    "quarantined test(s) failed ({listed}), but a quarantine cannot set them aside: package {pkg} defines TestMain, whose code after m.Run (goleak, a teardown check) may check only when every test passed. Fix the test or leave it unquarantined"
-                ));
-            }
-        }
-    }
-    None
-}
-
 /// Whether `line` is a compiler, vet or linter diagnostic of the project's
 /// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
 fn code_diagnostic(line: &str) -> bool {
@@ -2694,96 +2358,6 @@ fn line_before_make_stop(tail: &VecDeque<String>, error: &str) -> Option<String>
         .map(|l| l.trim())
         .find(|l| !l.is_empty() && !is_make_wrapup(l))
         .map(str::to_owned)
-}
-
-/// Whether `line` is libtest's JSON event of one of the quarantined tests
-/// (`{"type":"test","event":"failed","name":"calc::calc$tests::flaky",
-/// "stdout":"... panicked ..."}`, nextest's `libtest-json`): the runner's own
-/// record of that test, whose `stdout` is the test's output (ADR 0031 §1).
-fn libtest_event_of(line: &str, quarantined: &[String]) -> bool {
-    if !line.starts_with('{') {
-        return false;
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    if v.get("type").and_then(|t| t.as_str()) != Some("test") {
-        return false;
-    }
-    let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
-        return false;
-    };
-    // `crate::binary$tests::name` (nextest) or `tests::name` (libtest).
-    let test = name.rsplit('$').next().unwrap_or(name);
-    quarantined.iter().any(|q| q == test || q == name)
-}
-
-/// A line that says a process crashed, whatever it names.
-fn crash_like(t: &str) -> bool {
-    let lower = t.to_lowercase();
-    crate::output::looks_like_crash(t)
-        || [
-            "exited with code",
-            "oomkilled",
-            "killed",
-            "aborted",
-            "terminated",
-            "segmentation fault",
-            "core dumped",
-            "panicked",
-            "fatal",
-            "exception",
-            "traceback",
-        ]
-        .iter()
-        .any(|w| lower.contains(w))
-}
-
-/// The number before `failed` in a summary of counts (`2 failed, 1 passed`,
-/// `1 failed | 2 passed (3)`).
-fn failed_count(line: &str) -> Option<u64> {
-    line.split([',', '|'])
-        .find(|part| part.contains(" failed"))?
-        .split_whitespace()
-        .rev()
-        .skip_while(|w| *w != "failed")
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
-/// A line after the runner's summary that belongs to the test command's own
-/// wrap-up: the runner's summary of failures, a runner's timing lines, npm's report of its test script, a line
-/// of the quarantined test's own (without a crash).
-fn wrapper_line(t: &str, names: &[String]) -> bool {
-    let t = t.trim();
-    let info = t.strip_prefix("[INFO]").map(str::trim);
-    summary_of_failures(t)
-        || t.starts_with("Start at ")
-        || t.starts_with("Duration ")
-        || t.starts_with("Snapshots:")
-        || t.starts_with("Time:")
-        || t == "Ran all test suites."
-        || t.starts_with("Total time:")
-        || t.starts_with("Results File:")
-        || t.starts_with("Passed:")
-        || t.starts_with("Failed:")
-        || t.starts_with("Skipped:")
-        || t.starts_with("Test Run ")
-        || t.starts_with("npm ERR!")
-        || t.starts_with("npm error")
-        || t.starts_with("npm notice")
-        || t.starts_with("Lifecycle script `test` failed")
-        || t.starts_with("Lifecycle script \"test\" failed")
-        || (t.starts_with('`') && t.ends_with('`'))
-        || info.is_some_and(|i| {
-            i.is_empty()
-                || i.starts_with("---")
-                || i.starts_with("Total time:")
-                || i.starts_with("Finished at:")
-                || i.starts_with("BUILD ")
-        })
-        || (names.iter().any(|q| names_word(t, q)) && !crash_like(t))
 }
 
 /// The first crash-like line of the output that no quarantined failing
@@ -2859,13 +2433,8 @@ fn overlaps(store: &Store, run: &str, suites: &[String]) -> Result<bool> {
 /// The warning for known-flaky tests that have no result in this full run
 /// although this suite, or a suite sharing tests with it, ran them: leaving a
 /// flaky test out of the command proves nothing about it (ADR 0027 §6).
-/// Quarantined tests are set aside in the open and not named.
-fn left_out_flaky(
-    store: &Store,
-    run: &str,
-    suite: &str,
-    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
-) -> Result<Option<String>> {
+/// Quarantined tests too: a quarantine never makes a run look better (0034).
+fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String>> {
     let ran: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id WHERE a.run_id = ?1",
@@ -2883,7 +2452,6 @@ fn left_out_flaky(
         if ran.contains(&f.display)
             || ran.iter().any(|r| same_test_name(r, &f.display))
             || left.contains(&f.display)
-            || crate::quarantine::covers(quarantine, &f.display).is_some()
         {
             continue;
         }
@@ -3329,12 +2897,7 @@ pub fn unverified_runs(
         if r.status == Status::Finished
             && r.outcome == Some(Outcome::Passed)
             && !out.contains(&r.id)
-            && !flaky_passed_in(
-                store,
-                r,
-                &crate::quarantine::in_force_at(store, r.created_ms)?,
-            )?
-            .is_empty()
+            && !flaky_passed_in(store, r)?.is_empty()
         {
             out.insert(r.id.clone());
         }
@@ -3347,11 +2910,7 @@ pub fn unverified_runs(
 /// store alone; it once took a full summary of the run, whose history took
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
-fn flaky_passed_in(
-    store: &Store,
-    row: &RunRow,
-    quarantine: &BTreeMap<String, crate::quarantine::Entry>,
-) -> Result<Vec<String>> {
+fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     let passed: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
@@ -3369,10 +2928,7 @@ fn flaky_passed_in(
         return Ok(out);
     }
     for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
-        if passed.contains(&f.display)
-            && !out.contains(&f.display)
-            && crate::quarantine::covers(quarantine, &f.display).is_none()
-        {
+        if passed.contains(&f.display) && !out.contains(&f.display) {
             out.push(f.display);
         }
     }
@@ -3582,7 +3138,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // A pass of a known flaky test proves little: say so, or a green run
     // reads as a reliably green suite (round 7).
     let flaky_passed = if row.status == Status::Finished {
-        flaky_passed_in(store, &row, &quarantine)?
+        flaky_passed_in(store, &row)?
     } else {
         Vec::new()
     };
@@ -3624,7 +3180,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     finals
                         .values()
                         .find(|f| f.0.display() == *name && f.0.place_unknown())
-                        .map(|f| format!("{} in an unknown directory: not set aside", f.1.as_str()))
+                        .map(|f| format!("{} in an unknown directory", f.1.as_str()))
                 });
             // A selection that did not include it says nothing of it
             // (round 15: "not run" on every --select run).
@@ -3977,8 +3533,7 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         })
         .take(CHECKED_PASSES)
     {
-        let q = crate::quarantine::in_force_at(store, r.created_ms)?;
-        if flaky_passed_in(store, r, &q)?.is_empty() {
+        if flaky_passed_in(store, r)?.is_empty() {
             last_passed = Some(r);
             break;
         }
@@ -4096,57 +3651,6 @@ mod quarantine_tests {
     use super::*;
     use crate::quarantine::Entry;
 
-    /// Round 16: wrap-up lines after a runner's summary, and counts.
-    #[test]
-    fn only_the_commands_own_wrap_up_may_follow_the_summary() {
-        let names = vec!["tests::flaky".to_owned()];
-        for t in [
-            "error: test run failed",
-            "error: 1 target failed:",
-            "`--lib`",
-            "Start at  20:41:15",
-            "npm error Lifecycle script `test` failed",
-            "FAIL [   0.004s] (4/5) calc tests::flaky",
-        ] {
-            assert!(wrapper_line(t, &names), "{t}");
-        }
-        for t in [
-            "smoke: GET /health returned 503",
-            "Found 1 error.",
-            "error: 2 targets failed:",
-            "Segmentation fault (core dumped) ./bin/tests::flaky",
-        ] {
-            assert!(!wrapper_line(t, &names), "{t}");
-        }
-        assert_eq!(
-            failed_count("Test Suites: 2 failed, 1 passed, 3 total"),
-            Some(2)
-        );
-        assert_eq!(failed_count("Test Files  1 failed | 2 passed (3)"), Some(1));
-        assert_eq!(failed_count("Test Suites: 3 passed, 3 total"), None);
-    }
-
-    /// Round 16: Maven's wrap-up of a failed test step, as captured from
-    /// `mvn test`; a line that merely starts the same way is not one.
-    #[test]
-    fn maven_wrap_up_lines_of_a_failed_test_step_are_the_runners_summary() {
-        for t in [
-            "[ERROR] See /w/target/surefire-reports for the individual test results.",
-            "[ERROR] See dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.",
-            "[ERROR] Failures: ",
-            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0",
-        ] {
-            assert!(summary_of_failures(t), "{t}");
-        }
-        for t in [
-            "[ERROR] See you at /w/src/Other.java:[3,5] ';' expected",
-            "[ERROR] COMPILATION ERROR :",
-            "[ERROR] Tests run: 5, Failures: 1, Errors: 1, Skipped: 0",
-        ] {
-            assert!(!summary_of_failures(t), "{t}");
-        }
-    }
-
     fn q(names: &[&str]) -> BTreeMap<String, Entry> {
         names
             .iter()
@@ -4173,63 +3677,36 @@ mod quarantine_tests {
             .collect()
     }
 
+    /// Which failures the summary may call all quarantined (ADR 0034: the
+    /// run fails either way). A subtest follows its parent's quarantine
+    /// only when it was known before it (round 14); a parent failing only
+    /// through quarantined subtests goes with them; another failure, or no
+    /// quarantine, names none.
     #[test]
-    fn only_quarantined_plain_failures_are_set_aside() {
-        let o = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
+    fn every_failure_quarantined_is_named_and_nothing_else() {
+        let one = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Passed)]);
         assert_eq!(
-            quarantined_only_failures(&o, &q(&["a"]), Some(1), &|_| None),
+            all_failures_quarantined(&one, &q(&["a"]), &|_| None),
             Some(vec!["a".to_owned()])
         );
-        // Another failing test, an error, or no quarantine: the run fails.
-        let two = outcomes(&[("a", Outcome::Failed), ("c", Outcome::Failed)]);
-        assert_eq!(
-            quarantined_only_failures(&two, &q(&["a"]), Some(1), &|_| None),
-            None
-        );
-        let err = outcomes(&[("a", Outcome::Errored)]);
-        assert_eq!(
-            quarantined_only_failures(&err, &q(&["a"]), Some(1), &|_| None),
-            None
-        );
-        assert_eq!(
-            quarantined_only_failures(&o, &q(&[]), Some(1), &|_| None),
-            None
-        );
-        // A command that could not start, or was killed, is no test failure.
-        assert_eq!(
-            quarantined_only_failures(&o, &q(&["a"]), Some(127), &|_| None),
-            None
-        );
-        assert_eq!(
-            quarantined_only_failures(&o, &q(&["a"]), None, &|_| None),
-            None
-        );
-    }
-
-    /// Round 14: a parent's quarantine does not cover a subtest new since;
-    /// a parent failing only through its quarantined subtest is set aside.
-    #[test]
-    fn subtests_follow_their_quarantine_only_when_it_knew_them() {
-        // `q` quarantines at created_ms 0; first seen at 0 is not before.
+        let two = outcomes(&[("a", Outcome::Failed), ("b", Outcome::Failed)]);
+        assert_eq!(all_failures_quarantined(&two, &q(&["a"]), &|_| None), None);
+        assert_eq!(all_failures_quarantined(&one, &q(&[]), &|_| None), None);
         let parent = outcomes(&[
             ("TestQ", Outcome::Failed),
             ("TestQ/new", Outcome::Failed),
             ("TestO", Outcome::Passed),
         ]);
         assert_eq!(
-            quarantined_only_failures(&parent, &q(&["TestQ"]), Some(1), &|_| Some(0)),
-            None
+            all_failures_quarantined(&parent, &q(&["TestQ"]), &|_| Some(0)),
+            None,
+            "a subtest first seen at the quarantine is news"
         );
         let mut known = q(&["TestQ"]);
         known.get_mut("TestQ").unwrap().created_ms = 10;
         assert_eq!(
-            quarantined_only_failures(&parent, &known, Some(1), &|_| Some(5)),
+            all_failures_quarantined(&parent, &known, &|_| Some(5)),
             Some(vec!["TestQ".to_owned(), "TestQ/new".to_owned()])
-        );
-        let only = outcomes(&[("a", Outcome::Failed)]);
-        assert_eq!(
-            quarantined_only_failures(&only, &q(&["a"]), Some(1), &|_| None),
-            None
         );
         let child = outcomes(&[
             ("TestP", Outcome::Failed),
@@ -4237,7 +3714,7 @@ mod quarantine_tests {
             ("TestO", Outcome::Passed),
         ]);
         assert_eq!(
-            quarantined_only_failures(&child, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            all_failures_quarantined(&child, &q(&["TestP/flaky"]), &|_| None),
             Some(vec!["TestP".to_owned(), "TestP/flaky".to_owned()])
         );
         let other = outcomes(&[
@@ -4246,7 +3723,7 @@ mod quarantine_tests {
             ("TestP/flaky", Outcome::Failed),
         ]);
         assert_eq!(
-            quarantined_only_failures(&other, &q(&["TestP/flaky"]), Some(1), &|_| None),
+            all_failures_quarantined(&other, &q(&["TestP/flaky"]), &|_| None),
             None
         );
     }
@@ -4305,22 +3782,6 @@ mod readable_tests {
             super::readable(lines),
             vec!["    a_test.go:9: boom".to_owned(), "plain line".to_owned()]
         );
-    }
-
-    #[test]
-    fn a_libtest_json_event_of_a_quarantined_test_is_its_own_output() {
-        let q = vec!["tests::flaky_clock".to_owned()];
-        let own = r#"{"type":"test","event":"failed","name":"calc::calc$tests::flaky_clock","stdout":"thread panicked"}"#;
-        assert!(super::libtest_event_of(own, &q));
-        let plain = r#"{"type":"test","event":"failed","name":"tests::flaky_clock"}"#;
-        assert!(super::libtest_event_of(plain, &q));
-        let other = r#"{"type":"test","event":"failed","name":"calc::calc$tests::divides","stdout":"panicked"}"#;
-        assert!(!super::libtest_event_of(other, &q));
-        let suffix = r#"{"type":"test","event":"failed","name":"calc::calc$tests::flaky_clock_2"}"#;
-        assert!(!super::libtest_event_of(suffix, &q));
-        assert!(!super::libtest_event_of("not json", &q));
-        let suite = r#"{"type":"suite","event":"failed","name":"tests::flaky_clock"}"#;
-        assert!(!super::libtest_event_of(suite, &q));
     }
 
     #[test]

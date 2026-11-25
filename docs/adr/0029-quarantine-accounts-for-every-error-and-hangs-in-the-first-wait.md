@@ -1,6 +1,6 @@
 # 0029: A quarantine accounts for every error line; repeats are not retries; a hang is named in the first wait
 
-Status: Accepted (2026-11-24). Amends [0028](0028-quarantine-sets-aside-only-what-it-explains.md) §1 and §6, [0024](0024-sandbox-retries-and-abba.md) (what a retry is), and [0004](0004-liveness-and-fail-fast.md) (stall default).
+Status: Accepted (2026-11-24). Amends [0028](0028-quarantine-sets-aside-only-what-it-explains.md) §1 and §6, [0024](0024-sandbox-retries-and-abba.md) (what a retry is), and [0004](0004-liveness-and-fail-fast.md) (stall default). §1 superseded by [0034](0034-a-quarantine-never-turns-a-failed-run-green.md): a quarantine never turns a failed run green.
 
 ## Context
 

@@ -107,7 +107,7 @@ prova output <run>              # the kept excerpt; --test <name> for one failin
 prova run default --repeat 5    # is it flaky? each test's tally over 5 runs
 prova sizes                     # small / medium / large by what each test used
 prova slowest                   # the slowest tests, p50 and p95 from history
-prova quarantine add <test> --reason "..."   # set a known-flaky test aside, in the open (this machine's store)
+prova quarantine add <test> --reason "..."   # mark a known-flaky test, in the open; its failure still fails the run
 ```
 
 While a run goes, failures print as they happen. On a terminal a live line

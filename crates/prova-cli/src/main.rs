@@ -357,19 +357,18 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// Set known-flaky tests aside from the verdict, in the open.
+    /// Mark known-flaky tests, in the open: named in every run, never passing one.
     #[command(after_help = "\
 Examples:
   prova quarantine add tests::flaky_clock --reason \"clock tick, issue 42\"
   prova quarantine add tests::flaky_clock --reason \"still flaky\" --days 30
-  prova quarantine list           what is set aside now, and until when
+  prova quarantine list           what is quarantined now, and until when
   prova quarantine list --all     including removed ones
   prova quarantine remove tests::flaky_clock
 
-A quarantined test still runs and keeps its history. If it is the only thing
-that fails, the run passes (when the suite's command is one test-runner call: a make
-target, a script or a chain of steps is refused); every summary lists it. A
-quarantine expires.
+A quarantined test still runs and keeps its history, and every summary lists it
+with its result. It never turns a failed run green: when every failing test is
+quarantined the run says so, and still fails. A quarantine expires.
 It is kept in this machine's prova store (PROVA_HOME), not in the repository:
 CI and teammates do not see it; each quarantines in its own store.")]
     Quarantine {
@@ -2261,7 +2260,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             let e = q::add(store, &name, file.as_deref(), &reason, days, now_ms())?;
             println!(
-                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure of a suite that calls the test runner directly, the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
+                "quarantined {} ({}; {}): it still runs and keeps its history, and every run lists it; a run where it fails still fails. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
                 render::clean(&e.reason),
                 render::expires_in(e.expires_ms)
@@ -3287,13 +3286,6 @@ fn repeat_runs(
                     None => f.test.clone(),
                 })
                 .collect();
-            // A pass that set a quarantined failure aside says so (round 14).
-            let set_aside: Vec<&str> = s
-                .quarantined
-                .iter()
-                .filter(|q| q.result == "failed" || q.result == "errored")
-                .map(|q| q.test.as_str())
-                .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
             } else if ran == 0 && !counted {
@@ -3302,8 +3294,6 @@ fn repeat_runs(
                 (s.outcome, &s.detail)
             {
                 format!(" ({})", render::clean(d))
-            } else if !set_aside.is_empty() {
-                format!(" (quarantined, set aside: {})", set_aside.join(", "))
             } else {
                 String::new()
             };

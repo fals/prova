@@ -594,7 +594,8 @@ fn go_verbose_failures_count_once_under_their_package() {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    // A quarantine never passes a run (ADR 0034).
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
         out.contains("FAIL example.com/m::TestF (quarantined): failed every time")
             && !out.contains("FAIL TestF"),
@@ -762,47 +763,10 @@ fn a_quarantined_go_failure_is_no_retry() {
     );
     let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
     let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(s["outcome"], "passed", "{s}");
+    // A quarantine never passes a run (ADR 0034), and its failure is no
+    // retry either.
+    assert_eq!(s["outcome"], "failed", "{s}");
     assert!(!s.to_string().contains("passed on a retry"), "{s}");
-}
-
-/// ADR 0031 §1: code after `m.Run()` in a `TestMain` (goleak) may check only
-/// when every test passed, so a quarantined failure of that package cannot be
-/// set aside; the same failure in a package without one can.
-#[test]
-fn a_package_with_testmain_cannot_set_a_failure_aside() {
-    let d = workspace("q-testmain");
-    let script = format!(
-        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
-    );
-    fake_go(&d, &script);
-    std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
-    prova(&d, &["run", "--", "./rc/go", "test"]);
-    prova(
-        &d,
-        &[
-            "quarantine",
-            "add",
-            "example.com/m::TestFlaky",
-            "--reason",
-            "clock",
-        ],
-    );
-    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
-    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(s["outcome"], "passed", "no TestMain: {s}");
-    std::fs::write(
-        d.join("main_test.go"),
-        "package m\n\nfunc TestMain(m *testing.M) {\n\tgoleak.VerifyTestMain(m)\n}\n",
-    )
-    .unwrap();
-    let o = prova(&d, &["run", "--json", "--", "./rc/go", "test"]);
-    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(s["outcome"], "failed", "TestMain: {s}");
-    assert!(
-        s.to_string().contains("defines TestMain"),
-        "must say why: {s}"
-    );
 }
 
 /// Round 16: gotestsum prints a subpackage relative to the module

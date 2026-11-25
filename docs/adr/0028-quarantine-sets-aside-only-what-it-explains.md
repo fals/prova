@@ -1,6 +1,6 @@
 # 0028: A quarantine sets aside only what its tests explain; a hang shows on the first wait
 
-Status: Accepted (2026-11-24). Modelled in `spec/run.qnt` (`withQuarantine`, invariant `quarantineHidesOnlyItsOwn`, test `onlyQuarantinedFailingIsNoPassTest`). Amends [0027](0027-quarantine-and-slow-tests.md) §4 and §5, and [0004](0004-liveness-and-fail-fast.md) (stall default).
+Status: Accepted (2026-11-24). Modelled in `spec/run.qnt` (`withQuarantine`, invariant `quarantineHidesOnlyItsOwn`, test `onlyQuarantinedFailingIsNoPassTest`). Amends [0027](0027-quarantine-and-slow-tests.md) §4 and §5, and [0004](0004-liveness-and-fail-fast.md) (stall default). §1 superseded by [0034](0034-a-quarantine-never-turns-a-failed-run-green.md): a quarantine never turns a failed run green.
 
 ## Context
 
