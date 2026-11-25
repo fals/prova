@@ -1093,10 +1093,18 @@ impl Recognizers {
         let Some(cwd) = &self.cwd else {
             return;
         };
-        let dir = header.split(", ").next().unwrap_or(header).trim();
-        self.pytest_prefix = std::path::Path::new(dir)
+        let dir = std::path::Path::new(header.split(", ").next().unwrap_or(header).trim());
+        // Either path may run through a symlink (macOS `/var` is
+        // `/private/var`): compare them resolved when they differ as written.
+        let rel = dir
             .strip_prefix(cwd)
+            .map(|r| r.to_path_buf())
             .ok()
+            .or_else(|| {
+                let (d, c) = (dir.canonicalize().ok()?, cwd.canonicalize().ok()?);
+                d.strip_prefix(&c).map(|r| r.to_path_buf()).ok()
+            });
+        self.pytest_prefix = rel
             .map(|rel| rel.to_string_lossy().trim_matches('/').to_owned())
             .filter(|rel| !rel.is_empty());
     }

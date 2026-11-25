@@ -175,8 +175,13 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
 #[test]
 fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     let d = workspace("pyroot");
-    let sub = d.join("sub2");
-    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(d.join("sub2")).unwrap();
+    // The rootdir printed through a symlink of the working directory (macOS
+    // temp dirs: `/var` is `/private/var`) is still below it.
+    let link = PathBuf::from(format!("{}.link", d.display()));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&d, &link).unwrap();
+    let sub = link.join("sub2");
     let py = |rootdir: &Path, id: &str, outcome: &str, code: u8| {
         format!(
             "{BUSY} printf '%s\\n' '============ test session starts ============' 'rootdir: {}' 'collecting ... collected 1 item' '{id} {outcome} [100%]' '' '============ 1 {} in 0.01s ============'; exit {code}",
