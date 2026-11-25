@@ -365,14 +365,20 @@ fn pytest_dir(command: &str, cwd: &Path) -> Option<PathBuf> {
 /// wrapper's `sh -c "$*"` splits it again, so a node with a space, `$`, a
 /// quote, a parenthesis or a backslash breaks. Quoted-argument templates
 /// (`$PROVA_NODE_Q`) and a command that starts with the runner itself
-/// are safe.
+/// (`pytest`, `py.test`, `python -m pytest`) are safe.
 fn unquoted_through_a_wrapper(command: &str) -> bool {
     if command.contains("PROVA_NODE_Q") {
         return false;
     }
-    let first = command.split_whitespace().next().unwrap_or("");
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let first = words.first().copied().unwrap_or("");
     let program = first.rsplit('/').next().unwrap_or(first);
-    !(program == "pytest" || program == "py.test" || program.starts_with("python"))
+    // `python -m pytest` is the runner; another Python script is a wrapper
+    // that may join its arguments into a shell string.
+    let python_m_pytest = program.starts_with("python")
+        && words.get(1) == Some(&"-m")
+        && words.get(2) == Some(&"pytest");
+    !(program == "pytest" || program == "py.test" || python_m_pytest)
 }
 
 /// The node id pytest takes positionally for a selection that names one
@@ -1015,6 +1021,9 @@ mod tests {
         let unq = "./dev python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
         let q = "./dev \"python3 -m pytest -k $PROVA_FILTER_Q $PROVA_NODE_Q\"";
         let direct = "python3 -m pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
+        // A Python script that is not pytest may join its argv into a shell
+        // string: no exemption for it (review of PR 113).
+        let script = "python3 ./dev.py pytest -k \"$PROVA_FILTER\" ${PROVA_NODE:+\"$PROVA_NODE\"}";
         for bad in [
             "tests/test_calc.py::test_add[two plus-1]",
             "tests/test_calc.py::test_add[$two]",
@@ -1023,6 +1032,7 @@ mod tests {
             "tests/test_calc.py::test_add[a\\b]",
         ] {
             assert_eq!(super::pytest_node(unq, bad, &d), None, "{bad}");
+            assert_eq!(super::pytest_node(script, bad, &d), None, "{bad}");
             assert_eq!(
                 super::pytest_node(q, bad, &d).as_deref(),
                 Some(bad),
