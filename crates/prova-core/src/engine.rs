@@ -1397,6 +1397,12 @@ fn observe_child(
     // Tests set aside by hand, as they were when this run was created (0027).
     let quarantine = crate::quarantine::in_force_at(store, store.run(run)?.created_ms)?;
     let observed = sup.lifecycle.outcomes().len() + sup.lifecycle.open().len();
+    if status == Status::Finished
+        && observed == 0
+        && let Some(w) = surefire_report_off(&spec.command.display())
+    {
+        warnings.push(w);
+    }
     if spec.expects_tests() && status == Status::Finished {
         // A selection that only skipped tests ran none (round 11: vitest -t
         // reports the rest as skipped; 0 passed, 5 skipped exited 0).
@@ -2705,6 +2711,16 @@ fn runner_refusal(
 
 /// Whether `line` is a compiler, vet or linter diagnostic of the project's
 /// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
+/// The warning for a command that turns Surefire's XML report off: with
+/// `mvn -q` that leaves prova nothing to read (round 18).
+fn surefire_report_off(command: &str) -> Option<String> {
+    command
+        .contains("disableXmlReport=true")
+        .then(|| {
+            "Surefire's XML report is off (-DdisableXmlReport=true): prova sees no per-test result, so this pass cannot be verified; remove -DdisableXmlReport=true (or set it to false) to turn the report on".to_owned()
+        })
+}
+
 fn code_diagnostic(line: &str) -> bool {
     let mut parts = line.trim().splitn(4, ':');
     let (Some(path), Some(l), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
@@ -4467,6 +4483,22 @@ mod readable_tests {
     fn mavens_wrap_up_of_a_failed_test_step_is_the_runners() {
         assert!(super::runner_failure_summary("[INFO] BUILD FAILURE"));
         assert!(!super::runner_failure_summary("[INFO] BUILD SUCCESS"));
+    }
+}
+
+#[cfg(test)]
+mod xml_report_tests {
+    use super::surefire_report_off;
+
+    /// Round 18: `-DdisableXmlReport=true` gave an opaque pass whose next
+    /// line said "act on the warnings" with none that named the cause.
+    #[test]
+    fn a_disabled_surefire_report_is_named_with_its_cure() {
+        let w = surefire_report_off("mvn -q test -DdisableXmlReport=true").unwrap();
+        assert!(w.contains("XML report is off"), "{w}");
+        assert!(w.contains("-DdisableXmlReport"), "{w}");
+        assert!(surefire_report_off("mvn -q test").is_none());
+        assert!(surefire_report_off("./dev \"mvn -q test -DdisableXmlReport=false\"").is_none());
     }
 }
 

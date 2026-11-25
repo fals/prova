@@ -143,7 +143,22 @@ pub enum CommandSpec {
 impl CommandSpec {
     pub fn display(&self) -> String {
         match self {
-            CommandSpec::Argv(a) => a.join(" "),
+            // Quoted as a shell would need it, so the line can be pasted
+            // back (round 18).
+            CommandSpec::Argv(a) => a
+                .iter()
+                .map(|w| {
+                    let plain = !w.is_empty()
+                        && w.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "_./=:,@%+-".contains(c));
+                    if plain {
+                        w.clone()
+                    } else {
+                        shell_single_quote(w)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
             CommandSpec::Shell(s) => s.clone(),
         }
     }
@@ -290,6 +305,14 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
             .collect::<Vec<_>>()
             .join("(?: > | )");
     }
+    // pytest without `-k` (the template was rewritten for a node id): the
+    // selection is a node id, mapped back from prova's name if need be.
+    if command.contains("pytest")
+        && !command.contains(" -k ")
+        && let Some(node) = pytest_node(filter)
+    {
+        return node;
+    }
     let (Some(head), leaf) = split_node(filter) else {
         return filter.to_owned();
     };
@@ -309,6 +332,36 @@ pub fn framework_filter(command: &str, filter: &str) -> String {
         }
     } else {
         filter.to_owned()
+    }
+}
+
+/// A selection that names one pytest test or case, as the node id pytest
+/// takes positionally (`tests/test_calc.py::test_add[2-3]`): a node id as
+/// given, or prova's name (`tests.test_calc::test_add[2-3]`) with its module
+/// turned back into a path. None for a plain substring (that is a `-k`).
+pub fn pytest_node(filter: &str) -> Option<String> {
+    let (head, rest) = filter.split_once("::")?;
+    if rest.is_empty() {
+        return None;
+    }
+    if head.ends_with(".py") {
+        return Some(filter.to_owned());
+    }
+    let module = !head.is_empty()
+        && head
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+    module.then(|| format!("{}.py::{rest}", head.replace('.', "/")))
+}
+
+/// prova's name for a pytest node id (`tests/test_calc.py::test_add` is
+/// `tests.test_calc::test_add`); anything else unchanged.
+pub fn pytest_prova_name(filter: &str) -> String {
+    match filter.split_once("::") {
+        Some((head, rest)) if head.ends_with(".py") => {
+            format!("{}::{rest}", head.trim_end_matches(".py").replace('/', "."))
+        }
+        _ => filter.to_owned(),
     }
 }
 
@@ -445,7 +498,14 @@ impl Config {
                             .unwrap_or_default(),
                     )
                 })?;
-                fill_filter(template)
+                // A pytest node id is a positional argument, not a `-k`
+                // expression: `-k` rejects `::` and `[..]` ids or matches
+                // loosely (round 18). A plain substring stays a `-k`.
+                if pytest_node(f).is_some() && template.contains("-k {filter}") {
+                    fill_filter(&template.replace("-k {filter}", "{filter}"))
+                } else {
+                    fill_filter(template)
+                }
             }
         };
         let default_stall = s.size.map(Size::stall_after).unwrap_or(DEFAULT_STALL_AFTER);
@@ -704,6 +764,76 @@ mod tests {
             c.run_spec("nope", None),
             Err(ConfigError::UnknownSuite(..))
         ));
+    }
+
+    /// Round 18: `./dev "cd sub2 && python -m pytest -q"` was shown without
+    /// its quotes, so it could not be pasted back.
+    #[test]
+    fn an_argv_command_is_shown_shell_quoted() {
+        let c = CommandSpec::Argv(vec![
+            "./dev".into(),
+            "cd sub2 && python -m pytest -q".into(),
+            "it's".into(),
+            "-k".into(),
+            "a=b".into(),
+        ]);
+        assert_eq!(
+            c.display(),
+            r"./dev 'cd sub2 && python -m pytest -q' 'it'\''s' -k a=b"
+        );
+        let plain = CommandSpec::Argv(vec!["make".into(), "test".into()]);
+        assert_eq!(plain.display(), "make test");
+    }
+
+    /// Round 18: a node id or a parametrized case went to `-k`.
+    #[test]
+    fn a_pytest_node_id_is_a_positional_argument() {
+        let c: Config = toml::from_str(
+            r#"
+            [suite.p]
+            run = "python3 -m pytest -v"
+            select = "python3 -m pytest -v -rfE -k {filter}"
+            [suite.w]
+            run = "./dev x"
+            select = "./dev \"python3 -m pytest -v -k {filter}\""
+            "#,
+        )
+        .unwrap();
+        let cmd = |s: &str, f: &str| match c.run_spec(s, Some(f)).unwrap().command {
+            CommandSpec::Shell(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            cmd("p", "tests/test_calc.py::test_add"),
+            "python3 -m pytest -v -rfE \"$PROVA_FILTER\""
+        );
+        assert_eq!(
+            cmd(
+                "p",
+                "tests.test_params::test_add_cases[two plus $two-2-2-4]"
+            ),
+            "python3 -m pytest -v -rfE \"$PROVA_FILTER\""
+        );
+        assert_eq!(
+            cmd("w", "tests.test_calc::test_add"),
+            "./dev \"python3 -m pytest -v $PROVA_FILTER_Q\""
+        );
+        // A plain substring stays a -k expression.
+        assert_eq!(
+            cmd("p", "test_add"),
+            "python3 -m pytest -v -rfE -k \"$PROVA_FILTER\""
+        );
+        assert_eq!(
+            super::framework_filter(
+                "python3 -m pytest -v -rfE \"$PROVA_FILTER\"",
+                "tests.test_params::test_add_cases[two plus $two-2-2-4]"
+            ),
+            "tests/test_params.py::test_add_cases[two plus $two-2-2-4]"
+        );
+        assert_eq!(
+            super::pytest_prova_name("tests/test_calc.py::test_add"),
+            "tests.test_calc::test_add"
+        );
     }
 
     #[test]

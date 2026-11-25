@@ -123,7 +123,8 @@ fn adopt_keeps_the_wrapper_of_earlier_runs() {
     let v = json(&o);
     let t = v["toml"].as_str().unwrap();
     assert!(t.contains("run = \"./dev python3 -m pytest"), "{t}");
-    assert!(t.contains("select = \"./dev python3 -m pytest"), "{t}");
+    // The select takes the quoted form: `./dev` re-splits its words (round 18).
+    assert!(t.contains("select = \"./dev \\\"python3 -m pytest"), "{t}");
 }
 
 /// Round 15: pytest's exit 4 (a bad selection) was "FAILED exit 4" and
