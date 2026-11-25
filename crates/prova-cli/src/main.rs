@@ -1113,13 +1113,14 @@ fn exp_start(
             return Ok(exp_exit(&r));
         }
         if std::time::Instant::now() >= deadline {
-            render::experiment(&r, json);
-            if !json {
-                println!(
-                    "next: prova exp wait {name} --max-wait {}",
+            render::experiment_with_next(
+                &r,
+                json,
+                Some(format!(
+                    "prova exp wait {name} --max-wait {}",
                     max_wait.unwrap_or("9m")
-                );
-            }
+                )),
+            );
             return Ok(exit::RUNNING);
         }
         if !json {
