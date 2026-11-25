@@ -143,8 +143,8 @@ A foreground `exp run` (and `exp revalidate`) waits at most 9 minutes, or
 fails the comparison with a reason saying so; it is never a REJECT, so install
 what it needs and run again. `prova exp status` leads with the current best,
 then the latest comparison; it exits 0 when a kept best stands after a later
-REJECT. The Holm family is every comparison of this experiment on its metric,
-revalidations included. `caveat:` lines in the verdict flag a weak protocol,
+REJECT. The Holm family is every hypothesis tested in this experiment on its metric;
+a revalidation replicates one, adds none, and a revalidation that does not hold withdraws the accept (the best goes back). `caveat:` lines in the verdict flag a weak protocol,
 other experiments on the same baseline, or a protocol with no `--oracle` or `--spec`
 (correctness unchecked: only speed was judged). Sandboxed arms have no network
 unless the protocol has `--allow-network`: install dependencies in `--setup`.

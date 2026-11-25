@@ -1619,9 +1619,13 @@ fn work_comparison(
         }
         // Say how isolated the arms were (ADR 0024).
         result["sandbox"] = serde_json::json!(if sandbox_available() {
-            "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it"
+            if overlay_available() {
+                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; the oracle ran on a throwaway view of the checkout, so nothing it wrote reached the trials"
+            } else {
+                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; this system cannot show the oracle a throwaway checkout, so what it wrote in the checkout stayed for the trials"
+            }
         } else {
-            "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files"
+            "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files, and what the oracle wrote in a checkout stayed for the trials; read the candidate's diff"
         });
         // Say that the specification was checked, not only when it failed
         // (ADR 0018): both arms satisfied it before any trial ran.
@@ -1668,6 +1672,15 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/benches/**",
     "**/benchmarks/**",
     "**/spec/**",
+    // Expected values and inputs an oracle reads, and build scripts that run
+    // inside it (ADR 0032: a candidate must not move what it is judged by)
+    "**/testdata/**",
+    "**/fixtures/**",
+    "**/__snapshots__/**",
+    "**/golden/**",
+    "**/*.golden",
+    "**/*.snap",
+    "**/build.rs",
     "**/Makefile",
     "**/GNUmakefile",
     "**/*.mk",
@@ -2047,12 +2060,62 @@ pub fn sandbox_available() -> bool {
     })
 }
 
+/// Whether the sandbox can show a checkout through a throwaway overlay, so
+/// that nothing a command writes there survives it (ADR 0032).
+fn overlay_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !sandbox_available() {
+            return false;
+        }
+        let base = std::env::temp_dir().join(format!("prova-overlay-probe-{}", std::process::id()));
+        let (lower, upper, work) = (base.join("lower"), base.join("upper"), base.join("work"));
+        let made = [&lower, &upper, &work]
+            .iter()
+            .all(|d| std::fs::create_dir_all(d).is_ok());
+        let ok = made
+            && Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
+                .arg("--bind")
+                .arg(&base)
+                .arg(&base)
+                .arg("--overlay-src")
+                .arg(&lower)
+                .arg("--overlay")
+                .arg(&upper)
+                .arg(&work)
+                .arg(&lower)
+                .args(["--unshare-pid", "--", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        let _ = std::fs::remove_dir_all(&base);
+        ok
+    })
+}
+
 /// A command for one arm, sandboxed when bubblewrap works (ADR 0024): the
 /// whole filesystem read-only except the arm's own checkout, its private
 /// state (caches, bytecode), a private /tmp and the toolchain caches builds
 /// must write; its own process namespace, which dies with prova. The other
 /// arm's checkout, prova's store and the user's files cannot be changed.
 fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Command {
+    sandboxed_in(dir, program, args, network, None)
+}
+
+/// `sandboxed`, with the checkout shown through an overlay whose writes go
+/// to `overlay` (an empty directory `up` and `work` live in): what the
+/// command writes in the checkout is visible to it and to nobody after it
+/// (ADR 0032). Without bubblewrap and overlay support: as `sandboxed`.
+fn sandboxed_in(
+    dir: &Path,
+    program: &str,
+    args: &[String],
+    network: bool,
+    overlay: Option<&Path>,
+) -> Command {
     let state = pycache_dir(dir);
     let _ = std::fs::create_dir_all(&state);
     let mut c = if sandbox_available() {
@@ -2068,7 +2131,19 @@ fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Comma
             "--tmpfs",
             "/tmp",
         ]);
-        c.arg("--bind").arg(dir).arg(dir);
+        match overlay.filter(|_| overlay_available()) {
+            Some(o) => {
+                c.arg("--bind").arg(o).arg(o);
+                c.arg("--overlay-src").arg(dir);
+                c.arg("--overlay")
+                    .arg(o.join("up"))
+                    .arg(o.join("work"))
+                    .arg(dir);
+            }
+            None => {
+                c.arg("--bind").arg(dir).arg(dir);
+            }
+        }
         c.arg("--bind").arg(&state).arg(&state);
         // Shared toolchain caches stay read-only (round 11: a candidate
         // patched the baseline's compiled test in the shared Go build
@@ -2260,6 +2335,46 @@ fn checkout_differs(dir: &Path) -> Option<String> {
         .map(|((_, p), _)| p.clone())
 }
 
+/// The first tracked file of the checkout that an overlay's upper layer
+/// holds, i.e. one the sandboxed command wrote.
+fn rewritten_tracked(dir: &Path, upper: &Path) -> Option<String> {
+    let listed = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(["ls-files", "-z"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let tracked: std::collections::BTreeSet<String> = listed
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    let mut found: Option<String> = None;
+    let mut stack = vec![upper.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if m.is_dir() {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(upper) {
+                let rel = rel.to_string_lossy().into_owned();
+                if tracked.contains(&rel) && found.as_ref().is_none_or(|f| rel < *f) {
+                    found = Some(rel);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// `git status` of tracked files in a checkout (empty outside git).
 fn tracked_state(dir: &Path) -> String {
     Command::new("git")
@@ -2303,11 +2418,21 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    let status = sandboxed(
+    // The oracle runs the candidate's own code as the same user: whatever it
+    // writes in the checkout must not outlive it, or the code could leave
+    // the trials a measurement, a marker or a binary of its choosing
+    // (ADR 0032). Only its exit status and its log, which prova holds, count.
+    let scratch = logs.join(format!("oracle-{}-scratch", arm.as_str()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let isolated = overlay_available()
+        && std::fs::create_dir_all(scratch.join("up")).is_ok()
+        && std::fs::create_dir_all(scratch.join("work")).is_ok();
+    let status = sandboxed_in(
         dir,
         "sh",
         &["-c".to_owned(), oracle.clone()],
         p.allow_network,
+        isolated.then_some(scratch.as_path()),
     )
     .env_remove("PROVA_HOME")
     .env("PYTHONNOUSERSITE", "1")
@@ -2319,6 +2444,17 @@ fn satisfies_spec(
     .status()
     .ok();
     let ok = status.is_some_and(|s| s.success());
+    // Tracked files the oracle rewrote exist only in the overlay: say so, as
+    // the checkout-wide check does where there is none.
+    let rewrote = isolated
+        .then(|| rewritten_tracked(dir, &scratch.join("up")))
+        .flatten();
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Some(f) = rewrote {
+        return Ok(Err(SpecFail::Violated(format!(
+            "the oracle rewrote the tracked file {f}: code that rewrites the checkout (its spec, its reference data, the other arm) cannot be judged"
+        ))));
+    }
     // A process the oracle leaves behind would run into the trials and be
     // blamed on them (round 10: a daemon from the candidate's oracle was
     // reported as the baseline trial's leak).
@@ -2516,14 +2652,11 @@ pub fn evaluate(
             p.min_trials
         ));
     }
-    // Holm across this experiment's decided comparisons plus this one.
-    let mut stmt = store.conn().prepare(
-        "SELECT json_extract(result, '$.primary.p') FROM comparisons WHERE experiment = ?1 AND status = 'decided' AND id <> ?2",
-    )?;
-    let mut ps: Vec<f64> = stmt
-        .query_map(params![e.name, comparison], |r| r.get::<_, Option<f64>>(0))?
-        .filter_map(|r| r.ok().flatten())
-        .collect();
+    // Holm across this experiment's hypotheses (ADR 0032): a revalidation
+    // replicates a hypothesis already in the family, so its p takes the
+    // place of the p it replicates and adds no comparison.
+    let replicates = replicated(store, &e.name, comparison, i64::MAX)?;
+    let mut ps = family(store, &e.name, comparison, i64::MAX, replicates.as_deref())?;
     let raw = stats::mann_whitney(&base, &cand).p;
     ps.push(raw);
     let adjusted = *stats::holm(&ps).last().unwrap_or(&raw);
@@ -2551,10 +2684,60 @@ pub fn evaluate(
     } else {
         reason
     };
-    Ok((
-        verdict,
-        serde_json::json!({ "primary": primary, "guardrails": guards, "reason": reason, "comparisons_in_family": ps.len() }),
-    ))
+    let mut result = serde_json::json!({ "primary": primary, "guardrails": guards, "reason": reason, "comparisons_in_family": ps.len() });
+    if let Some(id) = &replicates {
+        result["revalidates"] = serde_json::json!(id);
+    }
+    Ok((verdict, result))
+}
+
+/// The earlier ACCEPT a comparison replicates, when it is a revalidation:
+/// the kept candidate again against the original baseline (ADR 0032).
+fn replicated(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    before_ms: i64,
+) -> Result<Option<String>> {
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT o.id FROM comparisons c JOIN comparisons o
+                ON o.experiment = c.experiment AND o.candidate = c.candidate
+              WHERE c.id = ?2 AND c.experiment = ?1 AND c.baseline = 'baseline'
+                AND o.id <> c.id AND o.status = 'decided' AND o.verdict = 'accept'
+                AND json_extract(o.result, '$.revalidates') IS NULL
+                AND COALESCE(o.ended_ms, 0) < ?3
+              ORDER BY o.ended_ms DESC, o.rowid DESC LIMIT 1",
+            params![exp, comparison, before_ms],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The raw p of each hypothesis already decided in an experiment (its Holm
+/// family), other than `comparison`: revalidations are not hypotheses of
+/// their own, and the one a replication stands in for is left out.
+fn family(
+    store: &Store,
+    exp: &str,
+    comparison: &str,
+    before_ms: i64,
+    replicates: Option<&str>,
+) -> Result<Vec<f64>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT json_extract(result, '$.primary.p') FROM comparisons
+          WHERE experiment = ?1 AND status = 'decided' AND id <> ?2
+            AND (?3 IS NULL OR id <> ?3)
+            AND json_extract(result, '$.revalidates') IS NULL
+            AND COALESCE(ended_ms, 0) < ?4",
+    )?;
+    Ok(stmt
+        .query_map(params![exp, comparison, replicates, before_ms], |r| {
+            r.get::<_, Option<f64>>(0)
+        })?
+        .filter_map(|r| r.ok().flatten())
+        .collect())
 }
 
 fn end_status(store: &Store, comparison: &str, status: &str) -> Result<()> {
@@ -2657,11 +2840,43 @@ fn finish(
             e.best
         ));
     }
+    // A replication that does not hold withdraws the accept it replicates
+    // (ADR 0032): the best goes back to what the accept was measured against.
+    let mut withdrawn_to: Option<String> = None;
+    if matches!(verdict, Verdict::Reject | Verdict::Inconclusive)
+        && e.best == candidate
+        && let Some(orig) = result["revalidates"].as_str()
+    {
+        let before: String = store.conn().query_row(
+            "SELECT baseline FROM comparisons WHERE id = ?1",
+            params![orig],
+            |r| r.get(0),
+        )?;
+        let to = if before != candidate && trusted_reference(store, &e.name, &before)? {
+            before
+        } else {
+            "baseline".to_owned()
+        };
+        reason.push_str(&format!(
+            "; the replication did not hold, so the accept of {candidate} is withdrawn and the best is {to} again"
+        ));
+        withdrawn_to = Some(to);
+    }
     let tx = store.conn().unchecked_transaction()?;
     tx.execute(
         "UPDATE comparisons SET status = 'decided', verdict = ?2, result = ?3, ended_ms = ?4 WHERE id = ?1",
         params![comparison, verdict.as_str(), result.to_string(), now_ms() as i64],
     )?;
+    if let Some(to) = &withdrawn_to {
+        tx.execute(
+            "INSERT INTO best_resets (experiment, from_best, to_best, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![e.name, candidate, to, format!("revalidation {comparison} did not replicate the accept"), now_ms() as i64],
+        )?;
+        tx.execute(
+            "UPDATE experiments SET best = ?2 WHERE name = ?1",
+            params![e.name, to],
+        )?;
+    }
     let decision = if verdict == Verdict::Accept {
         "keep"
     } else {
@@ -2898,14 +3113,8 @@ fn integrity(store: &Store, e: &Experiment) -> Result<Vec<String>> {
             ));
             continue;
         }
-        let mut fam = store.conn().prepare(
-            "SELECT json_extract(result, '$.primary.p') FROM comparisons
-              WHERE experiment = ?1 AND status = 'decided' AND id <> ?2 AND COALESCE(ended_ms, 0) < ?3",
-        )?;
-        let mut ps: Vec<f64> = fam
-            .query_map(params![e.name, id, ended], |r| r.get::<_, Option<f64>>(0))?
-            .filter_map(|r| r.ok().flatten())
-            .collect();
+        let replicates = replicated(store, &e.name, id, *ended)?;
+        let mut ps = family(store, &e.name, id, *ended, replicates.as_deref())?;
         let raw = stats::mann_whitney(&base, &c).p;
         ps.push(raw);
         let adjusted = *stats::holm(&ps).last().unwrap_or(&raw);
@@ -3163,5 +3372,173 @@ mod tests {
             None,
         );
         assert!(r.improvement < 0.0);
+    }
+}
+
+/// ADR 0032: a revalidation replicates a hypothesis; it adds no comparison to
+/// the Holm family, and a failed replication withdraws the accept.
+#[cfg(test)]
+mod revalidation_tests {
+    use super::*;
+
+    fn protocol() -> Protocol {
+        Protocol {
+            metric: "t".into(),
+            unit: None,
+            better: Better::Lower,
+            min_effect: 0.02,
+            alpha: 0.05,
+            trials: 5,
+            min_trials: 5,
+            max_trials: 5,
+            warmup: 0,
+            guardrails: Vec::new(),
+            command: vec!["true".into()],
+            kill_after_ms: 1000,
+            setup: None,
+            specs: Vec::new(),
+            oracle: None,
+            scope: Vec::new(),
+            scope_only: false,
+            allow_network: false,
+        }
+    }
+
+    fn fresh() -> (Store, PathBuf) {
+        let d = std::env::temp_dir().join(format!(
+            "prova-reval-{}-{}",
+            std::process::id(),
+            crate::ids::new_run_id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let s = Store::open_dir(&d, &d.join(".prova")).unwrap();
+        let p = protocol();
+        let c = s.conn();
+        c.execute(
+            "INSERT INTO experiments (name, hypothesis, protocol, protocol_hash, cwd, created_ms, best)
+             VALUES ('e', 'h', ?1, ?2, '', 1, 'c1')",
+            params![serde_json::to_string(&p).unwrap(), p.hash()],
+        )
+        .unwrap();
+        for v in ["baseline", "c1"] {
+            c.execute(
+                "INSERT INTO variants (experiment, name, kind, code, params, created_ms)
+                 VALUES ('e', ?1, 'workdir', 'x', '{}', 1)",
+                params![v],
+            )
+            .unwrap();
+        }
+        (s, d)
+    }
+
+    /// A comparison of c1 against the baseline with five samples per arm.
+    fn comparison(s: &Store, id: &str, decided: Option<(&str, serde_json::Value)>, cand: [f64; 5]) {
+        let c = s.conn();
+        let (status, verdict, result, ended) = match &decided {
+            Some((v, r)) => ("decided", Some(*v), Some(r.to_string()), Some(100)),
+            None => ("running", None, None, None),
+        };
+        let created = if decided.is_some() { 10 } else { 200 };
+        c.execute(
+            "INSERT INTO comparisons (id, experiment, baseline, candidate, status, verdict, result, created_ms, ended_ms)
+             VALUES (?1, 'e', 'baseline', 'c1', ?2, ?3, ?4, ?5, ?6)",
+            params![id, status, verdict, result, created, ended],
+        )
+        .unwrap();
+        let base = [10.0, 11.0, 12.0, 13.0, 14.0];
+        let rows = base
+            .iter()
+            .map(|v| ("baseline", *v))
+            .zip(cand.iter().map(|v| ("candidate", *v)))
+            .flat_map(|(a, b)| [a, b]);
+        for (i, (arm, v)) in rows.enumerate() {
+            let seq = i as i64 + 1;
+            c.execute(
+                "INSERT INTO trials (comparison, seq, arm, warmup, state, exit_code, fingerprint, started_ms, ended_ms)
+                 VALUES (?1, ?2, ?3, 0, 'complete', 0, 'f', 1, 2)",
+                params![id, seq, arm],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO samples (comparison, seq, metric, value) VALUES (?1, ?2, 't', ?3)",
+                params![id, seq, v],
+            )
+            .unwrap();
+        }
+    }
+
+    const FASTER: [f64; 5] = [1.0, 2.0, 3.0, 4.0, 5.0];
+    const SAME: [f64; 5] = [10.5, 11.5, 12.5, 13.5, 14.5];
+
+    fn decided_accept(revalidates: bool) -> (&'static str, serde_json::Value) {
+        let mut r = serde_json::json!({ "primary": { "p": 0.0079 } });
+        if revalidates {
+            r["revalidates"] = serde_json::json!("c-1");
+        }
+        ("accept", r)
+    }
+
+    #[test]
+    fn a_revalidation_adds_no_comparison_to_the_family() {
+        let (s, _d) = fresh();
+        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
+        // Six earlier revalidations, each with the smallest p the test allows.
+        for i in 0..6 {
+            let id = format!("rv-{i}");
+            comparison(&s, &id, Some(decided_accept(true)), FASTER);
+        }
+        comparison(&s, "rv-new", None, FASTER);
+        let e = get(&s, "e").unwrap();
+        let (verdict, result) = evaluate(&s, &e, "rv-new").unwrap();
+        assert_eq!(result["comparisons_in_family"], 1, "{result}");
+        assert_eq!(result["revalidates"], "c-1", "{result}");
+        assert_eq!(verdict, Verdict::Accept, "{result}");
+    }
+
+    #[test]
+    fn a_failed_replication_withdraws_the_accept() {
+        let (s, _d) = fresh();
+        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
+        comparison(&s, "rv", None, SAME);
+        let e = get(&s, "e").unwrap();
+        let (verdict, result) = evaluate(&s, &e, "rv").unwrap();
+        assert_ne!(verdict, Verdict::Accept, "{result}");
+        finish(&s, &e, "rv", "c1", verdict, result).unwrap();
+        assert_eq!(get(&s, "e").unwrap().best, "baseline");
+        let resets: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM best_resets WHERE experiment = 'e' AND from_best = 'c1' AND to_best = 'baseline'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resets, 1);
+    }
+}
+
+/// ADR 0032: files an oracle reads as expected values or build steps decide
+/// the verdict too; a candidate that edits them is out of scope.
+#[cfg(test)]
+mod oracle_input_tests {
+    use super::*;
+
+    #[test]
+    fn the_oracles_expected_data_and_build_scripts_are_harness_files() {
+        for f in [
+            "testdata/expected.json",
+            "pkg/testdata/primes.golden",
+            "tests/fixtures/input.csv",
+            "fixtures/answer.txt",
+            "src/__snapshots__/a.snap",
+            "pkg/a.golden",
+            "golden/out.txt",
+            "build.rs",
+            "crates/x/build.rs",
+        ] {
+            assert!(harness_file(f), "{f} should decide the verdict");
+        }
+        assert!(!harness_file("src/primes.rs"));
+        assert!(!harness_file("src/golden_ratio.rs"));
     }
 }

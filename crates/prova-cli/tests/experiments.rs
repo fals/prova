@@ -104,8 +104,8 @@ fn faster_candidate_is_accepted_and_becomes_best() {
     assert_eq!(v["comparison"]["candidate"], "c1");
     assert_eq!(v["comparison"]["baseline"], "baseline");
     assert_eq!(
-        v["comparison"]["result"]["comparisons_in_family"], 2,
-        "Holm family grows"
+        v["comparison"]["result"]["comparisons_in_family"], 1,
+        "a revalidation adds no comparison to the Holm family"
     );
 }
 
@@ -1111,9 +1111,7 @@ fn status_leads_with_the_best_after_a_later_reject() {
     assert!(best < latest, "{out}");
     // Holm: what the family holds is said.
     assert!(
-        out.contains(
-            "comparison(s) in this experiment's family for this metric (revalidations count)"
-        ),
+        out.contains("comparison(s) in this experiment's family for this metric, Holm"),
         "{out}"
     );
 }
@@ -1348,5 +1346,78 @@ fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
     assert!(
         t.contains("next: read the candidate's diff before trusting this"),
         "{t}"
+    );
+}
+
+/// ADR 0032 (oracle forging): the candidate's code runs inside the oracle, as
+/// the same user. It used that to plant a file in its checkout that the
+/// baseline's own workload reads, so the trials measured a number the code
+/// never produced. The oracle now runs on a throwaway view of the checkout.
+/// Medium: needs a repository, bubblewrap and the binary; a smaller test
+/// cannot start the sandbox.
+#[test]
+fn a_candidate_cannot_plant_files_during_the_oracle_for_the_trials() {
+    if !prova_core::experiment::sandbox_available() {
+        eprintln!("skipped: no bubblewrap here, the oracle is not isolated (ADR 0032)");
+        return;
+    }
+    let d = std::env::temp_dir().join(format!("prova-exp-plant-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("steps"), "100").unwrap();
+    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
+    std::fs::write(d.join("impl"), "echo 42\n").unwrap();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nif [ -f planted ]; then cat planted; else echo \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$(cat steps)}\"; fi\n",
+    )
+    .unwrap();
+    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
+    sh(
+        &d,
+        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
+    );
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "fewer steps, same answer",
+            "--metric",
+            "steps",
+            "--better",
+            "lower",
+            "--min-effect",
+            "10%",
+            "--trials",
+            "5",
+            "--max-trials",
+            "5",
+            "--warmup",
+            "0",
+            "--spec",
+            "spec.txt",
+            "--oracle",
+            "test \"$(sh ./impl)\" = 42 && echo 'test spec::answer ... ok'",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // Same steps, same answer; but while the oracle runs this code leaves a
+    // faked measurement behind for the workload to find.
+    std::fs::write(
+        d.join("impl"),
+        "echo '{\"metric\":\"steps\",\"value\":10}' > planted\necho 42\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
+    assert_eq!(
+        r["comparison"]["result"]["primary"]["candidate_median"], 100.0,
+        "the trials must measure the code, not the planted file: {r}"
     );
 }
