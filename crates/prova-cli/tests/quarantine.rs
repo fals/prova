@@ -36,8 +36,7 @@ fn workspace(name: &str) -> PathBuf {
     d
 }
 
-/// A command that qualifies for a quarantine (ADR 0031 §1): one test-runner
-/// call. A script named like the runner stands in for it and prints what the
+/// A script named like the test runner stands in for it and prints what the
 /// scripted command printed.
 fn runner(d: &Path, key: &str, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
@@ -149,42 +148,17 @@ fn flaky_history(d: &Path) {
     run(d, "make", "fail");
 }
 
+/// ADR 0034: a quarantined test that passes is still a known flaky test
+/// passing, which proves little: the pass is unverified, as without the
+/// quarantine; the quarantine is listed.
 #[test]
-fn a_quarantined_test_that_fails_does_not_fail_the_run_and_is_listed() {
-    let d = workspace("fails");
-    flaky_history(&d);
-    let o = prova(
-        &d,
-        &["quarantine", "add", "calc::x", "--reason", "clock tick"],
-    );
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let o = run(&d, "make", "fail");
-    let out = text(&o);
-    assert_eq!(o.status.code(), Some(0), "{out}");
-    assert!(
-        out.contains("PASSED") && !out.contains("unverified"),
-        "verified for the rest: {out}"
-    );
-    assert!(
-        out.contains("quarantined")
-            && out.contains("calc::x")
-            && out.contains("failed")
-            && out.contains("clock tick"),
-        "{out}"
-    );
-    // History keeps the failure: quarantine hides nothing from it.
-    let h = text(&prova(&d, &["history", "calc::x"]));
-    assert!(h.contains("fail"), "{h}");
-}
-
-#[test]
-fn a_quarantined_pass_is_verified_and_still_listed() {
+fn a_quarantined_test_that_passes_is_still_a_weak_pass() {
     let d = workspace("passes");
     flaky_history(&d);
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
     let out = text(&run(&d, "make", "pass"));
     assert!(
-        out.contains("PASSED") && !out.contains("unverified") && !out.contains("known flaky"),
+        out.contains("PASSED (unverified") && out.contains("known flaky"),
         "{out}"
     );
     assert!(
@@ -241,7 +215,8 @@ fn quarantine_list_remove_and_unknown_tests() {
 }
 
 /// Round 13: excluding the flaky test in the command gave a clean verified
-/// pass, because the new suite had no history of its own.
+/// pass, because the new suite had no history of its own. ADR 0034: a
+/// quarantine does not excuse it; the warning stays.
 #[test]
 fn leaving_a_known_flaky_test_out_of_another_suite_is_warned_about() {
     let d = workspace("leftout");
@@ -252,13 +227,10 @@ fn leaving_a_known_flaky_test_out_of_another_suite_is_warned_about() {
             && out.contains("1 known flaky test(s) did not run: calc::x"),
         "{out}"
     );
-    // Setting it aside openly is accepted, and listed as not run.
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
     let out = text(&run(&d, "stable", "pass"));
     assert!(
-        out.contains("PASSED")
-            && !out.contains("PASSED (unverified")
-            && !out.contains("did not run"),
+        out.contains("PASSED (unverified") && out.contains("did not run: calc::x"),
         "{out}"
     );
     assert!(
@@ -296,50 +268,6 @@ fn slow_tests_are_named_in_the_summary_and_listed_by_slowest() {
     assert_eq!(j[0]["test"], "TestSlow");
 }
 
-/// Round 14: a quarantined failure passed a run whose output also showed a
-/// build failure, a data race or more failures than the quarantined test's;
-/// and the quarantined test's own panic made a quarantined pass unverified.
-#[test]
-fn a_quarantine_sets_aside_only_what_its_test_explains() {
-    let d = workspace("explains");
-    let script = format!(
-        "{BUSY} echo 'test calc::ok ... ok'; case \"$(cat state)\" in \
-         pass) echo 'test calc::x ... ok' ;; \
-         own) echo 'test calc::x ... FAILED'; echo 'failures:'; echo '---- calc::x stdout ----'; echo \"thread 'calc::x' panicked at src/lib.rs:9:5:\"; exit 101 ;; \
-         summary) echo 'test calc::x ... FAILED'; echo 'error: test run failed'; echo 'error: test failed, to rerun pass `--lib`'; exit 100 ;; \
-         race) echo 'test calc::x ... FAILED'; echo 'WARNING: DATA RACE'; exit 101 ;; \
-         build) echo 'test calc::x ... FAILED'; echo 'error[E0425]: cannot find value `y` in this scope'; exit 101 ;; \
-         more) echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 1 passed; 3 failed; 0 ignored'; exit 101 ;; \
-         esac"
-    );
-    put(&d, format!("[suite.make]\nrun = {script:?}\n"));
-    run(&d, "make", "pass");
-    run(&d, "make", "own");
-    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    let o = run(&d, "make", "own");
-    let out = text(&o);
-    assert_eq!(o.status.code(), Some(0), "{out}");
-    assert!(!out.contains("unverified"), "its own panic: {out}");
-    // Round 15: the runner's own "tests failed" summary is the quarantined
-    // failure's, not something else that failed.
-    let o = run(&d, "make", "summary");
-    let out = text(&o);
-    assert_eq!(o.status.code(), Some(0), "runner summary: {out}");
-    for (state, why) in [
-        ("race", "WARNING: DATA RACE"),
-        ("build", "error[E0425]"),
-        ("more", "counted 3 failure(s)"),
-    ] {
-        let o = run(&d, "make", state);
-        let out = text(&o);
-        assert_eq!(o.status.code(), Some(1), "{state}: {out}");
-        assert!(
-            out.contains("FAILED") && out.contains(why),
-            "{state}: {out}"
-        );
-    }
-}
-
 /// Round 14: a bare name seen once (gotestsum's text) and the same test
 /// qualified (its json stream) were two tests; `add` set aside the stale
 /// bare one, and the real failure still failed the run.
@@ -365,30 +293,27 @@ fn a_bare_name_with_a_qualified_twin_is_ambiguous() {
     assert!(out.contains("this machine's prova store"), "{out}");
 }
 
-/// Round 14: a pass that set a quarantined failure aside looked like any
-/// pass in the run list and in `--repeat`; a run of only the quarantined
-/// test, failing, passed.
+/// Round 14 and ADR 0034: a run where the quarantined test fails is a
+/// failed run in the run list and in `--repeat`, and says the failure is
+/// the quarantined one.
 #[test]
-fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
+fn a_quarantined_failure_is_a_failed_run_everywhere() {
     let d = workspace("marked");
     flaky_history(&d);
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
     std::fs::write(d.join("state"), "fail").unwrap();
     let o = prova(&d, &["run", "make", "--repeat", "2"]);
     let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
-        out.contains("(quarantined, set aside: calc::x)")
-            && out.contains("FAIL calc::x (quarantined): failed every time"),
+        out.contains("FAIL calc::x (quarantined): failed every time"),
         "{out}"
     );
     let list = text(&prova(&d, &["status"]));
-    assert!(
-        list.contains("passed*") && list.contains("passed*: passed with quarantined tests failing"),
-        "{list}"
-    );
+    assert!(!list.contains("passed*"), "{list}");
     let last = text(&prova(&d, &["status", "last"]));
     assert!(
-        last.contains("PASSED (quarantined failures set aside)"),
+        last.contains("FAILED") && last.contains("every failing test is quarantined: calc::x"),
         "{last}"
     );
     put(
@@ -400,12 +325,6 @@ fn a_set_aside_failure_is_marked_everywhere_and_never_the_only_result() {
     );
     let o = prova(&d, &["run", "only"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
-    // Round 15: and it says why.
-    assert!(
-        text(&o).contains("only quarantined test(s) failed (calc::x), and no other test passed"),
-        "{}",
-        text(&o)
-    );
 }
 
 /// Round 15: `--repeat` over quiet output said a test that failed once in
@@ -442,24 +361,12 @@ fn repeat_tallies_say_what_was_not_seen() {
     );
 }
 
-/// Round 15: a pass that set a quarantined failure aside was named "last
-/// green", and every --select run listed the quarantined test "not run".
+/// Round 15: every --select run listed the quarantined test "not run".
 #[test]
-fn a_set_aside_pass_is_no_last_green_and_selections_stay_quiet() {
+fn a_selection_that_leaves_out_a_quarantined_test_says_nothing_of_it() {
     let d = workspace("lastgreen");
     flaky_history(&d);
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    let first = text(&run(&d, "make", "fail"));
-    let set_aside = first.split_whitespace().nth(1).unwrap().to_owned();
-    let out = text(&run(&d, "make", "fail"));
-    assert!(
-        out.contains("PASSED (quarantined failures set aside)"),
-        "{out}"
-    );
-    assert!(
-        !out.contains(&format!("last green: run {set_aside}")),
-        "{set_aside}: {out}"
-    );
     put(
         &d,
         format!(
@@ -470,161 +377,6 @@ fn a_set_aside_pass_is_no_last_green_and_selections_stay_quiet() {
     );
     let out = text(&prova(&d, &["run", "make", "--select", "calc::y"]));
     assert!(!out.contains("quarantined:"), "{out}");
-}
-
-/// Round 15: the guard matched a short list of crash lines; a coverage
-/// gate, a type checker, another make target, a killed run, an interrupted
-/// session or a crash of `test_queue` (next to quarantined `test_q`)
-/// passed behind a quarantined failure. Every error line must now be
-/// accounted for (ADR 0029).
-#[test]
-fn a_quarantine_accounts_for_every_error_line() {
-    let d = workspace("accounts");
-    let pytest = "printf '%s\\n' 'collected 3 items' \
-        'tests/test_a.py::test_q FAILED      [ 33%]' \
-        'tests/test_a.py::test_queue PASSED  [ 66%]' \
-        'tests/test_a.py::test_other PASSED  [100%]' \
-        '=================================== FAILURES ===================================' \
-        '___________________________________ test_q ____________________________________' \
-        '    def test_q():' \
-        '>       assert 2 == 1' \
-        'E       assert 2 == 1' \
-        'tests/test_a.py:3: AssertionError' \
-        '=========================== short test summary info ============================' \
-        'FAILED tests/test_a.py::test_q - assert 2 == 1' \
-        '========================= 1 failed, 2 passed in 0.12s =========================='";
-    let script = format!(
-        "{BUSY} {pytest}; case \"$(cat state)\" in \
-         plain) exit 1 ;; \
-         coverage) echo 'FAIL Required test coverage of 90% not reached. Total coverage: 50.00%'; exit 1 ;; \
-         tsc) echo \"src/app.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.\"; exit 1 ;; \
-         lint) echo 'make: *** [Makefile:5: lint] Error 1'; exit 2 ;; \
-         killed) exit 137 ;; \
-         segv) echo 'tests/test_a.py::test_queue Segmentation fault (core dumped)'; exit 1 ;; \
-         interrupted) echo '!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!'; exit 2 ;; \
-         esac"
-    );
-    put(&d, format!("[suite.make]\nrun = {script:?}\n"));
-    run(&d, "make", "plain");
-    prova(
-        &d,
-        &[
-            "quarantine",
-            "add",
-            "tests.test_a::test_q",
-            "--reason",
-            "flake",
-        ],
-    );
-    let o = run(&d, "make", "plain");
-    assert_eq!(o.status.code(), Some(0), "plain: {}", text(&o));
-    for state in ["coverage", "tsc", "lint", "killed", "segv", "interrupted"] {
-        let o = run(&d, "make", state);
-        assert_eq!(o.status.code(), Some(1), "{state}: {}", text(&o));
-    }
-}
-
-/// Round 15: in `go test -json`, a panic in the package's own output after
-/// the tests passed behind a quarantined failure.
-#[test]
-fn a_package_panic_in_go_json_is_not_a_quarantined_tests() {
-    let d = workspace("gojson-panic");
-    let ev = |a: &str, t: Option<&str>, out: Option<&str>| {
-        let mut v = serde_json::json!({"Action": a, "Package": "example.com/q"});
-        if let Some(t) = t {
-            v["Test"] = t.into();
-        }
-        if let Some(o) = out {
-            v["Output"] = format!("{o}\n").into();
-        }
-        format!("'{}'", v)
-    };
-    let lines = |panic: bool| {
-        let mut l = vec![
-            ev("run", Some("TestQueue"), None),
-            ev("pass", Some("TestQueue"), None),
-            ev("run", Some("TestQ"), None),
-            ev("output", Some("TestQ"), Some("=== RUN   TestQ")),
-            ev("output", Some("TestQ"), Some("    q_test.go:3: flake")),
-            ev("fail", Some("TestQ"), None),
-        ];
-        if panic {
-            l.push(ev("output", None, Some("panic: send on closed channel")));
-            l.push(ev("output", None, Some("goroutine 12 [running]:")));
-        }
-        l.push(ev("output", None, Some("FAIL\texample.com/q\t0.01s")));
-        l.push(ev("fail", None, None));
-        format!("{BUSY} printf '%s\\n' {}; exit 1", l.join(" "))
-    };
-    put(
-        &d,
-        format!(
-            "[suite.plain]\nrun = {:?}\n\n[suite.panic]\nrun = {:?}\n",
-            lines(false),
-            lines(true)
-        ),
-    );
-    prova(&d, &["run", "plain"]);
-    prova(
-        &d,
-        &[
-            "quarantine",
-            "add",
-            "example.com/q::TestQ",
-            "--reason",
-            "flake",
-        ],
-    );
-    let o = prova(&d, &["run", "plain"]);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let o = prova(&d, &["run", "panic"]);
-    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
-}
-
-/// Round 15: a quarantine refused for a new subtest said nothing of why.
-#[test]
-fn a_refused_quarantine_says_why() {
-    let d = workspace("why");
-    let go = |sub: bool| {
-        let subtest = if sub {
-            "'=== RUN   TestQ/new' '    q_test.go:9: real regression' '    --- FAIL: TestQ/new (0.00s)'"
-        } else {
-            "'    q_test.go:3: flake'"
-        };
-        format!(
-            "{BUSY} printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestQ' {subtest} '--- FAIL: TestQ (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
-        )
-    };
-    put(
-        &d,
-        format!(
-            "[suite.old]\nrun = {:?}\n\n[suite.new]\nrun = {:?}\n",
-            go(false),
-            go(true)
-        ),
-    );
-    prova(&d, &["run", "old"]);
-    prova(
-        &d,
-        &[
-            "quarantine",
-            "add",
-            "example.com/m::TestQ",
-            "--reason",
-            "flake",
-        ],
-    );
-    let o = prova(&d, &["run", "new"]);
-    let out = text(&o);
-    assert_eq!(o.status.code(), Some(1), "{out}");
-    assert!(
-        out.contains(
-            "first seen after their parent's quarantine failed (example.com/m::TestQ/new)"
-        ),
-        "{out}"
-    );
-    // Round 17: the new subtest is named, not only the detail.
-    assert!(out.contains("FAIL example.com/m::TestQ/new"), "{out}");
 }
 
 /// Round 15: a narrow suite (unit tests) was warned that a flaky test of
@@ -647,109 +399,15 @@ fn a_narrow_suite_is_not_warned_about_another_modules_flaky_test() {
     assert!(!out.contains("did not run"), "{out}");
 }
 
-/// Round 16: under gotestsum's default output, its red package line for
-/// the quarantined test's package was "an error outside the quarantined
-/// test(s)", so a quarantine never applied. (ADR 0031 retired the warning
-/// about make's stop: a make command is not set aside at all.)
-#[test]
-fn a_quarantine_applies_under_gotestsum() {
-    let d = workspace("gts-q");
-    let script = |flaky_fails: bool| {
-        let verdict = if flaky_fails { "fail" } else { "pass" };
-        let ev = |test: Option<&str>| match test {
-            Some(t) => format!(
-                r#"{{"Action":"{verdict}","Package":"example.com/calc","Test":"{t}","Elapsed":0}}"#
-            ),
-            None => format!(r#"{{"Action":"{verdict}","Package":"example.com/calc","Elapsed":0}}"#),
-        };
-        let pass_add =
-            r#"{"Action":"pass","Package":"example.com/calc","Test":"TestAdd","Elapsed":0}"#;
-        let json = format!(
-            "printf '%s\\n' '{pass_add}' '{}' '{}' >> \"$GOTESTSUM_JSONFILE\";",
-            ev(Some("TestFlaky")),
-            ev(None)
-        );
-        let text = if flaky_fails {
-            "printf '%s\\n' '\u{2716}  . (1.503s)' '' '=== Failed' '=== FAIL: . TestFlaky (0.00s)' '    calc_test.go:23: tick' '' 'DONE 2 tests, 1 failure in 0.1s'; exit 2"
-        } else {
-            "printf '%s\\n' '\u{2713}  . (1.503s)' '' 'DONE 2 tests in 0.1s'"
-        };
-        format!("{BUSY} {json} {text}")
-    };
-    put(
-        &d,
-        format!(
-            "[suite.flake]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n\n[suite.ok]\nrun = {:?}\ninject = [\"gotestsum-json\"]\n",
-            script(true),
-            script(false)
-        ),
-    );
-    std::fs::write(d.join("go.mod"), "module example.com/calc\n").unwrap();
-    prova(&d, &["run", "ok"]);
-    prova(&d, &["run", "flake"]);
-    prova(
-        &d,
-        &[
-            "quarantine",
-            "add",
-            "example.com/calc::TestFlaky",
-            "--reason",
-            "clock",
-        ],
-    );
-    let o = prova(&d, &["run", "flake"]);
-    let t = text(&o);
-    assert_eq!(o.status.code(), Some(0), "{t}");
-    assert!(!t.contains("any step after it did not run"), "{t}");
-}
-
-/// Round 16: under a quiet suite (`cargo test --quiet` via make) a refused
-/// quarantine said "no other test passed" next to "the framework counted 5".
-#[test]
-fn a_refusal_under_quiet_output_says_passes_were_only_counted() {
-    let d = workspace("quiet-q");
-    let quiet = format!(
-        "{BUSY} if [ \"$(cat state)\" = pass ]; then echo 'test result: ok. 5 passed; 0 failed; 0 ignored'; else echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 4 passed; 1 failed; 0 ignored'; exit 101; fi"
-    );
-    put(&d, format!("[suite.q]\nrun = {quiet:?}\n"));
-    run(&d, "q", "fail");
-    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    let o = run(&d, "q", "fail");
-    let t = text(&o);
-    assert_eq!(o.status.code(), Some(1), "{t}");
-    assert!(
-        t.contains("the framework counted 5 test(s), but its output names no passing test"),
-        "{t}"
-    );
-}
-
-/// Round 16: history said "none of them passed" when earlier runs had
-/// passed with a quarantined failure set aside.
-#[test]
-fn history_counts_passes_that_set_a_quarantine_aside() {
-    let d = workspace("setaside-hist");
-    suites(&d);
-    run(&d, "make", "fail");
-    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    run(&d, "make", "fail");
-    let out = text(&run(&d, "make", "fail"));
-    assert!(
-        out.contains(
-            "none passed with every test passing; 2 passed with quarantined failures set aside"
-        ) || out.contains("1 passed with quarantined failures set aside"),
-        "{out}"
-    );
-    assert!(!out.contains("none of them passed"), "{out}");
-}
-
 /// Round 16: two crates' `tests::flaky` shared one name; a quarantine of
-/// crate calc's set aside crate geo's real failure.
+/// crate calc's covered crate geo's real failure. ADR 0034: the run fails
+/// either way; only calc's own failure is called quarantined.
 #[test]
 fn a_quarantine_names_the_binary_when_a_name_is_shared() {
     let d = workspace("crates");
     let nx = |calc: &str, geo: &str, code: u8| {
         format!(
-            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run'; exit {code}"
+            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run: 2 passed, 1 failed'; exit {code}"
         )
     };
     put(
@@ -785,9 +443,13 @@ fn a_quarantine_names_the_binary_when_a_name_is_shared() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     let o = prova(&d, &["run", "a"]);
-    assert_eq!(o.status.code(), Some(0), "calc's own: {}", text(&o));
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "calc's own: {t}");
+    assert!(t.contains("every failing test is quarantined"), "{t}");
     let o = prova(&d, &["run", "b"]);
-    assert_eq!(o.status.code(), Some(1), "geo's failure: {}", text(&o));
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "geo's failure: {t}");
+    assert!(!t.contains("every failing test is quarantined"), "{t}");
 }
 
 /// Round 16: `quarantine add` accepted a file-level entry, which a
@@ -848,54 +510,6 @@ fn repeat_json_marks_quarantined_tests() {
     assert_eq!(x["quarantined"], true, "{v}");
 }
 
-/// ADR 0031 §1: a quarantine sets aside only the failures of one
-/// test-runner call. Every other command shape fails the run and says what
-/// made it so. A medium test: the verdict needs a real run end to end.
-#[test]
-fn a_quarantine_is_refused_unless_the_command_is_one_runner_call() {
-    let d = workspace("onecall");
-    flaky_history(&d);
-    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    std::fs::write(d.join("state"), "fail").unwrap();
-    // The same scripted tests, joined to other steps or behind make.
-    let inner = runner(&d, "inner", &full());
-    std::fs::write(d.join("Makefile"), format!("test:\n\t{inner}\n")).unwrap();
-    let cases = [
-        ("make test", "`make test` runs make"),
-        (
-            "./rc/inner/cargo test && echo lint",
-            "chains steps with `&&`",
-        ),
-        (
-            "./rc/inner/cargo test; echo lint; exit 1",
-            "chains steps with `;`",
-        ),
-        ("./rc/inner/cargo test | tee out.txt; exit 1", "pipe"),
-        ("sh ./rc/inner/cargo", "shell script"),
-        ("./rc/inner/cargo", "is not `cargo test`"),
-    ];
-    for (cmd, why) in cases {
-        let o = prova(&d, &["run", "--", "sh", "-c", cmd]);
-        let out = text(&o);
-        assert_eq!(o.status.code(), Some(1), "{cmd}: {out}");
-        assert!(out.contains(why), "{cmd}: {out}");
-        assert!(
-            out.contains("calc::x") && out.contains("a suite whose command is the runner alone"),
-            "{cmd}: {out}"
-        );
-    }
-    // The runner called directly, alone or through a wrapper, qualifies.
-    for argv in [
-        vec!["./rc/inner/cargo", "test"],
-        vec!["sh", "-c", "./rc/inner/cargo test"],
-    ] {
-        let mut args = vec!["run", "--"];
-        args.extend(argv.iter());
-        let o = prova(&d, &args);
-        assert_eq!(o.status.code(), Some(0), "{argv:?}: {}", text(&o));
-    }
-}
-
 /// Round 17: a quarantined test that failed in every run exited 0 with no
 /// word that it is broken, not flaky.
 #[test]
@@ -906,7 +520,7 @@ fn repeat_says_a_quarantined_test_that_failed_every_time_is_broken() {
     std::fs::write(d.join("state"), "fail").unwrap();
     let o = prova(&d, &["run", "make", "--repeat", "3"]);
     let out = text(&o);
-    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(
         out.contains("calc::x (quarantined): failed every time")
             && out.contains("broken, not flaky"),
@@ -934,10 +548,6 @@ fn repeat_names_what_failed_when_only_a_quarantined_test_did() {
     assert!(
         !out.contains("no failing test shown"),
         "a quarantined test failed: {out}"
-    );
-    assert!(
-        out.contains("run(s) failed although only quarantined test(s) failed"),
-        "{out}"
     );
 }
 
@@ -1018,4 +628,84 @@ fn repeat_does_not_call_a_skipped_test_passed() {
         out.contains("calc::s") && out.contains("skipped in every run"),
         "{out}"
     );
+}
+
+/// ADR 0034: a quarantine never turns a failed run green. A run whose only
+/// failing test is quarantined fails (exit 1) and says that every failing
+/// test is quarantined; the quarantine still shows, and history keeps the
+/// failure. A medium test: the verdict comes from the CLI end to end.
+#[test]
+fn a_quarantine_never_turns_a_failed_run_green() {
+    let d = workspace("never-green");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "make", "fail");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("FAILED"), "{out}");
+    assert!(!out.contains("PASSED"), "{out}");
+    assert!(
+        out.contains("every failing test is quarantined: calc::x"),
+        "{out}"
+    );
+    assert!(out.contains("quarantined: calc::x failed (clock"), "{out}");
+    // Failures first: the quarantined failure is in the FAIL list, marked.
+    assert!(out.contains("FAIL calc::x (quarantined)"), "{out}");
+    // History keeps the failure: a quarantine hides nothing from it.
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(h.contains("fail"), "{h}");
+}
+
+/// ADR 0034 (0027 §5): the one thing a quarantine changes is that a
+/// first-failure wait does not wake for a failure already known; it wakes
+/// for the next failure that is not quarantined. A medium test: a detached
+/// run and two waits through the CLI.
+#[test]
+fn a_first_failure_wait_does_not_wake_for_a_quarantined_failure() {
+    let d = workspace("wait-known");
+    flaky_history(&d);
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    put(
+        &d,
+        format!(
+            "[suite.later]\nrun = {:?}\n",
+            format!(
+                "{BUSY} echo 'test calc::x ... FAILED'; i=0; while [ ! -f go ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; echo 'test calc::y ... FAILED'; echo 'test result: FAILED. 0 passed; 2 failed'; exit 101"
+            )
+        ),
+    );
+    let o = prova(&d, &["run", "later", "--detach", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = v["run"].as_str().unwrap().to_owned();
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "2s",
+            "--json",
+        ],
+    );
+    let s: serde_json::Value = serde_json::from_slice(&w.stdout).unwrap();
+    // The wait ran out (reason `running`); it did not wake for calc::x.
+    assert_eq!(s["reason"], "running", "not woken by calc::x: {s}");
+    std::fs::write(d.join("go"), "").unwrap();
+    let w = prova(
+        &d,
+        &[
+            "wait",
+            &id,
+            "--until",
+            "first-failure",
+            "--max-wait",
+            "20s",
+            "--json",
+        ],
+    );
+    let s: serde_json::Value = serde_json::from_slice(&w.stdout).unwrap();
+    assert!(s.to_string().contains("calc::y"), "woken by calc::y: {s}");
+    let _ = prova(&d, &["cancel", &id]);
 }

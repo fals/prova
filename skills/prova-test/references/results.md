@@ -36,41 +36,30 @@ Contents: [Failure history](#failure-history) ·
   with different environment variables (named); find which one matters.
 - `warning: N known flaky test(s) did not run: ...`: the command left a
   known flaky test out (an exclude filter, a narrower suite). That is not a
-  pass of it, and the run is unverified. To set a flaky test aside in the
+  pass of it, and the run is unverified. To mark a known flaky test in the
   open instead, `prova quarantine add <test> --reason "..."` (expires in 14
-  days, `--days N` up to 90): it still runs and keeps its history; if it is
-  the only failure the run passes, verified for the rest, with the header
-  `PASSED (quarantined failures set aside)`. Every summary lists it as
-  `quarantined: <test> <result> (<reason>; expires in Nd)` (`not reported`
-  when the run gave no per-test results or was cut short, `not seen (quiet
-  output)` when quiet output hides passing tests);
-  `prova quarantine list` and `remove` manage it. **A quarantine sets aside
-  the failures of one test-runner call, nothing more.** The suite's command
-  must be the runner alone (`go test ./...`, `cargo nextest run`, `pytest`,
-  `vitest run`, `mvn test`, `dotnet test`, ...), optionally behind `sh -c`,
-  `docker run`/`exec`, `npx`, `uv run`, `npm test` (read through
-  package.json) or a script given the command as one quoted argument. A
-  `make` target, a script, or a chain (`&&`, `;`, `|`) fails the run
-  while the quarantined test fails, and `detail:` says what made it so:
-  another step could have failed or been skipped, and prova cannot see it.
-  The fix is a second suite whose command is the runner itself, next to the
-  full one. Vitest with coverage thresholds and a Go package with
-  `TestMain` are refused too (the runner skips a check once a test fails).
-  Within one runner call, every error line of the output must be its
-  own (in its section, naming it, or the runner's summary of failures), so
-  another failure, an error, a framework count above its failures, or a run
-  killed by a signal fails the run, and `detail:` says which. Nothing may
-  follow the tests' summary but the runner's own wrap-up. When tests of
-  several places share a name (two crates' `tests::flaky`, two Go packages,
-  two pytest or Vitest files), the run names the place (`FAIL tests::flaky
-  (geo)`), `prova history`, `flaky`, `slowest` and `diff` keep them apart,
-  and `prova quarantine add <test> --in <place>` names which (a crate,
-  `ex/a`, `tests/test_calc.py`); a parent's quarantine does not cover a
-  subtest first seen after it; a run where only quarantined tests ran and
-  failed fails. A quarantine lives in this machine's prova store, not in
-  the repository: CI and teammates do not see it. Do not quarantine a test
-  that fails every time now; that is a real failure (`--repeat` says "broken,
-  not flaky" when a quarantined test failed in every run).
+  days, `--days N` up to 90): it still runs and keeps its history, and every
+  summary lists it as `quarantined: <test> <result> (<reason>; expires in
+  Nd)` (`not reported` when the run gave no per-test results or was cut
+  short, `not seen (quiet output)` when quiet output hides passing tests).
+  **A quarantine never turns a failed run green, and never makes a pass
+  look better:** a run where it fails still fails (exit 1); when every
+  failing test is quarantined the run says `every failing test is
+  quarantined: <test>` and nothing more, since what did not run or ran out
+  of sight prints nothing. A quarantined test that passes is still a known
+  flaky test passing (an unverified pass), and one left out of the command
+  is still warned about. What it does change: `--until first-failure` does
+  not stop for a failure already known. `prova quarantine list` and `remove`
+  manage it. When tests of several places share a name (two crates'
+  `tests::flaky`, two Go packages, two pytest or Vitest files), the run
+  names the place (`FAIL tests::flaky (geo)`), and `prova quarantine add
+  <test> --in <place>` names which (a crate, `ex/a`, `tests/test_calc.py`);
+  a parent's quarantine does not cover a subtest first seen after it. A
+  quarantine lives in this machine's prova store, not in the repository: CI
+  and teammates do not see it. Do not quarantine a test that fails every
+  time now; that is a real failure (`--repeat` says "broken, not flaky"
+  when a quarantined test failed in every run). The fix for a flaky test is
+  fixing it, or leaving it out of the command with a reason everyone sees.
 - `slow tests: a 1.5s, b 1.1s (prova slowest)`: the slowest tests of this run
   (1 s or more). `prova slowest [--suite S] [-n N]` lists p50 and p95 from
   history, worst first.
@@ -113,8 +102,9 @@ A warning that ends with "no evidence about the tests" (impossible or
 identical durations, no CPU, shared result files, replayed output) keeps
 the run out of every test's history.
 
-`prova status` lists an unverified run as `passed?`, and a run that passed
-with quarantined failures set aside as `passed*`. In `--json`,
+`prova status` lists an unverified run as `passed?` (runs recorded before
+quarantines stopped passing runs show `passed*` for a pass with quarantined
+failures set aside). In `--json`,
 `verified` is `true` only for a clean pass. Do not report "tests pass" on
 an unverified run; read the warnings and make the suite run its tests.
 

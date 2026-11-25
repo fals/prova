@@ -3,7 +3,7 @@
 Format: one file per decision, `NNNN-title.md`, sections Status, Context, Decision, Consequences, Alternatives.
 Status values: Proposed, Accepted, Superseded by NNNN. An accepted ADR is never edited in substance; it is superseded.
 
-Records 0001 to 0033 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
+Records 0001 to 0034 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
 
 | # | Decision | Status | Deviates from README? |
 |---|---|---|---|
@@ -40,5 +40,6 @@ Records 0001 to 0033 are **Accepted**, each on the date in its row. Later amendm
 | [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) | A quarantine needs one test-runner call (make, scripts and chains are refused); a test keeps its place when names are shared; selections run what they name; container cancels and first-wait hangs; amends 0027, 0029, 0030 | Accepted 2026-11-25 | no |
 | [0032](0032-revalidation-replicates-and-the-oracle-leaves-nothing-behind.md) | A revalidation replicates a hypothesis and adds no comparison to the Holm family, a failed replication withdraws the accept; the oracle runs on a throwaway checkout view; expected data and build scripts are harness files; recording a result reads only the p95; amends 0007, 0021, 0023 | Accepted 2026-11-25 | no |
 | [0033](0033-places-are-checked-on-disk-and-quarantines-keep-them.md) | A test's directory is checked on disk (pytest ran where its file is, Vitest's root, a cargo test crate); a quarantine is per name and place; a pass inside a failed `-count` repeat is kept; amends 0029, 0031 | Accepted 2026-11-25 | no |
+| [0034](0034-a-quarantine-never-turns-a-failed-run-green.md) | A quarantine never turns a failed run green, nor makes a pass look verified; it names known failures (`every failing test is quarantined`) and nothing more; the set-aside rules of 0028 to 0031 are removed; supersedes 0027 §4, 0028 §1, 0029 §1, 0030 §1, 0031 §1 | Accepted 2026-11-25 | no |
 
 The deviations from the README were accepted with the records.

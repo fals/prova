@@ -1,6 +1,6 @@
 # 0030: A quarantine sets nothing aside after the tests' summary; a named selection must run its test
 
-Status: Accepted (2026-11-24). Amends [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) §1 and §4, and [0027](0027-quarantine-and-slow-tests.md) §2.
+Status: Accepted (2026-11-24). Amends [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) §1 and §4, and [0027](0027-quarantine-and-slow-tests.md) §2. §1 superseded by [0034](0034-a-quarantine-never-turns-a-failed-run-green.md): a quarantine never turns a failed run green.
 
 ## Context
 

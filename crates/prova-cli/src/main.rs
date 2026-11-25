@@ -57,7 +57,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum QuarantineCmd {
-    /// Quarantine a test prova has seen, with the reason it is set aside.
+    /// Quarantine a test prova has seen, with the reason it is known flaky.
     #[command(after_help = "\
 Example:
   prova quarantine add tests::flaky_clock --reason \"clock tick, issue 42\"")]
@@ -65,7 +65,7 @@ Example:
         /// The test's full name, or a substring that matches one test.
         #[arg(add = ArgValueCompleter::new(complete_tests))]
         test: String,
-        /// Why it is set aside (shown in every run that touches it).
+        /// Why it is quarantined (shown in every run that touches it).
         #[arg(long)]
         reason: String,
         /// Days until the quarantine expires and the test counts again.
@@ -357,19 +357,18 @@ Examples:
         #[arg(long)]
         json: bool,
     },
-    /// Set known-flaky tests aside from the verdict, in the open.
+    /// Mark known-flaky tests, in the open: named in every run, never passing one.
     #[command(after_help = "\
 Examples:
   prova quarantine add tests::flaky_clock --reason \"clock tick, issue 42\"
   prova quarantine add tests::flaky_clock --reason \"still flaky\" --days 30
-  prova quarantine list           what is set aside now, and until when
+  prova quarantine list           what is quarantined now, and until when
   prova quarantine list --all     including removed ones
   prova quarantine remove tests::flaky_clock
 
-A quarantined test still runs and keeps its history. If it is the only thing
-that fails, the run passes (when the suite's command is one test-runner call: a make
-target, a script or a chain of steps is refused); every summary lists it. A
-quarantine expires.
+A quarantined test still runs and keeps its history, and every summary lists it
+with its result. It never turns a failed run green: when every failing test is
+quarantined the run says so, and still fails. A quarantine expires.
 It is kept in this machine's prova store (PROVA_HOME), not in the repository:
 CI and teammates do not see it; each quarantines in its own store.")]
     Quarantine {
@@ -2163,7 +2162,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             names.dedup();
             // A bare name that is also a qualified test's tail is the same
             // test seen two ways (round 14: gotestsum text, then go json):
-            // say which, rather than set aside the stale one.
+            // say which, rather than quarantine the stale one.
             let qualified: Vec<&String> = names
                 .iter()
                 .filter(|n| **n != test && n.ends_with(&format!("::{test}")))
@@ -2209,10 +2208,10 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 }
             };
             // Tests of several binaries or modules sharing the name: only
-            // the one named with --in is set aside (round 16: a quarantine
-            // of crate calc's `tests::flaky` hid crate geo's failure).
-            // A file-level entry is an error, never a plain failure: a
-            // quarantine could never set it aside (round 16).
+            // the one named with --in is quarantined (round 16: a quarantine
+            // of crate calc's `tests::flaky` covered crate geo's failure).
+            // A file-level entry is an error, not a test: it cannot be
+            // quarantined (round 16).
             if [
                 "(file)",
                 "(package)",
@@ -2224,7 +2223,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             .any(|p| name.ends_with(p))
             {
                 return Err(UsageError(format!(
-                    "{name:?} is not a test but a file, package or suite that failed to load or run: a quarantine sets aside test failures only; fix what keeps it from loading"
+                    "{name:?} is not a test but a file, package or suite that failed to load or run: a quarantine marks tests only; fix what keeps it from loading"
                 ))
                 .into());
             }
@@ -2261,7 +2260,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             let e = q::add(store, &name, file.as_deref(), &reason, days, now_ms())?;
             println!(
-                "quarantined {} ({}; {}): it still runs and keeps its history; if it is the only failure of a suite that calls the test runner directly, the run passes, and every run lists it. Kept in this machine's prova store: CI and teammates do not see it",
+                "quarantined {} ({}; {}): it still runs and keeps its history, and every run lists it; a run where it fails still fails. Kept in this machine's prova store: CI and teammates do not see it",
                 render::clean(&e.test),
                 render::clean(&e.reason),
                 render::expires_in(e.expires_ms)
@@ -3171,10 +3170,7 @@ fn repeat_runs(
     // never "every test passed" (round 13: five runs whose selection matched
     // nothing were tallied as all green).
     let (mut no_tests, mut failed_otherwise) = (0u32, 0u32);
-    // Runs that failed although only quarantined tests failed (refused, not
-    // set aside), and tests skipped whenever they appeared.
-    let mut failed_quarantined = 0u32;
-    let mut quarantined_why: Option<String> = None;
+    // Tests skipped whenever they appeared.
     let mut skipped_in: std::collections::BTreeMap<String, u32> = Default::default();
     let mut quarantined = std::collections::BTreeSet::new();
     let (mut quiet, mut unverified) = (0u32, Vec::<String>::new());
@@ -3210,16 +3206,8 @@ fn repeat_runs(
         if ran == 0 && !counted {
             no_tests += 1;
         } else if s.outcome != Some(Outcome::Passed) && s.failures.is_empty() {
-            if s.quarantined
-                .iter()
-                .any(|q| q.result == "failed" || q.result == "errored")
-            {
-                failed_quarantined += 1;
-                quarantined_why = quarantined_why.or_else(|| s.detail.clone());
-            } else {
-                failed_otherwise += 1;
-                failed_why = failed_why.or_else(|| s.detail.clone());
-            }
+            failed_otherwise += 1;
+            failed_why = failed_why.or_else(|| s.detail.clone());
         }
         if counted && (ran as u64) < s.framework.map_or(0, |(t, _)| t) {
             quiet += 1;
@@ -3287,13 +3275,6 @@ fn repeat_runs(
                     None => f.test.clone(),
                 })
                 .collect();
-            // A pass that set a quarantined failure aside says so (round 14).
-            let set_aside: Vec<&str> = s
-                .quarantined
-                .iter()
-                .filter(|q| q.result == "failed" || q.result == "errored")
-                .map(|q| q.test.as_str())
-                .collect();
             let why = if !failing.is_empty() {
                 format!(" ({})", failing.join(", "))
             } else if ran == 0 && !counted {
@@ -3302,8 +3283,6 @@ fn repeat_runs(
                 (s.outcome, &s.detail)
             {
                 format!(" ({})", render::clean(d))
-            } else if !set_aside.is_empty() {
-                format!(" (quarantined, set aside: {})", set_aside.join(", "))
             } else {
                 String::new()
             };
@@ -3411,16 +3390,6 @@ fn repeat_runs(
                 render::clean(unverified_why.as_deref().unwrap_or("see each run's status"))
             );
         }
-        if failed_quarantined > 0 {
-            println!(
-                "  {failed_quarantined} of {done} run(s) failed although only quarantined test(s) failed: {}",
-                render::clean(
-                    quarantined_why
-                        .as_deref()
-                        .unwrap_or("see each run's status")
-                )
-            );
-        }
         if failed_otherwise > 0 {
             println!(
                 "  {failed_otherwise} of {done} run(s) failed with no failing test shown: {}",
@@ -3433,7 +3402,6 @@ fn repeat_runs(
             && always.is_empty()
             && no_tests == 0
             && failed_otherwise == 0
-            && failed_quarantined == 0
             && skipped_every.is_empty()
             && quiet == 0
             && unverified.is_empty()

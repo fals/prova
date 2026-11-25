@@ -68,8 +68,7 @@ fn nextest(calc: &str, geo: &str) -> String {
     )
 }
 
-/// Each suite runs a fake `cargo` printing nextest's output: one
-/// test-runner call, which a quarantine needs (ADR 0031).
+/// Each suite runs a fake `cargo` printing nextest's output.
 fn two_crates(d: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut toml = String::new();
@@ -122,9 +121,12 @@ fn a_failure_of_the_other_crates_same_named_test_is_reported_with_its_place() {
     let f = &j["failures"][0];
     assert_eq!(f["test"], "tests::flaky", "{j}");
     assert_eq!(f["place"], "geo", "{j}");
-    // And calc's own, quarantined, is set aside while geo passes.
+    assert!(!out.contains("every failing test is quarantined"), "{out}");
+    // calc's own, quarantined, is called so; the run still fails (ADR 0034).
     let o = prova(&d, &["run", "a"]);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("every failing test is quarantined"), "{out}");
 }
 
 /// Round 17 (probe M6): nextest's `alpha::it integ` and `beta::it integ`
@@ -317,9 +319,7 @@ fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
     assert!(!out.contains("test_flaky failed (r"), "{out}");
     // The quarantine line says what happened to it, not "not seen".
     assert!(
-        out.contains(
-            "tests.test_calc::test_flaky failed in an unknown directory: not set aside (r"
-        ),
+        out.contains("tests.test_calc::test_flaky failed in an unknown directory (r"),
         "{out}"
     );
 }
@@ -637,10 +637,16 @@ fn a_quarantine_is_kept_per_name_and_place() {
         list.contains("tests::flaky (calc)") && list.contains("tests::flaky (geo)"),
         "{list}"
     );
-    // Both are in force: a failure of either is set aside, on its own.
+    // Both are in force: a failure of either is called quarantined, on its
+    // own; the run still fails (ADR 0034).
     for suite in ["a", "b"] {
         let o = prova(&d, &["run", suite]);
-        assert_eq!(o.status.code(), Some(0), "{suite}: {}", text(&o));
+        let t = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{suite}: {t}");
+        assert!(
+            t.contains("every failing test is quarantined"),
+            "{suite}: {t}"
+        );
     }
     // Without the place, which one to remove is ambiguous.
     let o = prova(&d, &["quarantine", "remove", "tests::flaky"]);
@@ -653,7 +659,7 @@ fn a_quarantine_is_kept_per_name_and_place() {
         list.contains("tests::flaky (calc)") && !list.contains("(geo)"),
         "{list}"
     );
-    // geo's failure counts again; calc's is still set aside.
-    assert_eq!(prova(&d, &["run", "b"]).status.code(), Some(1));
-    assert_eq!(prova(&d, &["run", "a"]).status.code(), Some(0));
+    // geo's failure is no longer called quarantined; calc's still is.
+    assert!(!text(&prova(&d, &["run", "b"])).contains("every failing test is quarantined"));
+    assert!(text(&prova(&d, &["run", "a"])).contains("every failing test is quarantined"));
 }
