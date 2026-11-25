@@ -214,6 +214,40 @@ fn an_injected_report_that_never_appears_is_warned_about() {
     );
 }
 
+/// Round 17 (python-make): a failed run whose pytest-reportlog stream never
+/// came (the report was written inside a container) had no warning, fell
+/// to level opaque and said "2 failed" and "prova saw 0 individually". The
+/// warning is given for a failed run too, and the counts agree.
+#[test]
+fn a_failed_run_whose_stream_never_came_warns_and_counts_consistently() {
+    let d = workspace("inject-lost-failed");
+    let v = json(&prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--inject",
+            "pytest-reportlog",
+            "--",
+            "sh",
+            "-c",
+            "printf '=== short test summary info ===\\nFAILED tests/t.py::test_a - assert 1\\nFAILED tests/t.py::test_b - assert 2\\n=== 2 failed in 0.10s ===\\n'; exit 1",
+        ],
+    ));
+    assert!(
+        v["warnings"]
+            .to_string()
+            .contains("report was never written"),
+        "{v}"
+    );
+    assert_eq!(v["level"], "recognized", "{v}");
+    let text = v.to_string();
+    assert!(
+        !text.contains("individually") && !text.contains("but prova recorded 0"),
+        "{v}"
+    );
+}
+
 /// Round 15: at a stall, `pytest -v` had printed `test_slow PASSED` and the
 /// name of the test that hangs, without its outcome. The pass counts at
 /// once and `running now` names the hanging test.

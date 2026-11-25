@@ -1926,6 +1926,17 @@ fn observe_child(
             sup.emit(EventKind::RunNote { message: w.clone() });
         }
     }
+    // A report or stream an inject recipe asked for that never appeared
+    // is said whatever the outcome (round 17: a failed run behind a
+    // container dropped the warning and lost its level).
+    if outcome != Outcome::Passed {
+        for w in warnings
+            .iter()
+            .filter(|w| w.contains("report was never written"))
+        {
+            sup.emit(EventKind::RunWarning { message: w.clone() });
+        }
+    }
     let no_test_failed = !sup.lifecycle.outcomes().values().any(|o| o.is_failure());
     if outcome == Outcome::Failed && no_test_failed && reason.is_none() {
         // A failure no test explains: say so, and show the first error.
