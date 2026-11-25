@@ -3655,7 +3655,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             // "not run" for a subtest that ran and failed).
             let result = finals
                 .values()
-                .filter(|f| f.0.display() == *name)
+                .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
                     _ => true,

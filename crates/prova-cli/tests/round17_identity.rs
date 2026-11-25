@@ -217,6 +217,106 @@ fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     );
 }
 
+/// Round 17 follow-up: pytest prints ids relative to the directory it runs
+/// in (`cwd_relative_nodeid`), not to its rootdir, and `-q` prints no
+/// rootdir at all. prova checks which directory holds the test's file:
+/// the working directory, a `cd` in the command, the rootdir.
+#[test]
+fn pytest_ids_are_named_from_the_directory_pytest_ran_in() {
+    let d = workspace("pydir");
+    for dir in ["tests", "sub2/tests"] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join("test_calc.py"), "").unwrap();
+    }
+    std::fs::write(d.join("sub2/pytest.ini"), "[pytest]\n").unwrap();
+    let verbose = |id: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' 'rootdir: {}' 'collecting ... collected 2 items' '{id} FAILED [ 50%]' '' 'FAILED {id} - assert 1 == 2' '=== 1 failed, 1 passed in 0.01s ==='; exit 1",
+            d.join("sub2").display()
+        )
+    };
+    let quiet = |id: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' 'F.   [100%]' '' 'FAILED {id} - assert 1 == 2' '1 failed, 1 passed in 0.01s'; exit 1"
+        )
+    };
+    let suites = [
+        // `pytest -v sub2/tests` from the root: rootdir sub2, ids from the root.
+        ("verbose", verbose("sub2/tests/test_calc.py::test_flaky")),
+        // `cd sub2 && pytest -q tests`: no rootdir printed.
+        (
+            "cdquiet",
+            format!("cd sub2 && {}", quiet("tests/test_calc.py::test_flaky")),
+        ),
+        // `pytest -q` at the root.
+        ("rootquiet", quiet("tests/test_calc.py::test_flaky")),
+    ];
+    let toml: String = suites
+        .iter()
+        .map(|(n, c)| format!("[suite.{n}]\nrun = {c:?}\n\n"))
+        .collect();
+    std::fs::write(d.join("prova.toml"), toml).unwrap();
+    let out = text(&prova(&d, &["run", "verbose"]));
+    assert!(
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "{out}"
+    );
+    assert!(!out.contains("sub2.sub2"), "{out}");
+    let out = text(&prova(&d, &["run", "cdquiet"]));
+    assert!(
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "{out}"
+    );
+    let out = text(&prova(&d, &["run", "rootquiet"]));
+    assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
+    assert!(!out.contains("sub2"), "{out}");
+}
+
+/// When the directory pytest ran in cannot be told (two `cd` targets hold
+/// the file), the test's place is unknown: it is said, and no quarantine of
+/// another directory's test of that id sets its failure aside.
+#[test]
+fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
+    let d = workspace("pyunknown");
+    for dir in ["tests", "sub2/tests", "sub3/tests"] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join("test_calc.py"), "").unwrap();
+    }
+    let out = |outcome: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' 'tests/test_calc.py::test_flaky {outcome} [100%]' '=== 1 {} in 0.01s ==='; exit {code}",
+            outcome.to_lowercase()
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.root]\nrun = {:?}\n\n[suite.two]\nrun = {:?}\n",
+            out("PASSED", 0),
+            format!("(cd sub2; true); cd sub3; {}", out("FAILED", 1)),
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "root"]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests.test_calc::test_flaky",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "two"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("cannot tell which test is which"), "{out}");
+    assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
+    assert!(!out.contains("test_flaky failed (r"), "{out}");
+}
+
 /// Round 17 (java-maven): the live line and the XML record of one failing
 /// test were two tests in `adopt --verify`: "1 tests ran that do not match"
 /// for the full name, "2 matching test(s) ran" for `Class#method`.

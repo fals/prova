@@ -11,7 +11,7 @@ use std::path::Path;
 
 use prova_core::config::RunSpec;
 use prova_core::engine::{ExitReport, Observer};
-use prova_core::model::{EventKind, Level};
+use prova_core::model::{EventKind, Level, TestKey};
 
 /// How long output stays quiet before a held pytest pass is reported.
 const HELD_PASS_MS: u64 = 1000;
@@ -66,6 +66,7 @@ pub fn observer_for(spec: &RunSpec, root: &Path, cwd: &Path) -> Box<dyn Observer
     // import path. go.mod names it, so both name a test alike (round 15).
     let mut live = recognize::Recognizers::default();
     live.cwd = Some(cwd.to_owned());
+    live.command = Some(spec.command.display());
     live.go_module = std::fs::read_to_string(root.join("go.mod"))
         .ok()
         .and_then(|m| {
@@ -192,21 +193,22 @@ impl Observer for Ladder {
             report.level = report.level.max(injected.level);
         }
         // pytest's JUnit names tests from its rootdir, the live lines from
-        // the working directory (ADR 0031 section 2): a file result of a
-        // test the live output named with the rootdir's prefix is that test.
-        if let Some(prefix) = self.live.pytest_prefix() {
-            let dotted = prefix.replace('/', ".");
-            let live_names: std::collections::BTreeSet<&str> =
-                self.live.seen.values().map(|(d, _)| d.as_str()).collect();
+        // the working directory (ADR 0031 section 2): a file result that
+        // names no live test, but is the tail of exactly one live name, is
+        // that test (`tests.test_calc::t` is `sub2.tests.test_calc::t`).
+        if self.live.pytest_ran() {
+            let live: Vec<&TestKey> = self.live.seen_keys.values().collect();
+            let live_names: std::collections::BTreeSet<String> =
+                live.iter().map(|k| k.display()).collect();
             for e in &mut report.events {
                 if let EventKind::TestFinished { test, .. } = e
-                    && let Some(first) = test.path.first_mut()
-                    && !first.starts_with(&format!("{dotted}."))
+                    && !test.path.is_empty()
+                    && !live_names.contains(&test.display())
                 {
-                    let mut moved = test.clone();
-                    moved.path[0] = format!("{dotted}.{}", moved.path[0]);
-                    if live_names.contains(moved.display().as_str()) {
-                        *test = moved;
+                    let tail = format!(".{}", test.display());
+                    let mut hits = live.iter().filter(|k| k.display().ends_with(&tail));
+                    if let (Some(hit), None) = (hits.next(), hits.next()) {
+                        test.path[0].clone_from(&hit.path[0]);
                     }
                 }
             }

@@ -158,6 +158,11 @@ pub fn names_test(q: &BTreeMap<String, Entry>, display: &str) -> bool {
 /// quarantine names one. A name can be quarantined in several places.
 pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'a Entry> {
     let (file, display) = unique.rsplit_once('\u{1f}').unwrap_or(("", unique));
+    // A test whose directory is unknown may be any directory's: no
+    // quarantine covers it.
+    if file == crate::model::UNKNOWN_PLACE {
+        return None;
+    }
     let of_place = |name: &str| {
         q.values().find(|e| {
             e.test == name
@@ -179,7 +184,8 @@ pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'
 pub fn files_of(store: &Store, display: &str) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(
         "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL
-            AND file NOT LIKE '(package pending)%' ORDER BY file",
+            AND file NOT LIKE '(package pending)%' AND file NOT LIKE '(unknown directory)%'
+          ORDER BY file",
     )?;
     Ok(stmt
         .query_map(params![display], |r| r.get(0))?

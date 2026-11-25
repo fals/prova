@@ -122,6 +122,10 @@ pub struct TestKey {
     pub name: String,
 }
 
+/// The `file` of a test whose directory could not be told apart from
+/// another's of the same id (ADR 0031 section 2).
+pub const UNKNOWN_PLACE: &str = "(unknown directory)";
+
 impl TestKey {
     pub fn new(path: Vec<String>, name: impl Into<String>) -> TestKey {
         TestKey {
@@ -145,9 +149,15 @@ impl TestKey {
     /// test binary). Go, pytest and Vitest tests carry their package or file
     /// in the name already.
     pub fn place(&self) -> Option<&str> {
-        self.file
-            .as_deref()
-            .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+        self.file.as_deref().filter(|f| {
+            !f.is_empty() && !f.starts_with("(package pending)") && !f.starts_with(UNKNOWN_PLACE)
+        })
+    }
+
+    /// The test's directory could not be told (pytest from an unknown
+    /// directory): no quarantine sets it aside.
+    pub fn place_unknown(&self) -> bool {
+        self.file.as_deref() == Some(UNKNOWN_PLACE)
     }
 
     /// Human-readable full name, `path::name`.
