@@ -2448,9 +2448,7 @@ fn runs_through_container(store: &Store, id: &str) -> bool {
         .run(id)
         .ok()
         .and_then(|row| serde_json::from_value::<RunSpec>(row.spec).ok())
-        .is_some_and(|spec| {
-            prova_core::resources::container_client(&spec.command.display()).is_some()
-        })
+        .is_some_and(|spec| prova_core::resources::container_client(&spec.command.raw()).is_some())
 }
 
 /// How much longer a first wait of `budget` waits: the run goes through a
