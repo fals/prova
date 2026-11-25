@@ -2692,6 +2692,20 @@ impl Recognizers {
         {
             self.surefire_classes.push(class.to_owned());
         }
+        // `[ERROR] calc.CalcTest.divides -- Time elapsed: 0.003 s <<<
+        // FAILURE!` names the failing test in full: its class is the one
+        // the summary's `CalcTest.divides:19` means (`-q` prints no
+        // `-- in calc.CalcTest` line for a class whose tests all ran).
+        if let Some(rest) = line.strip_prefix("[ERROR] ")
+            && let Some((name, tail)) = rest.split_once(" -- Time elapsed: ")
+            && tail.contains("<<<")
+            && !name.contains(char::is_whitespace)
+            && let Some((class, _)) = name.rsplit_once('.')
+            && !class.is_empty()
+            && !self.surefire_classes.iter().any(|c| c == class)
+        {
+            self.surefire_classes.push(class.to_owned());
+        }
         let Some(body) = line
             .strip_prefix("[ERROR] ")
             .or_else(|| line.strip_prefix("[WARNING] "))
@@ -4894,6 +4908,32 @@ mod tests {
         assert_eq!(
             finished(&ev),
             vec![("calc.CalcTest::flakyClock".into(), Outcome::Failed)]
+        );
+    }
+
+    /// Round 18 (java-maven, `mvn -q`): the summary's `CalcTest.divides:19`
+    /// was a phantom `CalcTest::divides` beside the XML's
+    /// `calc.CalcTest::divides`: the failure's own full-name line says the
+    /// class.
+    #[test]
+    fn surefire_summary_takes_the_class_from_the_full_name_failure_line() {
+        let (_, ev) = feed(concat!(
+            "[ERROR] Tests run: 10, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.003 s <<< FAILURE! -- in calc.CalcTest$Division\n",
+            "[ERROR] calc.CalcTest.divides -- Time elapsed: 0.003 s <<< FAILURE!\n",
+            "org.opentest4j.AssertionFailedError: expected: <4> but was: <16>\n",
+            "\tat calc.CalcTest.divides(CalcTest.java:19)\n",
+            "\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   CalcTest$Division.exact:37 expected: <3> but was: <27>\n",
+            "[ERROR]   CalcTest.divides:19 expected: <4> but was: <16>\n",
+            "[ERROR] Tests run: 10, Failures: 2, Errors: 0, Skipped: 0\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("calc.CalcTest$Division::exact".into(), Outcome::Failed),
+                ("calc.CalcTest::divides".into(), Outcome::Failed),
+            ]
         );
     }
 
