@@ -687,6 +687,7 @@ impl Supervisor<'_> {
             _ if crate::resources::container_client_runs(&cmd) => {
                 let found = crate::resources::containers_of_run(
                     client,
+                    &cmd,
                     &self.run_cwd,
                     self.run_started_ms,
                 );
