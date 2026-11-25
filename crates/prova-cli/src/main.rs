@@ -3115,15 +3115,44 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 for (t, label) in d.larger.iter().take(20) {
                     println!("  {}: {}", render::clean(t), render::clean(label));
                 }
+                // The unknown ones by name: a count cannot be checked.
+                let unknown: Vec<&String> = d
+                    .tests
+                    .iter()
+                    .filter(|(_, l)| l == "unknown")
+                    .map(|(t, _)| t)
+                    .collect();
+                if !unknown.is_empty() {
+                    let shown: Vec<String> =
+                        unknown.iter().take(10).map(|t| render::clean(t)).collect();
+                    println!(
+                        "unknown: {}{}",
+                        shown.join(", "),
+                        if unknown.len() > shown.len() {
+                            format!(
+                                ", and {} more (`--json` lists all)",
+                                unknown.len() - shown.len()
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
             }
             Ok(exit::PASSED)
         }
         Cmd::Slowest { suite, count, json } => {
             let (store, _, _) = open_here()?;
-            render::slowest(
-                &analysis::slowest(&store, suite.as_deref(), count, 20)?,
-                json,
-            );
+            let mut rows = analysis::slowest(&store, suite.as_deref(), usize::MAX, 20)?;
+            let more = rows.len().saturating_sub(count);
+            rows.truncate(count);
+            render::slowest(&rows, json);
+            if more > 0 && !json {
+                println!(
+                    "... and {more} more (`prova slowest -n {}` lists all)",
+                    count + more
+                );
+            }
             Ok(exit::PASSED)
         }
         Cmd::Quarantine { action } => {
