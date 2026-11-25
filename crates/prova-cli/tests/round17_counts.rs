@@ -125,6 +125,37 @@ fn a_fall_in_the_frameworks_count_names_the_tests_that_did_not_run() {
     );
 }
 
+/// Wording: one subtest is "1 subtest", and a failing parent is listed
+/// before its failing subtest whichever the runner printed first.
+#[test]
+fn one_subtest_is_singular_and_the_parent_comes_first() {
+    let d = workspace("subtest");
+    let run = "printf '=== RUN   TestP\\n=== RUN   TestP/a\\n    p_test.go:9: boom\\n    --- FAIL: TestP/a (0.00s)\\n--- FAIL: TestP (0.00s)\\nFAIL\\nFAIL\\texample.com/p\\t0.01s\\n'; exit 1";
+    suite(
+        &d,
+        &format!("[suite.default]\nrun = {:?}\n", format!("{WORK}{run}")),
+    );
+    let out = text(&prova(&d, &["run", "default"]));
+    assert!(out.contains("(and 1 subtest, 1 failed)"), "{out}");
+    let parent = out.find("FAIL example.com/p::TestP ").unwrap_or(usize::MAX);
+    let child = out
+        .find("FAIL example.com/p::TestP/a")
+        .unwrap_or(usize::MAX);
+    assert!(parent < child, "{out}");
+}
+
+/// Every run of a `--repeat` that fails prints its live FAIL line, however
+/// fast it ended (round 17: run 8 of 8 printed none).
+#[test]
+fn every_repeat_prints_its_live_fail_line() {
+    let d = workspace("repeatlive");
+    let run = format!("{WORK}echo 'test calc::x ... FAILED'; exit 1");
+    suite(&d, &format!("[suite.default]\nrun = {run:?}\n"));
+    let o = prova(&d, &["run", "default", "--repeat", "4"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(err.matches("FAIL calc::x").count(), 4, "{err}");
+}
+
 /// Go `-count=4` (pass, fail, pass, fail) in one run: four attempts, and a
 /// test that both passed and failed is flaky evidence (ADR 0029 section 2).
 #[test]

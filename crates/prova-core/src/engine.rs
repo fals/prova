@@ -2092,6 +2092,29 @@ fn list_suspects(store: &Store, suite: &str, suspects: &[&String]) -> String {
     text
 }
 
+/// A failing parent is listed before its failing subtests, whichever the
+/// runner reported first (round 17: full and selected runs listed them in
+/// different orders).
+fn parents_before_subtests(failing: &mut Vec<&(TestKey, Outcome, Option<String>, u64, bool)>) {
+    let mut i = 0;
+    while i < failing.len() {
+        let parent = failing[i].0.display();
+        if !failing[i].4
+            && let Some(j) = failing[..i].iter().position(|s| {
+                s.4 && s
+                    .0
+                    .display()
+                    .strip_prefix(parent.as_str())
+                    .is_some_and(|rest| rest.starts_with(['/', '[', ' ']))
+            })
+        {
+            let f = failing.remove(i);
+            failing.insert(j, f);
+        }
+        i += 1;
+    }
+}
+
 /// The suite's last passing full run before `run` and the test count its
 /// framework summary gave.
 fn last_pass_total(store: &Store, run: &str, suite: &str) -> Result<Option<(String, u64)>> {
@@ -3296,6 +3319,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         }
     }
     failing.sort_by_key(|f| f.3); // in the order they happened
+    parents_before_subtests(&mut failing);
     // Quarantined tests are listed apart, with their result (ADR 0027).
     let quarantine = crate::quarantine::in_force_at(store, row.created_ms)?;
     failing.retain(|f| crate::quarantine::covers(&quarantine, &f.0.display()).is_none());
@@ -3609,7 +3633,10 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
             let mut v: Vec<String> = finals
                 .values()
                 .filter(|f| f.1 == Outcome::Skipped && !f.4)
-                .map(|f| f.0.display())
+                .map(|f| match f.2.as_deref() {
+                    Some("xfail") => format!("{} (xfail: expected to fail)", f.0.display()),
+                    _ => f.0.display(),
+                })
                 .collect();
             v.sort();
             v.truncate(10);

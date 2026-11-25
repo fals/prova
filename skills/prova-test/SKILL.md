@@ -91,7 +91,7 @@ needs attention.
 - `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
   flaky test that changed is listed apart (`changed, but known flaky`), never
   as fixed.
-- `prova flaky` known flaky tests; `prova quarantine add <test> --reason ...`
+- `prova flaky` known flaky tests (same code, different results; a pass on edited code and a failure on clean code is a change, not flakiness); `prova quarantine add <test> --reason ...`
   sets one aside in the open (listed in every run, expires), so the rest can
   be verified green. `prova slowest` the slowest tests (p50, p95).
   `prova sizes` how many tests of each size,

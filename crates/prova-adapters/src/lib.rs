@@ -394,6 +394,21 @@ impl Observer for Ladder {
             .count() as u64;
         let seen =
             (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
+        if !self.live.pytest_xpass.is_empty() {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "{} test(s) xpassed (expected to fail, passed; counted as passed): {}",
+                    self.live.pytest_xpass.len(),
+                    self.live
+                        .pytest_xpass
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
         let (failed_td, passed_td) = self.live.teardown_doubles();
         if failed_td + passed_td > 0 {
             // pytest counts such a test twice in its summary; prova counts

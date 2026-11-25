@@ -2759,7 +2759,9 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             if json {
                 println!("{}", serde_json::to_string(&list)?);
             } else if list.is_empty() {
-                println!("no flaky tests in recorded history");
+                println!(
+                    "no flaky tests in recorded history (flaky means different results on the same code; a pass on edited code and a failure on clean code is not that)"
+                );
             } else {
                 // Columns named, and a quarantine shown (round 16).
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
@@ -3199,6 +3201,10 @@ fn wait_until(
         match s.reason {
             WaitReason::Done => {
                 live.clear();
+                // A run that ends inside one poll shows its failures live
+                // like one that fails mid-run (round 17: run 8/8 of a
+                // repeat printed none while runs 2, 3 and 5 did).
+                render::progress_failures(&s, &mut reported);
                 return Ok(s);
             }
             // A stall ends any long wait: waiting out the budget on a hung

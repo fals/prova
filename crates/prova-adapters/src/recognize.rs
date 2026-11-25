@@ -149,6 +149,8 @@ pub struct Recognizers {
     /// test itself (a pass or a failure plus an error): unique key -> the
     /// test had failed before the error. Tests, not report lines.
     pytest_doubles: BTreeMap<String, bool>,
+    /// pytest `XPASS`: tests expected to fail that passed (non-strict).
+    pub pytest_xpass: Vec<String>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
@@ -2088,6 +2090,16 @@ impl Recognizers {
                 (key, false)
             };
             let msg = msg.filter(|_| outcome.is_failure());
+            // An expected failure is skipped, an unexpected pass a pass:
+            // both are named (round 17).
+            let msg = if word == "XFAIL" {
+                Some(XFAIL.to_owned())
+            } else {
+                msg
+            };
+            if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+                self.pytest_xpass.push(key.display());
+            }
             if outcome.is_failure() && !sub {
                 self.claim_pytest_block(&key);
             }
@@ -2176,6 +2188,9 @@ impl Recognizers {
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
+        if word == "XPASS" && !self.pytest_xpass.contains(&key.display()) {
+            self.pytest_xpass.push(key.display());
+        }
         // Failures are recorded now to keep first-failure fast; the message
         // only appears later in the summary section. A pass waits one line:
         // a teardown error follows it as a second line for the same test.
@@ -2183,7 +2198,8 @@ impl Recognizers {
             self.pytest_text_pass = Some((id.to_owned(), key));
             return true;
         }
-        self.finished(key, outcome, None, None, Level::Recognized, out);
+        let message = (word == "XFAIL").then(|| XFAIL.to_owned());
+        self.finished(key, outcome, None, message, Level::Recognized, out);
         true
     }
 
@@ -3278,6 +3294,9 @@ fn is_pytest_file(f: &str) -> bool {
     let f = f.trim();
     f.ends_with(".py") && !f.contains(' ') && !f.contains("::")
 }
+
+/// The message of a skipped result that pytest called an expected failure.
+pub const XFAIL: &str = "xfail";
 
 fn pytest_subtest(mut parent: TestKey, label: &str) -> TestKey {
     if !label.is_empty() {
@@ -4437,6 +4456,30 @@ mod tests {
             !finished(&summary)
                 .iter()
                 .any(|(n, _)| n.contains("second result"))
+        );
+    }
+
+    /// Round 17: an expected failure and an unexpected pass are named.
+    #[test]
+    fn pytest_names_xfail_and_xpass() {
+        let (r, ev) = feed_all(
+            "tests/t.py::test_xfail XFAIL (not yet)    [ 50%]\ntests/t.py::test_xpass XPASS (fixed)    [100%]\n",
+        );
+        assert_eq!(r.pytest_xpass, vec!["tests.t::test_xpass".to_owned()]);
+        let xf: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                EventKind::TestFinished {
+                    test,
+                    message: Some(m),
+                    ..
+                } => Some((test.display(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            xf,
+            vec![("tests.t::test_xfail".to_owned(), XFAIL.to_owned())]
         );
     }
 
