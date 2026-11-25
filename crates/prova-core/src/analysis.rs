@@ -114,6 +114,30 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
     Ok(rows)
 }
 
+/// What makes two stored tests one test for history (ADR 0018), as the
+/// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another).
+/// A name recorded bare (Go text with no package, quiet `cargo test` with no
+/// crate) is the qualified one only when the name belongs to one place: a
+/// name shared by several places is never matched to one of them (ADR 0034
+/// section 2).
+const SAME_TEST_ON: &str = "(t2.display = t1.display
+                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '')
+                        OR ((t1.file IS NULL OR t2.file IS NULL)
+                            AND (SELECT COUNT(DISTINCT x.file) FROM tests x
+                                 WHERE x.display = t1.display AND x.file IS NOT NULL
+                                   AND x.file NOT LIKE '(package pending)%'
+                                   AND x.file <> '(unknown directory)') < 2)))
+                OR (t2.name = t1.name
+                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]'))
+                   AND (SELECT COUNT(DISTINCT COALESCE(x.file, '') || '|' || x.path) FROM tests x
+                        WHERE x.name = t1.name AND NOT (x.file IS NULL AND x.path = '[]')
+                          AND COALESCE(x.file, '') NOT LIKE '(package pending)%'
+                          AND COALESCE(x.file, '') <> '(unknown directory)') < 2)";
+
+fn same_sql(sql: &str) -> String {
+    sql.replace("{SAME}", SAME_TEST_ON)
+}
+
 /// A name recorded bare (`TestX`, from text output that named no package)
 /// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
 /// test: the same name, or one is the other behind a `::` or `/`.
@@ -213,20 +237,36 @@ pub fn place_matches(wanted: &str, file: Option<&str>, path: &[String]) -> bool 
 /// it (`a` for `ex/a`), 0 not it. `tests/test_calc.py` is the same place as
 /// `tests.test_calc`, and only the end of `sub2.tests.test_calc`.
 pub fn place_rank(wanted: &str, file: Option<&str>, path: &[String]) -> u8 {
-    let Some(place) = file
-        .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
-        .or(path.first().map(String::as_str))
-    else {
+    let Some(place) = place_label(file, path) else {
         return 0;
     };
-    let (w, p) = (place_form(wanted), place_form(place));
+    let (w, p) = (place_form(wanted), place_form(&place));
     if w.is_empty() {
         0
     } else if w == p {
         2
     } else {
-        u8::from(p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+        // A crate names its integration tests (`calc` for `calc::it`).
+        u8::from(
+            p.ends_with(&format!(".{w}"))
+                || w.ends_with(&format!(".{p}"))
+                || p.starts_with(&format!("{w}::")),
+        )
     }
+}
+
+/// The place `--in` names for a stored test: its binary (Rust), else the
+/// package, module or file at the head of its name (Go, pytest, Vitest). A
+/// Rust module path (`tests`) is no place: a test with no binary and a bare
+/// first part has none.
+pub fn place_label(file: Option<&str>, path: &[String]) -> Option<String> {
+    file.filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+        .map(str::to_owned)
+        .or_else(|| {
+            path.first()
+                .filter(|p| p.contains(['/', '.']))
+                .map(|p| p.to_owned())
+        })
 }
 
 /// Keeps what `--in wanted` names: the tests of the exact place when there
@@ -343,13 +383,10 @@ fn test_runs_scoped(
     current: Option<&str>,
     suite: Option<&str>,
 ) -> Result<Vec<TestRun>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&same_sql(
         "WITH same AS (
              SELECT t2.id FROM tests t1 JOIN tests t2
-               ON (t2.display = t1.display
-                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-                OR (t2.name = t1.name
-                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+               ON {SAME}
                 -- a Go test seen before its package is known (`(package
                 -- pending) #N`) is the qualified test of that name that ran
                 -- most recently
@@ -382,7 +419,7 @@ fn test_runs_scoped(
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
-         ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
+         ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC"),
     )?;
     let rows = stmt.query_map(params![test_id, limit as i64, current, suite], |r| {
         Ok((
@@ -539,12 +576,9 @@ fn stats_scoped(
     let place = Names::new(store).place(&display, file.as_deref());
     let recent = test_runs_scoped(store, test_id, window, current, only_suite)?;
     let suites: Vec<String> = {
-        let mut stmt = store.conn().prepare(
+        let mut stmt = store.conn().prepare(&same_sql(
             "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
-               ON (t2.display = t1.display
-                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-                OR (t2.name = t1.name
-                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+               ON {SAME}
                 -- a Go test seen before its package is known (`(package
                 -- pending) #N`) is the qualified test of that name that ran
                 -- most recently
@@ -552,7 +586,7 @@ fn stats_scoped(
                       SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
                       WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
                       ORDER BY qr.created_ms DESC LIMIT 1))
-             WHERE t1.id = ?1 ORDER BY t2.suite",
+             WHERE t1.id = ?1 ORDER BY t2.suite"),
         )?;
         stmt.query_map(params![test_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -599,6 +633,9 @@ fn stats_scoped(
     // Same code, opposite results, different environments: name the
     // variables that differ between a pass and a failure.
     let mut env_dependent: BTreeSet<String> = BTreeSet::new();
+    // One earlier pass is too little to call a failure environment-
+    // dependent (ADR 0034 section 3): the pass may be anything else.
+    let mut env_passes: BTreeSet<&str> = BTreeSet::new();
     if flips == 0 {
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
             for f in counted
@@ -608,10 +645,14 @@ fn stats_scoped(
                 for k in p.env.keys().chain(f.env.keys()) {
                     if p.env.get(k) != f.env.get(k) {
                         env_dependent.insert(k.clone());
+                        env_passes.insert(p.run.as_str());
                     }
                 }
             }
         }
+    }
+    if env_passes.len() < 2 {
+        env_dependent.clear();
     }
     let retry = recent.iter().filter(|r| r.passed_on_retry).count();
     let mixed = recent.iter().filter(|r| r.passed_and_failed).count();
@@ -714,14 +755,11 @@ pub fn find_tests(
 
 /// Ids of every test that shares one history with `test_id` (ADR 0018).
 pub fn shared_ids(store: &Store, test_id: &str) -> Result<Vec<String>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&same_sql(
         "SELECT t2.id FROM tests t1 JOIN tests t2
-           ON (t2.display = t1.display
-               AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-            OR (t2.name = t1.name
-               AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+           ON {SAME}
          WHERE t1.id = ?1",
-    )?;
+    ))?;
     let ids = stmt
         .query_map(params![test_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1058,6 +1096,10 @@ pub struct RunDiff {
     pub removed: Vec<String>,
     /// (test, base ms, head ms) where head is >50% and >100ms slower.
     pub slower: Vec<(String, u64, u64)>,
+    /// The runs are of different suites or levels: a test one did not
+    /// print is not one the other dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// A run's final outcome per test, by name and place (two binaries' tests
@@ -1119,6 +1161,20 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
         }
     }
     d.removed = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
+    let (rb, rh) = (store.run(base)?, store.run(head)?);
+    let mut why = Vec::new();
+    if rb.suite != rh.suite {
+        why.push(format!("different suites ({}, {})", rb.suite, rh.suite));
+    }
+    if rb.level != rh.level {
+        why.push("different levels of detail".to_owned());
+    }
+    if !why.is_empty() {
+        d.warning = Some(format!(
+            "the runs are of {}: a test one did not print shows as added or not visible, not as removed",
+            why.join(" and ")
+        ));
+    }
     if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
         let names = Names::new(store);
         let known: Vec<String> = flaky(store, None, 50)?

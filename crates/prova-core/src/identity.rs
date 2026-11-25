@@ -75,9 +75,29 @@ const CACHES: &[&str] = &[
     ":(exclude,top,glob).prova/**",
 ];
 
+/// The repository a directory belongs to: the git work tree, else the
+/// nearest directory holding `prova.toml`, else the directory itself. Test
+/// names are read relative to it (ADR 0034 section 2).
+pub fn repo_root(dir: &Path) -> std::path::PathBuf {
+    if let Some(top) = git(dir, &["rev-parse", "--show-toplevel"]) {
+        let top = String::from_utf8_lossy(&top).trim().to_owned();
+        if !top.is_empty() {
+            return std::path::PathBuf::from(top);
+        }
+    }
+    dir.ancestors()
+        .find(|d| d.join("prova.toml").exists())
+        .unwrap_or(dir)
+        .to_path_buf()
+}
+
 /// `tree:<12>` for a clean checkout, `tree:<12>+dirty:<12>` with uncommitted
 /// changes, `nogit` outside git. Two runs are "same code" only when equal.
 pub fn code_identity(dir: &Path) -> String {
+    // The repository's, whatever directory the run started in (ADR 0034
+    // section 2).
+    let top = repo_root(dir);
+    let dir = top.as_path();
     let Some(tree) = git(dir, &["rev-parse", "HEAD^{tree}"]) else {
         return "nogit".into();
     };

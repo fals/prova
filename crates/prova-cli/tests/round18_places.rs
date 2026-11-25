@@ -1,0 +1,458 @@
+//! Medium tests for ADR 0034 sections 2 and 3 (usability round 18): a test's
+//! place comes from the repository, and history compares like with like.
+//! Real runs are needed: names come from a command's output and are compared
+//! with the store's history across runs started in different directories.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const PROVA: &str = env!("CARGO_BIN_EXE_prova");
+
+fn workspace(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("prova-r18pl-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(".gitignore"), "state\n").unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    d
+}
+
+/// Runs prova in `dir`; the home is the repository's (`repo`), so runs
+/// started in different directories share one history.
+fn prova_in(repo: &Path, dir: &Path, args: &[&str]) -> Output {
+    Command::new(PROVA)
+        .args(args)
+        .current_dir(dir)
+        .env("PROVA_HOME", format!("{}.home", repo.display()))
+        .output()
+        .expect("run prova")
+}
+
+fn prova(dir: &Path, args: &[&str]) -> Output {
+    prova_in(dir, dir, args)
+}
+
+fn text(o: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// Some real work first: prova does not believe results printed by a
+/// command that used no CPU (round 10).
+const BUSY: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done;";
+
+/// Round 18 (ts-vitest): `cd packages/b && prova run -- npm test` named
+/// tests from the directory prova started in, so two packages' (and the
+/// root's) `src/a.test.ts` were one test in one history. Why medium: it
+/// needs two runs started in different directories of one repository.
+#[test]
+fn r18_tests_are_named_from_the_repository_root_whatever_directory_prova_started_in() {
+    let d = workspace("repo");
+    std::fs::create_dir_all(d.join("pkg")).unwrap();
+    let run = |root: &Path| {
+        format!(
+            "{BUSY} printf '%s\\n' '' ' RUN  v3.2.4 {}' '' ' × src/a.test.ts > works 1ms' '' ' Test Files  1 failed (1)' '      Tests  1 failed (1)'; exit 1",
+            root.display()
+        )
+    };
+    let o = prova_in(
+        &d,
+        &d.join("pkg"),
+        &["run", "--", "sh", "-c", &run(&d.join("pkg"))],
+    );
+    let out = text(&o);
+    assert!(out.contains("FAIL pkg/src/a.test.ts::works"), "{out}");
+    let o = prova(&d, &["run", "--", "sh", "-c", &run(&d)]);
+    let out = text(&o);
+    assert!(
+        out.contains("FAIL src/a.test.ts::works") && !out.contains("FLAKY"),
+        "{out}"
+    );
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("pkg/src/a.test.ts::works") && all.contains("  src/a.test.ts::works"),
+        "{all}"
+    );
+}
+
+/// The same for pytest, whose ids are relative to the directory it runs in.
+#[test]
+fn r18_pytest_ids_run_from_a_subdirectory_carry_its_path() {
+    let d = workspace("pyrepo");
+    std::fs::create_dir_all(d.join("pkg/tests")).unwrap();
+    std::fs::write(d.join("pkg/tests/test_x.py"), "").unwrap();
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' 'tests/test_x.py::test_a FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1"
+    );
+    let o = prova_in(&d, &d.join("pkg"), &["run", "--", "sh", "-c", &cmd]);
+    let out = text(&o);
+    assert!(out.contains("FAIL pkg.tests.test_x::test_a"), "{out}");
+}
+
+/// What quiet `cargo test` prints for one failing unit test: no crate, only
+/// the panic message's path.
+fn quiet_cargo_failure(crate_dir: &str) -> String {
+    format!(
+        "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at {crate_dir}/src/lib.rs:29:9:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
+    )
+}
+
+/// Round 18 (rust-make): quiet `cargo test` names `tests::flaky_clock` with
+/// no crate, and geo's real failure took calc's history (FLAKY). The panic
+/// message's path gives the crate. Why medium: the crate is found on disk.
+#[test]
+fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
+    let d = workspace("quietcargo");
+    for krate in ["calc", "geo"] {
+        std::fs::create_dir_all(d.join(krate).join("src")).unwrap();
+        std::fs::write(
+            d.join(krate).join("Cargo.toml"),
+            format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join(krate).join("src/lib.rs"), "").unwrap();
+    }
+    let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("calc")]);
+    let out = text(&o);
+    assert!(out.contains("FAIL tests::flaky_clock"), "{out}");
+    let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("geo")]);
+    let out = text(&o);
+    assert!(
+        out.contains("first time seen") && !out.contains("FLAKY") && !out.contains("before"),
+        "geo's failure borrowed calc's history: {out}"
+    );
+    let all = text(&prova(&d, &["history", "tests::flaky_clock"]));
+    assert!(
+        all.contains("(calc)") && all.contains("(geo)"),
+        "each crate's test is its own: {all}"
+    );
+}
+
+/// Round 18 (go-make): `go test -json -count=4` with FAIL, FAIL, FAIL, PASS
+/// was "broken, not flaky" in history; the `-v` text said FLAKY. Why
+/// medium: the label comes from stored attempts.
+#[test]
+fn r18_go_json_count_with_a_late_pass_is_flaky_in_history() {
+    let d = workspace("gojsoncount");
+    let mut events = String::new();
+    for a in ["fail", "fail", "fail", "pass"] {
+        events.push_str(&format!(
+            "{{\"Action\":\"run\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\"}}\n{{\"Action\":\"{a}\",\"Package\":\"ex/a\",\"Test\":\"TestFlaky\",\"Elapsed\":0.01}}\n"
+        ));
+    }
+    events.push_str("{\"Action\":\"fail\",\"Package\":\"ex/a\",\"Elapsed\":0.1}\n");
+    std::fs::write(d.join("ev.json"), events).unwrap();
+    let cmd = format!("{BUSY} cat ev.json; exit 1");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let h = text(&prova(&d, &["history", "TestFlaky"]));
+    assert!(
+        h.contains("both passed and failed on 1 code version"),
+        "{h}"
+    );
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(
+        f.contains("TestFlaky"),
+        "prova flaky agrees with history: {f}"
+    );
+}
+
+/// Round 18 (probe M3): a pass with a quarantined failure set aside
+/// (`passed*`) made another place's real failure "likely FLAKY: suite
+/// passed on this exact code before". Why medium: needs a quarantine, a
+/// stored run and the same code across runs.
+#[test]
+fn r18_a_pass_that_set_a_failure_aside_is_not_a_pass_on_this_exact_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = workspace("setaside");
+    let out = PathBuf::from(format!("{}.out", d.display()));
+    std::fs::create_dir_all(&out).unwrap();
+    let nextest = |calc: &str, geo: &str| {
+        format!(
+            "    Starting 2 tests across 2 binaries\n        {calc} [   0.004s] calc tests::flaky\n        {geo} [   0.004s] geo tests::real_bug\n     Summary [   0.020s] 2 tests run\n"
+        )
+    };
+    std::fs::create_dir_all(d.join("rc")).unwrap();
+    let script = d.join("rc/cargo");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{BUSY}\ncat {o}/out.txt\nexit 100\n",
+            o = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.s]\nrun = \"./rc/cargo nextest run\"\n",
+    )
+    .unwrap();
+    std::fs::write(out.join("out.txt"), nextest("FAIL", "PASS")).unwrap();
+    prova(&d, &["run", "s"]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // calc fails again: set aside, the run passes (exit 100, outcome passed).
+    let o = prova(&d, &["run", "s"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    // geo's own failure of another test.
+    std::fs::write(out.join("out.txt"), nextest("PASS", "FAIL")).unwrap();
+    let o = prova(&d, &["run", "s"]);
+    let o = text(&o);
+    assert!(o.contains("FAIL tests::real_bug"), "{o}");
+    assert!(!o.contains("likely FLAKY"), "{o}");
+}
+
+/// Round 18 (rust M2, go MINOR 3): `history <name>` hid the other tests the
+/// name matches, and a Go parent was "ambiguous" with its own subtests.
+/// Why medium: it reads stored tests.
+#[test]
+fn r18_history_says_what_else_a_name_matches_and_the_exact_leaf_wins() {
+    let d = workspace("histmatch");
+    let rust = format!(
+        "{BUSY} printf '%s\\n' 'test tests::flaky_clock ... ok' 'test flaky_clock ... ok' 'test result: ok. 2 passed; 0 failed; 0 ignored'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &rust]);
+    let h = text(&prova(&d, &["history", "flaky_clock"]));
+    assert!(h.contains("runs with a result"), "{h}");
+    assert!(
+        h.contains("also matches 1 other test(s): tests::flaky_clock"),
+        "{h}"
+    );
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestMod' '=== RUN   TestMod/a' '    --- PASS: TestMod/a (0.00s)' '--- PASS: TestMod (0.00s)' 'PASS' 'ok  \tex/a\t0.01s'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    let h = text(&prova(&d, &["history", "TestMod"]));
+    assert!(h.contains("runs with a result"), "{h}");
+    assert!(!h.contains("be more specific"), "{h}");
+}
+
+/// Round 18 (probe N3, rust MINOR/NIT): `quarantine remove TestFlaky --in b`
+/// failed for Go; Rust `--in calc` was refused for an integration test
+/// (`calc::it`); the places listed `tests`, a module; a bare name that two
+/// crates' integration tests share was "also known qualified". Why medium:
+/// stored tests and quarantines.
+#[test]
+fn r18_quarantine_in_takes_go_packages_and_rust_crates() {
+    let d = workspace("qin");
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok  \tex/a\t0.01s' '=== RUN   TestFlaky' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\tex/b\t0.01s'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    for p in ["a", "b"] {
+        let o = prova(
+            &d,
+            &["quarantine", "add", "TestFlaky", "--in", p, "--reason", "r"],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let o = prova(&d, &["quarantine", "remove", "TestFlaky", "--in", "b"]);
+    assert_eq!(o.status.code(), Some(0), "go remove --in: {}", text(&o));
+    let rust = format!(
+        "{BUSY} printf '%s\\n' '    Starting 4 tests across 2 binaries' '        PASS [   0.004s] calc::it flaky_clock' '        PASS [   0.004s] geo::it flaky_clock' '        PASS [   0.004s] calc tests::flaky_clock' '        PASS [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 4 tests run'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &rust]);
+    let o = text(&prova(
+        &d,
+        &["quarantine", "add", "flaky_clock", "--reason", "r"],
+    ));
+    assert!(!o.contains("also known qualified"), "{o}");
+    assert!(o.contains("calc::it") && o.contains("--in"), "{o}");
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "flaky_clock",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "rust --in crate: {}", text(&o));
+    let o = text(&prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky_clock",
+            "--in",
+            "nowhere",
+            "--reason",
+            "r",
+        ],
+    ));
+    assert!(o.contains("it is in: calc, geo"), "{o}");
+}
+
+/// Round 18 (rust MINOR): the live SLOW line dropped the crate that the
+/// UNFINISHED line showed. Why medium: needs a run still going.
+#[test]
+fn r18_the_slow_line_names_the_crate() {
+    let d = workspace("slowcrate");
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' '    Starting 1 tests across 1 binaries' '        SLOW [> 60.000s] calc tests::hangs'; while [ ! -f {d}/stop ]; do sleep 0.2; done",
+        d = d.display()
+    );
+    let o = text(&prova(&d, &["run", "--detach", "--", "sh", "-c", &cmd]));
+    let i = o.find("run ").unwrap() + 4;
+    let id = o[i..i + 8].to_owned();
+    let w = text(&prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "10s"],
+    ));
+    std::fs::write(d.join("stop"), "").unwrap();
+    prova(&d, &["cancel", &id]);
+    assert!(w.contains("SLOW tests::hangs (calc)"), "{w}");
+}
+
+/// Round 18 (rust MINOR/NIT): `sizes` said "unknown 2" without naming
+/// them. Why medium: stored runs.
+#[test]
+fn r18_sizes_names_the_unknown() {
+    let d = workspace("sizesslow");
+    let mut lines = String::new();
+    for i in 0..12 {
+        lines.push_str(&format!("'test m::t{i} ... ok' "));
+    }
+    let cmd =
+        format!("{BUSY} printf '%s\\n' {lines} 'test result: ok. 12 passed; 0 failed; 0 ignored'");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let s = text(&prova(&d, &["sizes"]));
+    assert!(s.contains("m::t0") && s.contains("unknown"), "{s}");
+}
+
+/// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
+/// the tests the second did not print as "removed". Why medium: two stored
+/// runs of two suites.
+#[test]
+fn r18_diff_of_different_suites_says_not_visible_and_warns() {
+    let d = workspace("diffsuites");
+    let one = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... ok' 'test a::t2 ... ok' 'test result: ok. 2 passed; 0 failed; 0 ignored'"
+    );
+    let two = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... ok' 'test result: ok. 1 passed; 0 failed; 0 ignored'"
+    );
+    let run_id = |o: &Output| {
+        let t = text(o);
+        let i = t.find("run ").unwrap() + 4;
+        t[i..i + 8].to_owned()
+    };
+    let a = run_id(&prova(&d, &["run", "--", "sh", "-c", &one]));
+    let b = run_id(&prova(&d, &["run", "--", "sh", "-c", &two]));
+    let o = text(&prova(&d, &["diff", &a, &b]));
+    assert!(o.contains("not visible in this run"), "{o}");
+    assert!(!o.contains("removed ("), "{o}");
+    assert!(o.contains("different suites"), "{o}");
+}
+
+/// Round 18 (ts-vitest): "environment-dependent, not flaky" from a single
+/// earlier pass. Why medium: needs two runs with different environments.
+#[test]
+fn r18_one_earlier_pass_is_too_little_to_call_a_failure_environment_dependent() {
+    let d = workspace("envone");
+    let cmd = format!(
+        "{BUSY} if [ -n \"$BADENV\" ]; then echo 'test calc::e ... FAILED'; exit 1; else echo 'test calc::e ... ok'; fi"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let o = Command::new(PROVA)
+        .args(["run", "--", "sh", "-c", &cmd])
+        .current_dir(&d)
+        .env("PROVA_HOME", format!("{}.home", d.display()))
+        .env("BADENV", "1")
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert!(out.contains("FAIL calc::e"), "{out}");
+    assert!(!out.contains("environment-dependent"), "{out}");
+    assert!(out.contains("too little history"), "{out}");
+}
+
+/// Round 18 (ts-vitest): "this code passed in suite a" for a suite that did
+/// not run the failing test at all. Why medium: three stored runs.
+#[test]
+fn r18_another_suite_that_never_ran_the_test_says_nothing_about_it() {
+    let d = workspace("elsewhere");
+    let failing = format!(
+        "{BUSY} printf '%s\\n' 'test a::t1 ... FAILED' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101"
+    );
+    let other = format!(
+        "{BUSY} printf '%s\\n' 'test b::other ... ok' '' 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &failing]);
+    let o = prova(&d, &["run", "--", "sh", "-c", &other]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = text(&prova(&d, &["run", "--", "sh", "-c", &failing]));
+    assert!(o.contains("FAIL a::t1"), "{o}");
+    assert!(!o.contains("this code passed in suite"), "{o}");
+}
+
+/// A name of unknown place that two known places share is none of theirs:
+/// it takes no history, no FLAKY label, and no quarantine of theirs.
+#[test]
+fn r18_an_unknown_place_never_borrows_the_history_of_a_shared_name() {
+    let d = workspace("unknownshared");
+    let nextest = format!(
+        "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        PASS [   0.004s] calc tests::flaky_clock' '        FAIL [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 2 tests run'; exit 100"
+    );
+    let quiet = format!(
+        "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at somewhere.rs:1:1:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &nextest]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky_clock",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "--", "sh", "-c", &quiet]);
+    let out = text(&o);
+    assert!(out.contains("first time seen"), "{out}");
+    assert!(
+        !out.contains("FLAKY") && !out.contains("quarantined: tests::flaky_clock (calc) failed"),
+        "{out}"
+    );
+    assert!(!out.contains("only known flaky"), "{out}");
+}
