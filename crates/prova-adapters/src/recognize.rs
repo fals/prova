@@ -4948,8 +4948,10 @@ mod tests {
     /// named it with `pkg/`: one failure counted twice.
     #[test]
     fn vitest_stream_events_name_the_file_from_the_root_they_carry() {
-        let mut r = Recognizers::default();
-        r.vitest_stream = true;
+        let mut r = Recognizers {
+            vitest_stream: true,
+            ..Default::default()
+        };
         r.set_places(std::path::Path::new("/w"), std::path::Path::new("/w"));
         let mut ev = Vec::new();
         ev.extend(r.line(
