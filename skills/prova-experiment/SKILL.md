@@ -73,10 +73,13 @@ prova exp new <name> --hypothesis "<what you expect and why>" \
   the verdict: tests, benchmarks, build and runner files (`*_test.go`,
   `test_*.py`, `conftest.py`, `pytest.ini`, `*.bench.ts`, `src/test/**`,
   `Makefile`, `*.sh`, ...), runner configuration (`.npmrc`, `.yarnrc*`,
-  `.cargo/config*`, `rust-toolchain*`, `go.env`, `pip.conf`,
+  `.cargo/config*`, `rust-toolchain`, `rust-toolchain.toml`, `go.env`, `pip.conf`,
   `sitecustomize.py`), compiled modules (`*.pyc`, `__pycache__/`), and
   top-level Python files that shadow the standard library (`random.py`). A candidate that touches them is rejected
-  unmeasured. `--change go.mod` (repeatable, globs) also allows those paths;
+  unmeasured. A real change to `.cargo/config*` (rustflags, `target-cpu`)
+  is such a file: allow it with `--change .cargo/config.toml`, and read the
+  diff, since a `runner` there can forge the metric.
+  `--change go.mod` (repeatable, globs) also allows those paths;
   `--change primes.go --change-only` allows nothing else. `prova exp
   protocol <name> --change ...` works until the first trial.
 - Specification files must be committed: `exp new` refuses a `--spec` file
@@ -149,7 +152,7 @@ fails the comparison with a reason saying so; it is never a REJECT, so install
 what it needs and run again. `prova exp status` leads with the current best,
 then the latest comparison; it exits 0 when a kept best stands after a later
 REJECT. The Holm family is every hypothesis tested in this experiment on its metric;
-a revalidation replicates one, adds none, and a revalidation that does not hold, or is void (its output drifted 2x or more), withdraws the accept (the best goes back). `caveat:` lines in the verdict flag a weak protocol,
+a revalidation replicates one, adds none, and a revalidation that does not hold, or is void because of the candidate (its own median moved 2x or more while the baseline's did not, extra metric lines, leaked processes, rewritten tracked files), withdraws the accept (the best goes back). A revalidation the machine spoiled (both arms moved alike, load, a stopped arm, the oracle failing) is inconclusive: the accept stands, rerun it on a quieter machine. `caveat:` lines in the verdict flag a weak protocol,
 other experiments on the same baseline, or a protocol with no `--oracle` or `--spec`
 (correctness unchecked: only speed was judged). Sandboxed arms have no network
 unless the protocol has `--allow-network`: install dependencies in `--setup`.
