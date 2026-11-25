@@ -2121,6 +2121,19 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             in_file,
         } => {
             let mut found = analysis::find_tests(store, &test, None)?;
+            // A name that is exact in a test binary (Rust) is that test,
+            // not the same tail of another module's (`flaky_clock` and
+            // `tests::flaky_clock`).
+            if found.iter().any(|t| {
+                t.1 == test
+                    && analysis::place_of_test(store, &t.0)
+                        .ok()
+                        .flatten()
+                        .and_then(|p| p.0)
+                        .is_some_and(|f| !f.starts_with("(package pending)"))
+            }) {
+                found.retain(|t| t.1 == test);
+            }
             // `--in` names the place in the framework's own form: a Rust
             // test binary, a Go package, a pytest or Vitest file.
             if let Some(w) = in_file.as_deref() {
@@ -2134,7 +2147,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 };
                 for t in &found {
                     let (file, path) = place_of(t);
-                    places.extend(file.or(path.first().cloned()));
+                    places.extend(analysis::place_label(file.as_deref(), &path));
                 }
                 analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {
@@ -2151,10 +2164,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             > = Default::default();
             for t in &found {
                 let (file, path) = analysis::place_of_test(store, &t.0)?.unwrap_or_default();
-                if let Some(p) = file
-                    .filter(|f| !f.starts_with("(package pending)"))
-                    .or(path.first().cloned())
-                {
+                if let Some(p) = analysis::place_label(file.as_deref(), &path) {
                     places_of_names.entry(t.1.clone()).or_default().insert(p);
                 }
             }
@@ -2301,7 +2311,14 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             // A name quarantined in several places: `--in` says which.
             if let Some(w) = in_file.as_deref() {
-                analysis::retain_in_place(&mut hits, w, |e| (e.file.clone(), Vec::new()));
+                // A Go test has no binary: its package heads its name.
+                analysis::retain_in_place(&mut hits, w, |e| {
+                    let path = match (&e.file, e.test.rsplit_once("::")) {
+                        (None, Some((head, _))) => vec![head.to_owned()],
+                        _ => Vec::new(),
+                    };
+                    (e.file.clone(), path)
+                });
             }
             let entry = match hits.as_slice() {
                 [one] => *one,
@@ -2861,7 +2878,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 };
                 for t in &found {
                     let (file, path) = place_of(t);
-                    places.extend(file.or(path.first().cloned()));
+                    places.extend(analysis::place_label(file.as_deref(), &path));
                 }
                 analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {

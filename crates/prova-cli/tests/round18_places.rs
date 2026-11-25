@@ -252,12 +252,71 @@ fn r18_history_says_what_else_a_name_matches_and_the_exact_leaf_wins() {
         "{h}"
     );
     let go = format!(
-        "{BUSY} printf '%s\\n' '=== RUN   TestMod' '=== RUN   TestMod/a' '    --- PASS: TestMod/a (0.00s)' '--- PASS: TestMod (0.00s)' 'PASS' 'ok  \\tex/a\\t0.01s'"
+        "{BUSY} printf '%s\\n' '=== RUN   TestMod' '=== RUN   TestMod/a' '    --- PASS: TestMod/a (0.00s)' '--- PASS: TestMod (0.00s)' 'PASS' 'ok  \tex/a\t0.01s'"
     );
     prova(&d, &["run", "--", "sh", "-c", &go]);
     let h = text(&prova(&d, &["history", "TestMod"]));
     assert!(h.contains("runs with a result"), "{h}");
     assert!(!h.contains("be more specific"), "{h}");
+}
+
+/// Round 18 (probe N3, rust MINOR/NIT): `quarantine remove TestFlaky --in b`
+/// failed for Go; Rust `--in calc` was refused for an integration test
+/// (`calc::it`); the places listed `tests`, a module; a bare name that two
+/// crates' integration tests share was "also known qualified". Why medium:
+/// stored tests and quarantines.
+#[test]
+fn r18_quarantine_in_takes_go_packages_and_rust_crates() {
+    let d = workspace("qin");
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok  \tex/a\t0.01s' '=== RUN   TestFlaky' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\tex/b\t0.01s'; exit 1"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    for p in ["a", "b"] {
+        let o = prova(
+            &d,
+            &["quarantine", "add", "TestFlaky", "--in", p, "--reason", "r"],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let o = prova(&d, &["quarantine", "remove", "TestFlaky", "--in", "b"]);
+    assert_eq!(o.status.code(), Some(0), "go remove --in: {}", text(&o));
+    let rust = format!(
+        "{BUSY} printf '%s\\n' '    Starting 4 tests across 2 binaries' '        PASS [   0.004s] calc::it flaky_clock' '        PASS [   0.004s] geo::it flaky_clock' '        PASS [   0.004s] calc tests::flaky_clock' '        PASS [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 4 tests run'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &rust]);
+    let o = text(&prova(
+        &d,
+        &["quarantine", "add", "flaky_clock", "--reason", "r"],
+    ));
+    assert!(!o.contains("also known qualified"), "{o}");
+    assert!(o.contains("calc::it") && o.contains("--in"), "{o}");
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "flaky_clock",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "rust --in crate: {}", text(&o));
+    let o = text(&prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky_clock",
+            "--in",
+            "nowhere",
+            "--reason",
+            "r",
+        ],
+    ));
+    assert!(o.contains("it is in: calc, geo"), "{o}");
 }
 
 /// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
