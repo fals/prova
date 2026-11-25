@@ -50,8 +50,34 @@ pub fn check(command: &CommandSpec, cwd: &Path) -> Result<RunnerCall, String> {
 }
 
 fn analyze_shell(script: &str, cwd: &Path, depth: usize) -> Result<RunnerCall, String> {
+    // `cd /w && pytest -v`: moving to the directory is no other step.
+    if let Some((dir, rest)) = leading_cd(script) {
+        let next = if Path::new(dir).is_absolute() || dir.starts_with(['~', '$']) {
+            cwd.to_path_buf()
+        } else {
+            cwd.join(dir)
+        };
+        return analyze_shell(rest, &next, depth + 1);
+    }
     let words = shell_words(script)?;
     analyze(&words, cwd, depth)
+}
+
+/// `cd <dir> && <rest>`: the directory (a plain word) and the rest.
+fn leading_cd(script: &str) -> Option<(&str, &str)> {
+    let s = script.trim_start().strip_prefix("cd")?;
+    if !s.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let s = s.trim_start();
+    let end = s.find(char::is_whitespace)?;
+    let (dir, after) = s.split_at(end);
+    let plain = !dir.is_empty()
+        && dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./~$".contains(c));
+    let rest = after.trim_start().strip_prefix("&&")?;
+    (plain && !rest.trim().is_empty()).then_some((dir, rest.trim_start()))
 }
 
 /// Splits one shell command line into words, refusing anything that joins
@@ -269,7 +295,24 @@ fn analyze(words: &[String], cwd: &Path, depth: usize) -> Result<RunnerCall, Str
                 let rest = skip_options(rest, &["-u", "--unset", "-C", "--chdir", "-S"]);
                 w = rest;
             }
-            Some("exec" | "time") => w = &w[1..],
+            Some("exec" | "time" | "nohup" | "command") => w = &w[1..],
+            // `timeout 60 go test`: the duration is the wrapper's own.
+            Some("timeout") => {
+                let rest = skip_options(&w[1..], &["-s", "--signal", "-k", "--kill-after"]);
+                w = rest.get(1..).unwrap_or(&[]);
+            }
+            Some("nice") => {
+                let rest = skip_options(&w[1..], &["-n", "--adjustment"]);
+                w = rest;
+            }
+            Some("ionice") => {
+                let rest = skip_options(&w[1..], &["-c", "--class", "-n", "--classdata"]);
+                w = rest;
+            }
+            Some("stdbuf") => {
+                let rest = skip_options(&w[1..], &["-i", "-o", "-e"]);
+                w = rest;
+            }
             _ => break,
         }
     }
@@ -459,16 +502,124 @@ fn analyze(words: &[String], cwd: &Path, depth: usize) -> Result<RunnerCall, Str
             }
         }
         _ => {
-            // A script given the command as its one quoted argument:
-            // `./dev "go test ./..."`.
-            if rest.len() == 1 && rest[0].split_whitespace().count() > 1 {
-                return analyze_shell(&rest[0], cwd, depth + 1);
+            // A script given the command as its argument (`./dev "go test
+            // ./..."`) qualifies only when it does nothing but `exec` a
+            // runner or a container client with them (round 18: a script
+            // that ran a lint step after the runner was trusted).
+            if prog.contains('/') && !rest.is_empty() {
+                wrapper_script(&cwd.join(prog), prog)
+                    .map_err(|why| format!("`{whole}` runs the script `{prog}`: {why}"))?;
+                if rest.len() == 1 && rest[0].split_whitespace().count() > 1 {
+                    return analyze_shell(&rest[0], cwd, depth + 1);
+                }
+                return analyze(rest, cwd, depth + 1);
             }
             Err(format!(
                 "`{whole}` runs `{prog}`, which is not a known test runner"
             ))
         }
     }
+}
+
+/// Whether the script at `path` does nothing but `exec` a test runner or a
+/// container client with the script's own arguments (`"$@"`, `"$*"`,
+/// `"$1"`). Comments, blank lines, `set` options and plain variable
+/// assignments are ignored.
+fn wrapper_script(path: &Path, name: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|_| "it could not be read, so what it runs is not known".to_owned())?;
+    // A line ending in a backslash goes on.
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = String::new();
+    for l in text.lines() {
+        let t = l.trim();
+        match t.strip_suffix('\\') {
+            Some(head) => {
+                open.push_str(head);
+                open.push(' ');
+            }
+            None => {
+                open.push_str(t);
+                lines.push(std::mem::take(&mut open));
+            }
+        }
+    }
+    let mut statements: Vec<&str> = Vec::new();
+    for l in &lines {
+        let t = l.trim();
+        if t.is_empty()
+            || t.starts_with('#')
+            || t == "set"
+            || t.starts_with("set -")
+            || t.starts_with("set +")
+        {
+            continue;
+        }
+        let assignment = t.strip_prefix("export ").unwrap_or(t);
+        if is_assignment(assignment.split_whitespace().next().unwrap_or(""))
+            && assignment.split_whitespace().count() == 1
+            && !assignment.contains(['`', ';', '|', '&', '('])
+        {
+            continue;
+        }
+        statements.push(t);
+    }
+    let [one] = statements.as_slice() else {
+        return Err(format!(
+            "{name} does more than run its argument ({} steps): a quarantine sees one runner call only",
+            statements.len().max(1)
+        ));
+    };
+    let Some(call) = one.strip_prefix("exec ") else {
+        return Err(format!(
+            "{name} does not end in one `exec` of the runner: a step after it would be out of sight"
+        ));
+    };
+    let words = shell_words(call).map_err(|e| format!("{name}: {e}"))?;
+    let words: Vec<String> = words.into_iter().skip_while(|w| is_assignment(w)).collect();
+    let prog = words.first().map_or("", |w| w.as_str());
+    let arg_ref = |w: &str| matches!(w, "$@" | "$*" | "$1" | "${@}" | "${*}" | "${1}");
+    let known = matches!(
+        base(prog),
+        "docker" | "podman" | "docker-compose" | "podman-compose"
+    ) || arg_ref(prog)
+        || is_known_runner(base(prog));
+    if !known {
+        return Err(format!(
+            "{name} execs `{prog}`, which is not a known test runner or container client"
+        ));
+    }
+    if !words.iter().any(|w| arg_ref(w)) {
+        return Err(format!(
+            "{name} does not pass its arguments to what it runs (no \"$@\", \"$*\" or \"$1\" on its own)"
+        ));
+    }
+    Ok(())
+}
+
+fn is_known_runner(name: &str) -> bool {
+    matches!(
+        name,
+        "go" | "gotestsum"
+            | "cargo"
+            | "pytest"
+            | "py.test"
+            | "python"
+            | "python3"
+            | "vitest"
+            | "jest"
+            | "mvn"
+            | "mvnw"
+            | "gradle"
+            | "gradlew"
+            | "dotnet"
+            | "npx"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "uv"
+            | "poetry"
+    )
 }
 
 fn call(runner: Runner, words: &[String]) -> RunnerCall {
@@ -856,7 +1007,17 @@ mod tests {
             "sh -c 'go test ./...'",
             "bash -c \"cargo test\"",
             "bash -lc 'go test ./...'",
-            "./dev \"go test ./...\"",
+            "timeout 60 go test ./...",
+            "timeout -k 5 --signal=INT 1m cargo test",
+            "nice go test ./...",
+            "nice -n 10 pytest -q",
+            "stdbuf -oL go test ./...",
+            "stdbuf -o L -e0 go test ./...",
+            "env VAR=x go test ./...",
+            "cd sub && go test ./...",
+            "cd /w && pytest -v",
+            "docker run --rm img sh -c 'cd /w && pytest -v'",
+            "docker run --rm -v $PWD:/w -w /w img sh -c \"cd /w && python3 -m pytest -q\"",
             "docker run --rm -v $PWD:/w -w /w golang:1.22 go test ./...",
             "docker exec -it dev go test ./...",
             "docker compose run --rm app pytest",
@@ -870,7 +1031,6 @@ mod tests {
 
     #[test]
     fn argv_wrappers_qualify() {
-        assert!(argv(&["./dev", "go test ./..."]).is_ok());
         assert!(argv(&["sh", "-c", "pytest -q"]).is_ok());
         assert!(argv(&["go", "test", "./..."]).is_ok());
         assert!(argv(&["docker", "run", "--rm", "img", "pytest"]).is_ok());
@@ -890,7 +1050,11 @@ mod tests {
         assert!(why("go test $(go list ./...)").contains("substitution"));
         assert!(why("go test `go list`").contains("substitution"));
         assert!(why("./ci.sh").contains("not a known test runner"));
-        assert!(why("./dev test").contains("not a known test runner"));
+        assert!(why("./dev test").contains("runs the script `./dev`"));
+        assert!(why("timeout 60 make test").contains("runs make"));
+        assert!(why("cd sub && go vet ./... && go test ./...").contains("&&"));
+        assert!(why("cd sub ; go test ./...").contains("`;`"));
+        assert!(why("cd sub && ./ci.sh").contains("not a known test runner"));
         assert!(why("sh -c 'go vet ./... && go test ./...'").contains("&&"));
         assert!(why("sh script.sh").contains("shell script"));
         assert!(why("mvn verify").contains("verify"));

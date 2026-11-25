@@ -97,6 +97,64 @@ fn vitest_coverage_in_an_imported_or_named_config_is_refused() {
     assert!(run("npx vitest run --config ./strict.config.mjs", &dir).is_err());
 }
 
+/// Round 18: a script given the runner as its argument qualifies only when
+/// its body is one `exec` of a runner or container client with the
+/// script's arguments; a script that does more (a lint step after) does not.
+#[test]
+fn a_wrapper_script_qualifies_only_when_it_does_nothing_but_exec() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("wrapper");
+    let script = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // The shapes of round 18's `./dev` wrappers.
+    script(
+        "dev",
+        "#!/bin/sh\n# Runs a command in the toolchain container.\nset -eu\nHERE=\"$PWD\"\n\nexec docker run --rm -e HANG -v \"$HERE\":/w -w /w img sh -c \"$*\"\n",
+    );
+    script(
+        "dev1",
+        "#!/bin/sh\nexec docker run --rm -v \"$PWD\":/w -w /w img sh -c \"$1\"\n",
+    );
+    script("pass", "#!/bin/sh\nexec \"$@\"\n");
+    script("ci.sh", "#!/bin/sh\nsh -c \"$1\" && lint\n");
+    script(
+        "after.sh",
+        "#!/bin/sh\ndocker run --rm img sh -c \"$1\"\nlint\n",
+    );
+    script(
+        "extra.sh",
+        "#!/bin/sh\nexec docker run --rm img sh -c \"$1 && lint\"\n",
+    );
+    script(
+        "noargs.sh",
+        "#!/bin/sh\nexec docker run --rm img sh -c \"go test ./...\"\n",
+    );
+    script(
+        "subst.sh",
+        "#!/bin/sh\nexec docker run --rm img sh -c \"$(date) $1\"\n",
+    );
+    assert!(run("./dev \"go test ./...\"", &dir).is_ok());
+    assert!(run("./dev go test ./...", &dir).is_ok());
+    assert!(run("./dev1 \"python3 -m pytest -v\"", &dir).is_ok());
+    assert!(run("./pass pytest -q", &dir).is_ok());
+    for bad in [
+        "./ci.sh",
+        "./after.sh",
+        "./extra.sh",
+        "./noargs.sh",
+        "./subst.sh",
+    ] {
+        let e = run(&format!("{bad} \"go test ./...\""), &dir).unwrap_err();
+        assert!(e.contains(bad.trim_start_matches("./")), "{bad}: {e}");
+    }
+    assert!(run("./missing \"go test ./...\"", &dir).is_err());
+    // What the script runs is still checked.
+    assert!(run("./dev \"go test ./... && lint\"", &dir).is_err());
+}
+
 #[test]
 fn go_testmain_is_found_through_the_module_path() {
     let p = tmp("gomod");
