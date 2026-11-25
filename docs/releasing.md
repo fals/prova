@@ -11,7 +11,11 @@ shipped binary has passed on its own platform.
 2. The release workflow's builds passed on the last PR that touched the
    release path (`release.yml`, `Dockerfile.release`, `install.sh`,
    `Cargo.lock`).
-3. The version in `Cargo.toml` (`[workspace.package]`) is the one to tag:
+3. **Release candidate accepted.** CI green is not enough: it shows only that prova's own tests pass. Build the candidate from `main` and run, on that binary:
+   - the regression probes of every earlier usability round (their blocker repros, kept as large tests or corpus cases);
+   - a short acceptance round: the adversarial probe agent, plus a fixture agent for each area the release changed, using the real tools (Docker fixtures for containers).
+   Any blocker or false pass means no tag: fix it, then start this step again. Record the candidate's run ids in the release PR.
+4. The version in `Cargo.toml` (`[workspace.package]`) is the one to tag:
    bump it (and the `vX.Y.Z` pins in README, getting started and
    `llms.txt`) in a PR before tagging; the release refuses a mismatch.
 

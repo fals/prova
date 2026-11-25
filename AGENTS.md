@@ -97,7 +97,9 @@ Sizes follow [0005](docs/adr/0005-test-sizes.md).
 
 - Write the smallest test that can fail for the right reason. A medium or large test needs one line explaining why a smaller one cannot do it.
 - No `sleep` to wait for something to happen. Wait on an event or a condition with a bound.
-- Every bug fix starts with a failing test.
+- Every bug fix starts with a failing test, and the failure is seen: the PR gives, for each fix, a prova run id where the new test fails on the code before the fix (or with the fix's core line reverted). A test that never failed proves nothing; "written after the fix" is not done.
+- Behavior that depends on what a framework or tool prints is tested against its real output: a capture in a corpus (`crates/prova-cli/tests/fixtures/`, with the command that made it) or the real tool in a large test. A fake may only print lines the real tool prints (libtest always prints `test result:`, nextest's `Summary` always has its counts). Containers: at least one large test with a real container per behavior (cancel, mounts, first wait).
+- Every blocker a usability round finds becomes a permanent regression test with the real tool before its fix merges, so later releases are checked against it.
 - Lifecycle changes: spec, then trace replay test, then code.
 - Statistics: verify against reference values computed with R or SciPy, stored as test vectors with the command that produced them.
 - Process handling (signals, process groups, leaked children) is tested with real processes in medium tests, on Linux in CI.
@@ -125,7 +127,9 @@ Rules for agents:
 4. **Hand off with evidence.** A handoff states what was done, the prova run ids (Stage B) or test output (Stage A) that prove it, and what is known to be missing. No claim without a run id or output.
 5. **Do not trust a summary, including your own.** Before building on another agent's work, run its tests.
 6. **Parallel work needs disjoint files.** Coordinate on shared files (`Cargo.toml`, migrations, schema) through the owner of prova-core.
-7. **Escalate, do not guess**, on: anything that contradicts an ADR, a public CLI or event format change, a security trade-off, or a new dependency with a large footprint.
+7. **Review before merge.** Every PR is reviewed by an agent that did not write it (`/code-review` or the area's reviewer), against the ADRs, for regressions and for tests that cannot fail; findings are fixed or answered before merging. A PR with work from several agents gets its merged result tested and reviewed as a whole, not only each part.
+8. **Small PRs.** One area per PR. Several parallel areas become several PRs, each with its own CI and review, merged one at a time.
+9. **Escalate, do not guess**, on: anything that contradicts an ADR, a public CLI or event format change, a security trade-off, or a new dependency with a large footprint.
 
 ## Milestones until usable
 
