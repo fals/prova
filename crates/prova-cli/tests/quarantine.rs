@@ -823,7 +823,7 @@ fn flaky_names_its_columns_and_quarantines() {
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
     let out = text(&prova(&d, &["flaky"]));
     assert!(
-        out.contains("same-code flips") && out.contains("calc::x  (quarantined)"),
+        out.contains("code versions flipped") && out.contains("calc::x  (quarantined)"),
         "{out}"
     );
 }

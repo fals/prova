@@ -2902,9 +2902,23 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             // Exact names win over partial ones (round 10: 16 matches for a
             // name that is exact in every suite, next to an old renamed one).
+            // A name that is exact only in its last part (`TestMod` for
+            // `ex/mod::TestMod`) wins over its own subtests (`TestMod/a`).
+            let all_found = found.clone();
             let found: Vec<_> = {
                 let exact: Vec<_> = found.iter().filter(|t| t.1 == test).cloned().collect();
-                if exact.is_empty() { found } else { exact }
+                let leaf: Vec<_> = found
+                    .iter()
+                    .filter(|t| t.1.rsplit("::").next() == Some(test.as_str()))
+                    .cloned()
+                    .collect();
+                if !exact.is_empty() {
+                    exact
+                } else if !leaf.is_empty() {
+                    leaf
+                } else {
+                    found
+                }
             };
             let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
             // Same name in several suites: take the one that ran most recently.
@@ -2966,6 +2980,30 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 Some(s) => render::test_stats(&s, json),
                 None => bail!("test disappeared"),
             }
+            // The exact match was shown: say what else the name matches
+            // instead of hiding it (round 18: `flaky_clock` showed the
+            // integration tests and not `tests::flaky_clock`).
+            if !json && all_found.len() > found.len() {
+                let rest: std::collections::BTreeSet<&str> = all_found
+                    .iter()
+                    .filter(|t| !found.iter().any(|f| f.0 == t.0))
+                    .map(|t| t.1.as_str())
+                    .filter(|d| !found.iter().any(|f| f.1 == *d))
+                    .collect();
+                if !rest.is_empty() {
+                    let shown: Vec<&str> = rest.iter().take(8).copied().collect();
+                    println!(
+                        "also matches {} other test(s): {}{} (`prova history <name>` for one)",
+                        rest.len(),
+                        shown.join(", "),
+                        if rest.len() > shown.len() {
+                            ", ..."
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             Ok(exit::PASSED)
         }
         Cmd::Flaky {
@@ -3013,7 +3051,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else {
                 // Columns named, and a quarantine shown (round 16).
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
-                println!("fail%   retry-passes  same-code flips  test");
+                println!("fail%   retry-passes  code versions flipped  test");
                 for s in &list {
                     let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
                         let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
@@ -3021,7 +3059,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     });
                     let q = if covered { "  (quarantined)" } else { "" };
                     println!(
-                        "{:5.1}%  {:12}  {:15}  {}{q}",
+                        "{:5.1}%  {:12}  {:21}  {}{q}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
