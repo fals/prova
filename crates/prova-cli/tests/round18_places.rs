@@ -235,6 +235,31 @@ fn r18_a_pass_that_set_a_failure_aside_is_not_a_pass_on_this_exact_code() {
     assert!(!o.contains("likely FLAKY"), "{o}");
 }
 
+/// Round 18 (rust M2, go MINOR 3): `history <name>` hid the other tests the
+/// name matches, and a Go parent was "ambiguous" with its own subtests.
+/// Why medium: it reads stored tests.
+#[test]
+fn r18_history_says_what_else_a_name_matches_and_the_exact_leaf_wins() {
+    let d = workspace("histmatch");
+    let rust = format!(
+        "{BUSY} printf '%s\\n' 'test tests::flaky_clock ... ok' 'test flaky_clock ... ok' 'test result: ok. 2 passed; 0 failed; 0 ignored'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &rust]);
+    let h = text(&prova(&d, &["history", "flaky_clock"]));
+    assert!(h.contains("runs with a result"), "{h}");
+    assert!(
+        h.contains("also matches 1 other test(s): tests::flaky_clock"),
+        "{h}"
+    );
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestMod' '=== RUN   TestMod/a' '    --- PASS: TestMod/a (0.00s)' '--- PASS: TestMod (0.00s)' 'PASS' 'ok  \\tex/a\\t0.01s'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    let h = text(&prova(&d, &["history", "TestMod"]));
+    assert!(h.contains("runs with a result"), "{h}");
+    assert!(!h.contains("be more specific"), "{h}");
+}
+
 /// Round 18 (ts-vitest): "environment-dependent, not flaky" from a single
 /// earlier pass. Why medium: needs two runs with different environments.
 #[test]
