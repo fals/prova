@@ -3175,6 +3175,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
+                    // A result of unknown place is not that place's when
+                    // the name is shared (ADR 0034 section 2).
+                    (None, Some(_)) => !q.ambiguous,
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
