@@ -1473,6 +1473,18 @@ fn run_failure_cause(s: &Summary) -> Option<String> {
     }
 }
 
+/// A line in which a framework says it ran no test (Surefire, pytest, Jest,
+/// dotnet).
+fn names_zero_tests(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("tests run: 0,")
+        || l.contains("collected 0 items")
+        || l.contains("no tests ran")
+        || l.contains("0 passed")
+        || l.contains("total tests: 0")
+        || l.contains("tests:       0 total")
+}
+
 fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool) -> Result<u8> {
     let (store, root, _) = open_here()?;
     if let (Some(suite), Some(filter)) = (verify, filter) {
@@ -1488,7 +1500,7 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 extra_env: cfg.env.clone(),
             },
         )?;
-        let tests: Vec<String> = store
+        let finished: Vec<(String, Outcome)> = store
             .events_after(&s.run, 0)?
             .into_iter()
             .filter_map(|e| match e.kind {
@@ -1497,11 +1509,12 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 prova_core::model::EventKind::TestFinished { test, outcome, .. }
                     if outcome != Outcome::Skipped =>
                 {
-                    Some(test.display())
+                    Some((test.display(), outcome))
                 }
                 _ => None,
             })
             .collect();
+        let tests: Vec<String> = finished.iter().map(|(t, _)| t.clone()).collect();
         // The filter is the framework's own syntax: a Go regex (`^TestAdd$`)
         // is anchored to the test name, not to prova's full name (round 6).
         let matches = |t: &str| filter_matches(&filter, t);
@@ -1561,7 +1574,22 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 ),
             )
         } else if s.level == prova_core::model::Level::Opaque {
-            (false, "cannot verify: run is at level opaque (no per-test results); see the prova-<language> skill to raise the level".to_owned())
+            // The framework's own count says nothing ran: the filter is the
+            // cause, not the level (round 17: `-Dtest=CalcTest$Division`
+            // reached the container expanded, 0 tests, exit 0).
+            let zero = lines.iter().any(|l| names_zero_tests(l));
+            let blame = if zero {
+                format!(
+                    "the framework ran 0 tests for filter {filter:?}: the filter did not reach the framework or matched nothing (a wrapper or the shell may have changed it); read `prova output {} --tail 40`",
+                    s.run
+                )
+            } else {
+                format!(
+                    "cannot verify: no per-test results, so the filter {filter:?} cannot be checked. If the output shows 0 tests, the filter did not reach the framework or matched nothing (a wrapper or the shell may have changed it): `prova output {} --tail 40`. Otherwise the run is at level opaque: see the prova-<language> skill to raise the level",
+                    s.run
+                )
+            };
+            (false, blame)
         } else if tests.is_empty() {
             (
                 false,
@@ -1570,19 +1598,45 @@ fn adopt(write: bool, verify: Option<String>, filter: Option<String>, json: bool
                 ),
             )
         } else if !unrelated.is_empty() {
+            // A parameterized case cannot be selected alone by Surefire or
+            // VSTest: they select by method, so all its cases run (round 17).
+            let method = filter
+                .split(['(', '['])
+                .next()
+                .unwrap_or(&filter)
+                .trim_end();
+            let by_method =
+                method.len() < filter.len() && unrelated.iter().all(|t| t.starts_with(method));
             (
                 false,
-                format!(
-                    "{} tests ran that do not match {filter:?} (e.g. {}); select is not selective",
-                    unrelated.len(),
-                    unrelated[0]
-                ),
+                if by_method {
+                    format!(
+                        "{} other invocations of {method:?} ran with the selected one: the framework selects by method, so every invocation runs (this is not a template problem)",
+                        unrelated.len()
+                    )
+                } else {
+                    format!(
+                        "{} tests ran that do not match {filter:?} (e.g. {}); select is not selective",
+                        unrelated.len(),
+                        unrelated[0]
+                    )
+                },
             )
         } else {
-            (
-                true,
-                format!("{} matching test(s) ran and nothing else", tests.len()),
-            )
+            let failed: Vec<&str> = finished
+                .iter()
+                .filter(|(t, o)| matches!(o, Outcome::Failed | Outcome::Errored) && matches(t))
+                .map(|(t, _)| t.as_str())
+                .collect();
+            let mut why = format!("{} matching test(s) ran and nothing else", tests.len());
+            if !failed.is_empty() {
+                why.push_str(&format!(
+                    "; the selected test failed: {} (the filter works, the test does not pass: `prova status {}`)",
+                    failed.join(", "),
+                    s.run
+                ));
+            }
+            (true, why)
         };
         if json {
             println!(

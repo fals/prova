@@ -426,11 +426,11 @@ pub fn apply_wrapper_form(p: &mut Proposal, w: &Wrapper) {
     p.reportlog = false;
     p.notes.push(if w.quoted {
         format!(
-            "commands run through `{wrapper}`, as your earlier runs did, with the whole command as one quoted argument; `{{filter}}` stays inside that argument"
+            "commands run through `{wrapper}`, as your earlier runs did, with the whole command as one quoted argument; `{{filter}}` stays inside that argument, and prova passes it as one single-quoted word"
         )
     } else {
         format!(
-            "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none"
+            "commands run through `{wrapper}`, as your earlier runs did; a wrapper that re-splits its arguments (`$*`) breaks a filter with spaces: select with a substring that has none, or pass the whole command as one quoted argument"
         )
     });
 }

@@ -932,18 +932,23 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         }
     };
     let injected = observer.env(&dir);
+    let framework_filter = spec
+        .selection
+        .as_deref()
+        .map(|f| crate::config::framework_filter(&spec.command.display(), f))
+        .unwrap_or_default();
     for (k, v) in &injected {
         cmd.env(k, v);
     }
     cmd.current_dir(&row.cwd)
         .env("PROVA_RUN_ID", run)
         // The selection reaches the shell only as a variable, never as text.
+        .env("PROVA_FILTER", &framework_filter)
+        // The same, single-quoted, for a filter inside a wrapper's quoted
+        // argument (round 17).
         .env(
-            "PROVA_FILTER",
-            spec.selection
-                .as_deref()
-                .map(|f| crate::config::framework_filter(&spec.command.display(), f))
-                .unwrap_or_default(),
+            "PROVA_FILTER_Q",
+            crate::config::shell_single_quote(&framework_filter),
         )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1343,7 +1348,7 @@ fn observe_child(
                 "selection {sel:?} matched no test: nothing was verified"
             ));
         } else if let Some(sel) = &spec.selection
-            && sel.contains("::")
+            && (sel.contains("::") || go_subtest_selection(sel))
             && sup.level > Level::Opaque
         {
             // A test named in full must itself run: a framework filter by
@@ -2214,18 +2219,86 @@ fn quarantined_only_failures(
     (!names.is_empty() && verified_other).then_some(names)
 }
 
+/// A bare Go subtest selection (`TestTable/x`): a test function, then a
+/// subtest. A path (`tests/test_calc.py`) is a file, not a subtest.
+fn go_subtest_selection(sel: &str) -> bool {
+    let first = sel.split('/').next().unwrap_or("");
+    sel.contains('/')
+        && ["Test", "Example", "Fuzz", "Benchmark"]
+            .iter()
+            .any(|p| first.starts_with(p))
+}
+
+/// A test name the way frameworks compare them: Go writes spaces in a
+/// subtest name as `_` (`x y` runs as `x_y`), and a pytest node id names a
+/// file (`tests/test_calc.py::test_ok`) where prova names its module
+/// (`tests.test_calc::test_ok`).
+fn comparable(name: &str) -> String {
+    let underscored = |s: &str| s.replace(char::is_whitespace, "_");
+    match name.split_once("::") {
+        Some((head, rest)) if head.ends_with(".py") => {
+            let module = head.trim_end_matches(".py").replace('/', ".");
+            format!("{module}::{}", underscored(rest))
+        }
+        _ => underscored(name),
+    }
+}
+
+/// `display` against `sel`, both as `comparable` names: the selected test
+/// itself, one of its subtests, or one of its parameterized cases. A
+/// pytest selection that gives only the end of the module path
+/// (`test_calc.py::test_ok`) names the module's tail.
+fn names_comparable(display: &str, sel: &str) -> bool {
+    let whole = |d: &str, s: &str| {
+        d == s
+            || ["/", "[", "("]
+                .iter()
+                .any(|p| d.strip_prefix(s).is_some_and(|r| r.starts_with(p)))
+    };
+    if whole(display, sel) {
+        return true;
+    }
+    match (display.split_once("::"), sel.split_once("::")) {
+        (Some((dh, dr)), Some((sh, sr))) if !sh.contains('/') => {
+            (dh == sh || dh.ends_with(&format!(".{sh}"))) && whole(dr, sr)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a test's display name is the selected test, one of its
-/// subtests, or one of its parameterized cases.
+/// subtests, or one of its parameterized cases. A parent that ran is not
+/// its subtest: a subtest that does not exist leaves only the parent
+/// (round 17: `TestTable/x` passed on the parent alone).
 fn names_the_selection(display: &str, sel: &str) -> bool {
-    display == sel
-        || [
-            sel.to_owned() + "/",
-            sel.to_owned() + "[",
-            sel.to_owned() + "(",
-        ]
-        .iter()
-        .any(|p| display.starts_with(p.as_str()))
-        || sel.starts_with(&format!("{display}/"))
+    let (d, s) = (comparable(display), comparable(sel));
+    names_comparable(&d, &s)
+        // A selection without a package or file (`TestTable/x`) names the
+        // part of the display after it.
+        || (!s.contains("::")
+            && d.split_once("::").is_some_and(|(_, r)| names_comparable(r, &s)))
+}
+
+/// Whether a test that ran belongs to the selection, for the note about
+/// tests outside it: the selected test and its subtests, a parent of the
+/// selection, any test of a selected file, or (for a selection that is a
+/// bare name) a test that contains it.
+fn in_selection(t: &str, sel: &str) -> bool {
+    let (td, sd) = (comparable(t).to_lowercase(), comparable(sel).to_lowercase());
+    let parent = |p: &str, s: &str| s.starts_with(&format!("{p}/"));
+    if sel.contains("::") && t.contains("::") {
+        return names_comparable(&td, &sd) || parent(&td, &sd);
+    }
+    // A file as the selection (`test_fixtures.py`, `tests/test_fixtures.py`):
+    // every test of that module.
+    if let Some(file) = sel.strip_suffix(".py") {
+        let module = file.replace('/', ".");
+        if let Some((head, _)) = t.split_once("::") {
+            return head == module || head.ends_with(&format!(".{module}"));
+        }
+    }
+    let leaf = sd.rsplit("::").next().unwrap_or(&sd).to_owned();
+    td.contains(&leaf) || leaf.contains(td.rsplit("::").next().unwrap_or(&td))
 }
 
 /// Whether `name` occurs in `line` as a whole name, not inside a longer one
@@ -3404,22 +3477,16 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
     // file for `-t`), or a test the filter did not name (round 15: read as
     // the selection leaking).
     if let Some(sel) = &selection {
-        let leaf = sel.rsplit("::").next().unwrap_or(sel).to_lowercase();
         // A qualified selection (`pkg::TestAdd`) names one test and its
         // subtests: a same-named test of another package that ran is
         // outside it (round 16: `go test -run ^TestAdd$ ./...` ran both).
         let qualified = sel.contains("::");
-        let selected = |t: &str| {
-            let tl = t.to_lowercase();
-            if qualified && tl.contains("::") {
-                let sl = sel.to_lowercase();
-                tl == sl || tl.starts_with(&format!("{sl}/")) || sl.starts_with(&format!("{tl}/"))
-            } else {
-                tl.contains(&leaf) || leaf.contains(tl.rsplit("::").next().unwrap_or(&tl))
-            }
-        };
+        let selected = |t: &str| in_selection(t, sel);
         let mut outside: Vec<String> = finals
             .values()
+            // A test the filter skipped did not run (Vitest `-t` reports
+            // every other test as skipped).
+            .filter(|f| f.1 != Outcome::Skipped)
             .map(|f| f.0.display())
             .filter(|t| {
                 t.ends_with("::(file)")
@@ -3988,5 +4055,82 @@ mod readable_tests {
             super::readable(lines),
             vec!["    a_test.go:9: boom".to_owned(), "plain line".to_owned()]
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{in_selection, names_the_selection};
+
+    /// Round 17: pytest prints a node id (`tests/test_calc.py::test_ok`);
+    /// prova names the test `tests.test_calc::test_ok`.
+    #[test]
+    fn a_pytest_node_id_names_the_test() {
+        let d = "tests.test_calc::test_ok";
+        assert!(names_the_selection(d, "tests/test_calc.py::test_ok"));
+        assert!(names_the_selection(d, "test_calc.py::test_ok"));
+        assert!(names_the_selection(d, "tests.test_calc::test_ok"));
+        assert!(!names_the_selection(d, "tests/test_other.py::test_ok"));
+        let p = "tests.test_calc::test_param[a b-c::d]";
+        assert!(names_the_selection(
+            p,
+            "tests/test_calc.py::test_param[a b-c::d]"
+        ));
+        assert!(names_the_selection(p, "tests/test_calc.py::test_param"));
+        assert!(!names_the_selection(d, "tests/test_calc.py::test_o"));
+    }
+
+    /// Round 17: `TestTable/x` with no such subtest ran only the parent.
+    #[test]
+    fn a_parent_that_ran_is_not_its_missing_subtest() {
+        assert!(!names_the_selection(
+            "example.com/m::TestTable",
+            "example.com/m::TestTable/x"
+        ));
+        assert!(names_the_selection(
+            "example.com/m::TestTable/x",
+            "example.com/m::TestTable/x"
+        ));
+        // Go writes spaces as underscores.
+        assert!(names_the_selection("m::TestTable/x_y", "m::TestTable/x y"));
+        assert!(names_the_selection(
+            "m::TestTable/Name=1,_b=2",
+            "m::TestTable/Name=1, b=2"
+        ));
+        assert!(names_the_selection(
+            "m::TestTable/\u{e9}_\u{fc}",
+            "m::TestTable/\u{e9} \u{fc}"
+        ));
+    }
+
+    /// Round 17: tests "outside the selection" were tests the filter named.
+    #[test]
+    fn a_test_the_filter_names_is_inside_the_selection() {
+        // pytest file filter.
+        assert!(in_selection(
+            "tests.test_fixtures::test_a",
+            "test_fixtures.py"
+        ));
+        assert!(in_selection(
+            "tests.test_fixtures::test_a",
+            "tests/test_fixtures.py"
+        ));
+        assert!(!in_selection(
+            "tests.test_other::test_a",
+            "test_fixtures.py"
+        ));
+        // Go renames spaces.
+        assert!(in_selection("m::TestTable/x_y", "TestTable/x y"));
+        assert!(in_selection("m::TestTable/x_y", "m::TestTable/x y"));
+        // Vitest nested names and a parent of the selection.
+        assert!(in_selection(
+            "src/a.test.js::math > ops > adds",
+            "src/a.test.js::math > ops > adds"
+        ));
+        assert!(!in_selection(
+            "src/a.test.js::math > ops > subs",
+            "src/a.test.js::math > ops > adds"
+        ));
+        assert!(in_selection("m::TestTable", "m::TestTable/x"));
     }
 }
