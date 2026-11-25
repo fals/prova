@@ -2335,6 +2335,17 @@ fn checkout_differs(dir: &Path) -> Option<String> {
         .map(|((_, p), _)| p.clone())
 }
 
+/// Deletes an overlay's scratch directory. The kernel makes `work/work` with
+/// no permissions at all, which `remove_dir_all` cannot enter.
+fn remove_scratch(scratch: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(
+        scratch.join("work").join("work"),
+        std::fs::Permissions::from_mode(0o700),
+    );
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
 /// The first tracked file of the checkout that an overlay's upper layer
 /// holds, i.e. one the sandboxed command wrote.
 fn rewritten_tracked(dir: &Path, upper: &Path) -> Option<String> {
@@ -2423,7 +2434,7 @@ fn satisfies_spec(
     // the trials a measurement, a marker or a binary of its choosing
     // (ADR 0032). Only its exit status and its log, which prova holds, count.
     let scratch = logs.join(format!("oracle-{}-scratch", arm.as_str()));
-    let _ = std::fs::remove_dir_all(&scratch);
+    remove_scratch(&scratch);
     let isolated = overlay_available()
         && std::fs::create_dir_all(scratch.join("up")).is_ok()
         && std::fs::create_dir_all(scratch.join("work")).is_ok();
@@ -2449,7 +2460,7 @@ fn satisfies_spec(
     let rewrote = isolated
         .then(|| rewritten_tracked(dir, &scratch.join("up")))
         .flatten();
-    let _ = std::fs::remove_dir_all(&scratch);
+    remove_scratch(&scratch);
     if let Some(f) = rewrote {
         return Ok(Err(SpecFail::Violated(format!(
             "the oracle rewrote the tracked file {f}: code that rewrites the checkout (its spec, its reference data, the other arm) cannot be judged"
