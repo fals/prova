@@ -27,9 +27,14 @@ pub struct Recognizers {
     /// The run's working directory: pytest names tests from its rootdir,
     /// prova from here (ADR 0031 section 2).
     pub cwd: Option<std::path::PathBuf>,
-    /// Where pytest's rootdir lies below the working directory
-    /// (`sub2` for `rootdir: <cwd>/sub2`): put before its ids.
-    pytest_prefix: Option<String>,
+    /// pytest's rootdir as its header printed it (`-q` prints none).
+    pytest_root: Option<std::path::PathBuf>,
+    /// The run's command line: a `cd` in it moves pytest, whose ids are
+    /// relative to the directory it runs in.
+    pub command: Option<String>,
+    /// Where pytest ran, as a path below the working directory (`sub2`):
+    /// put before its ids. Settled on the first id.
+    pytest_dir: std::cell::OnceCell<PytestDir>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -42,6 +47,9 @@ pub struct Recognizers {
     pub seen_keys: BTreeMap<String, TestKey>,
     /// Vitest: current test file header, and a failure held for its message.
     vitest_file: Option<String>,
+    /// Where Vitest's root (its `RUN` header) lies below the working
+    /// directory: Vitest names files from its root, prova from here.
+    vitest_prefix: Option<String>,
     vitest_pending: Option<EventKind>,
     /// VSTest: collecting the "Error Message:" block of the held failure.
     dotnet_message: Option<Vec<String>>,
@@ -433,6 +441,7 @@ impl Recognizers {
             message,
             source: Level::Native,
             subtest: false,
+            passed_in_iteration: false,
         });
     }
 
@@ -461,6 +470,7 @@ impl Recognizers {
             message,
             source: level,
             subtest: false,
+            passed_in_iteration: false,
         });
     }
 
@@ -501,6 +511,7 @@ impl Recognizers {
                 message,
                 source: level,
                 subtest,
+                passed_in_iteration: false,
             });
             return;
         }
@@ -569,6 +580,7 @@ impl Recognizers {
             message,
             source: level,
             subtest,
+            passed_in_iteration: false,
         });
     }
 
@@ -1055,6 +1067,14 @@ impl Recognizers {
         if let Some(root) = line.strip_prefix("rootdir: ") {
             self.pytest_rootdir(root);
         }
+        // Vitest: " RUN  v3.2.4 /abs/root"
+        if let Some(rest) = line.trim_start().strip_prefix("RUN ")
+            && let Some((version, root)) = rest.trim_start().split_once(' ')
+            && version.starts_with('v')
+            && root.trim().starts_with('/')
+        {
+            self.vitest_root(root.trim());
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -1107,38 +1127,129 @@ impl Recognizers {
         out
     }
 
-    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header: when the
-    /// rootdir lies below the working directory, ids are read from there.
-    fn pytest_rootdir(&mut self, header: &str) {
+    /// Vitest's root, when it lies below the working directory (either
+    /// path may run through a symlink: compared resolved).
+    fn vitest_root(&mut self, root: &str) {
         let Some(cwd) = &self.cwd else {
             return;
         };
-        let dir = std::path::Path::new(header.split(", ").next().unwrap_or(header).trim());
-        // Either path may run through a symlink (macOS `/var` is
-        // `/private/var`): compare them resolved when they differ as written.
-        let rel = dir
+        let root = std::path::Path::new(root);
+        let rel = root
             .strip_prefix(cwd)
-            .map(|r| r.to_path_buf())
+            .map(std::path::Path::to_path_buf)
             .ok()
             .or_else(|| {
-                let (d, c) = (dir.canonicalize().ok()?, cwd.canonicalize().ok()?);
-                d.strip_prefix(&c).map(|r| r.to_path_buf()).ok()
+                let (r, c) = (root.canonicalize().ok()?, cwd.canonicalize().ok()?);
+                r.strip_prefix(&c).map(std::path::Path::to_path_buf).ok()
             });
-        self.pytest_prefix = rel
-            .map(|rel| rel.to_string_lossy().trim_matches('/').to_owned())
-            .filter(|rel| !rel.is_empty());
+        self.vitest_prefix = rel
+            .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+            .filter(|r| !r.is_empty());
     }
 
-    /// Where pytest's rootdir lies below the working directory, if it does.
-    pub fn pytest_prefix(&self) -> Option<&str> {
-        self.pytest_prefix.as_deref()
+    /// A Vitest file as prova names it, from the working directory.
+    fn vitest_path(&self, file: &str) -> String {
+        match &self.vitest_prefix {
+            Some(p) => format!("{p}/{file}"),
+            None => file.to_owned(),
+        }
+    }
+
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header.
+    fn pytest_rootdir(&mut self, header: &str) {
+        let dir = header.split(", ").next().unwrap_or(header).trim();
+        self.pytest_root = Some(std::path::PathBuf::from(dir));
+    }
+
+    /// Where pytest ran. The terminal ids of pytest are relative to the
+    /// directory it runs in, not to its rootdir (`cwd_relative_nodeid`), and
+    /// `-q` prints no rootdir: the directory is the one that holds the id's
+    /// file. Without a `cd` in the command that is the working directory;
+    /// with one, its target; then the rootdir; then any directory below.
+    /// When these cannot tell, the place is unknown and said so.
+    fn pytest_dir(&self, id: &str) -> &PytestDir {
+        self.pytest_dir.get_or_init(|| {
+            let Some(cwd) = &self.cwd else {
+                return PytestDir::Prefix(String::new());
+            };
+            let file = id.split("::").next().unwrap_or(id);
+            // Either path may run through a symlink (macOS `/var` is
+            // `/private/var`): compare them resolved.
+            let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let base = canon(cwd);
+            let has = |dir: &std::path::Path| dir.join(file).is_file();
+            let rel = |dir: &std::path::Path| {
+                canon(dir)
+                    .strip_prefix(&base)
+                    .ok()
+                    .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+            };
+            let moved: Vec<String> = self
+                .command
+                .as_deref()
+                .map(cd_targets)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|t| {
+                    let dir = base.join(t);
+                    (dir.is_dir() && has(&dir)).then(|| rel(&dir)).flatten()
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            match moved.as_slice() {
+                [one] => return PytestDir::Prefix(one.clone()),
+                [] => {}
+                _ => return PytestDir::Unknown,
+            }
+            if has(&base) {
+                return PytestDir::Prefix(String::new());
+            }
+            if let Some(p) = self.pytest_root.as_deref().filter(|r| has(r)).and_then(rel) {
+                return PytestDir::Prefix(p);
+            }
+            let below = dirs_holding(&base, file);
+            match below.as_slice() {
+                [one] => return PytestDir::Prefix(rel(one).unwrap_or_default()),
+                [] => {}
+                _ => return PytestDir::Unknown,
+            }
+            // Nothing on disk to check (a container, another machine): the
+            // rootdir below the working directory, as before.
+            PytestDir::Prefix(
+                self.pytest_root
+                    .as_deref()
+                    .and_then(rel)
+                    .unwrap_or_default(),
+            )
+        })
+    }
+
+    /// Whether Vitest's root lies below the working directory.
+    pub fn vitest_prefixed(&self) -> bool {
+        self.vitest_prefix.is_some()
+    }
+
+    /// Whether a pytest test was named in this run.
+    pub fn pytest_ran(&self) -> bool {
+        self.pytest_dir.get().is_some()
     }
 
     /// A pytest node id as prova names it, from the working directory.
     fn pytest_key(&self, id: &str) -> TestKey {
-        match &self.pytest_prefix {
-            Some(p) if id.contains("::") || id.ends_with(".py") => pytest_key(&format!("{p}/{id}")),
-            _ => pytest_key(id),
+        if !(id.contains("::") || id.ends_with(".py")) {
+            return pytest_key(id);
+        }
+        match self.pytest_dir(id) {
+            PytestDir::Prefix(p) if !p.is_empty() => pytest_key(&format!("{p}/{id}")),
+            PytestDir::Prefix(_) => pytest_key(id),
+            // Another directory's test of the same id must never be taken
+            // for this one: its place is marked, and no quarantine covers it.
+            PytestDir::Unknown => {
+                let mut key = pytest_key(id);
+                key.file = Some(prova_core::model::UNKNOWN_PLACE.to_owned());
+                key
+            }
         }
     }
 
@@ -1648,7 +1759,7 @@ impl Recognizers {
         let key = if let Some(file) = v["file"].as_str() {
             TestKey {
                 file: None,
-                path: vec![file.to_owned()],
+                path: vec![self.vitest_path(file)],
                 name: name.to_owned(),
             }
         } else if let Some((binary, test)) = name.split_once('$') {
@@ -1968,6 +2079,29 @@ impl Recognizers {
         }
     }
 
+    /// The package that owns the test binary of a cargo `Running` line,
+    /// read from the dependency file cargo wrote next to the binary
+    /// (`calc/tests/it.rs` -> `calc/Cargo.toml`). `None` when the files are
+    /// not there (a container, a relocated target directory).
+    fn cargo_package(&self, rest: &str) -> Option<String> {
+        let cwd = self.cwd.as_ref()?;
+        let bin = rest.rsplit_once(" (")?.1.trim_end_matches(')');
+        let dep = std::fs::read_to_string(cwd.join(format!("{bin}.d"))).ok()?;
+        let source = dep.lines().next()?.split_once(": ")?.1.split(' ').next()?;
+        let mut dir = cwd.join(source);
+        dir.pop();
+        loop {
+            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
+                && let Some(name) = cargo_package_name(&toml)
+            {
+                return Some(name.replace('-', "_"));
+            }
+            if !dir.pop() || !dir.starts_with(cwd) {
+                return None;
+            }
+        }
+    }
+
     fn libtest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         // A failing test's captured output: "---- path::name stdout ----"
         // up to the next block or the "failures:" list.
@@ -1992,7 +2126,14 @@ impl Recognizers {
         // "   Doc-tests prova_core": tests of different binaries may share names.
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("Running ") {
-            self.libtest_binary = Some(cargo_binary(rest));
+            let binary = cargo_binary(rest);
+            // An integration test's line names no crate: two crates' `it`
+            // are told apart as nextest does (`calc::it`), by the package
+            // that owns the binary's source (ADR 0031 section 2).
+            self.libtest_binary = Some(match self.cargo_package(rest) {
+                Some(krate) if !rest.starts_with("unittests ") => format!("{krate}::{binary}"),
+                _ => binary,
+            });
             return true;
         }
         if let Some(rest) = t.strip_prefix("Doc-tests ") {
@@ -2355,7 +2496,7 @@ impl Recognizers {
             && bracket.trim_end().trim_end_matches(']').trim() == f.trim()
             && is_js_file(f.trim())
         {
-            let key = TestKey::new(vec![f.trim().to_owned()], "(file)");
+            let key = TestKey::new(vec![self.vitest_path(f.trim())], "(file)");
             self.finished(
                 key,
                 Outcome::Errored,
@@ -2462,7 +2603,7 @@ impl Recognizers {
         }
         let key = TestKey {
             file: None,
-            path: file.into_iter().collect(),
+            path: file.map(|f| self.vitest_path(&f)).into_iter().collect(),
             name: parts.join(" > "),
         };
         let mut held = Vec::new();
@@ -3172,6 +3313,11 @@ impl Recognizers {
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
+        if matches!(self.pytest_dir.get(), Some(PytestDir::Unknown)) {
+            gts.push(EventKind::RunNote {
+                message: "pytest's test ids are relative to the directory it ran in, and more than one directory holds that file: prova cannot tell which test is which. No quarantine covers them, and their history is kept apart. Run pytest from one directory, or give the file path from the working directory.".into(),
+            });
+        }
         self.gotestsum_reruns_passed(&mut gts);
         if self.gotestsum_seen {
             for pkg in std::mem::take(&mut self.gts_pkg_failed) {
@@ -3461,6 +3607,84 @@ fn nextest_binary(id: &str) -> String {
         }
         None => id,
     }
+}
+
+/// Where pytest ran, below the working directory (ADR 0031 section 2).
+enum PytestDir {
+    Prefix(String),
+    Unknown,
+}
+
+/// The words after `cd` or `pushd` in a command line: where it may move.
+fn cd_targets(command: &str) -> Vec<String> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .map(|w| w.trim_matches(['"', '\'']))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| matches!(w[0], "cd" | "pushd"))
+        .map(|w| w[1].to_owned())
+        .collect()
+}
+
+/// The directories below `base` (a few levels, no hidden or vendored ones)
+/// that hold the file.
+fn dirs_holding(base: &std::path::Path, file: &str) -> Vec<std::path::PathBuf> {
+    const SKIP: &[&str] = &[
+        "node_modules",
+        "target",
+        "venv",
+        "site-packages",
+        "__pycache__",
+    ];
+    let mut found = Vec::new();
+    let mut level = vec![base.to_path_buf()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for dir in &level {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                    continue;
+                }
+                let path = e.path();
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    if path.join(file).is_file() {
+                        found.push(path.clone());
+                    }
+                    next.push(path);
+                }
+            }
+        }
+        level = next;
+        if found.len() > 1 {
+            break;
+        }
+    }
+    found
+}
+
+/// `name` of the `[package]` table of a Cargo.toml (a workspace-only
+/// manifest has none).
+fn cargo_package_name(toml: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in toml.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_package = l == "[package]";
+        } else if in_package
+            && let Some(v) = l.strip_prefix("name")
+            && let Some(v) = v.trim_start().strip_prefix('=')
+        {
+            return Some(v.trim().trim_matches(['"', '\'']).to_owned());
+        }
+    }
+    None
 }
 
 /// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
@@ -5494,10 +5718,13 @@ impl Recognizers {
         if !before.is_failure() && !outcome.is_failure() {
             return;
         }
+        let mut passed_in_iteration = false;
         let (outcome, message) = if before.is_failure() && !outcome.is_failure() {
             if !retry {
                 // A later iteration passing does not undo the failure: it is
-                // recorded as the failure standing, with its message.
+                // recorded as the failure standing, with its message, and
+                // marked as an execution that passed: flaky evidence.
+                passed_in_iteration = true;
                 let kept = self.go_failure_msg.get(&d).cloned().flatten();
                 (before, kept)
             } else {
@@ -5532,6 +5759,7 @@ impl Recognizers {
             message,
             source: level,
             subtest,
+            passed_in_iteration,
         });
     }
 
@@ -5979,6 +6207,18 @@ mod go_tests {
         );
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(r.failed_reported(), 0, "no stale totals");
+        // The pass is not lost: the second execution says it passed.
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                EventKind::TestFinished {
+                    attempt: 2,
+                    passed_in_iteration: true,
+                    ..
+                }
+            )),
+            "{ev:?}"
+        );
     }
 
     /// gotestsum `--rerun-fails` with `-v` text: the rerun is another

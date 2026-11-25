@@ -171,3 +171,30 @@ fn go_count_repeats_that_passed_and_failed_are_flaky_with_all_attempts() {
     let h = text(&prova(&d, &["history", "TestC"]));
     assert!(h.contains("(4 attempts)"), "{h}");
 }
+
+/// The other order (fail, then pass in a later iteration of the same run)
+/// is the same evidence: the run fails, the test is flaky, and the pass is
+/// not lost (round 17: it was labelled a plain failure).
+#[test]
+fn go_count_repeats_that_failed_then_passed_are_flaky_too() {
+    let d = workspace("gocountfp");
+    let run = "printf '=== RUN   TestC\\n    c_test.go:9: lost\\n--- FAIL: TestC (0.00s)\\n=== RUN   TestC\\n--- PASS: TestC (0.00s)\\nFAIL\\nFAIL\\texample.com/c\\t0.01s\\n'; exit 1";
+    suite(
+        &d,
+        &format!("[suite.default]\nrun = {:?}\n", format!("{WORK}{run}")),
+    );
+    let o = prova(&d, &["run", "default"]);
+    let out = text(&o);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a failure in any iteration fails: {out}"
+    );
+    assert!(out.contains("FLAKY"), "{out}");
+    let h = text(&prova(&d, &["history", "TestC"]));
+    assert!(h.contains("(2 attempts)"), "{h}");
+    assert!(
+        h.contains("both passed and failed on 1 code version"),
+        "{h}"
+    );
+}

@@ -51,9 +51,10 @@ pub fn add(
     now_ms: u64,
 ) -> Result<Entry> {
     let days = days.clamp(1, MAX_DAYS);
+    // One quarantine per name and place: another place's is not replaced.
     store.conn().execute(
-        "UPDATE quarantine SET removed_ms = ?2 WHERE test = ?1 AND removed_ms IS NULL",
-        params![test, now_ms as i64],
+        "UPDATE quarantine SET removed_ms = ?2 WHERE test = ?1 AND file IS ?3 AND removed_ms IS NULL",
+        params![test, now_ms as i64, file],
     )?;
     let expires = now_ms + u64::from(days) * DAY_MS;
     store.conn().execute(
@@ -71,13 +72,23 @@ pub fn add(
     })
 }
 
-/// Removes the test's open quarantine; `false` when it had none.
-pub fn remove(store: &Store, test: &str, now_ms: u64) -> Result<bool> {
+/// Removes the open quarantine of the test in `file` (`None`: the one made
+/// without a place); `false` when it had none.
+pub fn remove(store: &Store, test: &str, file: Option<&str>, now_ms: u64) -> Result<bool> {
     let n = store.conn().execute(
-        "UPDATE quarantine SET removed_ms = ?2 WHERE test = ?1 AND removed_ms IS NULL",
-        params![test, now_ms as i64],
+        "UPDATE quarantine SET removed_ms = ?2 WHERE test = ?1 AND file IS ?3 AND removed_ms IS NULL",
+        params![test, now_ms as i64, file],
     )?;
     Ok(n > 0)
+}
+
+/// The key a quarantine is kept under: the name, and its place when it has
+/// one (two crates' `tests::flaky` are two quarantines).
+pub fn key_of(test: &str, file: Option<&str>) -> String {
+    match file {
+        Some(f) => format!("{f}\u{1f}{test}"),
+        None => test.to_owned(),
+    }
 }
 
 /// Every quarantine, newest first; removed ones only with `include_removed`.
@@ -107,7 +118,7 @@ pub fn in_force_at(store: &Store, ts: u64) -> Result<BTreeMap<String, Entry>> {
         if e.file.is_some() {
             e.ambiguous = files_of(store, &e.test)?.len() > 1;
         }
-        out.insert(e.test.clone(), e);
+        out.insert(key_of(&e.test, e.file.as_deref()), e);
     }
     Ok(out)
 }
@@ -118,7 +129,7 @@ pub fn expired_at(store: &Store, ts: u64) -> Result<Vec<Entry>> {
     let all = list(store, true)?;
     let mut latest: BTreeMap<String, Entry> = BTreeMap::new();
     for e in all.into_iter().rev() {
-        latest.insert(e.test.clone(), e); // oldest first: the newest wins
+        latest.insert(key_of(&e.test, e.file.as_deref()), e); // oldest first: the newest wins
     }
     Ok(latest
         .into_values()
@@ -129,22 +140,43 @@ pub fn expired_at(store: &Store, ts: u64) -> Result<Vec<Entry>> {
 /// The quarantine that sets `display` aside: its own, or its parent test's
 /// (a Go subtest `TestX/case` follows `TestX`).
 pub fn covers<'a>(q: &'a BTreeMap<String, Entry>, display: &str) -> Option<&'a Entry> {
-    q.get(display).or_else(|| {
+    let of_name = |name: &str| q.values().find(|e| e.test == name);
+    of_name(display).or_else(|| {
         display
             .match_indices('/')
-            .find_map(|(i, _)| q.get(&display[..i]))
+            .find_map(|(i, _)| of_name(&display[..i]))
     })
+}
+
+/// Whether some quarantine (in any place) is of exactly this test name.
+pub fn names_test(q: &BTreeMap<String, Entry>, display: &str) -> bool {
+    q.values().any(|e| e.test == display)
 }
 
 /// The quarantine that sets aside the test with lifecycle key `unique`
 /// (`file<US>display`): as `covers`, and of the same file when the
-/// quarantine names one.
+/// quarantine names one. A name can be quarantined in several places.
 pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'a Entry> {
     let (file, display) = unique.rsplit_once('\u{1f}').unwrap_or(("", unique));
-    covers(q, display).filter(|e| match (&e.file, file) {
-        (Some(f), k) if !k.is_empty() => f == k,
-        (Some(_), _) => !e.ambiguous,
-        _ => true,
+    // A test whose directory is unknown may be any directory's: no
+    // quarantine covers it.
+    if file == crate::model::UNKNOWN_PLACE {
+        return None;
+    }
+    let of_place = |name: &str| {
+        q.values().find(|e| {
+            e.test == name
+                && match (&e.file, file) {
+                    (Some(f), k) if !k.is_empty() => f == k,
+                    (Some(_), _) => !e.ambiguous,
+                    _ => true,
+                }
+        })
+    };
+    of_place(display).or_else(|| {
+        display
+            .match_indices('/')
+            .find_map(|(i, _)| of_place(&display[..i]))
     })
 }
 
@@ -152,7 +184,8 @@ pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'
 pub fn files_of(store: &Store, display: &str) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(
         "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL
-            AND file NOT LIKE '(package pending)%' ORDER BY file",
+            AND file NOT LIKE '(package pending)%' AND file NOT LIKE '(unknown directory)%'
+          ORDER BY file",
     )?;
     Ok(stmt
         .query_map(params![display], |r| r.get(0))?
@@ -192,7 +225,9 @@ mod tests {
     #[test]
     fn a_subtest_follows_its_parent() {
         let mut q = BTreeMap::new();
-        q.insert("TestX".to_owned(), e(0, 10, None));
+        let mut x = e(0, 10, None);
+        x.test = "TestX".into();
+        q.insert(key_of("TestX", None), x);
         assert!(covers(&q, "TestX").is_some());
         assert!(covers(&q, "TestX/case/deep").is_some());
         assert!(covers(&q, "TestXY").is_none());
@@ -215,6 +250,24 @@ mod tests {
         q.insert("t".to_owned(), calc);
         assert!(covers_key(&q, "\u{1f}t").is_none());
         assert!(covers_key(&q, "calc\u{1f}t").is_some());
+    }
+
+    /// Round 17: a name quarantined in two places sets aside each place's
+    /// test, and no third.
+    #[test]
+    fn a_name_quarantined_in_two_places_covers_each_of_them() {
+        let mut q = BTreeMap::new();
+        for place in ["calc", "geo"] {
+            let mut x = e(0, 10, None);
+            x.file = Some(place.into());
+            x.ambiguous = true;
+            q.insert(key_of("t", Some(place)), x);
+        }
+        assert_eq!(q.len(), 2);
+        assert!(covers_key(&q, "calc\u{1f}t").is_some_and(|e| e.file.as_deref() == Some("calc")));
+        assert!(covers_key(&q, "geo\u{1f}t").is_some_and(|e| e.file.as_deref() == Some("geo")));
+        assert!(covers_key(&q, "other\u{1f}t").is_none());
+        assert!(covers_key(&q, "\u{1f}t").is_none(), "unknown place");
     }
 
     #[test]

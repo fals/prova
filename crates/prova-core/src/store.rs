@@ -41,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0011_superseded.sql"),
     include_str!("migrations/0012_recording_indexes.sql"),
     include_str!("migrations/0013_quarantine_file.sql"),
+    include_str!("migrations/0014_passed_in_iteration.sql"),
 ];
 
 pub struct Store {
@@ -403,6 +404,7 @@ impl Store {
                 duration_ms,
                 message,
                 source,
+                passed_in_iteration,
                 // Subtests have a history of their own too.
                 ..
             } = &e.kind
@@ -433,11 +435,11 @@ impl Store {
                 });
                 tx.execute(
                     "INSERT OR IGNORE INTO attempts
-                       (run_id, test_id, attempt, outcome, duration_ms, message, fingerprint, source, ts_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                       (run_id, test_id, attempt, outcome, duration_ms, message, fingerprint, source, ts_ms, passed_in_iteration)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         e.run, id, attempt, outcome.as_str(), duration_ms.map(|d| d as i64),
-                        message, fingerprint, source.as_u8(), e.ts_ms as i64
+                        message, fingerprint, source.as_u8(), e.ts_ms as i64, passed_in_iteration
                     ],
                 )?;
             }

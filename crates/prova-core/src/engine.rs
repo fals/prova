@@ -1914,7 +1914,7 @@ fn observe_child(
             .iter()
             .copied()
             .filter(|d| {
-                !quarantine.contains_key(*d)
+                !crate::quarantine::names_test(&quarantine, d)
                     && crate::quarantine::covers(&quarantine, d)
                         .is_some_and(|p| first_seen(d).is_none_or(|t| t >= p.created_ms))
             })
@@ -2020,6 +2020,7 @@ fn observe_child(
             message: Some("test did not finish before the run ended".into()),
             source: sup.level,
             subtest: false,
+            passed_in_iteration: false,
         };
         sup.pending.push(Event {
             v: EVENT_VERSION,
@@ -3618,12 +3619,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         let quiet = row.status == Status::Finished
             && framework.is_some_and(|(t, _)| t > 0)
             && !finals.values().any(|f| f.1 == Outcome::Passed);
-        for (name, q) in &quarantine {
+        for q in quarantine.values() {
+            let name = &q.test;
             // A quarantined subtest is listed by its own result (round 14:
             // "not run" for a subtest that ran and failed).
             let result = finals
                 .values()
-                .filter(|f| f.0.display() == *name)
+                .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
                     _ => true,

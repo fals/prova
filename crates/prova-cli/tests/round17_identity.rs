@@ -217,6 +217,146 @@ fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     );
 }
 
+/// Round 17 follow-up: pytest prints ids relative to the directory it runs
+/// in (`cwd_relative_nodeid`), not to its rootdir, and `-q` prints no
+/// rootdir at all. prova checks which directory holds the test's file:
+/// the working directory, a `cd` in the command, the rootdir.
+#[test]
+fn pytest_ids_are_named_from_the_directory_pytest_ran_in() {
+    let d = workspace("pydir");
+    for dir in ["tests", "sub2/tests"] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join("test_calc.py"), "").unwrap();
+    }
+    std::fs::write(d.join("sub2/pytest.ini"), "[pytest]\n").unwrap();
+    let verbose = |id: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' 'rootdir: {}' 'collecting ... collected 2 items' '{id} FAILED [ 50%]' '' 'FAILED {id} - assert 1 == 2' '=== 1 failed, 1 passed in 0.01s ==='; exit 1",
+            d.join("sub2").display()
+        )
+    };
+    let quiet = |id: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' 'F.   [100%]' '' 'FAILED {id} - assert 1 == 2' '1 failed, 1 passed in 0.01s'; exit 1"
+        )
+    };
+    let suites = [
+        // `pytest -v sub2/tests` from the root: rootdir sub2, ids from the root.
+        ("verbose", verbose("sub2/tests/test_calc.py::test_flaky")),
+        // `cd sub2 && pytest -q tests`: no rootdir printed.
+        (
+            "cdquiet",
+            format!("cd sub2 && {}", quiet("tests/test_calc.py::test_flaky")),
+        ),
+        // `pytest -q` at the root.
+        ("rootquiet", quiet("tests/test_calc.py::test_flaky")),
+    ];
+    let toml: String = suites
+        .iter()
+        .map(|(n, c)| format!("[suite.{n}]\nrun = {c:?}\n\n"))
+        .collect();
+    std::fs::write(d.join("prova.toml"), toml).unwrap();
+    let out = text(&prova(&d, &["run", "verbose"]));
+    assert!(
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "{out}"
+    );
+    assert!(!out.contains("sub2.sub2"), "{out}");
+    let out = text(&prova(&d, &["run", "cdquiet"]));
+    assert!(
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "{out}"
+    );
+    let out = text(&prova(&d, &["run", "rootquiet"]));
+    assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
+    assert!(!out.contains("sub2"), "{out}");
+}
+
+/// When the directory pytest ran in cannot be told (two `cd` targets hold
+/// the file), the test's place is unknown: it is said, and no quarantine of
+/// another directory's test of that id sets its failure aside.
+#[test]
+fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
+    let d = workspace("pyunknown");
+    for dir in ["tests", "sub2/tests", "sub3/tests"] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join("test_calc.py"), "").unwrap();
+    }
+    let out = |outcome: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' 'tests/test_calc.py::test_flaky {outcome} [100%]' '=== 1 {} in 0.01s ==='; exit {code}",
+            outcome.to_lowercase()
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.root]\nrun = {:?}\n\n[suite.two]\nrun = {:?}\n",
+            out("PASSED", 0),
+            format!("(cd sub2; true); cd sub3; {}", out("FAILED", 1)),
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "root"]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests.test_calc::test_flaky",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "two"]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("cannot tell which test is which"), "{out}");
+    assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
+    assert!(!out.contains("test_flaky failed (r"), "{out}");
+}
+
+/// Vitest names files from its root, which its `RUN` header prints: from a
+/// package directory (`cd pkg && vitest run`, `--root pkg`) two packages'
+/// `src/a.test.ts` were one file.
+#[test]
+fn vitest_files_are_named_from_the_working_directory_not_the_root() {
+    let d = workspace("vtroot");
+    std::fs::create_dir_all(d.join("pkg")).unwrap();
+    // Through a symlink of the working directory, as macOS temp dirs are.
+    let link = PathBuf::from(format!("{}.link", d.display()));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&d, &link).unwrap();
+    let run = |root: &Path, ok: &str| {
+        format!(
+            "{BUSY} printf '%s\\n' '' ' RUN  v3.2.4 {}' '' ' {ok} src/a.test.ts > works 1ms' ' ✓ src/a.test.ts > other 1ms' '' ' Test Files  1 failed (1)' '      Tests  1 failed | 1 passed (2)'; exit {}",
+            root.display(),
+            u8::from(ok != "✓")
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.root]\nrun = {:?}\n\n[suite.pkg]\nrun = {:?}\n",
+            run(&d, "✓"),
+            run(&link.join("pkg"), "×"),
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "root"]);
+    let out = text(&prova(&d, &["run", "pkg"]));
+    assert!(
+        out.contains("FAIL pkg/src/a.test.ts::works"),
+        "named from the working directory: {out}"
+    );
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("pkg/src/a.test.ts::works") && all.contains("  src/a.test.ts::works"),
+        "{all}"
+    );
+}
+
 /// Round 17 (java-maven): the live line and the XML record of one failing
 /// test were two tests in `adopt --verify`: "1 tests ran that do not match"
 /// for the full name, "2 matching test(s) ran" for `Class#method`.
@@ -407,4 +547,106 @@ fn two_crates_same_name_stay_apart_in_every_list() {
     // The run summary shows it, too.
     let out = text(&prova(&d, &["run", "y"]));
     assert!(out.contains("quarantined: tests::flaky (calc)"), "{out}");
+}
+
+/// Round 17 (rs-make): plain `cargo test` prints `Running tests/it.rs
+/// (target/debug/deps/it-<hash>)` with no crate, so two crates' integration
+/// tests of one file name were one test. cargo's dep-info file of that very
+/// binary names its source, and the source's Cargo.toml the crate; nextest
+/// names it `calc::it`, so does prova. Medium: it reads files cargo wrote.
+#[test]
+fn integration_tests_of_two_crates_run_by_cargo_test_keep_their_crate() {
+    let d = workspace("cargoit");
+    for (krate, hash) in [("calc", "aaaa1111"), ("geo", "bbbb2222")] {
+        std::fs::create_dir_all(d.join(krate).join("tests")).unwrap();
+        std::fs::write(
+            d.join(krate).join("Cargo.toml"),
+            format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join(krate).join("tests/it.rs"), "").unwrap();
+        let deps = d.join("target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(
+            deps.join(format!("it-{hash}.d")),
+            format!(
+                "{p}/it-{hash}.d: {krate}/tests/it.rs\n\n{p}/it-{hash}: {krate}/tests/it.rs\n\n{krate}/tests/it.rs:\n",
+                p = deps.display()
+            ),
+        )
+        .unwrap();
+    }
+    let out = |calc: &str, geo: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '     Running tests/it.rs (target/debug/deps/it-aaaa1111)' '' 'running 1 test' 'test works ... {calc}' '' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' '' '     Running tests/it.rs (target/debug/deps/it-bbbb2222)' '' 'running 1 test' 'test works ... {geo}' '' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit {code}"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n",
+            out("ok", "ok", 0),
+            out("ok", "FAILED", 101),
+        ),
+    )
+    .unwrap();
+    let o = prova(&d, &["run", "a"]);
+    assert!(text(&o).contains("tests: 2 passed"), "{}", text(&o));
+    let out = text(&prova(&d, &["run", "b"]));
+    assert!(out.contains("FAIL works (geo::it)"), "{out}");
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("works (calc::it)") && all.contains("works (geo::it)"),
+        "{all}"
+    );
+}
+
+/// Round 17 (rs-make): `quarantine add tests::flaky --in geo` replaced the
+/// quarantine `--in calc` made: one entry per name. A quarantine belongs to
+/// a name in a place; `remove` names the place too.
+#[test]
+fn a_quarantine_is_kept_per_name_and_place() {
+    let d = workspace("qplace");
+    two_crates(&d);
+    prova(&d, &["run", "a"]);
+    prova(&d, &["run", "b"]);
+    for krate in ["calc", "geo"] {
+        let o = prova(
+            &d,
+            &[
+                "quarantine",
+                "add",
+                "tests::flaky",
+                "--in",
+                krate,
+                "--reason",
+                krate,
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    }
+    let list = text(&prova(&d, &["quarantine", "list"]));
+    assert!(
+        list.contains("tests::flaky (calc)") && list.contains("tests::flaky (geo)"),
+        "{list}"
+    );
+    // Both are in force: a failure of either is set aside, on its own.
+    for suite in ["a", "b"] {
+        let o = prova(&d, &["run", suite]);
+        assert_eq!(o.status.code(), Some(0), "{suite}: {}", text(&o));
+    }
+    // Without the place, which one to remove is ambiguous.
+    let o = prova(&d, &["quarantine", "remove", "tests::flaky"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--in"), "{}", text(&o));
+    let o = prova(&d, &["quarantine", "remove", "tests::flaky", "--in", "geo"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let list = text(&prova(&d, &["quarantine", "list"]));
+    assert!(
+        list.contains("tests::flaky (calc)") && !list.contains("(geo)"),
+        "{list}"
+    );
+    // geo's failure counts again; calc's is still set aside.
+    assert_eq!(prova(&d, &["run", "b"]).status.code(), Some(1));
+    assert_eq!(prova(&d, &["run", "a"]).status.code(), Some(0));
 }
