@@ -24,6 +24,12 @@ pub struct Recognizers {
     /// The Go module of the run's directory (go.mod), for packages printed
     /// as `.`.
     pub go_module: Option<String>,
+    /// The run's working directory: pytest names tests from its rootdir,
+    /// prova from here (ADR 0031 section 2).
+    pub cwd: Option<std::path::PathBuf>,
+    /// Where pytest's rootdir lies below the working directory
+    /// (`sub2` for `rootdir: <cwd>/sub2`): put before its ids.
+    pytest_prefix: Option<String>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -997,6 +1003,9 @@ impl Recognizers {
         } else if !line.starts_with('{') && !line.starts_with("?   \t") {
             self.go_segment_line(line);
         }
+        if let Some(root) = line.strip_prefix("rootdir: ") {
+            self.pytest_rootdir(root);
+        }
         // Go replays cached results without running tests: say so once.
         if !self.cache_noted
             && line.contains("(cached)")
@@ -1049,6 +1058,33 @@ impl Recognizers {
         out
     }
 
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header: when the
+    /// rootdir lies below the working directory, ids are read from there.
+    fn pytest_rootdir(&mut self, header: &str) {
+        let Some(cwd) = &self.cwd else {
+            return;
+        };
+        let dir = header.split(", ").next().unwrap_or(header).trim();
+        self.pytest_prefix = std::path::Path::new(dir)
+            .strip_prefix(cwd)
+            .ok()
+            .map(|rel| rel.to_string_lossy().trim_matches('/').to_owned())
+            .filter(|rel| !rel.is_empty());
+    }
+
+    /// Where pytest's rootdir lies below the working directory, if it does.
+    pub fn pytest_prefix(&self) -> Option<&str> {
+        self.pytest_prefix.as_deref()
+    }
+
+    /// A pytest node id as prova names it, from the working directory.
+    fn pytest_key(&self, id: &str) -> TestKey {
+        match &self.pytest_prefix {
+            Some(p) if id.contains("::") || id.ends_with(".py") => pytest_key(&format!("{p}/{id}")),
+            _ => pytest_key(id),
+        }
+    }
+
     /// The start of an unfinished output line. A pytest `-v` line shows the
     /// test's id, then its outcome once it ends: an id followed by a space
     /// and nothing else is a test running now (round 15: a stall named the
@@ -1083,7 +1119,7 @@ impl Recognizers {
         if outside.is_none_or(|o| o.contains(char::is_whitespace)) {
             return out;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if self
             .pytest_text_pass
             .as_ref()
@@ -1643,7 +1679,7 @@ impl Recognizers {
             return;
         };
         lift(&mut self.level, Level::Native);
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         let outcome = match (when, result) {
             ("setup", "passed") => return self.started(key, out),
             ("setup", "failed") => Outcome::Errored,
@@ -1753,7 +1789,7 @@ impl Recognizers {
             "skipped" => Outcome::Skipped,
             _ => return,
         };
-        let parent = pytest_key(id);
+        let parent = self.pytest_key(id);
         let label = if label.trim().is_empty() {
             // No context to tell subtests apart: by order within the
             // parent, so none is merged into another or into the parent.
@@ -2052,7 +2088,7 @@ impl Recognizers {
             let start = left[..at].rfind(' ').map_or(0, |i| i + 1);
             let id = left[start..].trim();
             let label = left[..start].trim();
-            let key = pytest_key(id);
+            let key = self.pytest_key(id);
             let (key, sub) = if sub {
                 (pytest_subtest(key, label), true)
             } else {
@@ -2124,11 +2160,11 @@ impl Recognizers {
         if matches!(word, "SUBPASS" | "SUBFAIL" | "SUBSKIP")
             && let Some((parent, label)) = id.rsplit_once(" [")
         {
-            let key = pytest_subtest(pytest_key(parent.trim()), &format!("[{label}"));
+            let key = pytest_subtest(self.pytest_key(parent.trim()), &format!("[{label}"));
             self.result(key, outcome, None, None, Level::Recognized, true, out);
             return true;
         }
-        let key = pytest_key(id);
+        let key = self.pytest_key(id);
         if word == "RERUN" {
             let n = self.reruns.get(&key.unique()).copied().unwrap_or(0) + 1;
             self.reruns.insert(key.unique(), n);

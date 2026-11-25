@@ -3001,7 +3001,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let store = Store::open_dir(&root, &dir)?;
             let row = store.run(&run)?;
             let spec: RunSpec = serde_json::from_value(row.spec)?;
-            let mut observer = prova_adapters::observer_for(&spec, &root);
+            let mut observer = prova_adapters::observer_for(&spec, &root, Path::new(&row.cwd));
             engine::supervise(&store, &run, observer.as_mut())?;
             Ok(exit::PASSED)
         }

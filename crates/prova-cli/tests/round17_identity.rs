@@ -159,6 +159,50 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
     );
 }
 
+/// Round 17 (probe B4): pytest names tests from its rootdir, so
+/// `sub2/tests/test_calc.py::test_flaky` and the root's
+/// `tests/test_calc.py::test_flaky` were both `tests.test_calc::test_flaky`.
+/// Ids are read from prova's working directory.
+#[test]
+fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
+    let d = workspace("pyroot");
+    let sub = d.join("sub2");
+    std::fs::create_dir_all(&sub).unwrap();
+    let py = |rootdir: &Path, id: &str, outcome: &str, code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '============ test session starts ============' 'rootdir: {}' 'collecting ... collected 1 item' '{id} {outcome} [100%]' '' '============ 1 {} in 0.01s ============'; exit {code}",
+            rootdir.display(),
+            if outcome == "PASSED" {
+                "passed"
+            } else {
+                "failed"
+            },
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.root]\nrun = {:?}\n\n[suite.sub]\nrun = {:?}\n",
+            py(&d, "tests/test_calc.py::test_flaky", "PASSED", 0),
+            py(&sub, "tests/test_calc.py::test_flaky", "FAILED", 1),
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "root"]);
+    let out = text(&prova(&d, &["run", "sub"]));
+    assert!(
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "named from the working directory: {out}"
+    );
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("sub2.tests.test_calc::test_flaky")
+            && all.contains("  tests.test_calc::test_flaky")
+            && !all.contains("second result"),
+        "{all}"
+    );
+}
+
 /// The id of the run a `prova run` printed.
 fn run_id(o: &Output) -> String {
     text(o)
