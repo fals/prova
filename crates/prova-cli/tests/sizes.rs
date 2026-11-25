@@ -39,11 +39,14 @@ fn text(o: &Output) -> String {
 /// runs a child process, one that holds a socket to localhost. The waits
 /// are in the shell itself (no process), and work in bash 3.2 (macOS).
 /// Each test spins first: what a test starts in the instant its start line
-/// is read can be missed (a lower bound, ADR 0025 §5). The socket is held
+/// is read can be missed (a lower bound, ADR 0025 §5). The suite spins
+/// before its first test too: the shell's own start, in the same instant
+/// as an immediate first test, was once that test's (CI run 45642558379). The socket is held
 /// for 3 to 4 s: `$SECONDS` counts whole seconds, and sampling sockets on
 /// macOS is slow (a 1 to 2 s hold was missed there).
 const SUITE: &str = r#"
 spin() { end=$((SECONDS + $1)); while [ $SECONDS -lt $end ]; do :; done; }
+spin 1
 echo '{"type":"suite","event":"started","test_count":3}'
 echo '{"type":"test","event":"started","name":"m::computes"}'
 spin 3
