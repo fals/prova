@@ -25,6 +25,11 @@ pub struct Entry {
     /// tests of several: only that one is set aside.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Set when the store knows the name in other places too: a result of
+    /// unknown place (quiet `cargo test` names no binary) cannot be told
+    /// from the other places' and is not set aside by it.
+    #[serde(skip)]
+    pub ambiguous: bool,
 }
 
 impl Entry {
@@ -62,6 +67,7 @@ pub fn add(
         expires_ms: expires,
         removed_ms: None,
         file: file.map(str::to_owned),
+        ambiguous: false,
     })
 }
 
@@ -88,6 +94,7 @@ pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
             expires_ms: r.get::<_, i64>(3)? as u64,
             removed_ms: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
             file: r.get(5)?,
+            ambiguous: false,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -95,11 +102,14 @@ pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
 
 /// The quarantines that applied at `ts`, by test name.
 pub fn in_force_at(store: &Store, ts: u64) -> Result<BTreeMap<String, Entry>> {
-    Ok(list(store, true)?
-        .into_iter()
-        .filter(|e| e.in_force_at(ts))
-        .map(|e| (e.test.clone(), e))
-        .collect())
+    let mut out = BTreeMap::new();
+    for mut e in list(store, true)?.into_iter().filter(|e| e.in_force_at(ts)) {
+        if e.file.is_some() {
+            e.ambiguous = files_of(store, &e.test)?.len() > 1;
+        }
+        out.insert(e.test.clone(), e);
+    }
+    Ok(out)
 }
 
 /// Quarantines of `test`s that had expired (not removed) by `ts` and were
@@ -133,6 +143,7 @@ pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'
     let (file, display) = unique.rsplit_once('\u{1f}').unwrap_or(("", unique));
     covers(q, display).filter(|e| match (&e.file, file) {
         (Some(f), k) if !k.is_empty() => f == k,
+        (Some(_), _) => !e.ambiguous,
         _ => true,
     })
 }
@@ -140,7 +151,8 @@ pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'
 /// The files (binaries, modules) that hold a test of this name.
 pub fn files_of(store: &Store, display: &str) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(
-        "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL ORDER BY file",
+        "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL
+            AND file NOT LIKE '(package pending)%' ORDER BY file",
     )?;
     Ok(stmt
         .query_map(params![display], |r| r.get(0))?
@@ -165,6 +177,7 @@ mod tests {
             expires_ms: expires,
             removed_ms: removed,
             file: None,
+            ambiguous: false,
         }
     }
 

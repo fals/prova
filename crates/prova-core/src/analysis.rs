@@ -32,6 +32,10 @@ pub struct TestRun {
 pub struct TestStats {
     pub test_id: String,
     pub display: String,
+    /// The test binary, when tests of other binaries share the name
+    /// (ADR 0031 section 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
     pub suite: String,
     /// Every suite that ran this test (its history is shared, ADR 0018).
     pub suites: Vec<String>,
@@ -62,6 +66,114 @@ pub struct TestStats {
     pub last_passed: Option<(String, String)>,
     /// Newest first.
     pub recent: Vec<TestRun>,
+}
+
+/// Names tests with their place where several places hold one name
+/// (ADR 0031 section 2): `tests::flaky` alone when only one test binary
+/// has it, `tests::flaky (geo)` when two do. A result of unknown place (quiet
+/// `cargo test` names no binary) keeps the bare name.
+pub struct Names<'a> {
+    store: &'a Store,
+    shared: std::cell::RefCell<BTreeMap<String, bool>>,
+}
+
+impl<'a> Names<'a> {
+    pub fn new(store: &'a Store) -> Names<'a> {
+        Names {
+            store,
+            shared: Default::default(),
+        }
+    }
+
+    /// The place to show for a test of this name and file: `None` when the
+    /// name is not shared.
+    pub fn place(&self, display: &str, file: Option<&str>) -> Option<String> {
+        let file = file.filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))?;
+        let shared = *self
+            .shared
+            .borrow_mut()
+            .entry(display.to_owned())
+            .or_insert_with(|| {
+                crate::quarantine::files_of(self.store, display).is_ok_and(|f| f.len() > 1)
+            });
+        shared.then(|| file.to_owned())
+    }
+
+    /// The name to show and to group by.
+    pub fn name(&self, display: &str, file: Option<&str>) -> String {
+        match self.place(display, file) {
+            Some(p) => format!("{display} ({p})"),
+            None => display.to_owned(),
+        }
+    }
+}
+
+/// A place in the form that compares: no `./`, no trailing slash, no test
+/// file suffix, `.` for `/` (`tests/test_calc.py` and `tests.test_calc` are
+/// one place, so are `./a` and `ex/a`'s last part).
+fn place_form(s: &str) -> String {
+    let mut s = s.trim().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_owned();
+    }
+    let mut s = s.trim_end_matches('/').to_owned();
+    for suffix in [
+        ".test.js",
+        ".test.ts",
+        ".test.tsx",
+        ".test.jsx",
+        ".test.mjs",
+        ".spec.js",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.jsx",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".cs",
+    ] {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            s = rest.to_owned();
+            break;
+        }
+    }
+    s.replace('/', ".")
+}
+
+/// Whether the place `wanted` (what `--in` says) names the place of a test:
+/// its test binary (Rust), else its package, module or file (the first part
+/// of its name). Whole parts: `a` is `ex/a` but not `ex/data`.
+pub fn place_matches(wanted: &str, file: Option<&str>, path: &[String]) -> bool {
+    let Some(place) = file
+        .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+        .or(path.first().map(String::as_str))
+    else {
+        return false;
+    };
+    let (w, p) = (place_form(wanted), place_form(place));
+    !w.is_empty() && (w == p || p.ends_with(&format!(".{w}")) || w.ends_with(&format!(".{p}")))
+}
+
+/// The place of a stored test, as `--in` names it: its binary, else the
+/// first part of its name; `None` for a test that has neither.
+pub fn place_of_test(
+    store: &Store,
+    test_id: &str,
+) -> Result<Option<(Option<String>, Vec<String>)>> {
+    let row: Option<(Option<String>, String)> = store
+        .conn()
+        .query_row(
+            "SELECT file, path FROM tests WHERE id = ?1",
+            params![test_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(file, path)| (file, serde_json::from_str(&path).unwrap_or_default())))
 }
 
 /// Nearest-rank percentile of a sorted slice.
@@ -217,17 +329,18 @@ fn stats_with(
     window: usize,
     current: Option<&str>,
 ) -> Result<Option<TestStats>> {
-    let meta: Option<(String, String)> = store
+    let meta: Option<(String, String, Option<String>)> = store
         .conn()
         .query_row(
-            "SELECT display, suite FROM tests WHERE id = ?1",
+            "SELECT display, suite, file FROM tests WHERE id = ?1",
             params![test_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    let Some((display, suite)) = meta else {
+    let Some((display, suite, file)) = meta else {
         return Ok(None);
     };
+    let place = Names::new(store).place(&display, file.as_deref());
     let recent = test_runs_with(store, test_id, window, current)?;
     let suites: Vec<String> = {
         let mut stmt = store.conn().prepare(
@@ -346,6 +459,7 @@ fn stats_with(
     Ok(Some(TestStats {
         test_id: test_id.to_owned(),
         display,
+        place,
         suite,
         suites,
         runs: counted.len(),
@@ -454,6 +568,7 @@ pub fn flaky_as_of(
             && s.flaky
             && !out.iter().any(|o| {
                 o.display == s.display
+                    && o.place == s.place
                     && o.recent.first().map(|r| &r.run) == s.recent.first().map(|r| &r.run)
             })
         {
@@ -642,18 +757,21 @@ pub struct SizeReport {
 pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
     use crate::config::Size;
     let mut stmt = store.conn().prepare(
-        "SELECT id, display FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
+        "SELECT id, display, file FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
     )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let names = Names::new(store);
     // One test, one count: the same test in several suites shares its
     // history (round 12: a 5-test project showed 12 tests). The most
     // decided view wins.
     let mut views: BTreeMap<String, Option<SizeView>> = BTreeMap::new();
-    for (id, display) in rows {
+    for (id, display, file) in rows {
         let view = observed_size(store, &id)?;
-        let e = views.entry(display).or_insert(None);
+        let e = views
+            .entry(names.name(&display, file.as_deref()))
+            .or_insert(None);
         let better = match (&*e, &view) {
             (None, Some(_)) => true,
             (Some(old), Some(new)) => new.size > old.size,
@@ -724,9 +842,11 @@ pub struct RunDiff {
     pub slower: Vec<(String, u64, u64)>,
 }
 
+/// A run's final outcome per test, by name and place (two binaries' tests
+/// of one name are two entries).
 fn final_outcomes(store: &Store, run: &str) -> Result<BTreeMap<String, (Outcome, Option<u64>)>> {
     let mut stmt = store.conn().prepare(
-        "SELECT t.display, a.outcome, a.duration_ms FROM attempts a JOIN tests t ON t.id = a.test_id
+        "SELECT t.display, a.outcome, a.duration_ms, t.file FROM attempts a JOIN tests t ON t.id = a.test_id
          WHERE a.run_id = ?1 ORDER BY a.attempt",
     )?;
     let rows = stmt.query_map(params![run], |r| {
@@ -734,11 +854,14 @@ fn final_outcomes(store: &Store, run: &str) -> Result<BTreeMap<String, (Outcome,
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
+    let names = Names::new(store);
     let mut m = BTreeMap::new();
     for row in rows {
-        let (name, o, d) = row?;
+        let (display, o, d, file) = row?;
+        let name = names.name(&display, file.as_deref());
         m.insert(
             name,
             (
@@ -779,9 +902,10 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
     }
     d.removed = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
     if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
+        let names = Names::new(store);
         let known: Vec<String> = flaky(store, None, 50)?
             .into_iter()
-            .map(|s| s.display)
+            .map(|s| names.name(&s.display, s.place.as_deref()))
             .collect();
         for list in [&mut d.fixed, &mut d.newly_failing] {
             list.retain(|t| {
@@ -918,7 +1042,7 @@ pub fn slowest(
     window: usize,
 ) -> Result<Vec<SlowRow>> {
     let mut stmt = store.conn().prepare(
-        "SELECT t.display, t.suite, a.duration_ms FROM (
+        "SELECT t.display, t.suite, a.duration_ms, t.file FROM (
              SELECT a.test_id, a.duration_ms,
                     row_number() OVER (PARTITION BY a.test_id ORDER BY a.ts_ms DESC) AS rn
                FROM attempts a JOIN runs r ON r.id = a.run_id
@@ -936,12 +1060,16 @@ pub fn slowest(
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, i64>(2)? as u64,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
+    let names = Names::new(store);
     let mut by_test: BTreeMap<String, (BTreeSet<String>, Vec<u64>)> = BTreeMap::new();
     for row in rows {
-        let (display, suite, ms) = row?;
-        let e = by_test.entry(display).or_default();
+        let (display, suite, ms, file) = row?;
+        let e = by_test
+            .entry(names.name(&display, file.as_deref()))
+            .or_default();
         e.0.insert(suite);
         e.1.push(ms);
     }

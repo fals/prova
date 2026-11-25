@@ -195,11 +195,15 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
         match &f.message {
             Some(m) => println!(
                 "  {tag} {}{}: {}",
-                clean(&f.test),
+                named(&f.test, f.place.as_deref()),
                 context(f),
                 clean(&first_lines(m, 3))
             ),
-            None => println!("  {tag} {}{}", clean(&f.test), context(f)),
+            None => println!(
+                "  {tag} {}{}",
+                named(&f.test, f.place.as_deref()),
+                context(f)
+            ),
         }
     }
     if let Some(ms) = s.stalled_ms {
@@ -264,7 +268,7 @@ fn print_summary(s: &Summary, json: bool, until: Option<prova_core::engine::Unti
     for q in s.quarantined.iter().take(5) {
         println!(
             "quarantined: {} {} ({}; {})",
-            clean(&q.test),
+            named(&q.test, q.place.as_deref()),
             q.result,
             clean(&q.reason),
             expires_in(q.expires_ms)
@@ -343,6 +347,14 @@ pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
     }
 }
 
+/// A test's name with its place when names collide: `tests::flaky (geo)`.
+pub fn named(test: &str, place: Option<&str>) -> String {
+    match place {
+        Some(p) => format!("{} ({})", clean(test), clean(p)),
+        None => clean(test),
+    }
+}
+
 fn context(f: &prova_core::engine::Failure) -> String {
     let Some(c) = &f.context else {
         return String::new();
@@ -397,7 +409,7 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
     }
     println!(
         "{}  (suite{} {}{})",
-        clean(&s.display),
+        named(&s.display, s.place.as_deref()),
         if s.suites.len() > 1 { "s" } else { "" },
         s.suites.join(", "),
         if s.suites.len() > 1 {
@@ -729,8 +741,8 @@ pub fn progress(s: &Summary, reported: &mut std::collections::BTreeSet<String>) 
     match s.reason {
         WaitReason::Failure => {
             for f in &s.failures {
-                if reported.insert(f.test.clone()) {
-                    eprintln!("FAIL {}{}", clean(&f.test), context(f));
+                if reported.insert(named(&f.test, f.place.as_deref())) {
+                    eprintln!("FAIL {}{}", named(&f.test, f.place.as_deref()), context(f));
                 }
             }
         }
@@ -1062,6 +1074,7 @@ mod label_tests {
     fn label_after(seen_before: usize, flaky: bool, passes_before: usize) -> String {
         super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {
@@ -1093,6 +1106,7 @@ mod label_tests {
         assert_eq!(label(2, true), " [failed 2x before, FLAKY]");
         let mut first = super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {
@@ -1113,6 +1127,7 @@ mod label_tests {
         first.clear();
         let never = super::context(&Failure {
             test: "t".into(),
+            place: None,
             outcome: prova_core::model::Outcome::Failed,
             message: None,
             context: Some(FailureContext {

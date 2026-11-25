@@ -141,6 +141,15 @@ impl TestKey {
         )
     }
 
+    /// Where the test lives when its name alone does not say (Rust: the
+    /// test binary). Go, pytest and Vitest tests carry their package or file
+    /// in the name already.
+    pub fn place(&self) -> Option<&str> {
+        self.file
+            .as_deref()
+            .filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))
+    }
+
     /// Human-readable full name, `path::name`.
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = self.path.iter().map(String::as_str).collect();
