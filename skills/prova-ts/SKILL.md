@@ -25,8 +25,10 @@ description: Gives the Vitest, Jest and node --test settings that let prova see 
 - Vitest without the reporter: `npx vitest run --reporter=verbose` prints
   each test with ✓/×, recognized live. Add `--reporter=junit --outputFile=reports/junit.xml`
   (as a second reporter) for durations and messages.
-- Jest: add `jest-junit` and run `npx jest --ci --reporters=default --reporters=jest-junit`;
-  prova ingests `junit.xml`.
+- Jest: `npx jest --ci --verbose` prints every test (`✓`, `✕`, `○ skipped`,
+  `✎ todo`), which prova recognizes live; without `--verbose` Jest names only
+  failures. For durations and messages add `jest-junit`
+  (`--reporters=default --reporters=jest-junit`); prova ingests `junit.xml`.
 - Single test: Vitest `-t {filter}`, Jest `-t {filter}` (test name pattern).
 - Always `vitest run`, never watch mode: watch mode never ends.
 - Node's own runner (`node --test`) prints TAP with `--test-reporter=tap`,

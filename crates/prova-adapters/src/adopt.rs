@@ -167,9 +167,9 @@ fn detect(root: &Path, nextest: Probe) -> Vec<Framework> {
         out.push(Framework {
             language: "ts",
             base: "jest",
-            run: "npx jest --ci",
-            select: "npx jest --ci -t {filter}",
-            why: "jest in package.json; add jest-junit for per-test results".into(),
+            run: "npx jest --ci --verbose",
+            select: "npx jest --ci --verbose -t {filter}",
+            why: "jest in package.json; --verbose prints every test, which prova reads live (recognized)".into(),
         });
     }
     if root.join("pom.xml").exists() {
@@ -517,6 +517,10 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
                 let run = match &existing {
                     Some(cmd) if f.base == "vitest" && cmd.starts_with("npm ") => {
                         format!("{cmd} -- --reporter=default --reporter=\"$PROVA_VITEST_REPORTER\"")
+                    }
+                    // Jest prints a line per test only with --verbose.
+                    Some(cmd) if f.base == "jest" && cmd.starts_with("npm ") => {
+                        format!("{cmd} -- --verbose")
                     }
                     Some(cmd) => cmd.clone(),
                     None => f.run.into(),
@@ -931,6 +935,30 @@ mod tests {
             t.contains("\ninject = [\"vitest-stream\"]") && t.contains("$PROVA_VITEST_REPORTER"),
             "{t}"
         );
+    }
+
+    /// #92: Jest prints a line per test only with --verbose, which prova
+    /// reads live; the proposal asks for it, also behind `npm test`.
+    #[test]
+    fn jest_suite_runs_verbose() {
+        let p = propose(&dir(
+            "jest-verbose",
+            &[("package.json", r#"{"devDependencies":{"jest":"29"}}"#)],
+        ));
+        assert!(p.suites[0].run.contains("--verbose"), "{:?}", p.suites[0]);
+        assert!(
+            p.suites[0].select.as_deref().is_some_and(|s| s.contains("--verbose")),
+            "{:?}",
+            p.suites[0]
+        );
+        let p = propose(&dir(
+            "jest-npm",
+            &[(
+                "package.json",
+                r#"{"scripts":{"test":"jest"},"devDependencies":{"jest":"29"}}"#,
+            )],
+        ));
+        assert_eq!(p.suites[0].run, "npm test -- --verbose", "{:?}", p.suites[0]);
     }
 
     #[test]
