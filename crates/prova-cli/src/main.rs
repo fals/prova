@@ -2365,6 +2365,37 @@ fn until_name(u: UntilArg) -> &'static str {
 /// no --max-wait: its stall is called after 60 s (ADR 0031 §4).
 const CONTAINER_FIRST_WAIT: Duration = Duration::from_secs(65);
 
+/// The first wait's length when the run's own command is a container
+/// client: the caller gave no --max-wait, so the wait is as long as the
+/// stall needs, and the announcement says so up front.
+fn first_wait_budget(
+    until: UntilArg,
+    default_budget: bool,
+    through_container: bool,
+    budget: Duration,
+) -> Duration {
+    if default_budget
+        && through_container
+        && matches!(until, UntilArg::FirstFailure)
+        && budget < CONTAINER_FIRST_WAIT
+    {
+        CONTAINER_FIRST_WAIT
+    } else {
+        budget
+    }
+}
+
+/// Whether the run's command is itself a container client (`docker run ...`).
+fn runs_through_container(store: &Store, id: &str) -> bool {
+    store
+        .run(id)
+        .ok()
+        .and_then(|row| serde_json::from_value::<RunSpec>(row.spec).ok())
+        .is_some_and(|spec| {
+            prova_core::resources::container_client(&spec.command.display()).is_some()
+        })
+}
+
 /// How much longer a first wait of `budget` waits: the run goes through a
 /// container client (its note says so), the caller gave no --max-wait, and
 /// the wait ended running.
@@ -2674,6 +2705,12 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             if let Some(until) = until {
                 // One command for "run this and tell me" (ADR 0019).
                 let max = wait_budget(until, max_wait.as_deref())?;
+                let max = first_wait_budget(
+                    until,
+                    max_wait.is_none(),
+                    runs_through_container(&store, &id),
+                    max,
+                );
                 if !json {
                     eprintln!(
                         "run {id} started; waiting up to {} for {}",
@@ -2715,6 +2752,19 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             let (store, _, _) = open_here()?;
             let id = store.resolve_run(&run)?;
             let max = wait_budget(until, max_wait.as_deref())?;
+            let max = first_wait_budget(
+                until,
+                max_wait.is_none(),
+                runs_through_container(&store, &id),
+                max,
+            );
+            if !json && max_wait.is_none() && !matches!(until, UntilArg::Done) {
+                eprintln!(
+                    "waiting up to {} for {}",
+                    prova_core::ids::format_duration(max),
+                    until_name(until)
+                );
+            }
             let s = wait_until(&store, &id, until, after, max, max_wait.is_none())?;
             render::summary_until(&s, json, Some(until.into()));
             Ok(exit_code(&s))
@@ -3494,6 +3544,14 @@ fn wait_until(
         // wait the caller did not size waits long enough to name it
         // (ADR 0031 §4).
         if let Some(more) = container_wait_extension(default_budget, s.reason, &s.notes, budget) {
+            // The run turned out to go through a container client while
+            // waiting: say that the wait is longer than announced, and by
+            // how much; it ends there.
+            eprintln!(
+                "the tests run through a container client, whose stall is called after 60 s: waiting {} more, up to {} in all",
+                prova_core::ids::format_duration(more),
+                prova_core::ids::format_duration(budget + more)
+            );
             return Ok(engine::wait(
                 store,
                 id,
@@ -3715,6 +3773,19 @@ mod tests {
         assert_eq!(ext(false, Running, &n, thirty), None);
         assert_eq!(ext(true, Running, &[], thirty), None);
         assert_eq!(ext(true, Stall, &n, thirty), None);
+    }
+
+    #[test]
+    fn a_container_first_wait_is_announced_at_its_real_length() {
+        // Round 18: "waiting up to 30.0s", then 60 s+: the announced budget
+        // is the one waited.
+        use super::{UntilArg::*, first_wait_budget as b};
+        use std::time::Duration;
+        let thirty = Duration::from_secs(30);
+        assert_eq!(b(FirstFailure, true, true, thirty), Duration::from_secs(65));
+        assert_eq!(b(FirstFailure, false, true, thirty), thirty);
+        assert_eq!(b(FirstFailure, true, false, thirty), thirty);
+        assert_eq!(b(Done, true, true, thirty), thirty);
     }
 }
 
