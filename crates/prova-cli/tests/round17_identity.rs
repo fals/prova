@@ -237,6 +237,7 @@ fn verify_counts_one_failing_test_once_whatever_the_filter_form() {
 /// binaries; Go, pytest and Vitest said "be more specific" without a word
 /// of `--in`. Each framework's own form of the place picks the test.
 #[test]
+#[allow(clippy::type_complexity)]
 fn quarantine_in_takes_the_place_in_each_frameworks_form() {
     // (name of the shared test, command output, [(--in form, quarantined name)])
     let cases: [(&str, &str, &[(&str, &str)]); 3] = [

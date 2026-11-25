@@ -198,6 +198,25 @@ mod tests {
         assert!(covers(&q, "TestXY").is_none());
     }
 
+    /// Round 17: under quiet `cargo test` no binary is named, and another
+    /// crate's same-named failure was filed under calc's quarantine.
+    #[test]
+    fn a_result_of_unknown_place_is_not_set_aside_by_a_place_quarantine_of_a_shared_name() {
+        let mut calc = e(0, 10, None);
+        calc.file = Some("calc".into());
+        let mut q = BTreeMap::new();
+        q.insert("t".to_owned(), calc.clone());
+        // The name is only calc's: a quiet run's failure is calc's.
+        assert!(covers_key(&q, "\u{1f}t").is_some());
+        assert!(covers_key(&q, "calc\u{1f}t").is_some());
+        assert!(covers_key(&q, "geo\u{1f}t").is_none());
+        // Another place has it too: unknown is not calc.
+        calc.ambiguous = true;
+        q.insert("t".to_owned(), calc);
+        assert!(covers_key(&q, "\u{1f}t").is_none());
+        assert!(covers_key(&q, "calc\u{1f}t").is_some());
+    }
+
     #[test]
     fn a_removed_quarantine_still_explains_runs_made_before_its_removal() {
         let q = e(10, 100, Some(30));

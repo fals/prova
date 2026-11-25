@@ -50,8 +50,12 @@ Contents: [Failure history](#failure-history) ·
   failures, or a run killed by a signal fails the run, and `detail:` says
   which. Nothing may follow the tests' summary but the command's own
   wrap-up of the failed test step: a lint or coverage step after the tests
-  refuses the quarantine. When tests of several binaries share a name,
-  `prova quarantine add <test> --in <binary>` names which; a parent's quarantine does not cover a
+  refuses the quarantine. When tests of several places share a name (two
+  crates' `tests::flaky`, two Go packages, two pytest or Vitest files),
+  the run names the place (`FAIL tests::flaky (geo)`), `prova history`,
+  `flaky`, `slowest` and `diff` keep them apart, and
+  `prova quarantine add <test> --in <place>` names which (a crate, `ex/a`,
+  `tests/test_calc.py`); a parent's quarantine does not cover a
   subtest first seen after it; a run where only quarantined tests ran and
   failed fails. A quarantine lives in this machine's prova store, not in
   the repository: CI and teammates do not see it. Do not quarantine a test
