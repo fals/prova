@@ -1369,7 +1369,9 @@ fn cancel_warns_when_the_container_cannot_be_attributed() {
     assert!(!killed.exists(), "{s}");
     let text = s.to_string();
     assert!(
-        text.contains("does not stop its container") && text.contains("docker ps"),
+        text.contains("does not stop its container")
+            && text.contains("docker ps")
+            && text.contains("clock is behind"),
         "{text}"
     );
 }
@@ -1425,8 +1427,44 @@ fn cancel_does_not_kill_a_container_another_live_run_could_own() {
     assert!(!killed.exists(), "killed another run's container: {s}");
     let text = s.to_string();
     assert!(
-        text.contains("another live run") && text.contains("docker kill aaa111bbb222"),
+        text.contains(&format!("could also belong to run {a}"))
+            && text.contains("docker kill aaa111bbb222"),
         "{text}"
+    );
+}
+
+/// Review of round 18: a live run of another kind in the directory
+/// (`prova run small`) cannot own a container; it must not stop the cancel
+/// of a container run from killing its own container.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_run_that_is_not_a_container_run_does_not_hold_back_the_cancel() {
+    let d = workspace("cancel-container-plain-rival");
+    let (path, killed) = fake_docker(&d);
+    let cwd = d.canonicalize().unwrap();
+    std::fs::write(d.join("ps.out"), "aaa111bbb222\n").unwrap();
+    std::fs::write(
+        d.join("inspect.json"),
+        format!(
+            r#"[{{"Id":"aaa111bbb222ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}]"#,
+            cwd.display()
+        ),
+    )
+    .unwrap();
+    let o = Command::new(PROVA)
+        .args(["run", "--detach", "--json", "--", "sleep", "60"])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .output()
+        .unwrap();
+    let plain = json(&o)["run"].as_str().unwrap().to_owned();
+    let _guard = CancelOnDrop(&d, plain);
+    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
+    assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(
+        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
+        "kill aaa111bbb222",
+        "a run that is no container run held the cancel back: {s}"
     );
 }
 

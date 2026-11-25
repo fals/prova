@@ -680,29 +680,34 @@ fn cancel_stops_the_container_a_quoting_wrapper_started() {
 }
 
 /// Round 18 (blocker): with two runs of one directory live, a cancel of one
-/// killed the other's container. Now it names the candidates and kills none;
-/// the other run keeps running until it is cancelled too.
+/// killed the other's container. A cancel kills the container created for
+/// the run (the other run already has its own, created before it) and
+/// nothing else: the other run keeps running until it is cancelled too. The
+/// case where a container could be either run's (contested, kill nothing) is
+/// a race with docker's own latency and is tested in medium, with a fake client.
 #[test]
 #[ignore = "large: needs docker (two live runs of one directory, one container each)"]
 fn cancel_does_not_kill_the_container_of_another_live_run() {
     let w = DevWorld::new("wrapper-two-runs");
     let a = w.start_hanging();
     w.wait_stall(&a);
+    let a_container = w.containers();
+    assert_eq!(a_container.len(), 1, "A's container");
     let b = w.start_hanging();
     w.wait_stall(&b);
     assert_eq!(w.containers().len(), 2, "one container per run");
     let s = w.cancel_and_wait(&b);
     assert_eq!(s["status"], "cancelled", "{s}");
     assert_eq!(
-        w.containers().len(),
-        2,
-        "cancelling one run killed a container another live run could own: {s}"
+        w.containers(),
+        a_container,
+        "cancelling B must leave A's container and only it: {s}"
     );
     let other = json_last_line(&w.prova(&["status", &a, "--json"], &[]));
     assert_eq!(other["status"], "running", "{other}");
-    // The other run is cancelled too; the guard removes what is left.
     let s = w.cancel_and_wait(&a);
     assert_eq!(s["status"], "cancelled", "{s}");
+    assert!(w.containers().is_empty(), "{:?}\n{s}", w.containers());
 }
 
 /// Round 18: the first `--until first-failure` wait through a container

@@ -440,7 +440,9 @@ fn a_whole_suite_of_suspects_says_it_cannot_tell() {
         &["wait", &id, "--until", "stall", "--max-wait", "15s"],
     ));
     assert!(
-        w.contains("cannot be told") && !w.contains("likely among them"),
+        w.contains("cannot be told")
+            && w.contains("before any test reported")
+            && !w.contains("likely among them"),
         "{w}"
     );
     prova(&d, &["cancel", &id]);
@@ -468,7 +470,11 @@ fn a_stalled_make_run_names_the_direct_suite() {
         &d,
         &["wait", &id, "--until", "stall", "--max-wait", "15s"],
     ));
-    assert!(w.contains("prova run direct --until first-failure"), "{w}");
+    assert!(
+        w.contains("prova run direct --until first-failure")
+            && w.contains("if it runs these tests"),
+        "{w}"
+    );
     prova(&d, &["cancel", &id]);
     prova(&d, &["wait", &id, "--until", "done", "--max-wait", "10s"]);
 }

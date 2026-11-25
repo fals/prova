@@ -676,22 +676,24 @@ impl Supervisor<'_> {
         }
     }
 
-    /// Start times (ms) of the other live runs of this directory: any of
-    /// them may own a container created after it started (ADR 0035 §3).
-    fn live_rivals_ms(&self) -> Vec<u64> {
-        let rows: Vec<(i64, Option<i64>)> = (|| {
+    /// The other live runs of this directory that go through a container
+    /// client, and so may own a container created after they started (ADR
+    /// 0035 §3). A run that is not one (`prova run small`), or whose
+    /// supervisor is gone, cannot own any.
+    fn live_rivals(&self) -> Vec<crate::resources::Rival> {
+        let rows: Vec<(String, i64, Option<i64>, String)> = (|| {
             let mut stmt = self
                 .store
                 .conn()
                 .prepare(
-                    "SELECT started_ms, supervisor_pid FROM runs
+                    "SELECT id, started_ms, supervisor_pid, spec FROM runs
                      WHERE id <> ?1 AND cwd = ?2 AND status = 'running' AND ended_ms IS NULL
-                       AND started_ms IS NOT NULL",
+                       AND started_ms IS NOT NULL AND supervisor_pid IS NOT NULL",
                 )
                 .ok()?;
             let rows = stmt
                 .query_map(rusqlite::params![self.run, self.run_cwd], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .ok()?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -700,8 +702,31 @@ impl Supervisor<'_> {
         })()
         .unwrap_or_default();
         rows.into_iter()
-            .filter(|(_, pid)| pid.is_none_or(|p| crate::process::alive(p as u32)))
-            .map(|(ms, _)| ms.max(0) as u64)
+            .filter(|(_, _, pid, _)| pid.is_some_and(|p| crate::process::alive(p as u32)))
+            .filter_map(|(run, ms, _, spec)| {
+                let cmdline = serde_json::from_str::<RunSpec>(&spec)
+                    .ok()
+                    .map(|s| s.command.display())
+                    .filter(|c| crate::resources::container_client_runs(c));
+                // A wrapper's client is only known from the note it emitted.
+                let noted = || {
+                    self.store
+                        .conn()
+                        .query_row(
+                            "SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'run_note'
+                               AND json_extract(payload, '$.message') LIKE 'the tests ran through `%'
+                             LIMIT 1",
+                            rusqlite::params![run],
+                            |_| Ok(()),
+                        )
+                        .is_ok()
+                };
+                (cmdline.is_some() || noted()).then(|| crate::resources::Rival {
+                    run,
+                    started_ms: ms.max(0) as u64,
+                    cmdline,
+                })
+            })
             .collect()
     }
 
@@ -735,7 +760,7 @@ impl Supervisor<'_> {
                 })
             }
             _ if crate::resources::container_client_runs(&cmd) => {
-                let rivals = self.live_rivals_ms();
+                let rivals = self.live_rivals();
                 let found = crate::resources::containers_of_run(
                     client,
                     &cmd,
@@ -746,10 +771,10 @@ impl Supervisor<'_> {
                 match found.as_slice() {
                     // Another live run of this directory could own it too
                     // (ADR 0035 §3): name it, kill nothing.
-                    [one] if one.contested => self.emit(EventKind::RunWarning {
+                    [one] if one.contested() => self.emit(EventKind::RunWarning {
                         message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and the one running container that could be it ({}) could also belong to another live run of this directory; if it is this run's: `{client} kill {}`",
-                            one.matched, one.id
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and the one running container that could be it ({}) could also belong to run {}, still live in this directory; if it is this run's: `{client} kill {}`",
+                            one.matched, one.rivals.join(", "), one.id
                         ),
                     }),
                     [one] => {
@@ -768,7 +793,7 @@ impl Supervisor<'_> {
                     }
                     [] => self.emit(EventKind::RunWarning {
                         message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container mounts this directory); check `{client} ps` and stop it"
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container of the client's image mounts this directory since the run started; a container daemon whose clock is behind this host's can also hide it); check `{client} ps` and stop it"
                         ),
                     }),
                     many => self.emit(EventKind::RunWarning {
@@ -2878,7 +2903,7 @@ fn narrow_by_running<'a>(
 /// narrowed them: the whole suite, which says nothing about which test hung.
 fn unnarrowed_note(total: usize, prev: &str, listed: &str) -> String {
     format!(
-        "not reported yet ({total} of the last finished run {prev}): {listed}; that is every test the suite has, not a lead: the hung test cannot be told at this fidelity (a quiet runner prints nothing per test); a verbose or native suite names it as it starts (`prova adopt` proposes one)"
+        "not reported yet ({total} of the last finished run {prev}): {listed}; that is every test the suite has, not a lead: the run stalled before any test reported (a build, an image pull, or a runner that prints nothing per test), so the hung test cannot be told at this fidelity; a verbose or native suite names it as it starts (`prova adopt` proposes one)"
     )
 }
 
@@ -2910,7 +2935,7 @@ fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, command: &str) ->
             )
     })?;
     Some(format!(
-        "`make` hides the tests as they start: suite `{}` runs the runner directly (`{}`) and names the hung test: `prova run {} --until first-failure`",
+        "`make` hides the tests as they start: suite `{}` calls the runner directly (`{}`); if it runs these tests, it names the hung one as it starts: `prova run {} --until first-failure`",
         direct.0, direct.1.run, direct.0
     ))
 }
