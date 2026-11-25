@@ -114,6 +114,30 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
     Ok(rows)
 }
 
+/// What makes two stored tests one test for history (ADR 0018), as the
+/// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another).
+/// A name recorded bare (Go text with no package, quiet `cargo test` with no
+/// crate) is the qualified one only when the name belongs to one place: a
+/// name shared by several places is never matched to one of them (ADR 0034
+/// section 2).
+const SAME_TEST_ON: &str = "(t2.display = t1.display
+                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '')
+                        OR ((t1.file IS NULL OR t2.file IS NULL)
+                            AND (SELECT COUNT(DISTINCT x.file) FROM tests x
+                                 WHERE x.display = t1.display AND x.file IS NOT NULL
+                                   AND x.file NOT LIKE '(package pending)%'
+                                   AND x.file <> '(unknown directory)') < 2)))
+                OR (t2.name = t1.name
+                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]'))
+                   AND (SELECT COUNT(DISTINCT COALESCE(x.file, '') || '|' || x.path) FROM tests x
+                        WHERE x.name = t1.name AND NOT (x.file IS NULL AND x.path = '[]')
+                          AND COALESCE(x.file, '') NOT LIKE '(package pending)%'
+                          AND COALESCE(x.file, '') <> '(unknown directory)') < 2)";
+
+fn same_sql(sql: &str) -> String {
+    sql.replace("{SAME}", SAME_TEST_ON)
+}
+
 /// A name recorded bare (`TestX`, from text output that named no package)
 /// and its qualified form (`pkg::TestX`, `example.com/pkg::TestX`) are one
 /// test: the same name, or one is the other behind a `::` or `/`.
@@ -343,13 +367,10 @@ fn test_runs_scoped(
     current: Option<&str>,
     suite: Option<&str>,
 ) -> Result<Vec<TestRun>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&same_sql(
         "WITH same AS (
              SELECT t2.id FROM tests t1 JOIN tests t2
-               ON (t2.display = t1.display
-                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-                OR (t2.name = t1.name
-                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+               ON {SAME}
                 -- a Go test seen before its package is known (`(package
                 -- pending) #N`) is the qualified test of that name that ran
                 -- most recently
@@ -382,7 +403,7 @@ fn test_runs_scoped(
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
            AND a.run_id IN (SELECT id FROM counted ORDER BY created_ms DESC LIMIT ?2)
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
-         ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC",
+         ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC"),
     )?;
     let rows = stmt.query_map(params![test_id, limit as i64, current, suite], |r| {
         Ok((
@@ -539,12 +560,9 @@ fn stats_scoped(
     let place = Names::new(store).place(&display, file.as_deref());
     let recent = test_runs_scoped(store, test_id, window, current, only_suite)?;
     let suites: Vec<String> = {
-        let mut stmt = store.conn().prepare(
+        let mut stmt = store.conn().prepare(&same_sql(
             "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
-               ON (t2.display = t1.display
-                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-                OR (t2.name = t1.name
-                   AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+               ON {SAME}
                 -- a Go test seen before its package is known (`(package
                 -- pending) #N`) is the qualified test of that name that ran
                 -- most recently
@@ -552,7 +570,7 @@ fn stats_scoped(
                       SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
                       WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
                       ORDER BY qr.created_ms DESC LIMIT 1))
-             WHERE t1.id = ?1 ORDER BY t2.suite",
+             WHERE t1.id = ?1 ORDER BY t2.suite"),
         )?;
         stmt.query_map(params![test_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
@@ -714,14 +732,11 @@ pub fn find_tests(
 
 /// Ids of every test that shares one history with `test_id` (ADR 0018).
 pub fn shared_ids(store: &Store, test_id: &str) -> Result<Vec<String>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&same_sql(
         "SELECT t2.id FROM tests t1 JOIN tests t2
-           ON (t2.display = t1.display
-               AND (COALESCE(t2.file, '') = COALESCE(t1.file, '') OR t1.file IS NULL OR t2.file IS NULL))
-            OR (t2.name = t1.name
-               AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]')))
+           ON {SAME}
          WHERE t1.id = ?1",
-    )?;
+    ))?;
     let ids = stmt
         .query_map(params![test_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;

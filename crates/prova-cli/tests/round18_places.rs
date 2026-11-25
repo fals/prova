@@ -149,3 +149,38 @@ fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
         "each crate's test is its own: {all}"
     );
 }
+
+/// A name of unknown place that two known places share is none of theirs:
+/// it takes no history, no FLAKY label, and no quarantine of theirs.
+#[test]
+fn r18_an_unknown_place_never_borrows_the_history_of_a_shared_name() {
+    let d = workspace("unknownshared");
+    let nextest = format!(
+        "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        PASS [   0.004s] calc tests::flaky_clock' '        FAIL [   0.004s] geo tests::flaky_clock' '     Summary [   0.020s] 2 tests run'; exit 100"
+    );
+    let quiet = format!(
+        "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at somewhere.rs:1:1:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &nextest]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky_clock",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let o = prova(&d, &["run", "--", "sh", "-c", &quiet]);
+    let out = text(&o);
+    assert!(out.contains("first time seen"), "{out}");
+    assert!(
+        !out.contains("FLAKY") && !out.contains("quarantined: tests::flaky_clock (calc) failed"),
+        "{out}"
+    );
+    assert!(!out.contains("only known flaky"), "{out}");
+}
