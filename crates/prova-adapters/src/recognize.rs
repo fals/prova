@@ -1948,6 +1948,29 @@ impl Recognizers {
         }
     }
 
+    /// The package that owns the test binary of a cargo `Running` line,
+    /// read from the dependency file cargo wrote next to the binary
+    /// (`calc/tests/it.rs` -> `calc/Cargo.toml`). `None` when the files are
+    /// not there (a container, a relocated target directory).
+    fn cargo_package(&self, rest: &str) -> Option<String> {
+        let cwd = self.cwd.as_ref()?;
+        let bin = rest.rsplit_once(" (")?.1.trim_end_matches(')');
+        let dep = std::fs::read_to_string(cwd.join(format!("{bin}.d"))).ok()?;
+        let source = dep.lines().next()?.split_once(": ")?.1.split(' ').next()?;
+        let mut dir = cwd.join(source);
+        dir.pop();
+        loop {
+            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
+                && let Some(name) = cargo_package_name(&toml)
+            {
+                return Some(name.replace('-', "_"));
+            }
+            if !dir.pop() || !dir.starts_with(cwd) {
+                return None;
+            }
+        }
+    }
+
     fn libtest(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         // A failing test's captured output: "---- path::name stdout ----"
         // up to the next block or the "failures:" list.
@@ -1972,7 +1995,14 @@ impl Recognizers {
         // "   Doc-tests prova_core": tests of different binaries may share names.
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("Running ") {
-            self.libtest_binary = Some(cargo_binary(rest));
+            let binary = cargo_binary(rest);
+            // An integration test's line names no crate: two crates' `it`
+            // are told apart as nextest does (`calc::it`), by the package
+            // that owns the binary's source (ADR 0031 section 2).
+            self.libtest_binary = Some(match self.cargo_package(rest) {
+                Some(krate) if !rest.starts_with("unittests ") => format!("{krate}::{binary}"),
+                _ => binary,
+            });
             return true;
         }
         if let Some(rest) = t.strip_prefix("Doc-tests ") {
@@ -3371,6 +3401,24 @@ fn nextest_binary(id: &str) -> String {
         }
         None => id,
     }
+}
+
+/// `name` of the `[package]` table of a Cargo.toml (a workspace-only
+/// manifest has none).
+fn cargo_package_name(toml: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in toml.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_package = l == "[package]";
+        } else if in_package
+            && let Some(v) = l.strip_prefix("name")
+            && let Some(v) = v.trim_start().strip_prefix('=')
+        {
+            return Some(v.trim().trim_matches(['"', '\'']).to_owned());
+        }
+    }
+    None
 }
 
 /// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
