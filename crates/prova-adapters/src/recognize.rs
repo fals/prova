@@ -3181,12 +3181,24 @@ fn nextest_status(line: &str) -> Option<(&str, &str, &str, &str)> {
     Some((status, dur.trim(), binary, test))
 }
 
-/// Rust test binaries are named by target (ADR 0018): nextest's binary id
-/// keeps its last segment (`calc::calc` and `calc` give `calc`,
-/// `prova-cli::live` gives `live`, `crate::bin/tool` gives `tool`).
+/// Rust test binaries are named by crate and target (ADR 0018, 0031): the
+/// crate's own binary is `calc` (`calc::calc` too), another target of it
+/// `calc::live`, a bin `calc::tool`. The crate stays in the name: two
+/// crates' `it` integration tests are two binaries, whatever order they ran
+/// in (round 17).
 fn nextest_binary(id: &str) -> String {
-    let last = id.rsplit("::").next().unwrap_or(id);
-    last.trim_start_matches("bin/").replace('-', "_")
+    let id = id.replace('-', "_");
+    match id.rsplit_once("::") {
+        Some((krate, target)) => {
+            let target = target.trim_start_matches("bin/");
+            if krate == target {
+                krate.to_owned()
+            } else {
+                format!("{krate}::{target}")
+            }
+        }
+        None => id,
+    }
 }
 
 /// cargo's "Running unittests src/lib.rs (target/debug/deps/calc-1a2b)":
@@ -3879,8 +3891,12 @@ mod tests {
             cargo_binary("tests/live.rs (target/debug/deps/live-0123abcd)"),
             "live"
         );
-        assert_eq!(nextest_binary("prova-cli::live"), "live");
-        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova");
+        assert_eq!(nextest_binary("prova-cli::live"), "prova_cli::live");
+        assert_eq!(nextest_binary("prova-cli::bin/prova"), "prova_cli::prova");
+        assert_eq!(nextest_binary("calc::calc"), "calc");
+        assert_eq!(nextest_binary("calc"), "calc");
+        // Two crates' integration tests of one name are two binaries.
+        assert_ne!(nextest_binary("alpha::it"), nextest_binary("beta::it"));
     }
 
     /// Round 5: in quiet mode libtest's 60 s warning followed the progress

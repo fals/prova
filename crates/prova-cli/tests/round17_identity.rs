@@ -118,6 +118,47 @@ fn a_failure_of_the_other_crates_same_named_test_is_reported_with_its_place() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 }
 
+/// Round 17 (probe M6): nextest's `alpha::it integ` and `beta::it integ`
+/// became `integ` and `integ (second result)` by execution order, and two
+/// passing ones were counted once.
+#[test]
+fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
+    let d = workspace("integ");
+    let nx = |first: (&str, &str), second: (&str, &str), code: u8| {
+        format!(
+            "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        {} [   0.004s] {} integ' '        {} [   0.004s] {} integ' '     Summary [   0.020s] 2 tests run'; exit {code}",
+            first.0, first.1, second.0, second.1
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n\n[suite.c]\nrun = {:?}\n",
+            nx(("PASS", "alpha::it"), ("FAIL", "beta::it"), 100),
+            nx(("FAIL", "beta::it"), ("PASS", "alpha::it"), 100),
+            nx(("PASS", "alpha::it"), ("PASS", "beta::it"), 0),
+        ),
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "a"]));
+    assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
+    assert!(out.contains("FAIL integ (beta::it)"), "{out}");
+    let out = text(&prova(&d, &["run", "b"]));
+    assert!(out.contains("FAIL integ (beta::it)"), "{out}");
+    assert!(out.contains("failed 1x before"), "{out}");
+    let out = text(&prova(&d, &["run", "c"]));
+    assert!(
+        out.contains("tests: 2 passed"),
+        "two passing, one name: {out}"
+    );
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(!all.contains("second result"), "{all}");
+    assert!(
+        all.contains("integ (alpha::it)") && all.contains("integ (beta::it)"),
+        "{all}"
+    );
+}
+
 /// The id of the run a `prova run` printed.
 fn run_id(o: &Output) -> String {
     text(o)
