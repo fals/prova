@@ -43,6 +43,16 @@ fn bytecode_and_tool_caches_do_not_change_the_code_identity() {
         clean,
         "a new source file is"
     );
+    // A compiled module outside __pycache__ is importable code (ADR 0034,
+    // round 18: a top-level json.pyc shadowed the stdlib and changed results).
+    std::fs::remove_file(d.join("new.py")).unwrap();
+    assert_eq!(prova_core::identity::code_identity(&d), clean);
+    std::fs::write(d.join("json.pyc"), b"\x02module").unwrap();
+    assert_ne!(
+        prova_core::identity::code_identity(&d),
+        clean,
+        "a top-level compiled module is code"
+    );
 }
 
 /// Round 9 red team: experiment samples are written once; the store refuses

@@ -172,7 +172,8 @@ fn has_ties(x: &[f64], y: &[f64]) -> bool {
     all.windows(2).any(|w| w[0] == w[1])
 }
 
-/// Two-sided Mann-Whitney U test. Exact without ties (n*m <= 10_000),
+/// Two-sided Mann-Whitney U test. Exact without ties (n*m <= 10_000), exact
+/// with ties up to 40 pooled values (the tie pattern fixes the null),
 /// otherwise normal approximation with tie and continuity correction,
 /// matching `scipy.stats.mannwhitneyu`.
 /// The smallest two-sided p the exact Mann-Whitney test can give for
@@ -183,6 +184,58 @@ pub fn min_two_sided_p(n: usize, m: usize) -> f64 {
         c = c * (n + m - i) as f64 / (i + 1) as f64;
     }
     (2.0 / c).min(1.0)
+}
+
+/// Largest pooled sample for which ties are handled exactly.
+const EXACT_TIES_MAX: usize = 40;
+
+/// Exact two-sided p of the rank-sum statistic given the tie pattern: every
+/// way to give `x.len()` of the pooled midranks to the first sample is
+/// equally likely under the null. Counted by dynamic programming over the
+/// doubled midranks (integers), so there is no sampling and no normal
+/// approximation. Equals `scipy.stats.mannwhitneyu` with an exhaustive
+/// `PermutationMethod`; without ties it is the usual exact test.
+fn exact_p_with_ties(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    let mut all: Vec<f64> = x.iter().chain(y).copied().collect();
+    all.sort_by(f64::total_cmp);
+    // Doubled midrank of each pooled value (1-based ranks).
+    let mut ranks2: Vec<usize> = Vec::with_capacity(all.len());
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i;
+        while j + 1 < all.len() && all[j + 1] == all[i] {
+            j += 1;
+        }
+        // Midrank = (i+1 + j+1) / 2, doubled.
+        ranks2.extend(std::iter::repeat_n(i + j + 2, j - i + 1));
+        i = j + 1;
+    }
+    let observed: usize = x
+        .iter()
+        .map(|v| {
+            let first = all.partition_point(|a| a < v);
+            ranks2[first]
+        })
+        .sum();
+    let max_sum: usize = ranks2.iter().sum();
+    // ways[k][s]: choices of k items with doubled-rank sum s.
+    let mut ways = vec![vec![0.0_f64; max_sum + 1]; n + 1];
+    ways[0][0] = 1.0;
+    for r in &ranks2 {
+        for k in (1..=n).rev() {
+            for s in (*r..=max_sum).rev() {
+                let w = ways[k - 1][s - r];
+                ways[k][s] += w;
+            }
+        }
+    }
+    let total: f64 = ways[n].iter().sum();
+    // Two-sided as SciPy does: twice the smaller tail. With ties the
+    // midranks are not symmetric, so the tails differ.
+    let at_most: f64 = ways[n][..=observed].iter().sum();
+    let at_least: f64 = ways[n][observed..].iter().sum();
+    (2.0 * at_most.min(at_least) / total).min(1.0)
 }
 
 pub fn mann_whitney(x: &[f64], y: &[f64]) -> MannWhitney {
@@ -208,6 +261,13 @@ pub fn mann_whitney(x: &[f64], y: &[f64]) -> MannWhitney {
         return MannWhitney {
             u,
             p: (2.0 * sf).min(1.0),
+            method: "exact",
+        };
+    }
+    if n > 0 && m > 0 && n + m <= EXACT_TIES_MAX {
+        return MannWhitney {
+            u,
+            p: exact_p_with_ties(x, y),
             method: "exact",
         };
     }
