@@ -706,7 +706,7 @@ impl Supervisor<'_> {
             .filter_map(|(run, ms, _, spec)| {
                 let cmdline = serde_json::from_str::<RunSpec>(&spec)
                     .ok()
-                    .map(|s| s.command.display())
+                    .map(|s| s.command.raw())
                     .filter(|c| crate::resources::container_client_runs(c));
                 // A wrapper's client is only known from the note it emitted.
                 let noted = || {
