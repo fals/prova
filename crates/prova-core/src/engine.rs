@@ -676,6 +676,60 @@ impl Supervisor<'_> {
         }
     }
 
+    /// The other live runs of this directory that go through a container
+    /// client, and so may own a container created after they started (ADR
+    /// 0035 §3). A run that is not one (`prova run small`), or whose
+    /// supervisor is gone, cannot own any.
+    fn live_rivals(&self) -> Vec<crate::resources::Rival> {
+        let rows: Vec<(String, i64, Option<i64>, String)> = (|| {
+            let mut stmt = self
+                .store
+                .conn()
+                .prepare(
+                    "SELECT id, started_ms, supervisor_pid, spec FROM runs
+                     WHERE id <> ?1 AND cwd = ?2 AND status = 'running' AND ended_ms IS NULL
+                       AND started_ms IS NOT NULL AND supervisor_pid IS NOT NULL",
+                )
+                .ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![self.run, self.run_cwd], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .ok()?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .ok()?;
+            Some(rows)
+        })()
+        .unwrap_or_default();
+        rows.into_iter()
+            .filter(|(_, _, pid, _)| pid.is_some_and(|p| crate::process::alive(p as u32)))
+            .filter_map(|(run, ms, _, spec)| {
+                let cmdline = serde_json::from_str::<RunSpec>(&spec)
+                    .ok()
+                    .map(|s| s.command.display())
+                    .filter(|c| crate::resources::container_client_runs(c));
+                // A wrapper's client is only known from the note it emitted.
+                let noted = || {
+                    self.store
+                        .conn()
+                        .query_row(
+                            "SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'run_note'
+                               AND json_extract(payload, '$.message') LIKE 'the tests ran through `%'
+                             LIMIT 1",
+                            rusqlite::params![run],
+                            |_| Ok(()),
+                        )
+                        .is_ok()
+                };
+                (cmdline.is_some() || noted()).then(|| crate::resources::Rival {
+                    run,
+                    started_ms: ms.max(0) as u64,
+                    cmdline,
+                })
+            })
+            .collect()
+    }
+
     /// The run is being stopped: stopping a container client does not stop
     /// its container. A container the run named (`--name`, `--cidfile`) is
     /// killed; any other is not attributable, so the run says to check.
@@ -698,20 +752,38 @@ impl Supervisor<'_> {
                     self.emit(EventKind::RunWarning { message });
                 }
             }
+            _ if crate::resources::container_client_execs(&cmd) => {
+                self.emit(EventKind::RunWarning {
+                    message: format!(
+                        "the tests ran through `{client} exec` in a container that was already there: stopping the client does not stop the process it started, which may still run inside that container (the container itself is not the run's); look for the process with `{client} exec <container> ps`"
+                    ),
+                })
+            }
             _ if crate::resources::container_client_runs(&cmd) => {
+                let rivals = self.live_rivals();
                 let found = crate::resources::containers_of_run(
                     client,
                     &cmd,
                     &self.run_cwd,
                     self.run_started_ms,
+                    &rivals,
                 );
                 match found.as_slice() {
+                    // Another live run of this directory could own it too
+                    // (ADR 0035 §3): name it, kill nothing.
+                    [one] if one.contested() => self.emit(EventKind::RunWarning {
+                        message: format!(
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and the one running container that could be it ({}) could also belong to run {}, still live in this directory; if it is this run's: `{client} kill {}`",
+                            one.matched, one.rivals.join(", "), one.id
+                        ),
+                    }),
                     [one] => {
-                        let ok = crate::resources::kill_container(client, one);
+                        let id = &one.id;
+                        let ok = crate::resources::kill_container(client, id);
                         let message = if ok {
-                            format!("stopped the container `{one}` with `{client} kill {one}` (it mounts the run's directory and was created after the run started; the `{client}` command had no --name or --cidfile)")
+                            format!("stopped the container `{id}` with `{client} kill {id}` ({} and it was created after the run started; the `{client}` command had no --name or --cidfile)", one.matched)
                         } else {
-                            format!("could not stop the container `{one}`: run `{client} kill {one}`")
+                            format!("could not stop the container `{id}`: run `{client} kill {id}`")
                         };
                         if ok {
                             self.emit(EventKind::RunNote { message });
@@ -721,7 +793,7 @@ impl Supervisor<'_> {
                     }
                     [] => self.emit(EventKind::RunWarning {
                         message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container mounts this directory); check `{client} ps` and stop it"
+                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container of the client's image mounts this directory since the run started; a container daemon whose clock is behind this host's can also hide it); check `{client} ps` and stop it"
                         ),
                     }),
                     many => self.emit(EventKind::RunWarning {
@@ -729,7 +801,7 @@ impl Supervisor<'_> {
                             "the tests ran through `{client}`: stopping its client does not stop its container, and {} running containers could be it; stop the right one: {}",
                             many.len(),
                             many.iter()
-                                .map(|id| format!("`{client} kill {id}`"))
+                                .map(|c| format!("`{client} kill {}`", c.id))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -2827,6 +2899,47 @@ fn narrow_by_running<'a>(
     (missing.iter().collect(), None)
 }
 
+/// The suspects of a stall when no test reported at all and nothing
+/// narrowed them: the whole suite, which says nothing about which test hung.
+fn unnarrowed_note(total: usize, prev: &str, listed: &str) -> String {
+    format!(
+        "not reported yet ({total} of the last finished run {prev}): {listed}; that is every test the suite has, not a lead: the run stalled before any test reported (a build, an image pull, or a runner that prints nothing per test), so the hung test cannot be told at this fidelity; a verbose or native suite names it as it starts (`prova adopt` proposes one)"
+    )
+}
+
+/// For a run through `make` or another wrapper, a suite of the project
+/// that runs a known test runner directly, by name.
+fn direct_suite_hint(cfg: &crate::config::Config, suite: &str, command: &str) -> Option<String> {
+    let first = |c: &str| {
+        c.split_whitespace()
+            .find(|w| !w.contains('='))
+            .map(|w| w.rsplit('/').next().unwrap_or(w).to_owned())
+            .unwrap_or_default()
+    };
+    if !matches!(first(command).as_str(), "make" | "gmake" | "just" | "task") {
+        return None;
+    }
+    let direct = cfg.suite.iter().find(|(name, s)| {
+        name.as_str() != suite
+            && matches!(
+                first(&s.run).as_str(),
+                "go" | "cargo"
+                    | "pytest"
+                    | "mvn"
+                    | "mvnw"
+                    | "gradle"
+                    | "gradlew"
+                    | "vitest"
+                    | "jest"
+                    | "dotnet"
+            )
+    })?;
+    Some(format!(
+        "`make` hides the tests as they start: suite `{}` calls the runner directly (`{}`); if it runs these tests, it names the hung one as it starts: `prova run {} --until first-failure`",
+        direct.0, direct.1.run, direct.0
+    ))
+}
+
 /// The excerpt as a person reads it: `go test -json` lines become their
 /// own output text (round 13: 30 lines of raw JSON under a failure prova
 /// had already decoded).
@@ -3362,12 +3475,26 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                     "the framework was running {c}: the hung test is likely one of its {} test(s) not reported yet: {listed}",
                     suspects.len(),
                 ),
+                // Nothing reported and nothing narrowed it (Surefire -q):
+                // the list is the whole suite, not a lead (round 18).
+                None if current.is_empty() => unnarrowed_note(missing.len(), &prev, &listed),
                 None => format!(
                     "not reported yet ({} of the last finished run {prev}; the hung test is likely among them): {listed}",
                     missing.len(),
                 ),
             });
         }
+    }
+    // A stalled run through a wrapper that hides the tests as they start:
+    // a suite of this project that runs the runner directly names the hung
+    // test (round 18: make, quiet).
+    if !row.status.is_terminal()
+        && stalled_ms.is_some()
+        && running.is_empty()
+        && let Ok(cfg) = crate::config::load(store.root())
+        && let Some(hint) = direct_suite_hint(&cfg, &row.suite, &command)
+    {
+        notes.push(hint);
     }
     // Go buffers a package's text output until the package ends.
     if !row.status.is_terminal()
@@ -3929,5 +4056,36 @@ mod selection_tests {
         idle.push_back((at(500), 1));
         idle.push_back((at(1000), 1));
         assert_eq!(super::busy_since(&idle), None);
+    }
+}
+
+#[cfg(test)]
+mod hang_hint_tests {
+    /// Round 18: Surefire -q printed nothing, and the "not reported yet"
+    /// list was the whole suite, presented as a lead.
+    #[test]
+    fn a_whole_suite_of_suspects_says_it_cannot_tell() {
+        let n = super::unnarrowed_note(10, "abc", "a, b");
+        assert!(n.contains("cannot be told"), "{n}");
+        assert!(n.contains("10 of the last finished run abc"), "{n}");
+        assert!(n.contains("prova adopt"), "{n}");
+    }
+
+    #[test]
+    fn a_make_suite_names_the_direct_suite() {
+        let cfg: crate::config::Config = toml::from_str(
+            "[suite.make]\nrun = \"make test\"\n[suite.default]\nrun = \"go test -json ./...\"\n",
+        )
+        .unwrap();
+        let hint = super::direct_suite_hint(&cfg, "make", "make test").unwrap();
+        assert!(
+            hint.contains("`prova run default --until first-failure`"),
+            "{hint}"
+        );
+        // Not for a suite that is already the direct one, nor without one.
+        assert!(super::direct_suite_hint(&cfg, "default", "go test -json ./...").is_none());
+        let only: crate::config::Config =
+            toml::from_str("[suite.make]\nrun = \"make test\"\n").unwrap();
+        assert!(super::direct_suite_hint(&only, "make", "make test").is_none());
     }
 }
