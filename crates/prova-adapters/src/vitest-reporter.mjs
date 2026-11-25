@@ -48,6 +48,7 @@ export default class ProvaReporter {
       type: "test",
       name: testCase.fullName,
       file: relative(this.root, testCase.module.moduleId),
+      root: this.root,
     };
   }
 
@@ -124,6 +125,7 @@ export default class ProvaReporter {
         type: "test",
         name: "(file)",
         file: relative(this.root, file.filepath),
+        root: this.root,
         event: "failed",
         message,
         stack: stack || undefined,

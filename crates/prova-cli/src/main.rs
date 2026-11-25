@@ -321,7 +321,7 @@ Examples:
         #[arg(long)]
         all: bool,
         /// How many of the latest runs to look at.
-        #[arg(long, value_name = "RUNS", default_value_t = 100)]
+        #[arg(long, value_name = "RUNS", default_value_t = 50)]
         window: usize,
         /// JSON instead of text.
         #[arg(long)]
@@ -2161,6 +2161,19 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             in_file,
         } => {
             let mut found = analysis::find_tests(store, &test, None)?;
+            // A name that is exact in a test binary (Rust) is that test,
+            // not the same tail of another module's (`flaky_clock` and
+            // `tests::flaky_clock`).
+            if found.iter().any(|t| {
+                t.1 == test
+                    && analysis::place_of_test(store, &t.0)
+                        .ok()
+                        .flatten()
+                        .and_then(|p| p.0)
+                        .is_some_and(|f| !f.starts_with("(package pending)"))
+            }) {
+                found.retain(|t| t.1 == test);
+            }
             // `--in` names the place in the framework's own form: a Rust
             // test binary, a Go package, a pytest or Vitest file.
             if let Some(w) = in_file.as_deref() {
@@ -2174,7 +2187,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
                 };
                 for t in &found {
                     let (file, path) = place_of(t);
-                    places.extend(file.or(path.first().cloned()));
+                    places.extend(analysis::place_label(file.as_deref(), &path));
                 }
                 analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {
@@ -2191,10 +2204,7 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             > = Default::default();
             for t in &found {
                 let (file, path) = analysis::place_of_test(store, &t.0)?.unwrap_or_default();
-                if let Some(p) = file
-                    .filter(|f| !f.starts_with("(package pending)"))
-                    .or(path.first().cloned())
-                {
+                if let Some(p) = analysis::place_label(file.as_deref(), &path) {
                     places_of_names.entry(t.1.clone()).or_default().insert(p);
                 }
             }
@@ -2341,7 +2351,14 @@ fn quarantine_cmd(store: &Store, action: QuarantineCmd) -> Result<u8> {
             };
             // A name quarantined in several places: `--in` says which.
             if let Some(w) = in_file.as_deref() {
-                analysis::retain_in_place(&mut hits, w, |e| (e.file.clone(), Vec::new()));
+                // A Go test has no binary: its package heads its name.
+                analysis::retain_in_place(&mut hits, w, |e| {
+                    let path = match (&e.file, e.test.rsplit_once("::")) {
+                        (None, Some((head, leaf))) => vec![head.to_owned(), leaf.to_owned()],
+                        _ => Vec::new(),
+                    };
+                    (e.file.clone(), path)
+                });
             }
             let entry = match hits.as_slice() {
                 [one] => *one,
@@ -2949,7 +2966,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 };
                 for t in &found {
                     let (file, path) = place_of(t);
-                    places.extend(file.or(path.first().cloned()));
+                    places.extend(analysis::place_label(file.as_deref(), &path));
                 }
                 analysis::retain_in_place(&mut found, w, place_of);
                 if found.is_empty() && before > 0 {
@@ -2990,9 +3007,23 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             }
             // Exact names win over partial ones (round 10: 16 matches for a
             // name that is exact in every suite, next to an old renamed one).
+            // A name that is exact only in its last part (`TestMod` for
+            // `ex/mod::TestMod`) wins over its own subtests (`TestMod/a`).
+            let all_found = found.clone();
             let found: Vec<_> = {
                 let exact: Vec<_> = found.iter().filter(|t| t.1 == test).cloned().collect();
-                if exact.is_empty() { found } else { exact }
+                let leaf: Vec<_> = found
+                    .iter()
+                    .filter(|t| t.1.rsplit("::").next() == Some(test.as_str()))
+                    .cloned()
+                    .collect();
+                if !exact.is_empty() {
+                    exact
+                } else if !leaf.is_empty() {
+                    leaf
+                } else {
+                    found
+                }
             };
             let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
             // Same name in several suites: take the one that ran most recently.
@@ -3054,6 +3085,30 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 Some(s) => render::test_stats(&s, json),
                 None => bail!("test disappeared"),
             }
+            // The exact match was shown: say what else the name matches
+            // instead of hiding it (round 18: `flaky_clock` showed the
+            // integration tests and not `tests::flaky_clock`).
+            if !json && all_found.len() > found.len() {
+                let rest: std::collections::BTreeSet<&str> = all_found
+                    .iter()
+                    .filter(|t| !found.iter().any(|f| f.0 == t.0))
+                    .map(|t| t.1.as_str())
+                    .filter(|d| !found.iter().any(|f| f.1 == *d))
+                    .collect();
+                if !rest.is_empty() {
+                    let shown: Vec<&str> = rest.iter().take(8).copied().collect();
+                    println!(
+                        "also matches {} other test(s): {}{} (`prova history <name>` for one)",
+                        rest.len(),
+                        shown.join(", "),
+                        if rest.len() > shown.len() {
+                            ", ..."
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             Ok(exit::PASSED)
         }
         Cmd::Flaky {
@@ -3101,7 +3156,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
             } else {
                 // Columns named, and a quarantine shown (round 16).
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
-                println!("fail%   retry-passes  same-code flips  test");
+                println!("fail%   retry-passes  code versions flipped  test");
                 for s in &list {
                     let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
                         let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
@@ -3109,7 +3164,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     });
                     let q = if covered { "  (quarantined)" } else { "" };
                     println!(
-                        "{:5.1}%  {:12}  {:15}  {}{q}",
+                        "{:5.1}%  {:12}  {:21}  {}{q}",
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
@@ -3148,15 +3203,44 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 for (t, label) in d.larger.iter().take(20) {
                     println!("  {}: {}", render::clean(t), render::clean(label));
                 }
+                // The unknown ones by name: a count cannot be checked.
+                let unknown: Vec<&String> = d
+                    .tests
+                    .iter()
+                    .filter(|(_, l)| l == "unknown")
+                    .map(|(t, _)| t)
+                    .collect();
+                if !unknown.is_empty() {
+                    let shown: Vec<String> =
+                        unknown.iter().take(10).map(|t| render::clean(t)).collect();
+                    println!(
+                        "unknown: {}{}",
+                        shown.join(", "),
+                        if unknown.len() > shown.len() {
+                            format!(
+                                ", and {} more (`--json` lists all)",
+                                unknown.len() - shown.len()
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
             }
             Ok(exit::PASSED)
         }
         Cmd::Slowest { suite, count, json } => {
             let (store, _, _) = open_here()?;
-            render::slowest(
-                &analysis::slowest(&store, suite.as_deref(), count, 20)?,
-                json,
-            );
+            let mut rows = analysis::slowest(&store, suite.as_deref(), usize::MAX, 20)?;
+            let more = rows.len().saturating_sub(count);
+            rows.truncate(count);
+            render::slowest(&rows, json);
+            if more > 0 && !json {
+                println!(
+                    "... and {more} more (`prova slowest -n {}` lists all)",
+                    count + more
+                );
+            }
             Ok(exit::PASSED)
         }
         Cmd::Quarantine { action } => {
@@ -3174,13 +3258,18 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 println!("{}", serde_json::to_string(&d)?);
             } else {
                 println!("diff {} -> {}", d.base, d.head);
+                if let Some(w) = &d.warning {
+                    println!("warning: {w}");
+                }
                 for (label, v) in [
                     ("newly failing", &d.newly_failing),
                     ("fixed", &d.fixed),
                     ("still failing", &d.still_failing),
                     ("changed, but known flaky", &d.flaky),
                     ("added", &d.added),
-                    ("removed", &d.removed),
+                    // Not "removed": a reporter may print fewer tests (Vitest
+                    // collapses passing files), a suite may be another one.
+                    ("not visible in this run", &d.removed),
                 ] {
                     if !v.is_empty() {
                         println!("{label} ({}):", v.len());
@@ -3319,14 +3408,19 @@ fn repeat_runs(
         // A result re-keyed under another name (a Go test once its package
         // is known) counts under that name only (round 15: tallied twice).
         // Every attempt counts (a retry's failure too).
-        let mut results: Vec<(String, String, Outcome)> = Vec::new();
+        let mut results: Vec<(String, String, Outcome, bool)> = Vec::new();
         let mut gone = std::collections::BTreeSet::new();
         for e in store.events_after(&id, 0)? {
             match e.kind {
-                prova_core::model::EventKind::TestFinished { test, outcome, .. } => {
+                prova_core::model::EventKind::TestFinished {
+                    test,
+                    outcome,
+                    passed_in_iteration,
+                    ..
+                } => {
                     // Two binaries' tests of one name are two tests.
                     let named = analysis::Names::new(store).name(&test.display(), test.place());
-                    results.push((test.unique(), named, outcome));
+                    results.push((test.unique(), named, outcome, passed_in_iteration));
                 }
                 prova_core::model::EventKind::TestSuperseded { test, .. } => {
                     gone.insert(test.unique());
@@ -3335,7 +3429,9 @@ fn repeat_runs(
             }
         }
         let mut this_run = std::collections::BTreeSet::new();
-        for (_, display, outcome) in results.into_iter().filter(|(u, _, _)| !gone.contains(u)) {
+        for (_, display, outcome, late_pass) in
+            results.into_iter().filter(|(u, _, _, _)| !gone.contains(u))
+        {
             let first = this_run.insert(display.clone());
             if first {
                 *seen_in.entry(display.clone()).or_default() += 1;
@@ -3343,6 +3439,11 @@ fn repeat_runs(
             let t = tally.entry(display.clone()).or_default();
             if outcome.is_failure() {
                 t.1 += 1;
+                // `go test -count=N`: a later iteration passed, so the test
+                // both failed and passed in this run (round 18).
+                if late_pass {
+                    t.0 += 1;
+                }
             } else if outcome == Outcome::Passed {
                 t.0 += 1;
             } else if outcome == Outcome::Skipped && first {
