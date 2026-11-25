@@ -31,7 +31,19 @@ pub struct Proposal {
     /// the tests run.
     #[serde(default)]
     pub wrapped: bool,
+    /// A nextest suite and no `slow-timeout` in the project's nextest
+    /// config: `prova adopt --write` adds one (`NEXTEST_SLOW_CONFIG`), so
+    /// nextest names a hung test while it runs. Its libtest JSON gives a
+    /// test's start only with its result (issue #88).
+    #[serde(default)]
+    pub nextest_slow_timeout: bool,
 }
+
+/// `.config/nextest.toml` written by `prova adopt --write` when the project
+/// has none: nextest prints `SLOW [> 5.000s] <test>` every 5 s a test runs,
+/// which prova reads live as a slow test. A hung test is named after 5 s,
+/// not after nextest's default 60 s.
+pub const NEXTEST_SLOW_CONFIG: &str = "# Written by `prova adopt`: nextest prints SLOW for a test that runs longer than\n# the period, every period, so a hung test is named while it runs.\n[profile.default]\nslow-timeout = { period = \"5s\" }\n";
 
 /// nextest's libtest JSON: experimental, enabled by an environment variable,
 /// with the format version pinned so a change upstream cannot silently
@@ -464,6 +476,13 @@ fn propose_with(root: &Path, nextest: Probe) -> Proposal {
             || read(root, "package.json").contains("gotestsum"),
         ..Proposal::default()
     };
+    p.nextest_slow_timeout = frameworks
+        .iter()
+        .any(|f| f.run.contains("cargo nextest run"))
+        && !read(root, ".config/nextest.toml").contains("slow-timeout");
+    if p.nextest_slow_timeout {
+        p.notes.push("nextest names a running test only when it finishes, unless it has a slow-timeout: `prova adopt --write` writes .config/nextest.toml with a 5 s period when the project has none (a hung test is then named after 5 s, not 60 s); with your own file, add `slow-timeout = { period = \"5s\" }` to its profile".into());
+    }
     match (frameworks.as_slice(), &existing) {
         ([], None) => p
             .notes
@@ -816,6 +835,35 @@ mod tests {
         assert_eq!(p.suites[0].run, "cargo test");
         assert_eq!(p.suites[1].run, "make test");
         assert!(p.notes[0].contains("quiet"), "{:?}", p.notes);
+    }
+
+    /// Issue #88: nextest's libtest JSON shows a test only with its result, so
+    /// a hung test is named by nextest's own SLOW line: adopt asks for a
+    /// short slow-timeout unless the project already sets one.
+    #[test]
+    fn a_nextest_suite_gets_a_short_slow_timeout() {
+        let d = dir("nextest-slow", &[("Cargo.toml", "[package]\nname = \"x\"")]);
+        let p = propose_with(&d, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(p.nextest_slow_timeout);
+        assert!(
+            p.notes.iter().any(|n| n.contains("slow-timeout")),
+            "{:?}",
+            p.notes
+        );
+        let own = dir(
+            "nextest-slow-own",
+            &[
+                ("Cargo.toml", "[package]\nname = \"x\""),
+                (
+                    ".config/nextest.toml",
+                    "[profile.default]\nslow-timeout = \"30s\"\n",
+                ),
+            ],
+        );
+        let p = propose_with(&own, |_| Some("cargo-nextest 0.9.70".into()));
+        assert!(!p.nextest_slow_timeout);
+        let p = propose_with(&d, |_| None);
+        assert!(!p.nextest_slow_timeout);
     }
 
     /// Round 9: nextest skips doctests; a failing doctest gave a clean pass.

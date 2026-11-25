@@ -38,6 +38,17 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 const BUSY_TICKS: u64 = 10;
 const BUSY_WINDOW: Duration = Duration::from_secs(5);
 const GRACE: Duration = Duration::from_secs(3);
+
+/// When the process tree last used CPU, if it was busy over the window:
+/// `samples` are (sample time, CPU ticks since the previous sample) for the
+/// last `BUSY_WINDOW`. Busy is `BUSY_TICKS` or more in all; the time is that
+/// of the newest sample with any ticks.
+fn busy_since(samples: &VecDeque<(Instant, u64)>) -> Option<Instant> {
+    if samples.iter().map(|(_, d)| d).sum::<u64>() < BUSY_TICKS {
+        return None;
+    }
+    samples.iter().rev().find(|(_, d)| *d > 0).map(|(t, _)| *t)
+}
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 const TAIL_LINES: usize = 40;
 
@@ -1132,8 +1143,14 @@ fn observe_child(
             {
                 recent_ticks.pop_front();
             }
-            let busy = recent_ticks.iter().map(|(_, d)| d).sum::<u64>() >= BUSY_TICKS;
-            if busy || !s.pids.is_subset(&sample.pids) {
+            // The window decides whether the tree is busy at all; the time
+            // credited is that of the latest sample that used CPU, not
+            // `now`: CPU used 4 s ago is not activity now, and crediting it
+            // as such delayed a stall by the whole window (issue #89).
+            if let Some(at) = busy_since(&recent_ticks) {
+                last_activity = last_activity.max(at);
+            }
+            if !s.pids.is_subset(&sample.pids) {
                 last_activity = now;
             }
             sample = s;
@@ -4494,5 +4511,25 @@ mod selection_tests {
             "src/a.test.js::math > ops > adds"
         ));
         assert!(in_selection("m::TestTable", "m::TestTable/x"));
+    }
+
+    /// Issue #89: busy over the window, but the CPU was used earlier in it.
+    #[test]
+    fn busy_credits_the_last_cpu_use_not_now() {
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut w: VecDeque<(Instant, u64)> = VecDeque::new();
+        w.push_back((at(500), 30));
+        w.push_back((at(1000), 0));
+        w.push_back((at(1500), 0));
+        w.push_back((at(4000), 0));
+        assert_eq!(super::busy_since(&w), Some(at(500)));
+        // A few stray ticks are no activity (an idle runtime).
+        let mut idle: VecDeque<(Instant, u64)> = VecDeque::new();
+        idle.push_back((at(500), 1));
+        idle.push_back((at(1000), 1));
+        assert_eq!(super::busy_since(&idle), None);
     }
 }
