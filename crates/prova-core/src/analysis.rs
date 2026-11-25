@@ -468,8 +468,11 @@ fn test_runs_scoped(
             row_test,
             passed_in_iteration,
         ) = row?;
+        // Only its pass says nothing of the parent: a failure there is the
+        // parent's too, as its subtest's (round 18: the two disagreed).
         if let (Some(sel), Some(this)) = (&selection, &this)
             && leaf(sel).starts_with(&format!("{this}/"))
+            && !Outcome::parse(&outcome).is_some_and(Outcome::is_failure)
         {
             continue;
         }
@@ -693,11 +696,6 @@ fn stats_scoped(
         .filter_map(|r| r.duration_ms)
         .collect();
     durations.sort_unstable();
-    // Nothing but zeros: a framework that reports no time (or one measured
-    // between two adjacent lines), not tests that took no time (round 17).
-    if durations.iter().all(|d| *d == 0) {
-        durations.clear();
-    }
     let last_passed = recent
         .iter()
         .find(|r| r.outcome == Outcome::Passed)

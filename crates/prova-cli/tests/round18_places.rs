@@ -356,6 +356,56 @@ fn r18_sizes_names_the_unknown() {
     assert!(s.contains("m::t0") && s.contains("unknown"), "{s}");
 }
 
+/// Round 18 (go NIT 2): a Go test that took 0.00s read "duration unknown";
+/// 0 ms is a duration. Why medium: stored runs.
+#[test]
+fn r18_zero_milliseconds_is_a_duration() {
+    let d = workspace("zeroms");
+    let go = format!(
+        "{BUSY} printf '%s\\n' '=== RUN   TestQuick' '--- PASS: TestQuick (0.00s)' 'PASS' 'ok  \tex/a\t0.01s'"
+    );
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    prova(&d, &["run", "--", "sh", "-c", &go]);
+    let h = text(&prova(&d, &["history", "TestQuick"]));
+    assert!(!h.contains("duration unknown"), "{h}");
+    assert!(h.contains("p50 <1ms"), "{h}");
+}
+
+/// Round 18 (go NIT 1): a parent counted fewer runs than its subtest: the
+/// run that selected only the subtest was skipped even where the parent
+/// failed. Only a pass there is no evidence about the parent.
+#[test]
+fn r18_a_subtest_selection_run_still_counts_the_parents_failure() {
+    let d = workspace("subsel");
+    std::fs::write(
+        d.join("t.sh"),
+        format!(
+            "{BUSY}\nprintf '%s\\n' '=== RUN   TestP' '=== RUN   TestP/a' '    --- FAIL: TestP/a (0.00s)' '--- FAIL: TestP (0.00s)' 'FAIL' 'FAIL\tex/a\t0.01s'\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.s]\nrun = \"sh t.sh\"\nselect = \"sh t.sh {filter}\"\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "s"]);
+    prova(&d, &["run", "s", "--select", "TestP/a"]);
+    let h = text(&prova(&d, &["history", "TestP"]));
+    assert!(h.contains("2 runs with a result"), "{h}");
+}
+
+/// Round 18 (ts-vitest): "no history yet" for a budget, though the test has
+/// runs, meant no duration history.
+#[test]
+fn r18_budget_label_says_duration_history() {
+    assert!(
+        prova_core::model::BudgetFrom::Default
+            .describe()
+            .contains("no duration history yet")
+    );
+}
+
 /// Round 18 (ts MINOR, rust MINOR): a diff of two different suites listed
 /// the tests the second did not print as "removed". Why medium: two stored
 /// runs of two suites.
