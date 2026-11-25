@@ -395,6 +395,35 @@ fn r18_a_subtest_selection_run_still_counts_the_parents_failure() {
     assert!(h.contains("2 runs with a result"), "{h}");
 }
 
+/// Round 18 (probe M4): after one `-count=2` fail-then-pass and failures
+/// that run on, `prova flaky` and `prova history` must agree.
+#[test]
+fn r18_flaky_and_history_agree_when_failures_run_on() {
+    let d = workspace("agree");
+    let go =
+        |lines: &str| format!("{BUSY} printf '%s\\n' {lines} 'FAIL' 'FAIL\tex/a\t0.01s'; exit 1");
+    let mixed = go(
+        "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- PASS: TestM (0.00s)'",
+    );
+    let fail = go(
+        "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- FAIL: TestM (0.00s)'",
+    );
+    prova(&d, &["run", "--", "sh", "-c", &mixed]);
+    for n in 0..6 {
+        prova(&d, &["run", "--", "sh", "-c", &fail]);
+        let h = text(&prova(&d, &["history", "TestM"]));
+        let f = text(&prova(&d, &["flaky"]));
+        assert_eq!(
+            h.contains("=> FLAKY"),
+            f.contains("TestM"),
+            "after {n} more failures: history says\n{h}\nflaky says\n{f}"
+        );
+        if n == 5 {
+            assert!(h.contains("failing now"), "{h}");
+        }
+    }
+}
+
 /// Round 18 (ts-vitest): "no history yet" for a budget, though the test has
 /// runs, meant no duration history.
 #[test]

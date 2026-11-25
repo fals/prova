@@ -800,7 +800,11 @@ pub fn flaky_as_of(
         // Any test that failed somewhere: its history is shared across
         // suites (ADR 0018), so a flip between suites counts (round 6).
         "SELECT DISTINCT t.id FROM tests t JOIN attempts a ON a.test_id = t.id
-         WHERE (?1 IS NULL OR t.suite = ?1) AND a.outcome IN ('failed','errored')",
+         WHERE (?1 IS NULL OR t.suite = ?1) AND a.outcome IN ('failed','errored')
+           -- the provisional name of a test whose package was learned later
+           -- is the qualified test, which history shows (round 18: flaky
+           -- listed the bare one with a thinner history)
+           AND t.id NOT IN (SELECT test_id FROM superseded)",
     )?;
     let ids: Vec<String> = stmt
         .query_map(params![suite], |r| r.get(0))?

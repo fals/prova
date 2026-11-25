@@ -433,6 +433,9 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         s.flips_on_same_code,
         if s.flaky { "  => FLAKY" } else { "" }
     );
+    if s.failing_now {
+        println!("failing now: more failures in a row than its flakiness explains");
+    }
     if let (Some(p50), Some(p95)) = (s.p50_ms, s.p95_ms) {
         let show = |ms: u64| {
             if ms == 0 {
