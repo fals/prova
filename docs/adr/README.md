@@ -3,7 +3,7 @@
 Format: one file per decision, `NNNN-title.md`, sections Status, Context, Decision, Consequences, Alternatives.
 Status values: Proposed, Accepted, Superseded by NNNN. An accepted ADR is never edited in substance; it is superseded.
 
-Records 0001 to 0027 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
+Records 0001 to 0031 are **Accepted**, each on the date in its row. Later amendments are noted in each record's status line. Evidence lives in [`../research/`](../research/).
 
 | # | Decision | Status | Deviates from README? |
 |---|---|---|---|
@@ -37,5 +37,6 @@ Records 0001 to 0027 are **Accepted**, each on the date in its row. Later amendm
 | [0028](0028-quarantine-sets-aside-only-what-it-explains.md) | A quarantine sets aside only what its tests explain (counts, crash lines, subtests, something else verified); marked everywhere; stall after 30 s with no size, running tests' time so far; amends 0004, 0027 | Accepted 2026-11-24 | no |
 | [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) | A quarantine accounts for every error line (sections, summaries, kills); `-count` repeats are not retries; 20 s stall and slow defaults; containers stopped or warned about on cancel; amends 0004, 0024, 0028 | Accepted 2026-11-24 | no |
 | [0030](0030-nothing-after-the-summary-and-named-selections.md) | A quarantine sets nothing aside after the tests' summary (real-output corpus); quarantines name a file when a name is shared; a fully named selection must run its test; container stalls and cancels; amends 0027, 0029 | Accepted 2026-11-24 | no |
+| [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) | A quarantine needs one test-runner call (make, scripts and chains are refused); a test keeps its place when names are shared; selections run what they name; container cancels and first-wait hangs; amends 0027, 0029, 0030 | Accepted 2026-11-25 | no |
 
 The deviations from the README were accepted with the records.

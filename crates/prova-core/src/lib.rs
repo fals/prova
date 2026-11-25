@@ -13,5 +13,6 @@ pub mod output;
 pub mod process;
 pub mod quarantine;
 pub mod resources;
+pub mod runner_call;
 pub mod stats;
 pub mod store;

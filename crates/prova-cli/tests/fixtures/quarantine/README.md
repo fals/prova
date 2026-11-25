@@ -16,6 +16,7 @@ is its exit code. Paths are rewritten to `/w`. Used by
 | gotestsum-standard-verbose | `gotestsum --format standard-verbose -- ./...` | 1 |
 | cargo-test | `cargo test --no-fail-fast` | 101 |
 | cargo-nextest | `cargo nextest run --no-fail-fast` | 100 |
+| cargo-nextest-libtest-json | `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --no-fail-fast --message-format libtest-json --message-format-version 0.1` (what `prova adopt` proposes for Rust) | 100 |
 | vitest-default | `npx vitest run` (Vitest 3.2.4, colours on) | 1 |
 | vitest-verbose | `npx vitest run --reporter=verbose` | 1 |
 | pytest-q | `python -m pytest -q` | 1 |
