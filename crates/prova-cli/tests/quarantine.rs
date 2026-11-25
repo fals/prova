@@ -118,7 +118,7 @@ fn text(o: &Output) -> String {
 const BUSY: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done;";
 fn full() -> String {
     format!(
-        "{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi"
+        "{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; echo 'test result: ok. 3 passed; 0 failed'; else echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 2 passed; 1 failed'; exit 1; fi"
     )
 }
 /// The same suite as `full`, with the flaky test left out of the command.
@@ -557,7 +557,21 @@ fn a_package_panic_in_go_json_is_not_a_quarantined_tests() {
         }
         l.push(ev("output", None, Some("FAIL\texample.com/q\t0.01s")));
         l.push(ev("fail", None, None));
-        format!("{BUSY} printf '%s\\n' {}; exit 1", l.join(" "))
+        // A full pass first (a pass file), so the quarantine knows every
+        // test of the suite (ADR 0034).
+        let pass = [
+            ev("run", Some("TestQueue"), None),
+            ev("pass", Some("TestQueue"), None),
+            ev("run", Some("TestQ"), None),
+            ev("pass", Some("TestQ"), None),
+            ev("output", None, Some("ok\texample.com/q\t0.01s")),
+            ev("pass", None, None),
+        ];
+        format!(
+            "{BUSY} [ -f pass ] && {{ printf '%s\\n' {}; exit 0; }}; printf '%s\\n' {}; exit 1",
+            pass.join(" "),
+            l.join(" ")
+        )
     };
     put(
         &d,
@@ -567,6 +581,10 @@ fn a_package_panic_in_go_json_is_not_a_quarantined_tests() {
             lines(true)
         ),
     );
+    std::fs::write(d.join("pass"), "").unwrap();
+    prova(&d, &["run", "plain"]);
+    prova(&d, &["run", "panic"]);
+    std::fs::remove_file(d.join("pass")).unwrap();
     prova(&d, &["run", "plain"]);
     prova(
         &d,
@@ -637,7 +655,7 @@ fn a_refused_quarantine_says_why() {
 fn a_narrow_suite_is_not_warned_about_another_modules_flaky_test() {
     let d = workspace("narrow");
     let all = format!(
-        "{BUSY} echo 'test other::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; else echo 'test calc::x ... FAILED'; exit 1; fi"
+        "{BUSY} echo 'test other::y ... ok'; if [ \"$(cat state)\" = pass ]; then echo 'test calc::x ... ok'; echo 'test result: ok. 3 passed; 0 failed'; else echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 2 passed; 1 failed'; exit 1; fi"
     );
     let narrow = format!("{BUSY} echo 'test other::y ... ok'");
     put(
@@ -752,7 +770,9 @@ fn a_quarantine_names_the_binary_when_a_name_is_shared() {
     let d = workspace("crates");
     let nx = |calc: &str, geo: &str, code: u8| {
         format!(
-            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run'; exit {code}"
+            "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run: {} passed, {} failed'; exit {code}",
+            3 - [calc, geo].iter().filter(|o| **o == "FAIL").count(),
+            [calc, geo].iter().filter(|o| **o == "FAIL").count()
         )
     };
     put(
@@ -1059,6 +1079,23 @@ fn a_quarantined_failure_is_not_set_aside_when_known_tests_did_not_report() {
         out.contains("calc::y") && out.contains("did not report") && out.contains("fail-fast"),
         "{out}"
     );
+}
+
+/// ADR 0034 §1: with no earlier full passing run and no count from the
+/// framework, prova cannot tell whether every test ran; the quarantine
+/// waits for a full pass.
+#[test]
+fn a_quarantine_needs_a_full_pass_or_a_count_to_know_every_test_ran() {
+    let d = workspace("no-baseline");
+    let script =
+        format!("{BUSY} echo 'test calc::ok ... ok'; echo 'test calc::x ... FAILED'; exit 101");
+    put(&d, format!("[suite.make]\nrun = {script:?}\n"));
+    run(&d, "make", "all");
+    prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
+    let o = run(&d, "make", "all");
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("no earlier full passing run"), "{out}");
 }
 
 /// Round 18: under make the refusal said "no other test passed" (quiet

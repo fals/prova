@@ -746,9 +746,13 @@ fn a_parent_of_failing_subtests_has_no_framing_message() {
 fn a_quarantined_go_failure_is_no_retry() {
     let d = workspace("q-noretry");
     let script = format!(
-        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+        "{WORK}[ -f pass ] && {{ printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok\texample.com/m\t0.01s'; exit 0; }}; printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
     );
     fake_go(&d, &script);
+    // A full pass first, so the quarantine knows every test (ADR 0034).
+    std::fs::write(d.join("pass"), "").unwrap();
+    prova(&d, &["run", "--", "./rc/go", "test"]);
+    std::fs::remove_file(d.join("pass")).unwrap();
     prova(&d, &["run", "--", "./rc/go", "test"]);
     prova(
         &d,
@@ -773,10 +777,14 @@ fn a_quarantined_go_failure_is_no_retry() {
 fn a_package_with_testmain_cannot_set_a_failure_aside() {
     let d = workspace("q-testmain");
     let script = format!(
-        "{WORK}printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
+        "{WORK}[ -f pass ] && {{ printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '--- PASS: TestFlaky (0.00s)' 'PASS' 'ok\texample.com/m\t0.01s'; exit 0; }}; printf '%s\\n' '=== RUN   TestOK' '--- PASS: TestOK (0.00s)' '=== RUN   TestFlaky' '    f_test.go:4: tick' '--- FAIL: TestFlaky (0.00s)' 'FAIL' 'FAIL\texample.com/m\t0.01s' 'FAIL'; exit 1"
     );
     fake_go(&d, &script);
     std::fs::write(d.join("go.mod"), "module example.com/m\n").unwrap();
+    // A full pass first, so the quarantine knows every test (ADR 0034).
+    std::fs::write(d.join("pass"), "").unwrap();
+    prova(&d, &["run", "--", "./rc/go", "test"]);
+    std::fs::remove_file(d.join("pass")).unwrap();
     prova(&d, &["run", "--", "./rc/go", "test"]);
     prova(
         &d,

@@ -59,7 +59,9 @@ const BUSY: &str = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done;";
 /// nextest's human output for two crates that both have `tests::flaky`.
 fn nextest(calc: &str, geo: &str) -> String {
     format!(
-        "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run'; exit {}",
+        "{BUSY} printf '%s\\n' '    Starting 3 tests across 2 binaries' '        PASS [   0.004s] calc tests::adds' '        {calc} [   0.004s] calc tests::flaky' '        {geo} [   0.004s] geo tests::flaky' '     Summary [   0.020s] 3 tests run: {} passed, {} failed'; exit {}",
+        3 - [calc, geo].iter().filter(|o| **o == "FAIL").count(),
+        [calc, geo].iter().filter(|o| **o == "FAIL").count(),
         if calc == "FAIL" || geo == "FAIL" {
             100
         } else {
@@ -135,8 +137,13 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
     let d = workspace("integ");
     let nx = |first: (&str, &str), second: (&str, &str), code: u8| {
         format!(
-            "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        {} [   0.004s] {} integ' '        {} [   0.004s] {} integ' '     Summary [   0.020s] 2 tests run'; exit {code}",
-            first.0, first.1, second.0, second.1
+            "{BUSY} printf '%s\\n' '    Starting 2 tests across 2 binaries' '        {} [   0.004s] {} integ' '        {} [   0.004s] {} integ' '     Summary [   0.020s] 2 tests run: {} passed, {} failed'; exit {code}",
+            first.0,
+            first.1,
+            second.0,
+            second.1,
+            [first.0, second.0].iter().filter(|o| **o == "PASS").count(),
+            [first.0, second.0].iter().filter(|o| **o == "FAIL").count()
         )
     };
     std::fs::write(

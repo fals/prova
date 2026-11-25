@@ -2886,13 +2886,15 @@ fn unreported_refusal(
                 "{head}: the framework counted {t} test(s) but prova saw {} (no earlier full passing run to compare with): the runner may have stopped early (a fail-fast option?)",
                 outcomes.len()
             )),
-            _ => None,
+            Some(_) => None,
+            // Nothing to tell a full run from one cut short (ADR 0034 §1).
+            None => Some(format!(
+                "{head}: there is no earlier full passing run of this suite and the runner printed no test count, so prova cannot tell whether every test ran; once a full run of this suite passes, its tests are the ones that must report"
+            )),
         }),
     }
 }
 
-/// Whether `line` is a compiler, vet or linter diagnostic of the project's
-/// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
 /// The warning for a command that turns Surefire's XML report off: with
 /// `mvn -q` that leaves prova nothing to read (round 18).
 fn surefire_report_off(command: &str) -> Option<String> {
@@ -2903,6 +2905,8 @@ fn surefire_report_off(command: &str) -> Option<String> {
         })
 }
 
+/// Whether `line` is a compiler, vet or linter diagnostic of the project's
+/// code: `path/file.ext:LINE:COL: message` (or `:LINE: message`).
 fn code_diagnostic(line: &str) -> bool {
     let mut parts = line.trim().splitn(4, ':');
     let (Some(path), Some(l), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
