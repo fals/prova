@@ -155,6 +155,12 @@ pub struct Recognizers {
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
     pytest_in_failures: bool,
+    /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
+    /// then `× fails`): the open ones, by indentation.
+    vitest_suites: Vec<(usize, String)>,
+    /// Test classes Surefire's class lines named in full (`-- in
+    /// calc.CalcTest`): its summary names them without the package.
+    surefire_classes: Vec<String>,
     pytest_blocks: Vec<(String, Vec<String>)>,
     /// Test files (Jest `Test Suites:`, Vitest `Test Files`) the framework's
     /// own summary says failed. Such a file can fail without any test of it
@@ -2298,12 +2304,38 @@ impl Recognizers {
             && !rest.contains(" > ")
         {
             self.vitest_file = Some(f.trim().to_owned());
+            self.vitest_suites.clear();
             return true;
         }
+        let indent = line.len() - t.len();
+        self.vitest_suites.retain(|(i, _)| *i < indent);
         if t.starts_with("❯ ") {
+            // A suite of the default reporter's tree: `suite (2)`.
+            if self.vitest_file.is_some()
+                && let Some((name, count)) = rest.rsplit_once(" (")
+                && count.trim_end().ends_with(')')
+                && count
+                    .trim_end()
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+                && !name.contains(" > ")
+            {
+                self.vitest_suites.push((indent, name.trim().to_owned()));
+                return true;
+            }
             return false;
         }
         let mut parts: Vec<String> = rest.split(" > ").map(|p| p.trim().to_owned()).collect();
+        // `× fails` under `❯ suite` and `❯ inner`: the whole name, as the
+        // verbose reporter and the stream give it (round 17: the short one
+        // split history and let two describes' `works` collide).
+        if parts.len() == 1 && !self.vitest_suites.is_empty() {
+            let mut full: Vec<String> = self.vitest_suites.iter().map(|(_, n)| n.clone()).collect();
+            full.append(&mut parts);
+            parts = full;
+        }
         let file = if parts.len() > 1 && is_file(&parts[0]) {
             Some(parts.remove(0))
         } else if parts.len() > 1 || self.vitest_file.is_some() {
@@ -2343,8 +2375,29 @@ impl Recognizers {
     ///   `[ERROR]   CalcTest.io \u{bb} IO disk full`.
     /// The result files may name only some of the classes (a fork that
     /// died, a partial report): what the console names counts too.
+    /// The class as the XML will name it: Surefire's summary prints the
+    /// simple name, the class lines before it the package too. Only a
+    /// class that one full name ends with is qualified.
+    fn surefire_class(&self, class: &str) -> String {
+        let mut found = self
+            .surefire_classes
+            .iter()
+            .filter(|c| c.as_str() == class || c.ends_with(&format!(".{class}")));
+        match (found.next(), found.next()) {
+            (Some(c), None) => c.clone(),
+            _ => class.to_owned(),
+        }
+    }
+
     fn surefire(&mut self, line: &str, out: &mut Vec<EventKind>) -> bool {
         let line = line.trim_end();
+        if let Some((_, class)) = line.rsplit_once(" -- in ")
+            && !class.is_empty()
+            && !class.contains(char::is_whitespace)
+            && !self.surefire_classes.iter().any(|c| c == class)
+        {
+            self.surefire_classes.push(class.to_owned());
+        }
         let Some(body) = line
             .strip_prefix("[ERROR] ")
             .or_else(|| line.strip_prefix("[WARNING] "))
@@ -2404,7 +2457,7 @@ impl Recognizers {
                 && class_ok(method)
             {
                 self.surefire_rerun = Some((
-                    TestKey::new(vec![class.to_owned()], method),
+                    TestKey::new(vec![self.surefire_class(class)], method),
                     section,
                     Vec::new(),
                 ));
@@ -2439,7 +2492,7 @@ impl Recognizers {
             Outcome::Failed
         };
         self.result(
-            TestKey::new(vec![class.to_owned()], method),
+            TestKey::new(vec![self.surefire_class(class)], method),
             outcome,
             None,
             Some(msg.to_owned()).filter(|m| !m.is_empty()),
@@ -4170,6 +4223,30 @@ mod tests {
         assert_eq!(message.as_deref(), Some("expected 16 to be 4"));
     }
 
+    /// Round 17: the default reporter prints suites as a tree and a test
+    /// under its own short name; the verbose reporter and the stream give
+    /// the whole name. One test, one name (real Vitest 5.1.1 output).
+    #[test]
+    fn vitest_default_reporter_tree_gives_the_whole_name() {
+        let (_, ev) = feed(
+            " ❯ src/c/y.test.js (2 tests | 1 failed) 4ms\n   ❯ suite (2)\n     ❯ inner (2)\n       × fails 3ms\n         → expected '1' to be undefined\n       ✓ works 0ms\n   ❯ other (1)\n     ✓ works 1ms\n",
+        );
+        assert_eq!(
+            finished(&ev),
+            vec![
+                (
+                    "src/c/y.test.js::suite > inner > fails".into(),
+                    Outcome::Failed
+                ),
+                (
+                    "src/c/y.test.js::suite > inner > works".into(),
+                    Outcome::Passed
+                ),
+                ("src/c/y.test.js::other > works".into(), Outcome::Passed),
+            ]
+        );
+    }
+
     #[test]
     fn same_names_in_different_test_binaries_stay_apart() {
         let (r, ev) = feed(
@@ -4225,6 +4302,26 @@ mod tests {
         );
         assert_eq!(finished(&ev).len(), 2);
         assert_eq!(r.total(), 2, "the skipped test seen by name counts");
+    }
+
+    /// Round 17 (java-maven): the live FAIL line said `CalcTest::flakyClock`
+    /// (the summary's simple class name) where the XML says
+    /// `calc.CalcTest::flakyClock`: the class lines before it carry the
+    /// package (real Surefire 3.5.2 output).
+    #[test]
+    fn surefire_summary_names_the_package_the_class_lines_gave() {
+        let (_, ev) = feed(concat!(
+            "[INFO] Running calc.CalcTest\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.040 s <<< FAILURE! -- in calc.CalcTest\n",
+            "[INFO] Results:\n",
+            "[ERROR] Failures: \n",
+            "[ERROR]   CalcTest.flakyClock:21 clock tick landed on a bad boundary\n",
+            "[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0\n",
+        ));
+        assert_eq!(
+            finished(&ev),
+            vec![("calc.CalcTest::flakyClock".into(), Outcome::Failed)]
+        );
     }
 
     #[test]
