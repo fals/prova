@@ -146,15 +146,9 @@ child process that prints its answers, and compares them in a process that
 never imports the candidate's code (a small driver per language, the frozen
 reference table, a diff).
 
-The oracle runs in a checkout whose tracked files are read-only: it must not
-rewrite them (`go generate` into the tree fails); generate into a temporary
-directory instead.
-
-When the arms are sandboxed (bubblewrap), the oracle runs without network:
-loopback only. An oracle that downloads (`npx quint`, `go mod download`)
-fails there; install its tools in `--setup` (which keeps the network) or
-pass `--allow-network` to `prova exp new`. An oracle that leaves a process
-running after it ends is a violation.
+The oracle must not rewrite tracked files (a candidate whose oracle does is
+rejected); generate into a temporary directory instead. An oracle that leaves a
+process running after it ends fails the comparison.
 
 Wrap it as one command, e.g. `make conformance`, and add a prova suite so
 `prova run conformance` works in the test loop:

@@ -1860,7 +1860,7 @@ fn satisfies_spec(
     let left = process::reap_orphans();
     if let Some(l) = left.first() {
         // Not a verdict on the code: a process outliving its oracle is the
-        // sandbox or the environment (round 15).
+        // environment (round 15).
         return Ok(Err(SpecFail::Infra(format!(
             "the oracle left process {l} running after it ended (an infrastructure problem, not a verdict on the code); it would disturb the trials: stop what starts it, or run the oracle in the foreground"
         ))));

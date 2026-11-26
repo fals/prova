@@ -57,5 +57,4 @@ the metric read from the native benchmark output.
 `docker/` holds one Dockerfile per toolchain image: the official image
 plus `COPY --from=prova:dev /prova /usr/local/bin/prova`, the deployment pattern
 prova documents for containers. Dependencies are cached in the `prova-fixture-cache` volume.
-The images have no bubblewrap, so experiments inside them run without a
-sandbox and their verdicts say the arms were not isolated.
+Experiments inside them run like anywhere else: the arms are not sandboxed.

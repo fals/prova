@@ -70,16 +70,11 @@ prova exp new <name> --hypothesis "<what you expect and why>" \
 - `--spec spec/x.qnt --oracle "make conformance"`: see section 5.
 - `--kill-after 2m` bounds one trial.
 - By default a candidate may change anything except the files that decide
-  the verdict: tests, benchmarks, build and runner files (`*_test.go`,
-  `test_*.py`, `conftest.py`, `pytest.ini`, `*.bench.ts`, `src/test/**`,
-  `Makefile`, `*.sh`, ...), runner configuration (`.npmrc`, `.yarnrc*`,
-  `.cargo/config*`, `rust-toolchain`, `rust-toolchain.toml`, `go.env`, `pip.conf`,
-  `sitecustomize.py`), compiled modules (`*.pyc`, `__pycache__/`), and
-  top-level Python files that shadow the standard library (`random.py`). A candidate that touches them is rejected
-  unmeasured. A real change to `.cargo/config*` (rustflags, `target-cpu`)
-  is such a file: allow it with `--change .cargo/config.toml`, and read the
-  diff, since a `runner` there can forge the metric.
-  `--change go.mod` (repeatable, globs) also allows those paths;
+  the verdict: tests, benchmarks, build files and expected data
+  (`*_test.go`, `test_*.py`, `conftest.py`, `pytest.ini`, `*.bench.ts`,
+  `src/test/**`, `testdata/**`, `Makefile`, `go.mod`, `*.sh`, ...). A
+  candidate that touches them is rejected unmeasured.
+  `--change go.mod` (repeatable, globs) allows those paths;
   `--change primes.go --change-only` allows nothing else. `prova exp
   protocol <name> --change ...` works until the first trial.
 - Specification files must be committed: `exp new` refuses a `--spec` file
@@ -131,14 +126,8 @@ improvement loop does not get lucky by trying many ideas.
   arm), or the two arms printed the metric a different number of times per
   trial (forged or changed output); `prova exp log <name>` prints what failed
   (`--tail 40` for the end of each log).
-- An ACCEPT of 1000x or more, against the best or against the original
-  baseline, carries a warning: check for caching across iterations or a
-  smaller workload before believing it. A `caveat:` also says when trials
-  left files in their private `/tmp` (a cache read back by the next
-  iteration measures the cache, not the code).
-- A comparison is also void when a variant's median moved 2x or more from
-  its own earlier comparisons in the experiment (something disturbed it),
-  or when the machine was much busier during one arm's trials.
+- An ACCEPT of 1000x or more carries a warning: check for caching across
+  iterations or a smaller workload before believing it.
 - Only a win over the current best changes the best: an ACCEPT `--against
   baseline` says the best stays.
 - An ACCEPT found wrong afterwards: `prova exp best <name> baseline --reason
@@ -147,21 +136,49 @@ improvement loop does not get lucky by trying many ideas.
 
 A foreground `exp run` (and `exp revalidate`) waits at most 9 minutes, or
 `--max-wait <duration>` when your tool calls are shorter; continue with
-`prova exp wait`. An oracle that cannot run (exit 126 or 127: command not found)
+`prova exp wait <name> --max-wait 1h` (any length: the 9 minutes are only
+the foreground budget). To wait for a long comparison, run that one command,
+in the background if your tool calls are short, never a shell loop around
+`exp status`. An oracle that cannot run (exit 126 or 127: command not found)
 fails the comparison with a reason saying so; it is never a REJECT, so install
 what it needs and run again. `prova exp status` leads with the current best,
 then the latest comparison; it exits 0 when a kept best stands after a later
 REJECT. The Holm family is every hypothesis tested in this experiment on its metric;
-a revalidation replicates one, adds none, and a revalidation that does not hold, or is void because of the candidate (its own median moved 2x or more while the baseline's did not, extra metric lines, leaked processes, rewritten tracked files), withdraws the accept (the best goes back). A revalidation the machine spoiled (both arms moved alike, load, a stopped arm, the oracle failing) is inconclusive: the accept stands, rerun it on a quieter machine. `caveat:` lines in the verdict flag a weak protocol,
-other experiments on the same baseline, or a protocol with no `--oracle` or `--spec`
-(correctness unchecked: only speed was judged). Sandboxed arms have no network
-unless the protocol has `--allow-network`: install dependencies in `--setup`.
+a revalidation replicates one, adds none, and a revalidation that does not
+hold, or is void (extra metric lines, leaked processes, rewritten tracked
+files), withdraws the accept (the best goes back). A comparison that
+measured nothing (setup or oracle could not run, a crash) leaves the best as
+it was. `caveat:` lines in the verdict flag a weak protocol, other
+experiments on the same baseline, or a protocol with no `--oracle` or
+`--spec` (correctness unchecked: only speed was judged).
 
-prova guards the verdict against most ways of faking a win (what it checks,
-and how arms are isolated: [references/integrity.md](references/integrity.md)).
-It cannot judge code that detects the oracle or the benchmark and behaves
-differently there, or that rewrites its own output in process: read the
-candidate's diff before reporting a win, large or not.
+prova guards the verdict against honest mistakes (what it checks:
+[references/integrity.md](references/integrity.md)). It does not sandbox the
+arms or hide the session's environment from them, and it cannot judge code
+written to fool the measurement, or to detect the oracle or the benchmark:
+read the candidate's diff before reporting a win, large or not.
+
+## Reading the evidence
+
+Everything about an experiment is readable through prova; never query
+`prova.db` or parse the text output.
+
+```sh
+prova exp status <name> --json          protocol, hash, best, latest comparison with its statistics, decisions
+prova exp status <name> --comparison <id> --json     an older comparison (ids are in the decisions)
+prova exp wait <name> --max-wait 1h     wait for the running comparison; exit 5 = still running
+prova exp log <name> [<trial>|oracle-candidate] [--comparison <id>]    kept logs of what failed
+prova exp export <name> [--comparison <id>] [--output FILE]    every trial and sample, JSON
+```
+
+`exp export` prints `prova.exp-export.v1` (schema `schemas/exp-export.v1.json`
+in the repository): the frozen protocol, each comparison with its full
+verdict, every trial (arm, warmup or scored, complete or failed, exit code,
+machine fingerprint, times) with its samples (metric, value, unit), the
+decisions and best resets. It only reads, so it is safe while a comparison
+runs, and says `"partial": true` then. Attach it to a report.
+`prova exp protocol` is not a read: it changes the protocol and is refused
+after the first trial.
 
 Before reporting: `prova exp revalidate <name>` runs the best against the
 original baseline with fresh trials. `prova exp status <name>` shows the
