@@ -57,6 +57,16 @@ fn mcp_client_can_start_and_wait_for_a_run() {
         waited["result"]["isError"], false,
         "a failing test is a result, not a tool error"
     );
+    // `history --json` is an array; structuredContent must be an object.
+    let hist = call(
+        5,
+        "tools/call",
+        json!({"name": "test_history", "arguments": {"test": "a"}}),
+    );
+    assert!(
+        hist["result"]["structuredContent"]["history"][0]["suite"].is_string(),
+        "{hist}"
+    );
     let bad = call(
         4,
         "tools/call",

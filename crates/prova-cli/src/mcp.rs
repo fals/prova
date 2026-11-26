@@ -49,7 +49,7 @@ fn tools() -> Value {
         },
         {
             "name": "test_history",
-            "description": "History and flake statistics of a test, as a JSON array with one entry per suite that ran it: failure rate, flips on the same code, passed-on-retry, durations, recent outcomes.",
+            "description": "History and flake statistics of a test, as {history: [...]}, one entry per suite that ran it: failure rate, flips on the same code, passed-on-retry, durations, recent outcomes.",
             "inputSchema": {"type": "object", "required": ["test"], "properties": {
                 "test": {"type": "string", "description": "Substring of the test's full name"}
             }}
@@ -163,10 +163,12 @@ fn call_tool(name: &str, args: &Value) -> Value {
         "isError": is_error,
         "content": [{"type": "text", "text": format!("{text}\n(exit {code})")}],
     });
-    if let Ok(v) = serde_json::from_str::<Value>(&stdout)
-        && v.is_object()
-    {
-        result["structuredContent"] = v;
+    // structuredContent must be an object: a JSON array (`history --json`)
+    // is wrapped under `history`.
+    match serde_json::from_str::<Value>(&stdout) {
+        Ok(v) if v.is_object() => result["structuredContent"] = v,
+        Ok(v) if v.is_array() => result["structuredContent"] = json!({"history": v}),
+        _ => {}
     }
     result
 }
