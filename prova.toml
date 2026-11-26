@@ -27,6 +27,9 @@ stall_after = "5m"
 # Real fixture projects in every claimed language: go and cargo on the host,
 # Python, TypeScript, Java and C# in official images (needs docker). Opt-in.
 [suite.large]
-run = "cargo test -p prova-cli --test fixtures_large -- --ignored"
+# Its own emptied temporary directory too: the fixtures copied there (Go and
+# cargo builds) once filled /tmp and failed a build with "no space left on
+# device" (run 221b3f88).
+run = "d=/tmp/prova-suite-large-$(basename \"$PWD\") && rm -rf \"$d\" && mkdir -p \"$d\" && TMPDIR=\"$d\" cargo test -p prova-cli --test fixtures_large -- --ignored"
 size = "large"
 stall_after = "3m"

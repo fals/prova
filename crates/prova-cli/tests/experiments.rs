@@ -908,7 +908,7 @@ fn trials_get_private_caches_and_no_secrets() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\ncase \"$GOCACHE\" in *prova-arm-*) ;; *) exit 3;; esac\n[ -z \"$MY_API_TOKEN\" ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\ncase \"$GOCACHE\" in */prova-scratch-*/arm-*) ;; *) exit 3;; esac\n[ -z \"$MY_API_TOKEN\" ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -1610,4 +1610,58 @@ fn files_a_trial_leaves_in_its_private_tmp_are_reported() {
             && caveats.contains("results-cache"),
         "{r}"
     );
+}
+
+/// Why medium: the scratch space is real directories that a real worker
+/// process creates under the temporary directory and must remove (a
+/// comparison once filled a 6 GB runtime directory with arm caches, failing
+/// Go builds with "no space left on device").
+#[test]
+fn a_comparison_reclaims_its_scratch_space() {
+    let d = repo("scratch", "0.01");
+    let tmp = d.with_extension("tmpdir");
+    let run = d.with_extension("rundir");
+    for x in [&tmp, &run] {
+        let _ = std::fs::remove_dir_all(x);
+        std::fs::create_dir_all(x).unwrap();
+    }
+    // A worker killed outright cannot clean up: the next worker does. One
+    // still alive (its lock held, as by a worker in another container
+    // sharing this /tmp) is left alone.
+    let scratch = |name: &str| {
+        let r = tmp.join(name);
+        std::fs::create_dir_all(r.join("arm-0")).unwrap();
+        std::fs::write(r.join("arm-0").join("cache"), "x").unwrap();
+        std::fs::File::create(r.join(".lock")).unwrap()
+    };
+    drop(scratch("prova-scratch-abandoned"));
+    let live = scratch("prova-scratch-live");
+    live.lock().unwrap();
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = Command::new(PROVA)
+        .args(["exp", "run", "e", "--json"])
+        .current_dir(&d)
+        .env("PROVA_HOME", home_of(&d))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &run)
+        .output()
+        .unwrap();
+    assert!(
+        json(&o)["comparison"]["verdict"].is_string(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(tmp.join("prova-scratch-live/arm-0/cache").exists());
+    std::fs::remove_dir_all(tmp.join("prova-scratch-live")).unwrap();
+    drop(live);
+    for x in [&tmp, &run] {
+        let kept: Vec<String> = std::fs::read_dir(x)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("prova-"))
+            .collect();
+        assert!(kept.is_empty(), "left in {}: {kept:?}", x.display());
+    }
 }
