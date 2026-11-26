@@ -164,7 +164,7 @@ fn looks_like_error(line: &str) -> bool {
 
 /// A line without terminal colour sequences (`ESC [ ... m`): kept output
 /// is read as text (round 15: `[32m- Expected[39m`).
-fn plain(line: &str) -> std::borrow::Cow<'_, str> {
+pub fn plain(line: &str) -> std::borrow::Cow<'_, str> {
     if !line.contains('\u{1b}') {
         return line.into();
     }

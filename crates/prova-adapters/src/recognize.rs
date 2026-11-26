@@ -1051,6 +1051,9 @@ impl Recognizers {
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
+        // Coloured result lines (`test x ... ok` with colour) read as text.
+        let line = prova_core::output::plain(line);
+        let line = line.as_ref();
         let mut out = Vec::new();
         // nextest: output captured under a FAIL line belongs to that test
         // (its echoed libtest summary must not count as the run's totals).
@@ -4225,6 +4228,25 @@ mod tests {
             finished(&ev),
             vec![("p::(package)".into(), Outcome::Errored)]
         );
+    }
+
+    /// A coloured run (`--color always`, a tty-forcing wrapper) printed
+    /// `\x1b[32mok\x1b[0m`: the results were not seen (false fail).
+    #[test]
+    fn colour_codes_do_not_hide_results() {
+        let (r, ev) = feed(
+            "running 2 tests\ntest tests::a ... \x1b[32mok\x1b[0m\ntest tests::b ... \x1b[31mFAILED\x1b[0m\n",
+        );
+        assert_eq!(r.level, Some(Level::Recognized));
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests::a".into(), Outcome::Passed),
+                ("tests::b".into(), Outcome::Failed)
+            ]
+        );
+        let (_, ev) = feed("=== RUN   TestA\n\x1b[32m--- PASS\x1b[0m: TestA (0.00s)\n");
+        assert_eq!(finished(&ev), vec![("TestA".into(), Outcome::Passed)]);
     }
 
     #[test]
