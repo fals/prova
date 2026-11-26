@@ -39,7 +39,7 @@
       "type": "boolean"
     },
     "protocol": {
-      "description": "The frozen protocol as stored.",
+      "description": "The frozen protocol, in the fields this version knows;\n`protocol_hash` is the hash it was frozen with.",
       "$ref": "#/$defs/Protocol"
     },
     "protocol_hash": {
