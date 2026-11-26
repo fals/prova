@@ -64,6 +64,8 @@ lean version: prova promises what it can know and says when it cannot
 - Same-named tests whose runner prints no place (quiet `cargo test`, pytest
   in a container) are shown with an unknown place.
 - Switching between `make test` and a direct suite starts a new history.
+  `prova history <name> --json` prints a JSON array with one entry per
+  suite (it printed one object).
 - Experiment verdicts carry no isolation guarantee against a hostile
   candidate; review its diff. Workloads see the session's environment and
   the network; `exp new --allow-network` is gone (there is no sandbox for it
