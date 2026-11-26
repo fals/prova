@@ -1591,3 +1591,23 @@ fn a_stall_is_counted_from_the_last_cpu_use_not_the_busy_window() {
     );
     prova(&d, &["cancel", &id]);
 }
+
+/// Release candidate: `prova output` began with "[... 1 lines elided ...]"
+/// and `--tail 200` did not show that line, nor say it was never kept.
+#[test]
+fn output_tail_says_which_lines_were_not_kept() {
+    let d = workspace("tail-not-kept");
+    let s = json(&prova(&d, &["run", "--json", "--", "sh", "-c", "seq 1 21"]));
+    let run = s["run"].as_str().unwrap();
+    let out = stdout(&prova(&d, &["output", run, "--tail", "200"]));
+    assert!(out.contains("line 21\n") || out.contains("21\n"), "{out}");
+    assert!(
+        out.contains("1 line(s) of this run's output were not kept"),
+        "{out}"
+    );
+    // A short tail stays just the lines.
+    assert_eq!(
+        stdout(&prova(&d, &["output", run, "--tail", "1"])).trim(),
+        "21"
+    );
+}

@@ -2602,6 +2602,18 @@ fn print_output(
         return Ok(exit::PASSED);
     }
     if let Some(n) = tail {
+        // Only kept lines can be shown: a passed run keeps its last lines
+        // (ADR 0016). Say so when this asks for everything kept and some
+        // lines are not (the plain output marks them "elided").
+        if let Ok(Kept::Excerpt(e)) = output::run_excerpt(store, id)
+            && n as u64 >= e.kept_lines()
+            && e.total_lines > e.kept_lines()
+        {
+            println!(
+                "note: {} line(s) of this run's output were not kept (a passed run keeps only its last lines, a failed one its first lines, error lines and last lines); `--keep-output` on the run keeps all",
+                e.total_lines - e.kept_lines()
+            );
+        }
         for l in engine::output_tail(store, id, n) {
             println!("{l}");
         }
