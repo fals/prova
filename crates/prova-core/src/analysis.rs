@@ -817,8 +817,9 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
 }
 
 /// Tests that failed somewhere, whose history is worth reading for flakiness.
-/// A history is shared across suites (ADR 0018), so a flip between suites
-/// counts (round 6). A failure of a provisional name whose package was
+/// A history is shared across suites (ADR 0018), and a test that failed in
+/// one suite may have flipped in another; a flip counts within one suite
+/// (ADR 0036). A failure of a provisional name whose package was
 /// learned later (superseded in that run) is the qualified test's, which
 /// history shows (round 18); but a test superseded in one run is still its
 /// own where it failed unsuperseded in another.

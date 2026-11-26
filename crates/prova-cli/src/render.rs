@@ -433,7 +433,7 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         }
     );
     println!(
-        "{} runs with a result, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s){}",
+        "{} runs with a result, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s) within one suite{}",
         s.runs,
         s.failures,
         s.failure_rate * 100.0,
