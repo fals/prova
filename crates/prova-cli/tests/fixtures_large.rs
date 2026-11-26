@@ -958,55 +958,25 @@ impl Drop for DevWorld {
     }
 }
 
-/// Round 18 (blocker): `prova cancel` missed the run's container behind a
-/// wrapper that quotes its command (`sh -c "$*"`), so a hung suite kept a
-/// container running after the cancel. Large: only a real docker shows the
-/// words docker keeps for the container's command.
+/// A wrapper that starts its container without `--name` (`./dev`): the
+/// cancel does not guess which container is the run's. It kills nothing and
+/// says the container may still run and how to stop it. Large: only a real
+/// docker shows the container outlives the cancelled client.
 #[test]
-#[ignore = "large: needs docker (the cancel must find a container started by a wrapper script)"]
-fn cancel_stops_the_container_a_quoting_wrapper_started() {
+#[ignore = "large: needs docker (a cancel through a wrapper must not guess its container)"]
+fn cancel_through_a_wrapper_kills_no_container_and_says_how_to_stop_it() {
     let w = DevWorld::new("wrapper-cancel");
     let run = w.start_hanging();
     w.wait_stall(&run);
     assert_eq!(w.containers().len(), 1, "the run's container is up");
     let s = w.cancel_and_wait(&run);
     assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(w.containers().len(), 1, "prova guessed a container: {s}");
+    let text = s.to_string();
     assert!(
-        w.containers().is_empty(),
-        "container left running after cancel: {:?}\n{s}",
-        w.containers()
+        text.contains("may still run") && text.contains("docker ps") && text.contains("--name"),
+        "{text}"
     );
-}
-
-/// Round 18 (blocker): with two runs of one directory live, a cancel of one
-/// killed the other's container. A cancel kills the container created for
-/// the run (the other run already has its own, created before it) and
-/// nothing else: the other run keeps running until it is cancelled too. The
-/// case where a container could be either run's (contested, kill nothing) is
-/// a race with docker's own latency and is tested in medium, with a fake client.
-#[test]
-#[ignore = "large: needs docker (two live runs of one directory, one container each)"]
-fn cancel_does_not_kill_the_container_of_another_live_run() {
-    let w = DevWorld::new("wrapper-two-runs");
-    let a = w.start_hanging();
-    w.wait_stall(&a);
-    let a_container = w.containers();
-    assert_eq!(a_container.len(), 1, "A's container");
-    let b = w.start_hanging();
-    w.wait_stall(&b);
-    assert_eq!(w.containers().len(), 2, "one container per run");
-    let s = w.cancel_and_wait(&b);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert_eq!(
-        w.containers(),
-        a_container,
-        "cancelling B must leave A's container and only it: {s}"
-    );
-    let other = json_last_line(&w.prova(&["status", &a, "--json"], &[]));
-    assert_eq!(other["status"], "running", "{other}");
-    let s = w.cancel_and_wait(&a);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert!(w.containers().is_empty(), "{:?}\n{s}", w.containers());
 }
 
 /// Round 18: the first `--until first-failure` wait through a container

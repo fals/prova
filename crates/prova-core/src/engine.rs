@@ -276,11 +276,6 @@ struct Supervisor<'a> {
     /// (once, as soon as the client is known: a wait reads it to give a
     /// stall the time it needs, ADR 0031 §4).
     container_noted: bool,
-    /// The run's working directory and start (ms since the epoch): a
-    /// container started without a name is found by what it mounts and when
-    /// it was created (round 16).
-    run_cwd: String,
-    run_started_ms: u64,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -676,63 +671,9 @@ impl Supervisor<'_> {
         }
     }
 
-    /// The other live runs of this directory that go through a container
-    /// client, and so may own a container created after they started (ADR
-    /// 0035 §3). A run that is not one (`prova run small`), or whose
-    /// supervisor is gone, cannot own any.
-    fn live_rivals(&self) -> Vec<crate::resources::Rival> {
-        let rows: Vec<(String, i64, Option<i64>, String)> = (|| {
-            let mut stmt = self
-                .store
-                .conn()
-                .prepare(
-                    "SELECT id, started_ms, supervisor_pid, spec FROM runs
-                     WHERE id <> ?1 AND cwd = ?2 AND status = 'running' AND ended_ms IS NULL
-                       AND started_ms IS NOT NULL AND supervisor_pid IS NOT NULL",
-                )
-                .ok()?;
-            let rows = stmt
-                .query_map(rusqlite::params![self.run, self.run_cwd], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })
-                .ok()?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .ok()?;
-            Some(rows)
-        })()
-        .unwrap_or_default();
-        rows.into_iter()
-            .filter(|(_, _, pid, _)| pid.is_some_and(|p| crate::process::alive(p as u32)))
-            .filter_map(|(run, ms, _, spec)| {
-                let cmdline = serde_json::from_str::<RunSpec>(&spec)
-                    .ok()
-                    .map(|s| s.command.raw())
-                    .filter(|c| crate::resources::container_client_runs(c));
-                // A wrapper's client is only known from the note it emitted.
-                let noted = || {
-                    self.store
-                        .conn()
-                        .query_row(
-                            "SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'run_note'
-                               AND json_extract(payload, '$.message') LIKE 'the tests ran through `%'
-                             LIMIT 1",
-                            rusqlite::params![run],
-                            |_| Ok(()),
-                        )
-                        .is_ok()
-                };
-                (cmdline.is_some() || noted()).then(|| crate::resources::Rival {
-                    run,
-                    started_ms: ms.max(0) as u64,
-                    cmdline,
-                })
-            })
-            .collect()
-    }
-
     /// The run is being stopped: stopping a container client does not stop
     /// its container. A container the run named (`--name`, `--cidfile`) is
-    /// killed; any other is not attributable, so the run says to check.
+    /// killed; any other is not known, so the run says so and how to stop it.
     fn stop_container(&mut self) {
         let Some(client) = self.container else {
             return;
@@ -759,58 +700,9 @@ impl Supervisor<'_> {
                     ),
                 })
             }
-            _ if crate::resources::container_client_runs(&cmd) => {
-                let rivals = self.live_rivals();
-                let found = crate::resources::containers_of_run(
-                    client,
-                    &cmd,
-                    &self.run_cwd,
-                    self.run_started_ms,
-                    &rivals,
-                );
-                match found.as_slice() {
-                    // Another live run of this directory could own it too
-                    // (ADR 0035 §3): name it, kill nothing.
-                    [one] if one.contested() => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and the one running container that could be it ({}) could also belong to run {}, still live in this directory; if it is this run's: `{client} kill {}`",
-                            one.matched, one.rivals.join(", "), one.id
-                        ),
-                    }),
-                    [one] => {
-                        let id = &one.id;
-                        let ok = crate::resources::kill_container(client, id);
-                        let message = if ok {
-                            format!("stopped the container `{id}` with `{client} kill {id}` ({} and it was created after the run started; the `{client}` command had no --name or --cidfile)", one.matched)
-                        } else {
-                            format!("could not stop the container `{id}`: run `{client} kill {id}`")
-                        };
-                        if ok {
-                            self.emit(EventKind::RunNote { message });
-                        } else {
-                            self.emit(EventKind::RunWarning { message });
-                        }
-                    }
-                    [] => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container of the client's image mounts this directory since the run started; a container daemon whose clock is behind this host's can also hide it); check `{client} ps` and stop it"
-                        ),
-                    }),
-                    many => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and {} running containers could be it; stop the right one: {}",
-                            many.len(),
-                            many.iter()
-                                .map(|c| format!("`{client} kill {}`", c.id))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    }),
-                }
-            }
             _ => self.emit(EventKind::RunWarning {
                 message: format!(
-                    "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
+                    "the tests ran through `{client}`: stopping its client does not stop its container, and prova cannot tell which one is this run's, so the container may still run; stop it yourself (`{client} ps`, then `{client} kill <container>`); give the container `--name` (or `--cidfile`) and prova stops it"
                 ),
             }),
         }
@@ -998,8 +890,6 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         container: crate::resources::container_client(&spec.command.raw()),
         container_cmd: Some(spec.command.raw()),
         container_noted: false,
-        run_cwd: row.cwd.clone(),
-        run_started_ms: started_ms,
         superseded: Default::default(),
         phase: None,
         whole: None,

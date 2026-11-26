@@ -52,10 +52,10 @@ Then:
   run in a container are out of sight: their size is "unknown (ran through
   docker)" unless the suite declares it (`size = "small"` under
   `[suite.<name>]`), and then it reads "small (declared; out of sight)".
-  `prova cancel` stops the container named by `--name` or `--cidfile`, or the
-  one running container that mounts the working directory and was created
-  after the run started; if several qualify it prints their `docker kill`
-  commands. A container is not called stalled before 60 s of idle host
+  `prova cancel` stops the container named by `--name` or `--cidfile`; for any
+  other it kills nothing and says the container may still run (`docker ps`,
+  then `docker kill`): give it `--name` so prova stops it. A container is not
+  called stalled before 60 s of idle host
   processes: prova sees only its output.
 - pytest exit 4 with no test result (a selection or option it rejected) is
   not a test failure: prova reports it as errored and exits 4. `pytest-xdist` verbose lines (`[gw0] [ 33%] FAILED ...`) are read.
