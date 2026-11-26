@@ -3674,33 +3674,6 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
         "same_code_outcomes": same_code_outcomes,
-        // The same code may have passed in another suite (round 10: "none
-        // of them passed" read as a regression).
-        "passed_elsewhere": if last_passed.is_none() {
-            store
-                .conn()
-                .query_row(
-                    "SELECT id, suite FROM runs r WHERE code = ?1 AND code <> 'nogit' AND suite <> ?2
-                       AND status = 'finished' AND outcome = 'passed'
-                       AND json_extract(spec, '$.selection') IS NULL
-                       AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
-                       -- a suite that did not run the failing test says
-                       -- nothing about it (round 18)
-                       AND (NOT EXISTS (SELECT 1 FROM attempts fa WHERE fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored'))
-                            OR EXISTS (SELECT 1 FROM attempts pa JOIN tests pt ON pt.id = pa.test_id
-                                        JOIN tests ft ON ft.display = pt.display
-                                        JOIN attempts fa ON fa.test_id = ft.id
-                                       WHERE pa.run_id = r.id AND pa.outcome = 'passed'
-                                         AND fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored')))
-                       AND r.exit_code = 0
-                     ORDER BY created_ms DESC LIMIT 1",
-                    rusqlite::params![row.code, row.suite, row.id],
-                    |r| Ok(serde_json::json!({ "run": r.get::<_, String>(0)?, "suite": r.get::<_, String>(1)? })),
-                )
-                .ok()
-        } else {
-            None
-        },
     })))
 }
 

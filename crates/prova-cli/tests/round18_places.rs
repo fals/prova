@@ -629,25 +629,6 @@ fn r18_one_earlier_pass_is_too_little_to_call_a_failure_environment_dependent() 
     assert!(out.contains("too little history"), "{out}");
 }
 
-/// Round 18 (ts-vitest): "this code passed in suite a" for a suite that did
-/// not run the failing test at all. Why medium: three stored runs.
-#[test]
-fn r18_another_suite_that_never_ran_the_test_says_nothing_about_it() {
-    let d = workspace("elsewhere");
-    let failing = format!(
-        "{BUSY} printf '%s\\n' 'test a::t1 ... FAILED' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101"
-    );
-    let other = format!(
-        "{BUSY} printf '%s\\n' 'test b::other ... ok' '' 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
-    );
-    prova(&d, &["run", "--", "sh", "-c", &failing]);
-    let o = prova(&d, &["run", "--", "sh", "-c", &other]);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let o = text(&prova(&d, &["run", "--", "sh", "-c", &failing]));
-    assert!(o.contains("FAIL a::t1"), "{o}");
-    assert!(!o.contains("this code passed in suite"), "{o}");
-}
-
 /// A name of unknown place that two known places share is none of theirs:
 /// it takes no history, no FLAKY label, and no quarantine of theirs.
 #[test]

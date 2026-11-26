@@ -545,13 +545,7 @@ fn history_line(h: &serde_json::Value) -> String {
             p["code"].as_str().unwrap_or("")
         )),
         // "None of them passed" about zero runs reads as a verdict (round 9).
-        None if n > 0 => parts.push(match h["passed_elsewhere"].as_object() {
-            Some(o) => format!(
-                "none of them passed, but this code passed in suite {} (run {})",
-                o["suite"].as_str().unwrap_or("?"),
-                o["run"].as_str().unwrap_or("?")
-            ),
-            None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+        None if n > 0 => parts.push(match h["unverified_passes"].as_u64().unwrap_or(0) {
                 0 if h["set_aside_passes"].as_array().is_some_and(|a| !a.is_empty()) => {
                     let a = h["set_aside_passes"].as_array().map(Vec::as_slice).unwrap_or_default();
                     format!(
@@ -563,7 +557,6 @@ fn history_line(h: &serde_json::Value) -> String {
                 0 => "none of them passed".into(),
                 // (round 12: "none of them passed; on this exact code: passed?")
                 u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
-            },
         }),
         None => {}
     }
