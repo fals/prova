@@ -10,7 +10,7 @@ quick-xml = "0.38"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-prova-core = { version = "0.2.0", path = "../prova-core" }
+prova-core = { version = "0.3.0", path = "../prova-core" }
 
 [lints]
 workspace = true
