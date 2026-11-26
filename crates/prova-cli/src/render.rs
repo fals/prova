@@ -339,15 +339,31 @@ pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
         println!("no test durations recorded yet");
         return;
     }
-    for r in rows {
+    let labels = suite_labels(rows.iter().map(|r| (clean(&r.test), r.suite.as_str())));
+    for (r, label) in rows.iter().zip(labels) {
         println!(
-            "p50 {:>7}  p95 {:>7}  {:3} runs  {}",
+            "p50 {:>7}  p95 {:>7}  {:3} runs  {label}",
             format_duration(std::time::Duration::from_millis(r.p50_ms)),
             format_duration(std::time::Duration::from_millis(r.p95_ms)),
             r.runs,
-            clean(&r.test)
         );
     }
+}
+
+/// Test names, each with `(suite X)` when the name is listed for several
+/// suites: one test per suite, whichever suite knows the name (ADR 0037).
+pub fn suite_labels<'a>(tests: impl Iterator<Item = (String, &'a str)>) -> Vec<String> {
+    let tests: Vec<(String, &str)> = tests.collect();
+    tests
+        .iter()
+        .map(|(name, suite)| {
+            if tests.iter().filter(|(n, _)| n == name).count() > 1 {
+                format!("{name}  (suite {suite})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
 }
 
 /// A test's name with its place when names collide: `tests::flaky (geo)`.

@@ -1254,6 +1254,55 @@ fn a_named_selection_must_run_the_test_it_names() {
     );
 }
 
+/// Review of PR 126 (C): `slowest` and `flaky` listed a name once per suite
+/// without saying which suite each row was of (`sizes` did).
+#[test]
+fn flaky_names_its_suite_when_a_name_is_flaky_in_several() {
+    let d = workspace("flakysuites");
+    suites(&d);
+    for suite in ["make", "default"] {
+        run(&d, suite, "pass");
+        run(&d, suite, "fail");
+    }
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(
+        f.contains("calc::x  (suite make)") && f.contains("calc::x  (suite default)"),
+        "{f}"
+    );
+    run(&d, "make", "pass");
+    run(&d, "default", "pass");
+    let f = text(&prova(&d, &["flaky", "--suite", "make"]));
+    assert!(f.contains("calc::x") && !f.contains("(suite"), "{f}");
+}
+
+/// Why medium: durations are only believed when the run really took that
+/// long (ADR 0022), so each script sleeps.
+#[test]
+fn slowest_names_its_suite_when_a_name_is_in_several() {
+    let d = workspace("slowsuites");
+    let go = |n: &str| {
+        format!(
+            "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 1.7; echo '--- PASS: TestSlow ({n}s)'; echo 'PASS'; printf 'ok  \\texample.com/calc\\t0.01s\\n'"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.one]\nrun = {:?}\n\n[suite.two]\nrun = {:?}\n",
+            go("1.50"),
+            go("1.60")
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "one"]);
+    prova(&d, &["run", "two"]);
+    let s = text(&prova(&d, &["slowest"]));
+    assert!(
+        s.contains("calc::TestSlow  (suite one)") && s.contains("calc::TestSlow  (suite two)"),
+        "{s}"
+    );
+}
+
 /// A test flaky in suite `make` only (it passed and failed on the same code).
 fn flaky_in_make_only(name: &str) -> PathBuf {
     let d = workspace(name);

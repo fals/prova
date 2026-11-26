@@ -3243,7 +3243,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 // Columns named, and a quarantine shown (round 16).
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
                 println!("fail%   retry-passes  code versions flipped  test");
-                for s in &list {
+                let labels = render::suite_labels(list.iter().map(|s| {
+                    (
+                        render::named(&s.display, s.place.as_deref()),
+                        s.suite.as_str(),
+                    )
+                }));
+                for (s, label) in list.iter().zip(labels) {
                     let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
                         let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
                         prova_core::quarantine::covers_key(&quarantined, &key).is_some()
@@ -3254,7 +3260,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
-                        render::named(&s.display, s.place.as_deref())
+                        label
                     );
                 }
             }
