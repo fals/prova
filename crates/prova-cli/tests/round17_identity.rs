@@ -178,9 +178,10 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
     );
 }
 
-/// Round 17 (probe B4), ADR 0037: pytest prints ids relative to the directory
-/// it ran in, not to its rootdir: the place is the directory prova started
-/// the run in, whatever rootdir below the repository the header prints. A
+/// Round 17 (probe B4), ADR 0037: `sub2/tests/test_calc.py::test_flaky` and
+/// the root's `tests/test_calc.py::test_flaky` were both
+/// `tests.test_calc::test_flaky`. A rootdir below the directory the run
+/// started in, with bare ids (`cd sub2 && pytest`), is their place. A
 /// rootdir printed through a symlink of the repository (macOS `/var` is
 /// `/private/var`) is still inside it, not an unknown place.
 #[test]
@@ -214,10 +215,17 @@ fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     prova(&d, &["run", "root"]);
     let out = text(&prova(&d, &["run", "sub"]));
     assert!(
-        out.contains("FAIL tests.test_calc::test_flaky") && !out.contains("sub2.tests"),
-        "named from the working directory: {out}"
+        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        "named from the rootdir: {out}"
     );
     assert!(!out.contains("outside the repository"), "{out}");
+    let all = text(&prova(&d, &["history", ""]));
+    assert!(
+        all.contains("sub2.tests.test_calc::test_flaky")
+            && all.contains("  tests.test_calc::test_flaky")
+            && !all.contains("second result"),
+        "{all}"
+    );
 }
 
 /// Round 17 follow-up: pytest prints ids relative to the directory it runs

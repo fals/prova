@@ -30,11 +30,12 @@ pub struct Recognizers {
     /// The repository root: names are read relative to it, whatever
     /// directory the run started in (ADR 0035 section 1).
     pub repo_root: Option<std::path::PathBuf>,
-    /// pytest's rootdir as its header printed it (`-q` prints none).
-    pytest_root: Option<std::path::PathBuf>,
-    /// Where pytest ran, as a path below the repository root (`sub2`):
-    /// put before its ids. Settled on the first id.
-    pytest_dir: std::cell::OnceCell<PytestDir>,
+    /// Where the last `rootdir:` header put pytest's ids (`-q` prints none):
+    /// each header starts its own session, so each is read on its own.
+    pytest_dir: PytestDir,
+    /// A pytest id was named, and one of them in an unknown place.
+    pytest_named: std::cell::Cell<bool>,
+    pytest_unknown: std::cell::Cell<bool>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -1204,33 +1205,47 @@ impl Recognizers {
         }
     }
 
-    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header.
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header. Its ids are
+    /// relative to the directory pytest ran in, which the output does not
+    /// print: the run's start directory, unless the rootdir lies below it
+    /// and the ids do not carry it (`cd a && pytest`), then the rootdir.
+    /// A rootdir outside the repository (a path inside a container) leaves
+    /// the place unknown, unless it holds the repository (a `prova.toml` in
+    /// a subproject).
     fn pytest_rootdir(&mut self, header: &str) {
         let dir = header.split(", ").next().unwrap_or(header).trim();
-        self.pytest_root = Some(std::path::PathBuf::from(dir));
-    }
-
-    /// Where pytest ran: its ids are relative to the directory it ran in,
-    /// the one the run started in. A `rootdir:` header outside the
-    /// repository (a path inside a container) leaves the place unknown.
-    fn pytest_dir(&self) -> &PytestDir {
-        self.pytest_dir.get_or_init(|| {
-            let outside = self.pytest_root.as_ref().is_some_and(|root| {
-                let Some(base) = self.repo_root.as_ref().or(self.cwd.as_ref()) else {
-                    return false;
-                };
-                // Either path may run through a symlink (macOS `/var` is
-                // `/private/var`): compare them resolved.
-                let canon =
-                    |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-                canon(root).strip_prefix(canon(base)).is_err()
-            });
-            if outside {
-                PytestDir::Unknown
-            } else {
-                PytestDir::Prefix(self.start_prefix())
+        let (Some(cwd), Some(repo)) = (self.cwd.as_ref(), self.repo_root.as_ref()) else {
+            self.pytest_dir = PytestDir::Start;
+            return;
+        };
+        // Either path may run through a symlink (macOS `/var` is
+        // `/private/var`): compare them resolved.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let (root, cwd, repo) = (canon(std::path::Path::new(dir)), canon(cwd), canon(repo));
+        let rel = |p: &std::path::Path, base: &std::path::Path| {
+            p.strip_prefix(base)
+                .ok()
+                .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+        };
+        self.pytest_dir = if let Some(in_repo) = rel(&root, &repo) {
+            match rel(&root, &cwd) {
+                Some(below) if !below.is_empty() => PytestDir::Below {
+                    from_start: below,
+                    from_repo: in_repo,
+                },
+                // The run's start directory, or a directory above it.
+                _ if cwd.starts_with(&root) => PytestDir::Start,
+                // Neither above nor below the start: pytest ran in it.
+                _ => PytestDir::Below {
+                    from_start: in_repo.clone(),
+                    from_repo: in_repo,
+                },
             }
-        })
+        } else if repo.starts_with(&root) {
+            PytestDir::Start
+        } else {
+            PytestDir::Unknown
+        };
     }
 
     /// Whether Vitest's root lies below the working directory.
@@ -1240,7 +1255,7 @@ impl Recognizers {
 
     /// Whether a pytest test was named in this run.
     pub fn pytest_ran(&self) -> bool {
-        self.pytest_dir.get().is_some()
+        self.pytest_named.get()
     }
 
     /// A pytest node id as prova names it, from the working directory.
@@ -1248,12 +1263,30 @@ impl Recognizers {
         if !(id.contains("::") || id.ends_with(".py")) {
             return pytest_key(id);
         }
-        match self.pytest_dir() {
-            PytestDir::Prefix(p) if !p.is_empty() => pytest_key(&format!("{p}/{id}")),
-            PytestDir::Prefix(_) => pytest_key(id),
-            // A rootdir outside the repository: the place is marked unknown
-            // and never shares a history or a quarantine.
+        self.pytest_named.set(true);
+        let from = |p: &str| {
+            if p.is_empty() {
+                pytest_key(id)
+            } else {
+                pytest_key(&format!("{p}/{id}"))
+            }
+        };
+        match &self.pytest_dir {
+            PytestDir::Start => from(&self.start_prefix()),
+            PytestDir::Below {
+                from_start,
+                from_repo,
+            } => {
+                if id.starts_with(&format!("{from_start}/")) {
+                    from(&self.start_prefix())
+                } else {
+                    from(from_repo)
+                }
+            }
+            // The place is marked unknown and never shares a history or a
+            // quarantine.
             PytestDir::Unknown => {
+                self.pytest_unknown.set(true);
                 let mut key = pytest_key(id);
                 key.file = Some(prova_core::model::UNKNOWN_PLACE.to_owned());
                 key
@@ -3347,7 +3380,7 @@ impl Recognizers {
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
-        if matches!(self.pytest_dir.get(), Some(PytestDir::Unknown)) {
+        if self.pytest_unknown.get() {
             gts.push(EventKind::RunNote {
                 message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. No quarantine covers them and they share no history.".into(),
             });
@@ -3643,9 +3676,19 @@ fn nextest_binary(id: &str) -> String {
     }
 }
 
-/// Where pytest ran, below the working directory (ADR 0031 section 2).
+/// Where pytest's ids start, read from its `rootdir:` header (ADR 0037).
+#[derive(Default)]
 enum PytestDir {
-    Prefix(String),
+    /// Ids are relative to the run's start directory.
+    #[default]
+    Start,
+    /// The rootdir lies below the start directory: ids carry `from_start`
+    /// when pytest ran at the start, else they are relative to the rootdir
+    /// (`from_repo`, below the repository root).
+    Below {
+        from_start: String,
+        from_repo: String,
+    },
     Unknown,
 }
 
@@ -4843,6 +4886,68 @@ mod tests {
                 "packages/b/src/calc.test.ts::adds".to_owned(),
                 Outcome::Failed
             )]
+        );
+    }
+
+    /// pytest's places from its printed rootdir, read from the output alone.
+    fn pytest_names(cwd: &str, repo: &str, lines: &[&str]) -> (Vec<String>, bool) {
+        let mut r = Recognizers::default();
+        r.set_places(std::path::Path::new(cwd), std::path::Path::new(repo));
+        let mut ev = Vec::new();
+        for l in lines {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        let note = ev.iter().any(|e| {
+            matches!(e, EventKind::RunNote { message } if message.contains("rootdir is outside"))
+        });
+        (finished(&ev).into_iter().map(|(n, _)| n).collect(), note)
+    }
+
+    /// Review of PR 126 (B): `cd a && pytest -v; cd b && pytest -v` from the
+    /// repository root: each rootdir is below the start directory and the ids
+    /// are bare. Two sessions in one run, two places.
+    #[test]
+    fn pytest_rootdir_below_the_start_directory_is_the_place_of_bare_ids() {
+        let (names, note) = pytest_names(
+            "/w",
+            "/w",
+            &[
+                "rootdir: /w/a",
+                "test_calc.py::t FAILED [100%]",
+                "rootdir: /w/b",
+                "test_calc.py::t FAILED [100%]",
+            ],
+        );
+        assert_eq!(names, vec!["a.test_calc::t", "b.test_calc::t"]);
+        assert!(!note);
+    }
+
+    /// `pytest -v sub/tests` from the root prints rootdir `sub` and ids that
+    /// already start with it: the place is the start directory, not `sub.sub`.
+    #[test]
+    fn pytest_ids_that_carry_the_rootdir_are_named_from_the_start_directory() {
+        let (names, _) = pytest_names(
+            "/w",
+            "/w",
+            &["rootdir: /w/sub", "sub/tests/test_calc.py::t FAILED [100%]"],
+        );
+        assert_eq!(names, vec!["sub.tests.test_calc::t"]);
+    }
+
+    /// A rootdir outside the repository is an unknown place unless it is an
+    /// ancestor of the repository root (a `prova.toml` in a subproject).
+    #[test]
+    fn pytest_rootdir_outside_the_repository_is_unknown_unless_an_ancestor() {
+        let line = "tests/test_calc.py::t FAILED [100%]";
+        let (_, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /w", line]);
+        assert!(!note, "an ancestor of the repository root");
+        let (names, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /w/proj/", line]);
+        assert!(!note && names == vec!["tests.test_calc::t"], "{names:?}");
+        let (_, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /elsewhere", line]);
+        assert!(
+            note,
+            "neither ancestor nor descendant of the repository root"
         );
     }
 
