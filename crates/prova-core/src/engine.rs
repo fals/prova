@@ -1720,6 +1720,20 @@ fn observe_child(
             "{PYTEST_NO_TEST} (exit {code}: usage error, e.g. a selection or option pytest rejected); no test failed"
         ));
     }
+    // The runner itself is missing (`python3 -m pytest` without pytest,
+    // exit 1): no test ran, and none failed (ADR 0017, like exit 127).
+    if let Some(code) = exit_code
+        && code != 0
+        && reason.is_none()
+        && status == Status::Finished
+        && observed == 0
+        && let Some(line) = sup.tail.iter().find(|l| runner_missing(l))
+    {
+        reason = Some(format!(
+            "{RUNNER_MISSING} (exit {code}: {}); no test ran",
+            line.trim().chars().take(120).collect::<String>()
+        ));
+    }
     if !contradictions.is_empty() {
         let _ = sup.lifecycle.contradict();
         reason.get_or_insert_with(|| contradictions.join("; "));
@@ -1734,7 +1748,7 @@ fn observe_child(
     if outcome == Outcome::Failed
         && reason
             .as_deref()
-            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST))
+            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST) || r.starts_with(RUNNER_MISSING))
     {
         outcome = Outcome::Errored;
     }
@@ -1924,6 +1938,19 @@ fn observe_child(
 
 /// The reason prefix of a pytest run that ran no test (exit 4 or 5).
 pub const PYTEST_NO_TEST: &str = "pytest ran no test";
+
+/// The reason prefix of a run whose test runner was not there to start.
+const RUNNER_MISSING: &str = "the test runner could not start";
+
+/// A line that says the runner itself is missing, not that a test failed.
+fn runner_missing(line: &str) -> bool {
+    let l = line.trim();
+    l.contains("No module named pytest")
+        || l.contains("No module named 'pytest'")
+        || l.ends_with("command not found")
+        || l.ends_with(": not found")
+        || l.contains("executable file not found")
+}
 
 /// A line pytest prints when it ran no test: usage errors and empty
 /// collections.

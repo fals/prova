@@ -294,3 +294,41 @@ fn the_header_of_an_argv_run_shows_its_quoted_word() {
     let o = prova(&d, &["run", "--json", "--", "echo", "cd sub && pytest"]);
     assert_eq!(json(&o)["command"], "echo 'cd sub && pytest'");
 }
+
+/// Release candidate: `python3 -m pytest` with pytest not installed (exit
+/// 1, no test ran) was "failed: no test failed". The runner itself was
+/// missing: errored, like a command that could not start.
+#[test]
+fn a_missing_test_runner_is_errored_not_failed() {
+    let d = workspace("no-runner");
+    for text in [
+        "/usr/bin/python3: No module named pytest",
+        "sh: 1: pytest: command not found",
+    ] {
+        let v = json(&prova(
+            &d,
+            &[
+                "run",
+                "--json",
+                "--",
+                "sh",
+                "-c",
+                &format!("echo '{text}' >&2; exit 1"),
+            ],
+        ));
+        assert_eq!(v["outcome"], "errored", "{v}");
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap()
+                .contains("test runner could not start"),
+            "{v}"
+        );
+    }
+    // Any other exit 1 is still a failure.
+    let v = json(&prova(
+        &d,
+        &["run", "--json", "--", "sh", "-c", "echo boom; exit 1"],
+    ));
+    assert_eq!(v["outcome"], "failed", "{v}");
+}
