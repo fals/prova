@@ -209,9 +209,24 @@ impl ResultFiles {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(cases) = junit::parse(&text) else {
-                continue;
+            let (cases, problems) = match junit::parse_checked(&text) {
+                Ok(parsed) => parsed,
+                // Not a result file we know: skipped. A broken one cannot
+                // verify the pass.
+                Err(junit::ParseError::Xml(e)) => {
+                    report.warnings.push(format!(
+                        "result file {} is incomplete: {e}; its tests were not seen",
+                        path.display()
+                    ));
+                    continue;
+                }
+                Err(_) => continue,
             };
+            for p in problems {
+                report
+                    .warnings
+                    .push(format!("result file {} is incomplete: {p}", path.display()));
+            }
             if cases.is_empty() {
                 continue;
             }

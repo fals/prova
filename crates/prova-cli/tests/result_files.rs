@@ -176,3 +176,40 @@ fn result_files_are_distilled_not_copied() {
 fn home_of(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.home", dir.display()))
 }
+
+/// A command that writes `xml` as its JUnit report and exits 0, after real
+/// work (results from a command that used no CPU are no evidence).
+fn run_writing(d: &Path, xml: &str) -> serde_json::Value {
+    std::fs::write(d.join("report.xml.src"), xml).unwrap();
+    let script = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; mkdir -p build/test-results; cp report.xml.src build/test-results/junit.xml";
+    json(&prova(d, &["run", "--json", "--", "sh", "-c", script]))
+}
+
+/// A report cut mid-attribute and a header counting more tests than the
+/// file holds are evidence missing: the exit-0 pass is unverified.
+#[test]
+fn an_incomplete_junit_report_makes_the_pass_unverified() {
+    let d = workspace("truncated");
+    let s = run_writing(
+        &d,
+        "<testsuite name=\"s\" tests=\"3\"><testcase classname=\"s\" name=\"a\"/><testcase classname=\"s\" name=\"b\"/><testcase classname=\"s\" na",
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(s["warnings"].to_string().contains("incomplete"), "{s}");
+
+    let d = workspace("truncated-first");
+    let s = run_writing(
+        &d,
+        "<testsuite name=\"s\" tests=\"3\"><testcase classname=\"s\" na",
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(s["warnings"].to_string().contains("incomplete"), "{s}");
+
+    let d = workspace("short-header");
+    let s = run_writing(
+        &d,
+        "<testsuite name=\"s\" tests=\"5\"><testcase classname=\"s\" name=\"a\"/><testcase classname=\"s\" name=\"b\"/></testsuite>",
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(s["warnings"].to_string().contains("counts 5 tests"), "{s}");
+}
