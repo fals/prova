@@ -926,10 +926,6 @@ struct TrialResult {
     primary_lines: usize,
     /// Processes the workload left running after it ended (`pid comm`).
     leaked: Vec<String>,
-    /// CPU (ms) other processes on the machine used during the trial.
-    foreign_ms: f64,
-    /// CPU (ms) the trial's own processes used.
-    own_ms: f64,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -991,7 +987,6 @@ fn run_trial(
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
     }
-    let cpu_before = process::cpu_ticks();
     let start = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1003,8 +998,6 @@ fn run_trial(
                 metrics: vec![],
                 primary_lines: 0,
                 leaked: vec![],
-                foreign_ms: 0.0,
-                own_ms: 0.0,
             });
         }
     };
@@ -1070,11 +1063,6 @@ fn run_trial(
             leaked.push(l);
         }
     }
-    let cpu_after = process::cpu_ticks();
-    let foreign_ms = (cpu_after.0.saturating_sub(cpu_before.0) as f64
-        - cpu_after.1.saturating_sub(cpu_before.1) as f64)
-        .max(0.0)
-        * 10.0;
     for l in &leaked {
         writeln!(
             log,
@@ -1096,8 +1084,6 @@ fn run_trial(
         metrics,
         primary_lines,
         leaked,
-        foreign_ms,
-        own_ms: cpu_after.1.saturating_sub(cpu_before.1) as f64 * 10.0,
     })
 }
 
@@ -1137,54 +1123,6 @@ fn remove_tree(root: &Path) -> std::result::Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
-}
-
-/// For an ACCEPT against something other than the original baseline: the
-/// over-1000x warning again, against the original baseline's earlier
-/// measurements of the same metric.
-fn against_original(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    metric: &str,
-    result: &serde_json::Value,
-) -> Result<Option<String>> {
-    let base: String = store.conn().query_row(
-        "SELECT baseline FROM comparisons WHERE id = ?1",
-        params![comparison],
-        |r| r.get(0),
-    )?;
-    if base == "baseline" {
-        return Ok(None);
-    }
-    let Some(cand) = result["primary"]["candidate_median"].as_f64() else {
-        return Ok(None);
-    };
-    let mut stmt = store.conn().prepare(
-        "SELECT s.value FROM samples s
-           JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
-           JOIN comparisons c ON c.id = s.comparison
-          WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
-            AND t.warmup = 0 AND t.state = 'complete'
-            AND ((t.arm = 'baseline' AND c.baseline = 'baseline')
-              OR (t.arm = 'candidate' AND c.candidate = 'baseline'))",
-    )?;
-    let before: Vec<f64> = stmt
-        .query_map(params![exp, comparison, metric], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if before.len() < 5 {
-        return Ok(None);
-    }
-    let orig = stats::median(&before);
-    Ok(((orig > 0.0 && cand > 0.0 && (orig / cand).max(cand / orig) >= 1000.0)
-        || (orig == 0.0) != (cand == 0.0))
-        .then(|| {
-            format!(
-                "warning: against the original baseline this is {} -> {}: a change this large is rarely real: check that the workload still does the same work (no caching across iterations, same input) and that the numbers come from the benchmark, not from the code",
-                short(orig),
-                short(cand)
-            )
-        }))
 }
 
 fn fingerprint() -> String {
@@ -1334,11 +1272,6 @@ fn work_comparison(
     // Primary-metric lines per trial, per arm; and the first leaked process.
     let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
-    // CPU other processes used per trial, per arm, with the trial's wall time.
-    let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
-    // The trial's own CPU, with its wall time: a process stopped from
-    // outside (SIGSTOP) takes wall time but no CPU (round 11).
-    let own: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     let run_one = |arm: Arm, warmup: bool| -> Result<bool> {
         counter.set(counter.get() + 1);
         let seq = counter.get();
@@ -1355,8 +1288,6 @@ fn work_comparison(
         )?;
         if !warmup {
             lines.borrow_mut()[i].push(r.primary_lines);
-            foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
-            own.borrow_mut()[i].push((r.own_ms, r.wall_ms));
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1488,7 +1419,7 @@ fn work_comparison(
                     // Nothing was measured or judged: not a verdict on
                     // either arm.
                     let reason = why.replace("<experiment>", &exp);
-                    return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+                    return end_failed(store, &exp, comparison, &cand_name, &reason);
                 }
                 SpecFail::Violated(why) => why.replace("<experiment>", &exp),
             };
@@ -1496,7 +1427,7 @@ fn work_comparison(
                 let reason = format!(
                     "baseline violates the specification: {why}; measure only implementations that satisfy it"
                 );
-                return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
             c.reject_violation();
             let result = serde_json::json!({
@@ -1522,11 +1453,10 @@ fn work_comparison(
                     || format!("{} warmup trial failed", arm.as_str()),
                     |l| format!("{l} after it ended; it would disturb the other arm's trials (`prova exp log {exp}`)"),
                 );
-                // Leftover processes are the candidate's own doing (a
-                // revalidation of the accept does not hold); a plain failure
-                // is not.
+                // Leftover processes void the comparison (a revalidation of
+                // the accept does not hold); a plain failure does not.
                 if left.is_some() {
-                    return end_offence(store, &exp, comparison, &cand_name, arm, &why);
+                    return end_void(store, &exp, comparison, &cand_name, &why);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &why);
             }
@@ -1558,7 +1488,7 @@ fn work_comparison(
                     },
                 );
                 if left.is_some() {
-                    return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
+                    return end_void(store, &exp, comparison, &cand_name, &reason);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
@@ -1567,37 +1497,9 @@ fn work_comparison(
                     "trial {} changed tracked files in the {where_}: a workload must not rewrite code or data; the comparison is void",
                     counter.get()
                 );
-                return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
-            }
-            c.trial(&fingerprint_of(store, comparison, counter.get())?);
-        }
-        // Load from outside the trials must not favour one arm: interleaving
-        // spreads background noise evenly, so a large difference is
-        // something aimed at one arm (round 9: systemd-run burner).
-        if let Some(reason) = {
-            let f = foreign.borrow();
-            let o = own.borrow();
-            load_imbalance(&f[0], &f[1]).or_else(|| stopped_arm(&o[0], &o[1]))
-        } {
-            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
-        }
-        // Each arm against its own earlier measurements: a variant whose
-        // median moved 2x or more since its earlier comparisons was disturbed
-        // (round 10: the other arm was slowed through Python's user site
-        // and a planted .pyc), or its workload changed.
-        if let Some(reason) = drifted(
-            store,
-            &exp,
-            comparison,
-            &p.metric,
-            [&arms[0].0, &arms[1].0],
-            [&base_name_for(store, comparison)?, &cand_name],
-        )? {
-            let (reason, own) = reason;
-            if own {
                 return end_void(store, &exp, comparison, &cand_name, &reason);
             }
-            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+            c.trial(&fingerprint_of(store, comparison, counter.get())?);
         }
         // Each arm's workload must report the metric as often per trial as
         // the other: extra lines are forged output (a candidate's code can
@@ -1668,22 +1570,6 @@ fn work_comparison(
                     p.metric
                 ));
             }
-        }
-        // A win this large against the original baseline is as suspect as
-        // one against the best (ADR 0035 section 4: a cache in /tmp took a
-        // candidate from 152x over the best to 4100x over the baseline).
-        if verdict == Verdict::Accept
-            && let Some(w) = against_original(store, &exp, comparison, &p.metric, &result)?
-        {
-            let reason = result["reason"].as_str().unwrap_or("").to_owned();
-            if !reason.contains("a change this large is rarely real") {
-                result["reason"] = serde_json::json!(format!("{reason}; {w}"));
-            }
-        }
-        if !process::MACHINE_COUNTERS {
-            caveats.push(
-                "this OS gives prova no CPU counters for the machine or for finished children, and no subreaper: load from other processes, an arm stopped from outside, and processes that left a trial's or oracle's process group were not checked".into(),
-            );
         }
         if !caveats.is_empty() {
             result["caveats"] = serde_json::json!(caveats);
@@ -1842,57 +1728,6 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Whether other processes loaded the machine much more during one arm's
-/// trials than the other's: (CPU ms used by others, trial wall ms) per
-/// trial. Interleaving spreads background noise evenly; a large difference
-/// is aimed at one arm (round 9: a burner started through systemd-run).
-pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
-    fn median(mut x: Vec<f64>) -> f64 {
-        x.sort_by(f64::total_cmp);
-        x.get(x.len() / 2).copied().unwrap_or(0.0)
-    }
-    // Cores busy with other work: a longer trial collects more of the same
-    // background load, so compare rates.
-    let rate = |v: &[(f64, f64)]| {
-        median(
-            v.iter()
-                .filter(|(_, w)| *w > 0.0)
-                .map(|(ms, w)| ms / w)
-                .collect(),
-        )
-    };
-    let (b, c) = (rate(base), rate(cand));
-    // CPU time is counted in 10 ms ticks: under a second per trial the rate
-    // is noise, so only longer trials are judged.
-    let wall = median(base.iter().chain(cand).map(|(_, w)| *w).collect());
-    if wall < 1000.0 || (b - c).abs() <= 0.5f64.max(0.5 * b.max(c)) {
-        return None;
-    }
-    // Aimed load is on every trial of one arm; a busy machine's load comes
-    // and goes (round 10: parallel docker builds voided an honest run). Only
-    // a complete separation counts: every trial of the busier arm saw more
-    // than every trial of the other (under 1% by chance with 5 + 5).
-    let rates = |v: &[(f64, f64)]| -> Vec<f64> {
-        v.iter()
-            .filter(|(_, w)| *w > 0.0)
-            .map(|(ms, w)| ms / w)
-            .collect()
-    };
-    let (rb, rc) = (rates(base), rates(cand));
-    let (hi, lo) = if b > c { (&rb, &rc) } else { (&rc, &rb) };
-    let separated = hi.iter().cloned().fold(f64::INFINITY, f64::min)
-        > lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if !separated {
-        return None;
-    }
-    let busier = if b > c { "baseline" } else { "candidate" };
-    Some(format!(
-        "the machine was busier during the {busier}'s trials: other processes kept {:.1} cores busy there, {:.1} during the other arm's; something outside the trials disturbed one arm, so the comparison is void (rerun on a quiet machine)",
-        b.max(c),
-        b.min(c)
-    ))
-}
-
 /// A command for one arm with its own caches: nothing one arm compiles is
 /// read by the other. The workload must not reach prova's own store (round
 /// 9) or Python's user site.
@@ -1966,132 +1801,6 @@ fn remove_abandoned_scratch() {
             let _ = remove_tree(&e.path());
         }
     }
-}
-
-fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
-    Ok(store.conn().query_row(
-        "SELECT baseline FROM comparisons WHERE id = ?1",
-        params![comparison],
-        |r| r.get(0),
-    )?)
-}
-
-/// A variant whose median in this comparison is 2x away from its median in
-/// earlier decided comparisons of the experiment: the reason, and whether
-/// the drift is the candidate's own (see `classify_drift`).
-fn drifted(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    metric: &str,
-    arms: [&Arm; 2],
-    names: [&str; 2],
-) -> Result<Option<(String, bool)>> {
-    let (now_b, now_c) = samples(store, comparison, metric)?;
-    let mut medians: [Option<(f64, f64)>; 2] = [None, None];
-    for (i, now) in [now_b, now_c].into_iter().enumerate() {
-        let mut stmt = store.conn().prepare(
-            "SELECT s.value FROM samples s
-               JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
-               JOIN comparisons c ON c.id = s.comparison
-              WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
-                AND t.warmup = 0 AND t.state = 'complete'
-                AND ((t.arm = 'baseline' AND c.baseline = ?4) OR (t.arm = 'candidate' AND c.candidate = ?4))",
-        )?;
-        let before: Vec<f64> = stmt
-            .query_map(params![exp, comparison, metric, names[i]], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        if before.len() < 5 || now.is_empty() {
-            continue;
-        }
-        let (m0, m1) = (stats::median(&before), stats::median(&now));
-        if m0 > 0.0 && m1 > 0.0 {
-            medians[i] = Some((m0, m1));
-        }
-    }
-    Ok(classify_drift(medians[0], medians[1]).map(|d| {
-        let (m0, m1) = medians[d.arm].unwrap_or((1.0, 1.0));
-        let tail = if d.own {
-            "something disturbed it or its workload changed, so the comparison is void"
-        } else {
-            "the other arm moved alike (a loaded or throttled machine?), so the comparison says nothing about the candidate"
-        };
-        (
-            format!(
-                "the {} ({}) measured {} now but {} in this experiment's earlier comparisons ({:.1}x): {tail}",
-                arms[d.arm].as_str(),
-                names[d.arm],
-                short(m1),
-                short(m0),
-                (m1 / m0).max(m0 / m1)
-            ),
-            d.own,
-        )
-    }))
-}
-
-struct Drift {
-    /// The arm that moved most: 0 baseline, 1 candidate.
-    arm: usize,
-    /// The drift is the candidate's own: its median moved 2x or more AND
-    /// its ratio to the baseline moved 2x or more. Both arms moving alike
-    /// (a throttled host, a cold start) is the machine, not the candidate.
-    own: bool,
-}
-
-/// Each argument: (median in earlier comparisons, median now) of one arm.
-fn classify_drift(base: Option<(f64, f64)>, cand: Option<(f64, f64)>) -> Option<Drift> {
-    let factor = |a: Option<(f64, f64)>| a.map_or(1.0, |(m0, m1)| (m1 / m0).max(m0 / m1));
-    let (fb, fc) = (factor(base), factor(cand));
-    if fb < 2.0 && fc < 2.0 {
-        return None;
-    }
-    let ratio_moved = match (base, cand) {
-        (Some((b0, b1)), Some((c0, c1))) => {
-            let (r0, r1) = (c0 / b0, c1 / b1);
-            (r1 / r0).max(r0 / r1) >= 2.0
-        }
-        _ => true,
-    };
-    Some(Drift {
-        arm: usize::from(fc > fb),
-        own: fc >= 2.0 && ratio_moved,
-    })
-}
-
-/// Whether one arm's trials sat stopped (SIGSTOP from outside, or starved)
-/// while the other's ran: (own CPU ms, wall ms) per trial. A CPU-bound
-/// workload keeps about one core busy; one arm far below it, every trial,
-/// while the other is near it, was held back (round 11).
-pub fn stopped_arm(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
-    let util = |v: &[(f64, f64)]| -> Vec<f64> {
-        v.iter()
-            .filter(|(_, w)| *w >= 1000.0)
-            .map(|(ms, w)| ms / w)
-            .collect()
-    };
-    let (ub, uc) = (util(base), util(cand));
-    if ub.len() < 3 || uc.len() < 3 {
-        return None;
-    }
-    let max = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
-    let (low, high, arm) = if max(&ub) < min(&uc) {
-        (&ub, &uc, "baseline")
-    } else if max(&uc) < min(&ub) {
-        (&uc, &ub, "candidate")
-    } else {
-        return None;
-    };
-    // Held back: every trial of one arm under 60% of a core while every
-    // trial of the other kept at least 90% of one busy.
-    (max(low) < 0.6 && min(high) >= 0.9).then(|| {
-        format!(
-            "the {arm}'s trials ran only {:.0}% of their time while the other arm's ran {:.0}% or more: something stopped or starved that arm (SIGSTOP from outside?), so the comparison is void",
-            max(low) * 100.0,
-            min(high) * 100.0
-        )
-    })
 }
 
 /// `git status` of tracked files in a checkout (empty outside git).
@@ -2454,60 +2163,11 @@ fn end_failed(
     Ok(())
 }
 
-/// A comparison that says nothing about the candidate (the machine, an arm
-/// held back, the oracle's own infrastructure, a baseline that violates the
-/// spec). It ends failed; when it is a revalidation of the current best the
-/// accept STANDS and the reason says the revalidation was inconclusive
-/// (ADR 0035 section 4: noise never withdraws a real accept).
-fn end_inconclusive(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    candidate: &str,
-    reason: &str,
-) -> Result<()> {
-    let best: Option<String> = store
-        .conn()
-        .query_row(
-            "SELECT best FROM experiments WHERE name = ?1",
-            params![exp],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if replicated(store, exp, comparison, i64::MAX)?.is_some() && best.as_deref() == Some(candidate)
-    {
-        let reason = format!(
-            "{reason}; the revalidation is inconclusive, not about {candidate} itself: its accept stands (rerun `prova exp revalidate {exp}` on a quieter machine)"
-        );
-        return end_failed(store, exp, comparison, candidate, &reason);
-    }
-    end_failed(store, exp, comparison, candidate, reason)
-}
-
-/// An offence seen in a trial (tampering, a leaked process): the candidate's
-/// own doing only when its arm's trial committed it. The baseline's is not
-/// about the candidate: inconclusive, the accept stands.
-fn end_offence(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    candidate: &str,
-    arm: Arm,
-    reason: &str,
-) -> Result<()> {
-    if arm == Arm::Candidate {
-        end_void(store, exp, comparison, candidate, reason)
-    } else {
-        end_inconclusive(store, exp, comparison, candidate, reason)
-    }
-}
-
-/// A comparison that is void because of the candidate's own doing (it
-/// tampered with tracked files, left processes behind, forged output, or its
-/// own median moved). When it is a revalidation of the current best, the
-/// accept it should have replicated is withdrawn as a failed replication is
-/// (ADR 0032, 0035 section 4): a result that could not be reproduced does
-/// not stay accepted.
+/// A comparison that is void (trials tampered with tracked files, left
+/// processes behind, or the workload reported the metric a different number
+/// of times). When it is a revalidation of the current best, the accept it
+/// should have replicated is withdrawn as a failed replication is (ADR
+/// 0032): a result that could not be reproduced does not stay accepted.
 fn end_void(
     store: &Store,
     exp: &str,
@@ -2754,10 +2414,6 @@ pub struct Report {
     /// How to read the kept logs of the latest comparison, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
-    /// Stored verdicts or a best that the immutable samples do not support
-    /// (an edited database): each is a reason not to trust the record.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub integrity: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2873,7 +2529,6 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
                     .is_some_and(|r| r["specification"] == "violated")
         })
         .map(|_| format!("prova exp log {exp}"));
-    let integrity = integrity(store, &e)?;
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
@@ -2883,63 +2538,7 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         comparison,
         decisions,
         logs,
-        integrity,
     })
-}
-
-/// Re-derives every stored ACCEPT from the immutable samples, with the Holm
-/// family as it stood when it was decided, and checks the best against the
-/// record (round 11: editing prova.db turned a REJECT into an ACCEPT). The
-/// same user can edit the file; this makes it show.
-fn integrity(store: &Store, e: &Experiment) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut stmt = store.conn().prepare(
-        "SELECT id, candidate, COALESCE(ended_ms, 0) FROM comparisons
-          WHERE experiment = ?1 AND status = 'decided' AND verdict = 'accept'",
-    )?;
-    let accepted: Vec<(String, String, i64)> = stmt
-        .query_map(params![e.name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let p = &e.protocol;
-    for (id, cand, ended) in &accepted {
-        let (base, c) = samples(store, id, &p.metric)?;
-        if base.len() < p.min_trials as usize || c.len() < p.min_trials as usize {
-            out.push(format!(
-                "comparison {id} is recorded as ACCEPT but has no measurements to support it"
-            ));
-            continue;
-        }
-        let replicates = replicated(store, &e.name, id, *ended)?;
-        let mut ps = family(store, &e.name, id, *ended, replicates.as_deref())?;
-        let raw = stats::mann_whitney(&base, &c).p;
-        ps.push(raw);
-        let adjusted = *stats::holm(&ps).last().unwrap_or(&raw);
-        let primary = measure(&p.metric, p.better, &base, &c, p.alpha, Some(adjusted));
-        let (v, _) = judge(&primary, &[], p.min_effect, p.alpha);
-        if v != Verdict::Accept {
-            out.push(format!(
-                "comparison {id} ({cand}) is recorded as ACCEPT, but its own samples give {}: the record was changed",
-                v.as_str()
-            ));
-        }
-    }
-    let best_ok = e.best == "baseline"
-        || accepted.iter().any(|(_, c, _)| *c == e.best)
-        || store
-            .conn()
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM best_resets WHERE experiment = ?1 AND to_best = ?2)",
-                params![e.name, e.best],
-                |r| r.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-    if !best_ok {
-        out.push(format!(
-            "the best is {}, but no ACCEPT or recorded reset made it so: the record was changed",
-            e.best
-        ));
-    }
-    Ok(out)
 }
 
 /// Blocks at most `max_wait` until the latest comparison ends.
@@ -2956,52 +2555,6 @@ pub fn wait(store: &Store, exp: &str, max_wait: Duration) -> Result<Report> {
 }
 
 use std::os::unix::process::CommandExt;
-
-#[cfg(test)]
-mod stopped_tests {
-    #[test]
-    fn an_arm_held_back_while_the_other_ran_is_caught() {
-        let ran = vec![(1950.0, 2000.0); 5];
-        let held = vec![(1000.0, 2000.0); 5];
-        assert!(super::stopped_arm(&held, &ran).is_some());
-        // A parallel speedup: more than a core is fine, the baseline ran.
-        let parallel = vec![(7000.0, 2000.0); 5];
-        assert!(super::stopped_arm(&ran, &parallel).is_none());
-        // Both mostly waiting (sleep-bound workloads): nothing to say.
-        assert!(super::stopped_arm(&[(100.0, 2000.0); 5], &[(200.0, 2000.0); 5]).is_none());
-    }
-}
-
-#[cfg(test)]
-mod load_tests {
-    #[test]
-    fn a_burner_on_one_arm_voids_but_even_noise_does_not() {
-        let quiet = vec![(100.0, 2000.0); 5];
-        let burned = vec![(8000.0, 2000.0); 5];
-        assert!(super::load_imbalance(&quiet, &burned).is_some());
-        let busy = vec![(6000.0, 2000.0); 5];
-        let busy2 = vec![(5000.0, 1800.0); 5];
-        assert!(super::load_imbalance(&busy, &busy2).is_none());
-        // Load that comes and goes, even if one arm's median is higher.
-        let a = [
-            (100.0, 2000.0),
-            (9000.0, 2000.0),
-            (8000.0, 2000.0),
-            (200.0, 2000.0),
-            (7000.0, 2000.0),
-        ];
-        let b = [
-            (150.0, 2000.0),
-            (300.0, 2000.0),
-            (8500.0, 2000.0),
-            (100.0, 2000.0),
-            (250.0, 2000.0),
-        ];
-        assert!(super::load_imbalance(&a, &b).is_none());
-        // Short trials: too coarse to judge.
-        assert!(super::load_imbalance(&[(10.0, 20.0); 5], &[(60.0, 20.0); 5]).is_none());
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3293,46 +2846,6 @@ mod revalidation_tests {
     /// ADR 0035 section 4: a cache in /tmp took a candidate from 152x over
     /// the best to 4100x over the original baseline; the warning looks at both.
     #[test]
-    fn the_implausible_win_warning_also_compares_with_the_original_baseline() {
-        let (s, _d) = fresh();
-        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
-        let c = s.conn();
-        c.execute(
-            "INSERT INTO variants (experiment, name, kind, code, params, created_ms)
-             VALUES ('e', 'c2', 'workdir', 'x', '{}', 1)",
-            [],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO comparisons (id, experiment, baseline, candidate, status, created_ms)
-             VALUES ('c-2', 'e', 'c1', 'c2', 'running', 200)",
-            [],
-        )
-        .unwrap();
-        // 3 now against the best (1x), but the baseline measured about 12.
-        let near = serde_json::json!({ "primary": { "candidate_median": 3.0 } });
-        assert!(
-            against_original(&s, "e", "c-2", "t", &near)
-                .unwrap()
-                .is_none()
-        );
-        let huge = serde_json::json!({ "primary": { "candidate_median": 0.001 } });
-        let w = against_original(&s, "e", "c-2", "t", &huge)
-            .unwrap()
-            .unwrap();
-        assert!(
-            w.starts_with("warning: against the original baseline"),
-            "{w}"
-        );
-        // Against the baseline itself the comparison's own warning applies.
-        assert!(
-            against_original(&s, "e", "c-1", "t", &huge)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
     fn a_spec_frozen_file_is_not_offered_for_change() {
         let mut p = protocol();
         p.specs = vec![SpecFile {
@@ -3352,24 +2865,6 @@ mod revalidation_tests {
         );
     }
 
-    /// A revalidation that cannot say anything about the candidate (the
-    /// machine, an arm that was stopped) keeps the accept and says so.
-    #[test]
-    fn an_inconclusive_revalidation_keeps_the_accept() {
-        let (s, _d) = fresh();
-        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
-        comparison(&s, "rv", None, SAME);
-        end_inconclusive(&s, "e", "rv", "c1", "the load differed between the arms").unwrap();
-        assert_eq!(get(&s, "e").unwrap().best, "c1");
-        let reason: String = s
-            .conn()
-            .query_row("SELECT result FROM comparisons WHERE id = 'rv'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(reason.contains("inconclusive"), "{reason}");
-    }
-
     /// The candidate's own misbehaviour in a revalidation withdraws it.
     #[test]
     fn a_void_revalidation_of_the_candidates_own_making_withdraws_the_accept() {
@@ -3378,19 +2873,6 @@ mod revalidation_tests {
         comparison(&s, "rv", None, SAME);
         end_void(&s, "e", "rv", "c1", "it left a process behind").unwrap();
         assert_eq!(get(&s, "e").unwrap().best, "baseline");
-    }
-
-    /// Both arms moved alike: the machine, not the candidate.
-    #[test]
-    fn a_drift_of_both_arms_is_not_the_candidates_own() {
-        // (earlier median, median now) per arm.
-        let both = classify_drift(Some((10.0, 30.0)), Some((4.0, 12.0))).unwrap();
-        assert!(!both.own);
-        let cand = classify_drift(Some((10.0, 10.5)), Some((4.0, 10.0))).unwrap();
-        assert!(cand.own);
-        let base = classify_drift(Some((10.0, 25.0)), Some((4.0, 4.1))).unwrap();
-        assert!(!base.own);
-        assert!(classify_drift(Some((10.0, 12.0)), Some((4.0, 5.0))).is_none());
     }
 
     /// A worker's scratch root is removed even when the workload left

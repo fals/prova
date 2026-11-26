@@ -1109,9 +1109,6 @@ pub fn experiment_with_next(
             r.experiment
         );
     }
-    for w in &r.integrity {
-        println!("warning: {}", clean(w));
-    }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).
         let skip = r.decisions.len().saturating_sub(5);

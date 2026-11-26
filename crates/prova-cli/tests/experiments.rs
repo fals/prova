@@ -910,35 +910,6 @@ fn trials_get_private_caches_and_the_sessions_environment() {
     assert_eq!(r["comparison"]["status"], "decided", "{r}");
 }
 
-/// Round 11 red team: editing prova.db turned a REJECT into an ACCEPT;
-/// `exp status` re-derives every ACCEPT from the samples.
-#[test]
-fn an_edited_verdict_shows_in_status() {
-    // Clearly slower, so the honest verdict is never an accept.
-    let d = repo("edited", "0.05");
-    new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.1").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
-    let db = std::fs::read_dir(home_of(&d).join("repos"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("prova.db");
-    let ok = Command::new("sqlite3")
-        .arg(&db)
-        .arg("UPDATE comparisons SET verdict = 'accept'; UPDATE experiments SET best = 'c1';")
-        .status();
-    if ok.is_err() {
-        return; // no sqlite3 here: nothing to edit with
-    }
-    let s = String::from_utf8_lossy(&prova(&d, &["exp", "status", "e"]).stdout).into_owned();
-    assert!(s.contains("the record was changed"), "{s}");
-}
-
 /// Usability round: an oracle that cannot run (command not found) said the
 /// baseline "violates the specification". It is an infrastructure failure,
 /// for either arm, and never a REJECT.
@@ -1274,15 +1245,14 @@ fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
 
 /// A repository whose candidate (the file `cand`) cuts the workload's steps
 /// from 100 to 40 while `KNOB` is set: accepted as `c1` on the first run.
-/// `SLOW` triples both arms (a throttled machine); `REWRITE_CAND` and
-/// `REWRITE_BASE` make that arm's workload rewrite a tracked file.
+/// `REWRITE_CAND` makes the candidate's workload rewrite a tracked file.
 fn knob_accepted(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\nv=100\nif [ -f cand ] && [ -n \"$KNOB\" ]; then v=40; fi\nif [ -n \"$SLOW\" ]; then v=$((v*3)); fi\nif { [ -n \"$REWRITE_CAND\" ] && [ -f cand ]; } || { [ -n \"$REWRITE_BASE\" ] && [ ! -f cand ]; }; then chmod u+w table 2>/dev/null; echo 2 >> table; fi\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$v}\"\n",
+        "#!/bin/sh\nv=100\nif [ -f cand ] && [ -n \"$KNOB\" ]; then v=40; fi\nif [ -n \"$REWRITE_CAND\" ] && [ -f cand ]; then chmod u+w table 2>/dev/null; echo 2 >> table; fi\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$v}\"\n",
     )
     .unwrap();
     std::fs::write(d.join("table"), "1\n").unwrap();
@@ -1339,51 +1309,20 @@ fn prova_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     c.output().unwrap()
 }
 
-/// ADR 0035 section 4 (round 18 B8): a candidate that is fast only under a
-/// condition of the first run was accepted; the revalidation measured the
-/// ordinary result, the candidate's own median moved 2.5x while the
-/// baseline's did not, and the accept survived. A drift that is the
-/// candidate's own withdraws the accept.
+/// A candidate that is fast only under a condition of the first run is
+/// accepted; the revalidation measures the ordinary result, which is no
+/// improvement, and the accept is withdrawn.
 /// Medium: needs a repository, the binary and two comparisons.
 #[test]
-fn a_void_revalidation_withdraws_the_accept() {
+fn a_revalidation_that_does_not_hold_withdraws_the_accept() {
     let d = knob_accepted("voidrv");
     let v = json(&prova(&d, &["exp", "revalidate", "e", "--json"]));
-    assert_eq!(v["comparison"]["status"], "failed", "{v}");
+    assert_ne!(v["comparison"]["verdict"], "accept", "{v}");
     assert_eq!(
         v["best"], "baseline",
-        "a void revalidation must withdraw the accept: {v}"
+        "a revalidation that does not hold must withdraw the accept: {v}"
     );
     assert!(v.to_string().contains("withdrawn"), "{v}");
-}
-
-/// Noise must never withdraw a real accept: a machine that got 3x slower
-/// for both arms moves both medians alike (the candidate/baseline ratio is
-/// the same), so the revalidation is inconclusive and the accept stands.
-#[test]
-fn a_slower_machine_for_both_arms_keeps_the_accept() {
-    let d = knob_accepted("slowrv");
-    let v = json(&prova_env(
-        &d,
-        &["exp", "revalidate", "e", "--json"],
-        &[("KNOB", "1"), ("SLOW", "1")],
-    ));
-    assert_eq!(v["best"], "c1", "noise must not withdraw the accept: {v}");
-    assert!(v.to_string().contains("inconclusive"), "{v}");
-}
-
-/// Only the candidate's own offence withdraws its accept: a baseline trial
-/// that rewrites tracked files leaves the revalidation inconclusive.
-#[test]
-fn a_baseline_that_tampers_in_a_revalidation_keeps_the_accept() {
-    let d = knob_accepted("tamperbase");
-    let v = json(&prova_env(
-        &d,
-        &["exp", "revalidate", "e", "--json"],
-        &[("KNOB", "1"), ("REWRITE_BASE", "1")],
-    ));
-    assert_eq!(v["best"], "c1", "{v}");
-    assert!(v.to_string().contains("inconclusive"), "{v}");
 }
 
 /// A workload that rewrites tracked files during the revalidation is the

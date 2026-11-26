@@ -134,11 +134,6 @@ pub fn sample_group(pgid: u32) -> GroupSample {
     .unwrap_or_default()
 }
 
-/// Whether this OS gives machine-wide CPU counters and orphan reaping:
-/// without them, experiments cannot see load from other processes, arms
-/// stopped from outside, or processes a trial left behind.
-pub const MACHINE_COUNTERS: bool = cfg!(target_os = "linux");
-
 /// Members of group `pgid` in `ps -o pid=,pgid=,stat=,time=` output; CPU
 /// time (`[[H:]M:]S.cc`) in ticks of 10 ms, as on Linux. Zombies are out.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -400,39 +395,6 @@ fn children_of_me() -> Vec<(u32, String, String)> {
 #[cfg(not(target_os = "linux"))]
 pub fn reap_orphans() -> Vec<String> {
     Vec::new()
-}
-
-/// CPU ticks the whole machine spent busy, and those this process's
-/// waited-for children used: their difference over a trial is what other
-/// processes used meanwhile (round 9: load started outside the trial's tree,
-/// e.g. through systemd-run, slowed only the other arm).
-#[cfg(target_os = "linux")]
-pub fn cpu_ticks() -> (u64, u64) {
-    let busy = std::fs::read_to_string("/proc/stat")
-        .ok()
-        .and_then(|s| {
-            let l = s.lines().next()?.to_owned();
-            let f: Vec<u64> = l
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            // user nice system idle iowait irq softirq steal
-            Some(
-                f.iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != 3 && *i != 4)
-                    .map(|(_, v)| v)
-                    .sum(),
-            )
-        })
-        .unwrap_or(0);
-    (busy, children_ticks().unwrap_or(0))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn cpu_ticks() -> (u64, u64) {
-    (0, 0)
 }
 
 /// CPU ticks of this process's waited-for children, when the OS says.
