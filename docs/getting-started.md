@@ -78,13 +78,7 @@ see processes only).
 Some checks need counters macOS does not give: a pass whose command used
 no CPU at all is not flagged there; a quiet loop of commands that each
 last milliseconds can look idle and be reported as a stall; sizes have no
-process start times there; and experiments run without a sandbox or CPU
-counters (every verdict says which checks did not run).
-
-Experiments isolate each arm in a sandbox when
-[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
-installed; without it they still run, and every verdict says the arms were
-not isolated.
+process start times there.
 
 ## Five minutes on an existing project
 
@@ -232,6 +226,7 @@ prova exp new speed --hypothesis "sieve beats trial division" \
 prova exp candidate speed
 prova exp run speed             # ABBA trials, Mann-Whitney + Hodges-Lehmann CI, verdict
 prova exp log speed             # what failed: a trial, the setup, the oracle
+prova exp export speed          # every trial and sample behind the verdicts, as JSON
 ```
 
 Native benchmark output is read directly (`go test -bench`, criterion,
@@ -241,12 +236,12 @@ accuracy or throughput, `--setup "npm ci"` when the checkouts need
 dependencies installed: it runs once in each variant's checkout (the
 baseline's and the candidate's snapshots), with network.
 
-By default a candidate may change anything but tests, benchmarks, build and
-runner files. When the change needs one of those (a new dependency in
+By default a candidate may change anything but tests, benchmarks, build files and
+expected data. When the change needs one of those (a new dependency in
 `go.mod`), allow it with `--change go.mod` (a glob, repeatable);
 `--change-only` limits the candidate to those paths. Trials and the oracle
-run without network (loopback only) when the arms are sandboxed; pass
-`--allow-network` when the workload or the oracle needs it.
+see the session's environment; arms are not sandboxed (ADR 0037), so read
+the candidate's diff.
 
 An ACCEPT makes the candidate the new best only if it beats the current
 best. To go back after one that turned out wrong:

@@ -588,10 +588,6 @@ struct ProtocolArgs {
     /// With --change: the candidate may change only those paths.
     #[arg(long = "change-only", requires = "scope")]
     scope_only: bool,
-    /// Let trials and the oracle use the network (by default a sandboxed
-    /// arm has only loopback).
-    #[arg(long)]
-    allow_network: bool,
 }
 
 #[derive(Subcommand)]
@@ -709,27 +705,41 @@ Example:
     },
     /// Wait for the running comparison, at most --max-wait.
     #[command(after_help = "\
-Example:
-  prova exp wait speed --max-wait 5m")]
+Examples:
+  prova exp wait speed --max-wait 5m
+  prova exp wait speed --max-wait 1h     as long as the comparison needs
+The 9 minute limit is only the foreground `exp run` budget: `exp wait` takes
+any --max-wait, so one command (in the background if your tool calls are
+short) replaces a polling loop. Exit 5 means still running: wait again.")]
     Wait {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
-        /// Wait at most this long.
+        /// Wait at most this long (any length, e.g. 1h).
         #[arg(long, value_name = "DURATION", default_value = "30s")]
         max_wait: String,
         /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
-    /// Show the experiment, latest comparison and decision log.
+    /// Show the experiment, latest comparison and decision log. Read the
+    /// frozen protocol, the verdict and its statistics from `--json`, never
+    /// from the database or the text.
     #[command(after_help = "\
-Example:
-  prova exp status speed")]
+Examples:
+  prova exp status speed
+  prova exp status speed --json
+  prova exp status speed --comparison 6ddda6cb   an older comparison
+`prova exp protocol` changes the protocol (before the first trial); it is
+not how to read it.")]
     Status {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
+        /// Show this comparison instead of the latest (an id from the
+        /// decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
         /// JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -749,12 +759,13 @@ Example:
   prova exp list        name, best variant, protocol hash, hypothesis")]
     List,
     /// Kept logs of what failed in the latest comparison (a trial, the
-    /// setup, the oracle).
+    /// setup, the oracle), or in the one `--comparison` names.
     #[command(after_help = "\
 Examples:
   prova exp log speed                    every kept log
   prova exp log speed oracle-candidate   one of them
-  prova exp log speed 3 --tail 20        trial 3, last 20 lines")]
+  prova exp log speed 3 --tail 20        trial 3, last 20 lines
+  prova exp log speed --comparison 6ddda6cb   an older comparison")]
     Log {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
@@ -764,6 +775,30 @@ Examples:
         /// Only the last N kept lines of each log.
         #[arg(long)]
         tail: Option<usize>,
+        /// Read this comparison instead of the latest (an id from the
+        /// decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
+    },
+    /// Print the evidence behind the verdicts as JSON (`prova.exp-export.v1`,
+    /// schema in schemas/exp-export.v1.json): the protocol, every
+    /// comparison with its trials (warmups and failed ones included) and
+    /// their samples, the decisions. Read-only; `partial` while a comparison
+    /// runs.
+    #[command(after_help = "\
+Examples:
+  prova exp export speed                          everything, to stdout
+  prova exp export speed --comparison 6ddda6cb --output evidence.json")]
+    Export {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
+        name: String,
+        /// Only this comparison (an id from the decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
+        /// Write the JSON to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
     /// Run a workload once and show the metrics prova reads from it
     /// (benchmark tools and JSON metric lines), to choose --metric.
@@ -988,7 +1023,6 @@ fn protocol_from(
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
         scope_only: a.scope_only,
-        allow_network: a.allow_network,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -1972,8 +2006,12 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             render::experiment(&r, json);
             Ok(exp_exit(&r))
         }
-        ExpCmd::Status { name, json } => {
-            let r = experiment::report(&store, &name)?;
+        ExpCmd::Status {
+            name,
+            comparison,
+            json,
+        } => {
+            let r = experiment::report_at(&store, &name, comparison.as_deref())?;
             render::experiment(&r, json);
             Ok(exp_status_exit(&r))
         }
@@ -2004,9 +2042,19 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)
         }
-        ExpCmd::Log { name, entry, tail } => {
-            let Some(c) = experiment::latest_comparison(&store, &name)? else {
-                bail!("experiment {name} has no comparison yet");
+        ExpCmd::Log {
+            name,
+            entry,
+            tail,
+            comparison,
+        } => {
+            let c = match comparison {
+                Some(id) => {
+                    experiment::check_comparison(&store, &name, &id)?;
+                    id
+                }
+                None => experiment::latest_comparison(&store, &name)?
+                    .ok_or_else(|| anyhow!("experiment {name} has no comparison yet"))?,
             };
             let kept = prova_core::output::comparison_excerpts(&store, &c)?;
             let shown: Vec<_> = kept
@@ -2032,6 +2080,22 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     continue;
                 }
                 print!("{}", e.render());
+            }
+            Ok(exit::PASSED)
+        }
+        ExpCmd::Export {
+            name,
+            comparison,
+            output,
+        } => {
+            let x = prova_core::exp_export::export(&store, &name, comparison.as_deref())?;
+            let text = serde_json::to_string_pretty(&x)?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, format!("{text}\n"))?;
+                    println!("wrote {}", path.display());
+                }
+                None => println!("{text}"),
             }
             Ok(exit::PASSED)
         }

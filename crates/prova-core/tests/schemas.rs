@@ -27,4 +27,8 @@ fn schemas_are_current() {
         "event.v1.json",
         schemars::schema_for!(prova_core::model::Event),
     );
+    check(
+        "exp-export.v1.json",
+        schemars::schema_for!(prova_core::exp_export::ExpExport),
+    );
 }

@@ -290,35 +290,6 @@ fn cargo_experiment(name: &str) -> PathBuf {
     d
 }
 
-/// ADR 0035 section 4 (round 18 B9): a candidate that adds
-/// `.cargo/config.toml` with a `runner` that prints the metric forged the
-/// result. Runner configuration is a harness file: out of scope, unmeasured.
-#[test]
-#[ignore = "large: needs cargo"]
-fn cargo_runner_config_is_out_of_scope() {
-    let d = cargo_experiment("exp-runner");
-    std::fs::create_dir_all(d.join(".cargo")).unwrap();
-    std::fs::write(
-        d.join(".cargo/config.toml"),
-        r#"[target.'cfg(unix)']
-runner = ["sh", "-c", "echo '{\"metric\":\"steps\",\"value\":1}'", "x"]
-"#,
-    )
-    .unwrap();
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
-    assert_eq!(
-        r["comparison"]["candidate_trials"], 0,
-        "never measured: {r}"
-    );
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("out of scope") && reason.contains(".cargo/config.toml"),
-        "{reason}"
-    );
-}
-
 /// ADR 0035 section 4 (round 18 B8): a candidate fast only while an
 /// environment variable is set is accepted with it, and the revalidation
 /// without it withdraws the accept.
@@ -338,30 +309,6 @@ fn cargo_env_dependent_speedup_is_withdrawn_on_revalidation() {
     let v = json_last_line(&host(&d, &["exp", "revalidate", "e", "--json"], &[]));
     assert_eq!(v["best"], "baseline", "the accept must be withdrawn: {v}");
     assert!(v.to_string().contains("withdrawn"), "{v}");
-}
-
-/// ADR 0035 section 4 (round 18 M1): a candidate that caches results in the
-/// temp directory between iterations gets the private-/tmp caveat.
-#[test]
-#[ignore = "large: needs cargo and bubblewrap"]
-fn cargo_results_cached_in_tmp_are_reported() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, /tmp is not private");
-        return;
-    }
-    let d = cargo_experiment("exp-tmp");
-    write_main(
-        &d,
-        "std::fs::write(std::env::temp_dir().join(\"results-cache\"), \"x\").unwrap();",
-        "100",
-    );
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    let caveats = r["comparison"]["result"]["caveats"].to_string();
-    assert!(
-        caveats.contains("private /tmp") && caveats.contains("results-cache"),
-        "{r}"
-    );
 }
 
 // ------------------------------------------------------------- docker
