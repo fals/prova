@@ -380,7 +380,11 @@ fn failure_name(f: &prova_core::engine::Failure) -> String {
 
 pub fn named(test: &str, place: Option<&str>) -> String {
     match place {
-        Some(p) => format!("{} ({})", clean(test), clean(p)),
+        Some(p) => format!(
+            "{} {}",
+            clean(test),
+            prova_core::model::place_label(&clean(p))
+        ),
         None => clean(test),
     }
 }

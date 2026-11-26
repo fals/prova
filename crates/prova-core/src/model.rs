@@ -131,6 +131,16 @@ pub const UNKNOWN_PLACE: &str = "(unknown directory)";
 /// of its own, so no other run's history is ever its history.
 pub const AMBIGUOUS_PLACE: &str = "(ambiguous in this run";
 
+/// A place as shown after a name: in parentheses, once (the ambiguous and
+/// unknown places already come in parentheses).
+pub fn place_label(place: &str) -> String {
+    if place.starts_with('(') && place.ends_with(')') {
+        place.to_owned()
+    } else {
+        format!("({place})")
+    }
+}
+
 impl TestKey {
     pub fn new(path: Vec<String>, name: impl Into<String>) -> TestKey {
         TestKey {

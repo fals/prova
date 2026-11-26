@@ -184,7 +184,7 @@ impl<'a> Names<'a> {
     /// The name to show and to group by.
     pub fn name(&self, display: &str, file: Option<&str>) -> String {
         match self.place(display, file) {
-            Some(p) => format!("{display} ({p})"),
+            Some(p) => format!("{display} {}", crate::model::place_label(&p)),
             None => display.to_owned(),
         }
     }
