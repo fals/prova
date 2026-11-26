@@ -16,17 +16,19 @@ Contents: [Failure history](#failure-history) ·
   before; not caused by your change alone.
 - `ERROR`: the test errored rather than failing an assertion.
 - `last passed at tree:...`: the last code where it was green.
-- A test's history is shared by every suite that runs it (`make`,
-  `default`, an ad-hoc `prova run -- ...`).
+- A test's history is per suite: `make`, `default` and an ad-hoc `prova
+  run -- ...` (its own suite, per command) each keep their own, and the
+  same test run another way starts with none (`first time seen`).
+  `prova history <test>` lists one entry per suite.
 
 ## Flaky tests
 
 - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
   same code both passed and failed, in the same suite (or the same ad hoc
   command). Do not chase it as your bug; confirm with `prova history
-  <test>` and report it. A pass under another suite or command only sets
-  `last passed`: a failure that only one way of running the tests produces
-  is a real failure there, not flakiness.
+  <test>` and report it. A pass under another suite or command is not
+  evidence: a failure that only one way of running the tests produces is a
+  real failure there, not flakiness.
 - `failed, then passed on a retry`: the run passes (a test's last attempt
   decides) but unverified: the test is flaky.
 - `failing now: more failures in a row than its flakiness explains`: a
@@ -93,7 +95,7 @@ proved little. The warnings name the reason:
 
 - no test was observed, or every test was skipped;
 - tests from the last passing run did not run or were skipped (`#[ignore]`,
-  `@Disabled`, `skip`; also when they passed in another suite or command);
+  `@Disabled`, `skip`);
 - a test reports (or always took) longer than the whole run;
 - the results equal an earlier run's to the millisecond (stale files);
 - the command used no CPU at all (results printed, not run);

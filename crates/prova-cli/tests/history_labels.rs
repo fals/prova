@@ -83,24 +83,29 @@ fn a_first_failure_without_history_is_not_called_new() {
 }
 
 #[test]
-fn history_is_shared_by_suites_that_run_the_same_test() {
+fn each_suite_has_its_own_history_of_the_same_test() {
     let d = workspace("shared");
     suites(&d);
     // Flaky in `make`: passes and fails on the same code.
     run(&d, "make", "pass");
     run(&d, "make", "fail");
-    // In `default` it is the same test: known flaky, not new.
+    // In `default` it is its own test: nothing known yet (ADR 0037).
     let out = run(&d, "default", "fail");
     assert!(
-        out.contains("FAIL calc::x [failed") && out.contains("FLAKY"),
+        out.contains("FAIL calc::x [first time seen") && !out.contains("FLAKY"),
         "{out}"
+    );
+    // `history` lists one entry per suite.
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("calc::x  (suite default)") && h.contains("calc::x  (suite make)"),
+        "{h}"
     );
     assert!(
-        !out.contains("new failure") && !out.contains("first time seen"),
-        "{out}"
+        h.contains("2 runs with a result, 1 failed")
+            && h.contains("1 runs with a result, 1 failed"),
+        "{h}"
     );
-    let h = text(&prova(&d, &["history", "calc::x"]));
-    assert!(h.contains("suites default, make"), "{h}");
 }
 
 #[test]
@@ -153,18 +158,18 @@ fn quiet_counts_never_contradict() {
     assert!(!out.contains("no test was observed"), "{out}");
 }
 
-/// Round 5: quiet `cargo test` names no binary and `go test` text names no
-/// package; their results are still the same tests as the full streams'.
+/// Round 5, ADR 0037: quiet `cargo test` names no binary and `go test` text
+/// names no package; within one suite their results are still the same
+/// tests as the full streams'. Another suite's pass is no evidence.
 #[test]
-fn quiet_and_text_runs_join_the_full_history() {
+fn quiet_and_text_runs_join_the_full_history_of_their_suite() {
     let d = workspace("join");
     std::fs::write(
         d.join("prova.toml"),
         concat!(
-            "[suite.rust_full]\nrun = \"echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; sh r.sh\"\n",
-            "[suite.rust_quiet]\nrun = \"sh r.sh\"\n",
-            "[suite.go_json]\nrun = \"sh g.sh\"\n",
-            "[suite.go_text]\nrun = \"echo '--- FAIL: TestDiv (0.00s)'; printf 'FAIL\\\\texample.com/calc\\\\t0.01s\\\\n'; exit 1\"\n",
+            "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; sh r.sh\"\n",
+            "[suite.rust_other]\nrun = \"sh r.sh\"\n",
+            "[suite.go]\nrun = \"if [ -f text ]; then echo '--- FAIL: TestDiv (0.00s)'; printf 'FAIL\\\\texample.com/calc\\\\t0.01s\\\\n'; exit 1; fi; sh g.sh\"\n",
         ),
     )
     .unwrap();
@@ -175,17 +180,24 @@ fn quiet_and_text_runs_join_the_full_history() {
     )
     .unwrap();
     std::fs::write(d.join("state"), "pass").unwrap();
-    prova(&d, &["run", "rust_full"]);
+    prova(&d, &["run", "rust"]);
+    std::fs::write(d.join("quiet"), "").unwrap();
     std::fs::write(d.join("state"), "fail").unwrap();
-    let out = text(&prova(&d, &["run", "rust_quiet"]));
+    let out = text(&prova(&d, &["run", "rust"]));
     assert!(
         out.contains("FAIL tests::x [")
             && out.contains("last passed at")
             && !out.contains("first time seen"),
-        "quiet run knows the earlier pass: {out}"
+        "quiet run knows the earlier pass of its suite: {out}"
     );
-    prova(&d, &["run", "go_json"]);
-    let out = text(&prova(&d, &["run", "go_text"]));
+    let out = text(&prova(&d, &["run", "rust_other"]));
+    assert!(
+        out.contains("FAIL tests::x [first time seen"),
+        "another suite's passes are no history: {out}"
+    );
+    prova(&d, &["run", "go"]);
+    std::fs::write(d.join("text"), "").unwrap();
+    let out = text(&prova(&d, &["run", "go"]));
     assert!(
         out.contains("TestDiv [")
             && out.contains("last passed at")
@@ -258,9 +270,10 @@ fn a_failure_before_the_cancel_is_still_evidence() {
     assert!(h.contains("1 failed"), "{h}");
 }
 
-/// ADR 0036: a test that fails every time one way of running it and passes
-/// another way, on the same code, is not flaky (acceptance 2026-11-26: it
-/// was FLAKY and "nothing else failed"). Its pass elsewhere is still history.
+/// ADR 0036, 0037: a test that fails every time one way of running it and
+/// passes another way, on the same code, is not flaky (acceptance
+/// 2026-11-26: it was FLAKY and "nothing else failed"). Its pass elsewhere
+/// is no history of this suite: the failure is first time seen.
 #[test]
 fn a_pass_in_another_suite_is_not_flaky_evidence() {
     let d = workspace("flakyacross");
@@ -269,7 +282,7 @@ fn a_pass_in_another_suite_is_not_flaky_evidence() {
     run(&d, "make", "pass");
     let out = run(&d, "default", "fail");
     assert!(
-        out.contains("FAIL calc::x [new failure") && !out.contains("FLAKY"),
+        out.contains("FAIL calc::x [first time seen") && !out.contains("FLAKY"),
         "{out}"
     );
     assert!(!out.contains("only known flaky"), "{out}");
@@ -749,30 +762,17 @@ fn a_short_streak_of_a_frequent_flake_is_still_flaky() {
 }
 
 /// Round 10: `@Disabled` on a test that passed before gave a clean pass in
-/// an ad-hoc run (its own command had no earlier pass to compare with).
+/// an ad-hoc run (the same command had an earlier pass to compare with).
 #[test]
-fn a_test_skipped_now_that_passed_in_another_command_is_unverified() {
+fn a_test_skipped_now_that_passed_in_the_same_command_is_unverified() {
     let d = workspace("skipadhoc");
-    prova(
-        &d,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            &format!("{WORK_SH}echo 'test calc::d ... ok'"),
-        ],
+    // The same command twice: an ad hoc command is its own suite.
+    let cmd = format!(
+        "{WORK_SH}echo 'test calc::a ... ok'; if [ -f state ]; then echo 'test calc::d ... ignored'; else echo 'test calc::d ... ok'; fi"
     );
-    let o = prova(
-        &d,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            &format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::d ... ignored'"),
-        ],
-    );
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    std::fs::write(d.join("state"), "").unwrap();
+    let o = prova(&d, &["run", "--", "sh", "-c", &cmd]);
     let out = text(&o);
     assert!(
         out.contains("unverified") && out.contains("calc::d"),
@@ -929,17 +929,16 @@ fn bare_console_names_take_the_result_files_identity() {
     let trx = r#"<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><TestDefinitions><UnitTest name="Divide" id="1"><TestMethod className="P.CalcTests" name="Divide"/></UnitTest><UnitTest name="Divide" id="2"><TestMethod className="P.MathTests" name="Divide"/></UnitTest></TestDefinitions><Results><UnitTestResult testId="1" testName="Divide" outcome="Failed"/><UnitTestResult testId="2" testName="Divide" outcome="Passed"/></Results></TestRun>"#;
     std::fs::write(d.join("r.trx.src"), trx).unwrap();
     let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
-    let lines = |first: &str, second: &str| {
-        format!(
-            "{busy}; printf '  {first} Divide [1 ms]\\n  {second} Divide [1 ms]\\n'; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
-        )
-    };
-    for (a, b) in [
-        ("Failed", "Passed"),
-        ("Passed", "Failed"),
-        ("Failed", "Passed"),
-    ] {
-        let out = text(&prova(&d, &["run", "--", "sh", "-c", &lines(a, b)]));
+    // One command (history is per suite); the file `state` swaps the order.
+    let cmd = format!(
+        "{busy}; if [ -f state ]; then printf '  Passed Divide [1 ms]\\n  Failed Divide [1 ms]\\n'; else printf '  Failed Divide [1 ms]\\n  Passed Divide [1 ms]\\n'; fi; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
+    );
+    for flip in [false, true, false] {
+        let _ = std::fs::remove_file(d.join("state"));
+        if flip {
+            std::fs::write(d.join("state"), "").unwrap();
+        }
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
         assert!(!out.contains("FLAKY"), "{out}");
         assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
     }

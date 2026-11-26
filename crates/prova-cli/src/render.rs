@@ -422,15 +422,9 @@ pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
         return;
     }
     println!(
-        "{}  (suite{} {}{})",
+        "{}  (suite {})",
         named(&s.display, s.place.as_deref()),
-        if s.suites.len() > 1 { "s" } else { "" },
-        s.suites.join(", "),
-        if s.suites.len() > 1 {
-            "; history shared across them"
-        } else {
-            ""
-        }
+        s.suite
     );
     println!(
         "{} runs with a result, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s) within one suite{}",

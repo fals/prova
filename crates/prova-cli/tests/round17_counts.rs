@@ -71,10 +71,22 @@ fn history_suite_option_limits_the_runs() {
     );
     prova(&d, &["run", "make"]);
     prova(&d, &["run", "default"]);
+    // One entry per suite (ADR 0037), each with its own runs.
     let all = text(&prova(&d, &["history", "calc::x"]));
-    assert!(all.contains("2 runs with a result, 1 failed"), "{all}");
+    assert!(
+        all.contains("(suite default)") && all.contains("(suite make)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("1 runs with a result, 0 failed")
+            && all.contains("1 runs with a result, 1 failed"),
+        "{all}"
+    );
     let one = text(&prova(&d, &["history", "calc::x", "--suite", "default"]));
-    assert!(one.contains("1 runs with a result, 0 failed"), "{one}");
+    assert!(
+        one.contains("1 runs with a result, 0 failed") && !one.contains("(suite make)"),
+        "{one}"
+    );
 }
 
 #[test]

@@ -128,12 +128,16 @@ fn corpus(name: &str, result: Option<(&str, &str)>, extra: (&str, &str)) {
         )
     });
     // `extra.txt` is empty until a case appends to it.
+    // The pytest captures were made in a container (`rootdir: /w`): a place
+    // outside the repository is unknown (ADR 0037), so the replay puts the
+    // rootdir where the replay runs.
     let argv = runner(
         &d,
         "one",
         name,
         &format!(
-            "{BUSY} {copy} cat {} extra.txt; exit {code}",
+            "{BUSY} {copy} sed 's|^rootdir: /w$|rootdir: {}|' {} extra.txt; exit {code}",
+            d.display(),
             output.display()
         ),
     );
