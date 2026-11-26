@@ -1071,6 +1071,34 @@ fn a_cancelled_run_has_no_test_outcome_in_the_list() {
     );
 }
 
+/// ADR 0038 section 3: a test that failed before the cancel keeps its
+/// failure output, as in a run that ended (real `go test -v` lines, then a
+/// hang that is cancelled).
+#[test]
+fn a_cancelled_run_keeps_the_output_of_the_test_that_failed() {
+    let d = workspace("cancel-keeps");
+    let id = detach(
+        &d,
+        &[],
+        "printf '=== RUN   TestDiv\\n    calc_test.go:17: Div(8, 2) = 16, want 4\\n--- FAIL: TestDiv (0.00s)\\n=== RUN   TestHang\\n'; sleep 30",
+    );
+    let first = prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "20s"],
+    );
+    assert!(stdout(&first).contains("TestDiv"), "{}", stdout(&first));
+    prova(&d, &["cancel", &id]);
+    let done = prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
+    assert!(stdout(&done).contains("cancelled"), "{}", stdout(&done));
+    let o = prova(&d, &["output", &id, "--test", "TestDiv"]);
+    assert!(
+        stdout(&o).contains("Div(8, 2) = 16, want 4"),
+        "{}{}",
+        stdout(&o),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 /// Round 14: a wait that ended on its budget named the hung test without
 /// saying how long it had been running; the stall default for a suite of
 /// no declared size (60 s) outlasted two 30 s waits.
