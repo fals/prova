@@ -31,6 +31,10 @@ pub struct TestRun {
     /// The run's environment fingerprint (name -> hash of value).
     #[serde(skip)]
     pub env: BTreeMap<String, String>,
+    /// The run's suite (a named suite, or `cmd:<hash>` of an ad hoc
+    /// command): flaky flips count within one (ADR 0036).
+    #[serde(skip)]
+    pub suite: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -428,7 +432,7 @@ fn test_runs_scoped(
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration
+                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration, r.suite
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -450,6 +454,7 @@ fn test_runs_scoped(
             r.get::<_, Option<String>>(9)?,
             r.get::<_, String>(10)?,
             r.get::<_, i64>(11)? != 0,
+            r.get::<_, String>(12)?,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -482,6 +487,7 @@ fn test_runs_scoped(
             selection,
             row_test,
             passed_in_iteration,
+            run_suite,
         ) = row?;
         // Only its pass says nothing of the parent: a failure there is the
         // parent's too, as its subtest's (round 18: the two disagreed).
@@ -535,6 +541,7 @@ fn test_runs_scoped(
                     message: if outcome.is_failure() { msg } else { None },
                     fingerprint: fp,
                     env,
+                    suite: run_suite,
                 })
             }
         }
@@ -621,6 +628,8 @@ fn stats_scoped(
     // A flip is flaky only on the same code in the same environment: a test
     // that fails only when a variable is set is environment-dependent, not
     // flaky (round 11). Runs recorded before the fingerprint share "".
+    // And in the same suite: one that fails only one way of running it is
+    // not flaky either (ADR 0036).
     let env_key = |r: &TestRun| {
         r.env
             .iter()
@@ -628,12 +637,14 @@ fn stats_scoped(
             .collect::<Vec<_>>()
             .join(",")
     };
-    let mut by_code: BTreeMap<(&str, String), BTreeSet<bool>> = BTreeMap::new();
+    let mut by_code: BTreeMap<(&str, &str, String), BTreeSet<bool>> = BTreeMap::new();
     // Outside git the code version is unknown: two runs there are never
     // "the same code" (round 12: a fix in a project without git was
     // called a flaky flip).
     for r in counted.iter().filter(|r| r.code != "nogit") {
-        let e = by_code.entry((r.code.as_str(), env_key(r))).or_default();
+        let e = by_code
+            .entry((r.code.as_str(), r.suite.as_str(), env_key(r)))
+            .or_default();
         e.insert(r.outcome.is_failure());
         // Passed and failed within the one run: both results on this code.
         if r.passed_and_failed {
@@ -645,7 +656,7 @@ fn stats_scoped(
     let flips = by_code
         .iter()
         .filter(|(_, s)| s.len() == 2)
-        .map(|((code, _), _)| *code)
+        .map(|((code, _, _), _)| *code)
         .collect::<BTreeSet<_>>()
         .len();
     // Same code, opposite results, different environments: name the
@@ -656,10 +667,12 @@ fn stats_scoped(
     let mut env_passes: BTreeSet<&str> = BTreeSet::new();
     if flips == 0 {
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
-            for f in counted
-                .iter()
-                .filter(|r| r.outcome.is_failure() && r.code == p.code && r.code != "nogit")
-            {
+            for f in counted.iter().filter(|r| {
+                r.outcome.is_failure()
+                    && r.code == p.code
+                    && r.suite == p.suite
+                    && r.code != "nogit"
+            }) {
                 for k in p.env.keys().chain(f.env.keys()) {
                     if p.env.get(k) != f.env.get(k) {
                         env_dependent.insert(k.clone());
@@ -804,8 +817,9 @@ pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<Te
 }
 
 /// Tests that failed somewhere, whose history is worth reading for flakiness.
-/// A history is shared across suites (ADR 0018), so a flip between suites
-/// counts (round 6). A failure of a provisional name whose package was
+/// A history is shared across suites (ADR 0018), and a test that failed in
+/// one suite may have flipped in another; a flip counts within one suite
+/// (ADR 0036). A failure of a provisional name whose package was
 /// learned later (superseded in that run) is the qualified test's, which
 /// history shows (round 18); but a test superseded in one run is still its
 /// own where it failed unsuperseded in another.

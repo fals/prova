@@ -91,9 +91,9 @@ needs attention.
 - `prova diff <run-a> <run-b>` newly failing, fixed, slower tests; a known
   flaky test that changed is listed apart (`changed, but known flaky`), never
   as fixed.
-- `prova flaky` known flaky tests (same code, different results; a pass on edited code and a failure on clean code is a change, not flakiness); `prova quarantine add <test> --reason ...`
-  sets one aside in the open (listed in every run, expires), so the rest can
-  be verified green. `prova slowest` the slowest tests (p50, p95).
+- `prova flaky` known flaky tests (same code, same suite, different results; a pass on edited code and a failure on clean code is a change, not flakiness); `prova quarantine add <test> --reason ...`
+  names one in the open (listed in every run, expires). It never makes a
+  run pass or a pass verified: a quarantined failure still fails the run. `prova slowest` the slowest tests (p50, p95).
   `prova sizes` how many tests of each size,
   and what made each medium or large one so ("started postgres", "1 local
   socket"). `prova history <test>` shows its `size:` and why; `small?`

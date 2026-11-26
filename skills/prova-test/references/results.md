@@ -22,8 +22,11 @@ Contents: [Failure history](#failure-history) ·
 ## Flaky tests
 
 - `FLAKY` or `likely FLAKY: suite passed on this exact code before`: the
-  same code both passed and failed. Do not chase it as your bug; confirm
-  with `prova history <test>` and report it.
+  same code both passed and failed, in the same suite (or the same ad hoc
+  command). Do not chase it as your bug; confirm with `prova history
+  <test>` and report it. A pass under another suite or command only sets
+  `last passed`: a failure that only one way of running the tests produces
+  is a real failure there, not flakiness.
 - `failed, then passed on a retry`: the run passes (a test's last attempt
   decides) but unverified: the test is flaky.
 - `failing now: more failures in a row than its flakiness explains`: a
