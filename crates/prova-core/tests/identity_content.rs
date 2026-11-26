@@ -197,7 +197,10 @@ fn content_id_submodule_commit_and_uncommitted_content_count() {
     // 0.3.1: a failure it caused was labelled FLAKY on the same id).
     std::fs::write(s.join("extra.py"), "x = 1\n").unwrap();
     let untracked = code_identity(&d);
-    assert_ne!(untracked, clean, "untracked submodule content is a new version");
+    assert_ne!(
+        untracked, clean,
+        "untracked submodule content is a new version"
+    );
     std::fs::remove_file(s.join("extra.py")).unwrap();
     assert_eq!(code_identity(&d), clean);
 
