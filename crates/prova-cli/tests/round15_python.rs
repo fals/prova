@@ -305,7 +305,7 @@ fn a_missing_test_runner_is_errored_not_failed() {
         "/usr/bin/python3: No module named pytest",
         "sh: 1: pytest: command not found",
     ] {
-        let v = json(&prova(
+        let o = prova(
             &d,
             &[
                 "run",
@@ -315,7 +315,13 @@ fn a_missing_test_runner_is_errored_not_failed() {
                 "-c",
                 &format!("echo '{text}' >&2; exit 1"),
             ],
-        ));
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(4),
+            "infrastructure, not a test failure"
+        );
+        let v = json(&o);
         assert_eq!(v["outcome"], "errored", "{v}");
         assert!(
             v["detail"]

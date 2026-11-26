@@ -3939,6 +3939,14 @@ fn exit_code(s: &Summary) -> u8 {
             {
                 exit::INFRA
             }
+            // The test runner itself is missing (ADR 0017 section 2).
+            (Some(Outcome::Errored), Status::Finished)
+                if s.detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with(engine::RUNNER_MISSING)) =>
+            {
+                exit::INFRA
+            }
             (_, Status::Cancelled) => exit::STALLED_OR_KILLED,
             (_, Status::Aborted)
                 if s.detail.as_deref().is_some_and(|d| d.starts_with("killed")) =>

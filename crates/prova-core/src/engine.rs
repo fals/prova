@@ -1956,7 +1956,7 @@ fn observe_child(
 pub const PYTEST_NO_TEST: &str = "pytest ran no test";
 
 /// The reason prefix of a run whose test runner was not there to start.
-const RUNNER_MISSING: &str = "the test runner could not start";
+pub const RUNNER_MISSING: &str = "the test runner could not start";
 
 /// A line that says the runner itself is missing, not that a test failed.
 fn runner_missing(line: &str) -> bool {
