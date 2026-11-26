@@ -117,18 +117,14 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
 
 /// What makes two stored tests one test for history (ADR 0037), as the
 /// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another):
-/// the same suite, and the same name and place. A name recorded bare (Go
-/// text with no package, quiet `cargo test` with no crate) is the qualified
-/// one only when the suite knows the name in one place: a name shared by
-/// several places is never matched to one of them (ADR 0035 section 1).
+/// the same suite, and the same name and place. A test of no place (quiet
+/// `cargo test` names no crate) is that of other results of no place, never
+/// of a known one. A Go name recorded bare (text with no package) is the
+/// qualified one only when the suite knows the name in one place: a name
+/// shared by several places is never matched to one of them.
 const SAME_TEST_ON: &str = "(t2.suite = t1.suite AND (
                 (t2.display = t1.display
-                   AND (COALESCE(t2.file, '') = COALESCE(t1.file, '')
-                        OR ((t1.file IS NULL OR t2.file IS NULL)
-                            AND (SELECT COUNT(DISTINCT x.file) FROM tests x
-                                 WHERE x.suite = t1.suite AND x.display = t1.display AND x.file IS NOT NULL
-                                   AND x.file NOT LIKE '(package pending)%'
-                                   AND x.file <> '(unknown directory)') < 2)))
+                   AND COALESCE(t2.file, '') = COALESCE(t1.file, ''))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]'))
                    AND (SELECT COUNT(DISTINCT COALESCE(x.file, '') || '|' || x.path) FROM tests x

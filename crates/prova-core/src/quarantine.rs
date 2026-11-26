@@ -26,11 +26,6 @@ pub struct Entry {
     /// tests of several: only that one is quarantined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Set when the store knows the name in other places too: a result of
-    /// unknown place (quiet `cargo test` names no binary) cannot be told
-    /// from the other places' and is not covered by it.
-    #[serde(skip)]
-    pub ambiguous: bool,
 }
 
 impl Entry {
@@ -69,7 +64,6 @@ pub fn add(
         expires_ms: expires,
         removed_ms: None,
         file: file.map(str::to_owned),
-        ambiguous: false,
     })
 }
 
@@ -106,7 +100,6 @@ pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
             expires_ms: r.get::<_, i64>(3)? as u64,
             removed_ms: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
             file: r.get(5)?,
-            ambiguous: false,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -115,10 +108,7 @@ pub fn list(store: &Store, include_removed: bool) -> Result<Vec<Entry>> {
 /// The quarantines that applied at `ts`, by test name.
 pub fn in_force_at(store: &Store, ts: u64) -> Result<BTreeMap<String, Entry>> {
     let mut out = BTreeMap::new();
-    for mut e in list(store, true)?.into_iter().filter(|e| e.in_force_at(ts)) {
-        if e.file.is_some() {
-            e.ambiguous = files_of(store, &e.test)?.len() > 1;
-        }
+    for e in list(store, true)?.into_iter().filter(|e| e.in_force_at(ts)) {
         out.insert(key_of(&e.test, e.file.as_deref()), e);
     }
     Ok(out)
@@ -169,7 +159,8 @@ pub fn covers_key<'a>(q: &'a BTreeMap<String, Entry>, unique: &str) -> Option<&'
             e.test == name
                 && match (&e.file, file) {
                     (Some(f), k) if !k.is_empty() => f == k,
-                    (Some(_), _) => !e.ambiguous,
+                    // A result of no place is no place's.
+                    (Some(_), _) => false,
                     _ => true,
                 }
         })
@@ -211,7 +202,6 @@ mod tests {
             expires_ms: expires,
             removed_ms: removed,
             file: None,
-            ambiguous: false,
         }
     }
 
@@ -241,16 +231,11 @@ mod tests {
         let mut calc = e(0, 10, None);
         calc.file = Some("calc".into());
         let mut q = BTreeMap::new();
-        q.insert("t".to_owned(), calc.clone());
-        // The name is only calc's: a quiet run's failure is calc's.
-        assert!(covers_key(&q, "\u{1f}t").is_some());
-        assert!(covers_key(&q, "calc\u{1f}t").is_some());
-        assert!(covers_key(&q, "geo\u{1f}t").is_none());
-        // Another place has it too: unknown is not calc.
-        calc.ambiguous = true;
         q.insert("t".to_owned(), calc);
+        // Unknown is not calc, even when calc is the only place known.
         assert!(covers_key(&q, "\u{1f}t").is_none());
         assert!(covers_key(&q, "calc\u{1f}t").is_some());
+        assert!(covers_key(&q, "geo\u{1f}t").is_none());
     }
 
     /// Round 17: a name quarantined in two places covers each place's
@@ -261,7 +246,6 @@ mod tests {
         for place in ["calc", "geo"] {
             let mut x = e(0, 10, None);
             x.file = Some(place.into());
-            x.ambiguous = true;
             q.insert(key_of("t", Some(place)), x);
         }
         assert_eq!(q.len(), 2);

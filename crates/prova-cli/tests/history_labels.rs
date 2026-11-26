@@ -183,11 +183,11 @@ fn quiet_counts_never_contradict() {
     assert!(!out.contains("no test was observed"), "{out}");
 }
 
-/// Round 5, ADR 0037: quiet `cargo test` names no binary and `go test` text
-/// names no package; within one suite their results are still the same
-/// tests as the full streams'. Another suite's pass is no evidence.
+/// Round 5, ADR 0037: `go test` text names no package; within one suite its
+/// results are still the same tests as the full streams'. Another suite's
+/// pass is no evidence. (Quiet `cargo test` names no binary: it is no go.)
 #[test]
-fn quiet_and_text_runs_join_the_full_history_of_their_suite() {
+fn text_runs_join_the_full_history_of_their_suite() {
     let d = workspace("join");
     std::fs::write(
         d.join("prova.toml"),
@@ -210,10 +210,8 @@ fn quiet_and_text_runs_join_the_full_history_of_their_suite() {
     std::fs::write(d.join("state"), "fail").unwrap();
     let out = text(&prova(&d, &["run", "rust"]));
     assert!(
-        out.contains("FAIL tests::x [")
-            && out.contains("last passed at")
-            && !out.contains("first time seen"),
-        "quiet run knows the earlier pass of its suite: {out}"
+        out.contains("FAIL tests::x [first time seen"),
+        "a result of unknown binary shares no history with a known one: {out}"
     );
     let out = text(&prova(&d, &["run", "rust_other"]));
     assert!(
@@ -232,6 +230,30 @@ fn quiet_and_text_runs_join_the_full_history_of_their_suite() {
     // Two names, one test: history answers instead of asking (round 6).
     let h = prova(&d, &["history", "TestDiv"]);
     assert!(h.status.success(), "{}", text(&h));
+}
+
+/// Review of PR 126 (C), ADR 0037: quiet `cargo test` names no binary, so
+/// its `tests::x` is a test of unknown place. The suite's one known place
+/// (`calc`) is not it: another crate's quiet failure was "failed 1x before".
+#[test]
+fn a_quiet_cargo_test_shares_no_history_with_a_known_binary() {
+    let d = workspace("quietcargo");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test tests::x ... FAILED'; exit 1\"\n",
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(out.contains("FAIL tests::x"), "{out}");
+    std::fs::write(d.join("quiet"), "").unwrap();
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(
+        out.contains("FAIL tests::x [first time seen") && !out.contains("failed 1x before"),
+        "{out}"
+    );
+    // Quiet runs are of one place with each other.
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(out.contains("failed 1x before"), "{out}");
 }
 
 /// Round 5: a test cut off by a cancel kept a garbled duplicate identity,

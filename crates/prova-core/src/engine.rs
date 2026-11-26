@@ -3206,9 +3206,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
-                    // A result of unknown place is not that place's when
-                    // the name is shared (ADR 0035 section 1).
-                    (None, Some(_)) => !q.ambiguous,
+                    // A result of unknown place is not that place's.
+                    (None, Some(_)) => false,
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
@@ -3700,7 +3699,6 @@ mod quarantine_tests {
                         expires_ms: 1,
                         removed_ms: None,
                         file: None,
-                        ambiguous: false,
                     },
                 )
             })
