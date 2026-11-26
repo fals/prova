@@ -36,6 +36,14 @@ pub struct Recognizers {
     /// A pytest id was named, and one of them in an unknown place.
     pytest_named: std::cell::Cell<bool>,
     pytest_unknown: std::cell::Cell<bool>,
+    /// A `rootdir:` header was read; without one (`--no-header`, `-q`) the
+    /// place of a pytest id is only the start directory, a fallback.
+    pytest_rootdir_seen: bool,
+    /// Ids were named with no rootdir read: the place is that fallback.
+    pytest_unrooted: std::cell::Cell<bool>,
+    /// libtest results were read with no test binary named (quiet `cargo
+    /// test`): their names have no place.
+    libtest_unplaced: std::cell::Cell<bool>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -171,6 +179,9 @@ pub struct Recognizers {
     /// test itself (a pass or a failure plus an error): unique key -> the
     /// test had failed before the error. Tests, not report lines.
     pytest_doubles: BTreeMap<String, bool>,
+    /// Names printed with several different results and no place to tell
+    /// them apart (unique key -> the one result recorded for the run).
+    ambiguous: BTreeMap<String, Ambiguous>,
     /// pytest `XPASS`: tests expected to fail that passed (non-strict).
     pub pytest_xpass: Vec<String>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
@@ -258,6 +269,27 @@ pub struct Recognizers {
 
 /// A rerun test: its key, its section, and its attempts so far.
 type SurefireRerun = (TestKey, SurefireSection, Vec<(Outcome, Option<String>)>);
+
+/// The one result of a name whose results cannot be told apart: failed
+/// because one of them failed.
+struct Ambiguous {
+    /// The key it is recorded under (a place of its own to this run).
+    key: TestKey,
+    results: u64,
+    failed: u64,
+}
+
+/// A place no result of another run shares: the name is ambiguous in this run only.
+fn ambiguous_place() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(
+        "{}, #{:06x})",
+        prova_core::model::AMBIGUOUS_PLACE,
+        (nanos ^ std::process::id()) & 0xff_ffff
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SurefireSection {
@@ -542,6 +574,29 @@ impl Recognizers {
         if let Some(n) = self.reruns.remove(&d) {
             return self.attempt_result(key, n + 1, outcome, duration_ms, message, level, out);
         }
+        // Results of one name with no place to tell them apart (quiet
+        // `cargo test`, pytest from several directories): one result for the
+        // run, failed if any failed, and no place of any other run's.
+        let unplaced = key.place_unknown()
+            || (key.file.is_none() && (self.libtest_unplaced.get() || self.pytest_unrooted.get()));
+        if unplaced && let Some(a) = self.ambiguous.get_mut(&d) {
+            a.results += 1;
+            self.repeats += 1;
+            if outcome.is_failure() {
+                a.failed += 1;
+                if let Some(m) = message {
+                    self.failure_fallback.push((a.key.clone(), m));
+                }
+            }
+            return;
+        }
+        if unplaced
+            && let Some((_, before)) = self.seen.get(&d)
+            && before.is_failure() != outcome.is_failure()
+        {
+            let before = *before;
+            return self.ambiguate(d, before, key, outcome, duration_ms, message, level, out);
+        }
         if let Some((_, before)) = self.seen.get(&d) {
             // A different result under the same name is another test (two
             // test binaries both with `tests::it_works`, round 12): keep it,
@@ -588,6 +643,81 @@ impl Recognizers {
             subtest,
             passed_in_iteration: false,
         });
+    }
+
+    /// A pass and a failure under one name with no place to tell them apart:
+    /// the name's one result for this run is the failure (never hidden behind
+    /// the pass), under a place no other run shares. The result already
+    /// recorded is superseded, so it is no history of any test.
+    #[allow(clippy::too_many_arguments)]
+    fn ambiguate(
+        &mut self,
+        d: String,
+        before: Outcome,
+        key: TestKey,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        level: Level,
+        out: &mut Vec<EventKind>,
+    ) {
+        let first = self
+            .seen_keys
+            .get(&d)
+            .cloned()
+            .unwrap_or_else(|| key.clone());
+        let mut one = first.clone();
+        one.file = Some(ambiguous_place());
+        let failure = if outcome.is_failure() {
+            outcome
+        } else {
+            before
+        };
+        for (k, _) in self
+            .failure_fallback
+            .iter_mut()
+            .chain(self.failure_output.iter_mut())
+        {
+            if *k == first {
+                *k = one.clone();
+            }
+        }
+        if outcome.is_failure()
+            && let Some(m) = &message
+        {
+            self.failure_fallback.push((one.clone(), m.clone()));
+        }
+        out.push(EventKind::TestFinished {
+            test: one.clone(),
+            attempt: 1,
+            outcome: failure,
+            duration_ms: if outcome.is_failure() {
+                duration_ms
+            } else {
+                None
+            },
+            message: if outcome.is_failure() { message } else { None },
+            source: level,
+            subtest: false,
+            passed_in_iteration: false,
+        });
+        // After the result it is replaced by: the store links the two.
+        out.push(EventKind::TestSuperseded {
+            test: first,
+            by: one.clone(),
+        });
+        lift(&mut self.level, level);
+        self.repeats += 1;
+        self.seen.insert(d.clone(), (one.display(), failure));
+        self.seen_keys.insert(d.clone(), one.clone());
+        self.ambiguous.insert(
+            d,
+            Ambiguous {
+                key: one,
+                results: 2,
+                failed: 1,
+            },
+        );
     }
 
     /// Framework summary lines: "test result: ok. 4 passed; 1 failed; 0 ignored"
@@ -888,6 +1018,20 @@ impl Recognizers {
         if self.no_tests_line.is_none() && PHRASES.iter().any(|p| t.contains(p)) {
             self.no_tests_line = Some(t.chars().take(200).collect());
         }
+    }
+
+    /// Names printed several times with no place to tell the results apart,
+    /// with how many results were counted (ADR 0037 section 2).
+    pub fn ambiguous_names(&self) -> Vec<(String, u64)> {
+        self.ambiguous
+            .values()
+            .map(|a| (a.key.display(), a.results))
+            .collect()
+    }
+
+    /// Failures beyond the one each ambiguous name records.
+    pub fn ambiguous_extra_failed(&self) -> u64 {
+        self.ambiguous.values().map(|a| a.failed - 1).sum()
     }
 
     /// Tests that errored in teardown after a failure, and after a pass:
@@ -1213,6 +1357,7 @@ impl Recognizers {
     /// the place unknown, unless it holds the repository (a `prova.toml` in
     /// a subproject).
     fn pytest_rootdir(&mut self, header: &str) {
+        self.pytest_rootdir_seen = true;
         let dir = header.split(", ").next().unwrap_or(header).trim();
         let (Some(cwd), Some(repo)) = (self.cwd.as_ref(), self.repo_root.as_ref()) else {
             self.pytest_dir = PytestDir::Start;
@@ -1264,6 +1409,9 @@ impl Recognizers {
             return pytest_key(id);
         }
         self.pytest_named.set(true);
+        if !self.pytest_rootdir_seen {
+            self.pytest_unrooted.set(true);
+        }
         let from = |p: &str| {
             if p.is_empty() {
                 pytest_key(id)
@@ -2118,6 +2266,8 @@ impl Recognizers {
     // ------------------------------------------------------------- libtest
 
     fn libtest_key(&self, name: &str) -> TestKey {
+        self.libtest_unplaced
+            .set(self.libtest_unplaced.get() || self.libtest_binary.is_none());
         let (path, leaf) = split_rust_path(name);
         TestKey {
             file: self.libtest_binary.clone(),
@@ -3852,6 +4002,63 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Quiet `cargo test` prints no binary: results of one name from three
+    /// crates cannot be told apart. The run has one result of that name, a
+    /// failure when any failed, none of it history for another run (a place
+    /// of its own), and the name is listed as ambiguous (ADR 0037).
+    #[test]
+    fn same_name_with_no_place_is_one_result_failed_if_any_failed() {
+        for order in [
+            ["FAILED", "ok", "FAILED"],
+            ["ok", "FAILED", "FAILED"],
+            ["FAILED", "FAILED", "ok"],
+            ["ok", "ok", "FAILED"],
+            ["ok", "FAILED", "ok"],
+        ] {
+            let mut input = String::new();
+            for o in order {
+                input.push_str(&format!(
+                    "running 1 test\ntest tests::same ... {o}\n\ntest result: ok. 1 passed; 0 failed\n\n"
+                ));
+            }
+            let (r, ev) = feed_all(&input);
+            let done = finished(&ev);
+            assert_eq!(
+                done,
+                vec![("tests::same".to_owned(), Outcome::Failed)],
+                "{order:?}: {ev:?}"
+            );
+            let own_place = ev
+                .iter()
+                .filter_map(|e| match e {
+                    EventKind::TestFinished { test, .. } => test.file.as_deref(),
+                    _ => None,
+                })
+                .filter(|f| f.starts_with(prova_core::model::AMBIGUOUS_PLACE))
+                .count();
+            assert_eq!(own_place, 1, "{order:?}: {ev:?}");
+            // Equal results before a differing one cannot be counted apart
+            // from a summary line repeating one: at least two are known.
+            let named = r.ambiguous_names();
+            assert!(
+                named.len() == 1 && named[0].0 == "tests::same" && named[0].1 >= 2,
+                "{order:?}: {named:?}"
+            );
+        }
+    }
+
+    /// Passing results of one unplaced name are still one passing test.
+    #[test]
+    fn same_name_passing_everywhere_stays_one_pass() {
+        let (r, ev) =
+            feed_all("test tests::same ... ok\ntest tests::same ... ok\ntest tests::same ... ok\n");
+        assert_eq!(
+            finished(&ev),
+            vec![("tests::same".to_owned(), Outcome::Passed)]
+        );
+        assert!(r.ambiguous_names().is_empty());
     }
 
     fn fixture(name: &str) -> String {

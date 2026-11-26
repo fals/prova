@@ -45,6 +45,9 @@ verdict (`prova exp export`).
   package), relative to the repository. prova does not infer it from panic
   paths, container mounts or a search of the disk; an unknown place is shown
   as unknown and never shares the history of a test whose place is known.
+  Several results of one name with no place printed (quiet `cargo test`,
+  pytest without its header) are one failed result for that run, with no
+  history, and the run says so.
 - **History across suites.** Each suite and each ad hoc command keeps its
   own history; the same test run another way starts its own.
 - **Deliberately adversarial experiment candidates.** prova keeps a

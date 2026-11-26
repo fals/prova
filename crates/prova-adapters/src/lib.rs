@@ -422,6 +422,13 @@ impl Observer for Ladder {
             .count() as u64;
         let seen =
             (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
+        for (name, n) in self.live.ambiguous_names() {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "{n} results named `{name}` that prova cannot tell apart (no place printed): recorded as one failed test with no history; run `cargo test` without `--quiet` (pytest with `-v` and its header) to tell them apart"
+                ),
+            });
+        }
         if !self.live.pytest_xpass.is_empty() {
             report.events.push(EventKind::RunNote {
                 message: format!(
@@ -481,7 +488,8 @@ impl Observer for Ladder {
             })
             .collect();
         outcomes.extend(finals.iter().map(|(k, o)| (k.clone(), *o)));
-        let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64;
+        let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64
+            + self.live.ambiguous_extra_failed();
         let failed_reported = self.live.failed_reported();
         if failed_reported > failed_seen {
             report.contradictions.push(format!(

@@ -177,6 +177,7 @@ pub fn files_of(store: &Store, display: &str) -> Result<Vec<String>> {
     let mut stmt = store.conn().prepare(
         "SELECT DISTINCT file FROM tests WHERE display = ?1 AND file IS NOT NULL
             AND file NOT LIKE '(package pending)%' AND file NOT LIKE '(unknown directory)%'
+            AND file NOT LIKE '(ambiguous in this run%'
           ORDER BY file",
     )?;
     Ok(stmt
