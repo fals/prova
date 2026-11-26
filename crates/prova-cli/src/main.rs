@@ -2584,7 +2584,7 @@ fn print_output(
             .collect();
         if found.is_empty() {
             bail!(
-                "no kept output for a failing test matching {name:?} in run {id}: a test cut off before it finished, or a framework that printed nothing per test, has none; `prova output {id}` shows the run's kept output"
+                "no kept output for a failing test matching {name:?} in run {id}: the test printed none before the run ended (pytest and libtest print failure details only in their end-of-run summary, which a cancel or kill cuts off; a test cut off before it finished has none either); `prova output {id}` shows the run's kept output"
             );
         }
         if json {
