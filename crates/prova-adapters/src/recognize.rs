@@ -188,6 +188,9 @@ pub struct Recognizers {
     /// (header of `___ test_q ___`, lines), claimed by the short summary's
     /// `FAILED id - message` lines that follow.
     pytest_in_failures: bool,
+    /// pytest's short test summary is being read: its lines repeat results
+    /// the verbose lines already gave.
+    pytest_in_summary: bool,
     /// Vitest's default reporter prints suites as a tree (`❯ suite (2)`,
     /// then `× fails`): the open ones, by indentation.
     vitest_suites: Vec<(usize, String)>,
@@ -580,10 +583,15 @@ impl Recognizers {
         let unplaced = key.place_unknown()
             || (key.file.is_none() && (self.libtest_unplaced.get() || self.pytest_unrooted.get()));
         if unplaced && let Some(a) = self.ambiguous.get_mut(&d) {
-            a.results += 1;
-            self.repeats += 1;
+            // A summary line repeats a result already counted.
+            if !self.pytest_in_summary {
+                a.results += 1;
+                self.repeats += 1;
+            }
             if outcome.is_failure() {
-                a.failed += 1;
+                if !self.pytest_in_summary {
+                    a.failed += 1;
+                }
                 if let Some(m) = message {
                     self.failure_fallback.push((a.key.clone(), m));
                 }
@@ -1051,6 +1059,9 @@ impl Recognizers {
     }
 
     pub fn line(&mut self, line: &str) -> Vec<EventKind> {
+        // Coloured result lines (`test x ... ok` with colour) read as text.
+        let line = prova_core::output::plain(line);
+        let line = line.as_ref();
         let mut out = Vec::new();
         // nextest: output captured under a FAIL line belongs to that test
         // (its echoed libtest summary must not count as the run's totals).
@@ -2629,6 +2640,9 @@ impl Recognizers {
     fn pytest_section(&mut self, line: &str) {
         let t = line.trim_end();
         let bar = t.trim_matches('=').trim();
+        if t.starts_with("==") {
+            self.pytest_in_summary = bar == "short test summary info";
+        }
         if t.starts_with("==") && matches!(bar, "FAILURES" | "ERRORS") {
             self.pytest_in_failures = true;
             self.pytest_blocks.clear();
@@ -4225,6 +4239,25 @@ mod tests {
             finished(&ev),
             vec![("p::(package)".into(), Outcome::Errored)]
         );
+    }
+
+    /// A coloured run (`--color always`, a tty-forcing wrapper) printed
+    /// `\x1b[32mok\x1b[0m`: the results were not seen (false fail).
+    #[test]
+    fn colour_codes_do_not_hide_results() {
+        let (r, ev) = feed(
+            "running 2 tests\ntest tests::a ... \x1b[32mok\x1b[0m\ntest tests::b ... \x1b[31mFAILED\x1b[0m\n",
+        );
+        assert_eq!(r.level, Some(Level::Recognized));
+        assert_eq!(
+            finished(&ev),
+            vec![
+                ("tests::a".into(), Outcome::Passed),
+                ("tests::b".into(), Outcome::Failed)
+            ]
+        );
+        let (_, ev) = feed("=== RUN   TestA\n\x1b[32m--- PASS\x1b[0m: TestA (0.00s)\n");
+        assert_eq!(finished(&ev), vec![("TestA".into(), Outcome::Passed)]);
     }
 
     #[test]

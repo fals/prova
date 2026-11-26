@@ -1602,3 +1602,53 @@ fn exp_export_while_a_comparison_runs_is_partial() {
     let x = json(&prova(&d, &["exp", "export", "e"]));
     assert_eq!(x["partial"], false, "{x}");
 }
+
+/// Release candidate: `exp status` right after `exp candidate` said "no
+/// comparison yet; next: prova exp candidate", though a candidate waited.
+#[test]
+fn status_with_a_recorded_candidate_says_to_run_it() {
+    let d = repo("status-next", "0.01");
+    new_exp(&d, &[]);
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.contains("next: prova exp candidate e"), "{out}");
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains("no comparison yet; next: prova exp run e")
+            && !out.contains("exp candidate e"),
+        "{out}"
+    );
+}
+
+/// Release candidate: `exp wait --help` and `exp status --help` did not say
+/// what their exit codes mean (1 for a REJECT).
+#[test]
+fn exp_wait_and_status_help_say_their_exit_codes() {
+    let d = repo("help-exit", "0.01");
+    for sub in ["wait", "status"] {
+        let o = prova(&d, &["exp", sub, "--help"]);
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(
+            out.contains("Exit codes:")
+                && out.contains("1 REJECT")
+                && out.contains("5 still running"),
+            "{sub}: {out}"
+        );
+    }
+}
+
+/// Release candidate: `exp status` did not say how long a comparison took.
+#[test]
+fn status_says_how_long_the_comparison_took() {
+    let d = repo("duration", "0.05");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    prova(&d, &["exp", "run", "e", "--json"]);
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.contains(", took "), "{out}");
+    let j = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    assert!(j["comparison"]["elapsed_ms"].as_u64().unwrap() > 0, "{j}");
+}

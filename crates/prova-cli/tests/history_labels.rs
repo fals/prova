@@ -1375,3 +1375,58 @@ fn a_repeat_does_not_call_a_test_flaky_from_another_suites_history() {
     assert!(out.contains("2 run(s)"), "{out}");
     assert!(!out.contains("history knows it as flaky"), "{out}");
 }
+
+/// Release candidate: `history` showed an ad hoc suite as `cmd:38dcb90d`
+/// only. It also says the command the name stands for.
+#[test]
+fn history_of_an_ad_hoc_suite_shows_its_command() {
+    let d = workspace("adhoc-command");
+    let cmd = format!("{SCRIPT} # a command with a long tail {}", "x".repeat(120));
+    std::fs::write(d.join("state"), "pass").unwrap();
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("(suite cmd:") && h.contains("sh -c") && h.contains("..."),
+        "{h}"
+    );
+    assert!(!h.contains(&"x".repeat(100)), "shortened: {h}");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["history", "calc::x", "--json"]))).unwrap();
+    assert!(
+        j[0]["suite_command"]
+            .as_str()
+            .unwrap()
+            .contains(&"x".repeat(120)),
+        "{j}"
+    );
+    // A named suite stands for itself.
+    suites(&d);
+    run(&d, "make", "pass");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["history", "calc::x", "--json"]))).unwrap();
+    assert!(
+        j.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["suite"] == "make" && s.get("suite_command").is_none()),
+        "{j}"
+    );
+}
+
+/// Release candidate: `--repeat` said "3 of 4 pass(es) verified little
+/// (known flaky passed)" when the test only became known flaky by the second
+/// run: that run's pass was no pass of an already known flaky test.
+#[test]
+fn repeat_counts_only_passes_after_the_test_was_known_flaky() {
+    let d = workspace("repeat-flaky");
+    std::fs::write(d.join("state"), "0").unwrap();
+    // Fails the first time, passes after; `state` counts the runs.
+    let cmd = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; n=$(cat state); echo $((n+1)) > state; if [ \"$n\" = 0 ]; then echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101; else echo 'test calc::x ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; fi";
+    let o = prova(&d, &["run", "--repeat", "4", "--", "sh", "-c", cmd]);
+    let all = format!("{}{}", text(&o), String::from_utf8_lossy(&o.stderr));
+    assert!(all.contains("FLAKY calc::x: failed 1 of 4"), "{all}");
+    assert!(
+        all.contains("2 of 4 pass(es) verified little"),
+        "only runs 3 and 4 passed a test already known flaky: {all}"
+    );
+}

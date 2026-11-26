@@ -710,7 +710,10 @@ Examples:
   prova exp wait speed --max-wait 1h     as long as the comparison needs
 The 9 minute limit is only the foreground `exp run` budget: `exp wait` takes
 any --max-wait, so one command (in the background if your tool calls are
-short) replaces a polling loop. Exit 5 means still running: wait again.")]
+short) replaces a polling loop.
+Exit codes: 0 ACCEPT (or no comparison yet), 1 REJECT or any other verdict
+that is not an accept, 3 cancelled, 4 the comparison failed, 5 still running:
+wait again.")]
     Wait {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
@@ -731,7 +734,10 @@ Examples:
   prova exp status speed --json
   prova exp status speed --comparison 6ddda6cb   an older comparison
 `prova exp protocol` changes the protocol (before the first trial); it is
-not how to read it.")]
+not how to read it.
+Exit codes: 0 ACCEPT, no comparison yet, or a REJECT after a candidate was
+accepted as best; 1 REJECT with no accepted best; 3 cancelled; 4 the
+comparison failed; 5 still running.")]
     Status {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
@@ -2602,6 +2608,18 @@ fn print_output(
         return Ok(exit::PASSED);
     }
     if let Some(n) = tail {
+        // Only kept lines can be shown: a passed run keeps its last lines
+        // (ADR 0016). Say so when this asks for everything kept and some
+        // lines are not (the plain output marks them "elided").
+        if let Ok(Kept::Excerpt(e)) = output::run_excerpt(store, id)
+            && n as u64 >= e.kept_lines()
+            && e.total_lines > e.kept_lines()
+        {
+            println!(
+                "note: {} line(s) of this run's output were not kept (a passed run keeps only its last lines, a failed one its first lines, error lines and last lines); `--keep-output` on the run keeps all",
+                e.total_lines - e.kept_lines()
+            );
+        }
         for l in engine::output_tail(store, id, n) {
             println!("{l}");
         }
@@ -3492,8 +3510,16 @@ fn repeat_runs(
         // A pass that proved little (cached results, warnings) is no
         // evidence of a steady test (round 15: "every test passed every
         // time" over replayed go test results).
+        // A pass whose only reason is a known flaky test counts when the
+        // test was known flaky before this run (the run that made it flaky
+        // is not a pass of a known flaky test).
+        let flaky_only = s.warnings.is_empty() && !s.flaky_passed.is_empty() && {
+            let before = analysis::flaky_before(store, &store.run(&id)?.suite, &id)?;
+            !s.flaky_passed.iter().any(|t| before.contains(t))
+        };
         if s.outcome == Some(Outcome::Passed)
             && (!s.warnings.is_empty() || s.verified == Some(false))
+            && !flaky_only
         {
             // The reason itself, not a generic one (round 16: "e.g. cached
             // results" for a known flaky test's pass).
