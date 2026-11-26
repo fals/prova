@@ -62,14 +62,21 @@ fn clip(s: &str) -> Option<String> {
 }
 
 pub fn parse(xml: &str) -> Result<Vec<Case>, ParseError> {
+    parse_checked(xml).map(|(cases, _)| cases)
+}
+
+/// The cases, and what shows the file is incomplete: it ends before its
+/// root closes, or a suite's header counts more tests than it holds. Such a
+/// file cannot verify a pass.
+pub fn parse_checked(xml: &str) -> Result<(Vec<Case>, Vec<String>), ParseError> {
     let trimmed = xml.trim_start_matches('\u{feff}');
     let root = first_element(trimmed)?;
     match root.as_str() {
         "testsuites" | "testsuite" => parse_junit(trimmed),
-        "TestRun" => parse_trx(trimmed),
+        "TestRun" => parse_trx(trimmed).map(|c| (c, Vec::new())),
         _ => Err(ParseError::Unknown),
     }
-    .map(number_repeats)
+    .map(|(c, problems)| (number_repeats(c), problems))
 }
 
 /// Each `<testcase>` is its own result: Gradle names a JUnit 5 repetition by
@@ -118,9 +125,15 @@ struct Current {
 /// test cases show.
 #[derive(Default)]
 struct Frame {
+    header_tests: u64,
+    cases: u64,
     header_failed: u64,
     cases_failed: u64,
     has_child_suite: bool,
+    /// Catch2 (`hostname="tbd"`) and doctest (`status=` on test cases) put
+    /// the number of assertions in `tests=`: it says nothing about how many
+    /// test cases the file should hold.
+    counts_assertions: bool,
 }
 
 fn header_count(e: &BytesStart<'_>, name: &[u8]) -> u64 {
@@ -136,7 +149,7 @@ enum Text {
     Retry,
 }
 
-fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
+fn parse_junit(xml: &str) -> Result<(Vec<Case>, Vec<String>), ParseError> {
     let mut r = Reader::from_str(xml);
     let mut suites: Vec<String> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
@@ -144,11 +157,18 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
     let mut text = Text::None;
     let mut buf = String::new();
     let mut out = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
 
     // A suite whose header says more tests failed than its test cases show
     // (a class that failed to initialize, a `ignoreFailures` build): the
     // gap is an error of the suite itself.
-    let close_suite = |f: Frame, name: &str, out: &mut Vec<Case>| {
+    let close_suite = |f: Frame, name: &str, out: &mut Vec<Case>, problems: &mut Vec<String>| {
+        if !f.has_child_suite && !f.counts_assertions && f.header_tests > f.cases {
+            problems.push(format!(
+                "suite {name:?} counts {} tests in its header but the file holds {}",
+                f.header_tests, f.cases
+            ));
+        }
         if !f.has_child_suite && f.header_failed > f.cases_failed {
             out.push(Case {
                 key: TestKey::new(vec![name.to_owned()], "(suite)"),
@@ -170,6 +190,9 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
             && c.final_kind.is_some_and(|k| k.is_failure())
         {
             f.cases_failed += 1;
+        }
+        if let Some(f) = frames.last_mut() {
+            f.cases += 1;
         }
         let path = match &c.classname {
             Some(cn) if !cn.is_empty() && *cn != c.name => vec![cn.clone()],
@@ -196,7 +219,12 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
         let ev = match r.read_event() {
             Ok(ev) => ev,
             // Truncated or broken file: keep what was complete.
-            Err(_) if !out.is_empty() => break,
+            Err(_) if !out.is_empty() => {
+                problems.push(
+                    "the file is cut short (invalid XML after its last complete test)".into(),
+                );
+                break;
+            }
             Err(e) => return Err(ParseError::Xml(e.to_string())),
         };
         match ev {
@@ -209,19 +237,27 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                             parent.has_child_suite = true;
                         }
                         let f = Frame {
+                            header_tests: header_count(e, b"tests"),
                             header_failed: header_count(e, b"failures")
                                 + header_count(e, b"errors"),
+                            counts_assertions: attr(e, b"hostname").as_deref() == Some("tbd")
+                                || attr(e, b"assertions").is_some(),
                             ..Frame::default()
                         };
                         let name = attr(e, b"name").unwrap_or_default();
                         if empty {
-                            close_suite(f, &name, &mut out);
+                            close_suite(f, &name, &mut out, &mut problems);
                         } else {
                             suites.push(name);
                             frames.push(f);
                         }
                     }
                     b"testcase" => {
+                        if attr(e, b"status").is_some()
+                            && let Some(f) = frames.last_mut()
+                        {
+                            f.counts_assertions = true;
+                        }
                         let c = Current {
                             name: attr(e, b"name").unwrap_or_default(),
                             classname: attr(e, b"classname"),
@@ -290,7 +326,7 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                 b"testsuite" => {
                     let name = suites.pop().unwrap_or_default();
                     if let Some(f) = frames.pop() {
-                        close_suite(f, &name, &mut out);
+                        close_suite(f, &name, &mut out, &mut problems);
                     }
                 }
                 b"testcase" => {
@@ -321,11 +357,16 @@ fn parse_junit(xml: &str) -> Result<Vec<Case>, ParseError> {
                 }
                 _ => {}
             },
-            Event::Eof => break,
+            Event::Eof => {
+                if !frames.is_empty() || cur.is_some() {
+                    problems.push("the file ends before its root element closes".into());
+                }
+                break;
+            }
             _ => {}
         }
     }
-    Ok(out)
+    Ok((out, problems))
 }
 
 /// `hh:mm:ss.fffffff`
@@ -451,6 +492,21 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
 mod tests {
     use super::*;
 
+    /// Real Catch2 and doctest reports (README-assertion-counters.md): their
+    /// `tests=` counts assertions, so a header above the test cases is not
+    /// a cut report and the pass is not made unverified.
+    #[test]
+    fn real_assertion_counting_reports_are_not_called_incomplete() {
+        for (name, cases) in [
+            ("catch2-selftest.xml", 1045),
+            ("doctest-assertion-macros.xml", 23),
+        ] {
+            let (parsed, problems) = parse_checked(&fixture(name)).unwrap();
+            assert!(parsed.len() >= cases, "{name}: {} results", parsed.len());
+            assert!(problems.is_empty(), "{name}: {problems:?}");
+        }
+    }
+
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/fixtures/junit/{name}",
@@ -469,6 +525,38 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Catch2 and doctest put the number of assertions in `tests=`: a
+    /// passing run must stay verified, while a header that counts more tests
+    /// than a plain JUnit file holds is still incomplete.
+    #[test]
+    fn header_counts_of_assertion_counting_generators_are_not_missing_tests() {
+        let catch2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="exe" errors="0" failures="0" tests="12" hostname="tbd" time="0.003" timestamp="2024-05-01T10:00:00Z">
+    <testcase classname="exe.global" name="Factorial" time="0.001"/>
+    <testcase classname="exe.global" name="Sum" time="0.001"/>
+    <system-out/>
+    <system-err/>
+  </testsuite>
+</testsuites>"#;
+        let (cases, problems) = parse_checked(catch2).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert!(problems.is_empty(), "{problems:?}");
+        let doctest = r#"<testsuites>
+  <testsuite name="exe" errors="0" failures="0" tests="9">
+    <testcase classname="a.cpp" name="adds" status="run"/>
+    <testcase classname="a.cpp" name="subs" status="run"/>
+  </testsuite>
+</testsuites>"#;
+        let (_, problems) = parse_checked(doctest).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        // The truncated plain JUnit file still warns.
+        let plain = r#"<testsuite name="s" tests="2" errors="0" failures="0">
+            <testcase classname="s" name="a" time="0.1"/></testsuite>"#;
+        let (_, problems) = parse_checked(plain).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     /// Round 14: a suite's header counts an error no test case shows (a

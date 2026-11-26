@@ -1,0 +1,1949 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="SelfTest" errors="17" failures="141" skipped="12" tests="2445" hostname="tbd" time="0.001" timestamp="2026-11-26T12:00:00Z">
+    <properties>
+      <property name="random-seed" value="1"/>
+      <property name="filters" value="&quot;*&quot; ~[!nonportable] ~[!benchmark] ~[approvals]"/>
+    </properties>
+    <testcase classname="SelfTest.global" name="# A test name that starts with a #" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1027: Bitfields can be captured" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1147" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1175 - Hidden Test" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1238" time="0.001" status="run"/>
+    <testcase classname="SelfTest.(Fixture_1245&lt;int, int>)" name="#1245" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1319: Sections can have description (even if it is not saved" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1319: Sections can have description (even if it is not saved/SectionName" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1403" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1455 - INFO and WARN can start with a linebreak" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1514: stderr/stdout is not captured in tests aborted by an exception" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+1514
+at Tricky.tests.cpp:42
+      </failure>
+      <system-out>
+This would not be caught previously
+      </system-out>
+      <system-err>
+Nor would this
+      </system-err>
+    </testcase>
+    <testcase classname="SelfTest.global" name="#1548" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1905 -- test spec parser properly clears internal state between compound tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1912 -- test spec parser handles escaping" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1912 -- test spec parser handles escaping/Various parentheses" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1912 -- test spec parser handles escaping/backslash in test name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1913 - GENERATE inside a for loop should not keep recreating the generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1913 - GENERATEs can share a line" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - GENERATE after a section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - GENERATE after a section/A" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - GENERATE after a section/B" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - Section followed by flat generate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - Section followed by flat generate/A" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - flat generate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - mixed sections and generates" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - mixed sections and generates/A" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - mixed sections and generates/B" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1938 - nested generate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1954 - 7 arg template test case sig compiles - 1, 1, 1, 1, 1, 0, 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1954 - 7 arg template test case sig compiles - 5, 1, 1, 1, 1, 0, 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#1954 - 7 arg template test case sig compiles - 5, 3, 1, 1, 1, 0, 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#2152 - ULP checks between differently signed values were wrong - double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#2152 - ULP checks between differently signed values were wrong - float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#2615 - Throwing in constructor generator fails test case but does not abort" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+failure to init
+at Generators.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="#3001: Enum-based bitfields can be captured" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#748 - captures with unexpected exceptions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#748 - captures with unexpected exceptions/outside assertions" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+expected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="#748 - captures with unexpected exceptions/inside REQUIRE_NOTHROW" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="thisThrows()" type="REQUIRE_NOTHROW">
+FAILED:
+  REQUIRE_NOTHROW( thisThrows() )
+expected exception
+answer := 42
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="#748 - captures with unexpected exceptions/inside REQUIRE_THROWS" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#809" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#833" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#835 -- errno should not be touched by Catch2" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="f() == 0" type="CHECK">
+FAILED:
+  CHECK( f() == 0 )
+with expansion:
+  1 == 0
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="#872" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported/Looped section 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported/Looped section 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported/Looped section 2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported/Looped section 3" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="#961 -- Dynamically created sections should all be reported/Looped section 4" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="'Not' checks that should fail" time="0.001" status="run">
+      <failure message="false != false" type="CHECK">
+FAILED:
+  CHECK( false != false )
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="'Not' checks that should succeed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated/compare to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated/compare to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated/negation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated/double negation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="(unimplemented) static bools can be evaluated/direct" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="3x3x3 ints" time="0.001" status="run"/>
+    <testcase classname="SelfTest.TestClass" name="A METHOD_AS_TEST_CASE based test run that fails" time="0.001" status="run">
+      <failure message="s == &quot;world&quot;" type="REQUIRE">
+FAILED:
+  REQUIRE( s == "world" )
+with expansion:
+  "hello" == "world"
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.TestClass" name="A METHOD_AS_TEST_CASE based test run that succeeds" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that fails - Template_Foo&lt;float>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>::m_a.size() == 1" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>::m_a.size() == 1 )
+with expansion:
+  0 == 1
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that fails - Template_Foo&lt;int>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>::m_a.size() == 1" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>::m_a.size() == 1 )
+with expansion:
+  0 == 1
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that fails - std::vector&lt;float>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>::m_a.size() == 1" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>::m_a.size() == 1 )
+with expansion:
+  0 == 1
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that fails - std::vector&lt;int>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>::m_a.size() == 1" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>::m_a.size() == 1 )
+with expansion:
+  0 == 1
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that succeeds - Template_Foo&lt;float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that succeeds - Template_Foo&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that succeeds - std::vector&lt;float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD based test run that succeeds - std::vector&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that fails - Template_Foo_2&lt;float, 6>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2 )
+with expansion:
+  6 &lt; 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that fails - Template_Foo_2&lt;int, 2>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2 )
+with expansion:
+  2 &lt; 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that fails - std::array&lt;float, 6>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2 )
+with expansion:
+  6 &lt; 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that fails - std::array&lt;int, 2>" time="0.001" status="run">
+      <failure message="Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture_2&lt;TestType>{}.m_a.size() &lt; 2 )
+with expansion:
+  2 &lt; 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that succeeds - Template_Foo_2&lt;float,6>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that succeeds - Template_Foo_2&lt;int,2>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that succeeds - std::array&lt;float,6>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture_2" name="A TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG based test run that succeeds - std::array&lt;int,2>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that fails - double" time="0.001" status="run">
+      <failure message="Template_Fixture&lt;TestType>::m_a == 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture&lt;TestType>::m_a == 2 )
+with expansion:
+  1.0 == 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that fails - float" time="0.001" status="run">
+      <failure message="Template_Fixture&lt;TestType>::m_a == 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture&lt;TestType>::m_a == 2 )
+with expansion:
+  1.0f == 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that fails - int" time="0.001" status="run">
+      <failure message="Template_Fixture&lt;TestType>::m_a == 2" type="REQUIRE">
+FAILED:
+  REQUIRE( Template_Fixture&lt;TestType>::m_a == 2 )
+with expansion:
+  1 == 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that succeeds - double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that succeeds - float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="A TEMPLATE_TEST_CASE_METHOD based test run that succeeds - int" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that fails - 1" time="0.001" status="run">
+      <failure message="Nttp_Fixture&lt;V>::value == 0" type="REQUIRE">
+FAILED:
+  REQUIRE( Nttp_Fixture&lt;V>::value == 0 )
+with expansion:
+  1 == 0
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that fails - 3" time="0.001" status="run">
+      <failure message="Nttp_Fixture&lt;V>::value == 0" type="REQUIRE">
+FAILED:
+  REQUIRE( Nttp_Fixture&lt;V>::value == 0 )
+with expansion:
+  3 == 0
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that fails - 6" time="0.001" status="run">
+      <failure message="Nttp_Fixture&lt;V>::value == 0" type="REQUIRE">
+FAILED:
+  REQUIRE( Nttp_Fixture&lt;V>::value == 0 )
+with expansion:
+  6 == 0
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that succeeds - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that succeeds - 3" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Nttp_Fixture" name="A TEMPLATE_TEST_CASE_METHOD_SIG based test run that succeeds - 6" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Fixture" name="A TEST_CASE_METHOD based test run that fails" time="0.001" status="run">
+      <failure message="m_a == 2" type="REQUIRE">
+FAILED:
+  REQUIRE( m_a == 2 )
+with expansion:
+  1 == 2
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Fixture" name="A TEST_CASE_METHOD based test run that succeeds" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Persistent_Fixture" name="A TEST_CASE_PERSISTENT_FIXTURE based test run that fails/First partial run" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Persistent_Fixture" name="A TEST_CASE_PERSISTENT_FIXTURE based test run that fails/Second partial run" time="0.001" status="run">
+      <failure message="m_a == 0" type="REQUIRE">
+FAILED:
+  REQUIRE( m_a == 0 )
+with expansion:
+  1 == 0
+at Class.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.Persistent_Fixture" name="A TEST_CASE_PERSISTENT_FIXTURE based test run that succeeds" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Persistent_Fixture" name="A TEST_CASE_PERSISTENT_FIXTURE based test run that succeeds/First partial run" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Persistent_Fixture" name="A TEST_CASE_PERSISTENT_FIXTURE based test run that succeeds/Second partial run" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case - Foo&lt;float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case - Foo&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case - std::vector&lt;float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case - std::vector&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case with array signature - Bar&lt;float, 42>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case with array signature - Bar&lt;int, 9>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case with array signature - std::array&lt;float, 42>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A Template product test case with array signature - std::array&lt;int, 9>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A comparison that uses literals instead of the normal constructor" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A couple of nested sections followed by a failure" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+to infinity and beyond
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="A couple of nested sections followed by a failure/Outer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A couple of nested sections followed by a failure/Outer/Inner" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="A failing expression with a non streamable type is still captured" time="0.001" status="run">
+      <failure message="&amp;o1 == &amp;o2" type="CHECK">
+FAILED:
+  CHECK( &amp;o1 == &amp;o2 )
+with expansion:
+  0x0x1234 == 0x0x1234
+at Tricky.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Absolute margin" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="An empty test with no assertions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="An expression with side-effects should only be evaluated once" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="An unchecked exception reports the line of the last assertion" time="0.001" status="run">
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+unexpected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Anonymous test case 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approx setters validate their arguments" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approx with exactly-representable margin" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approximate PI" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approximate comparisons with different epsilons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approximate comparisons with floats" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approximate comparisons with ints" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Approximate comparisons with mixed numeric types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Arbitrary predicate matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Arbitrary predicate matcher/Function pointer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Arbitrary predicate matcher/Lambdas + different type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Assertion macros support bit operators and bool conversions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Assertions can be nested - CHECK" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="i > 10" type="REQUIRE">
+FAILED:
+  REQUIRE( i > 10 )
+with expansion:
+  2 > 10
+at AssertionHandler.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Assertions can be nested - REQUIRE" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="i > 10" type="REQUIRE">
+FAILED:
+  REQUIRE( i > 10 )
+with expansion:
+  2 > 10
+at AssertionHandler.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Assertions then sections" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Assertions then sections/A section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Assertions then sections/A section/Another section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Assertions then sections/A section/Another other section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Different argument ranges, same element type, default comparison" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Different argument ranges, same element type, custom comparison" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Different element type, custom comparisons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Can handle type that requires ADL-found free function begin and end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Initialization with move only types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Contains range matcher/Matching using matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Empty range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Empty range matcher/Simple, std-provided containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Empty range matcher/Type with empty" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Basic use of the Empty range matcher/Type requires ADL found empty free function" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CAPTURE can deal with complex expressions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CAPTURE can deal with complex expressions involving commas" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CAPTURE parses string and character constants" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Capture and info messages" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Capture and info messages/Capture should stringify like assertions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Capture and info messages/Info should NOT stringify the way assertions do" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Captures do not leave block with an exception" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+a := 1
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Captures outlive section end" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+a := 1
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Captures outlive section end/Dummy section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveEqualsTo is case insensitive" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveEqualsTo is case insensitive/Degenerate cases" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveEqualsTo is case insensitive/Plain comparisons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveLess is case insensitive" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveLess is case insensitive/Degenerate cases" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="CaseInsensitiveLess is case insensitive/Plain comparisons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Character pretty printing" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Character pretty printing/Specifically escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Character pretty printing/General chars" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Character pretty printing/Low ASCII" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Clara::Arg does not crash on incomplete input" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Clara::Arg supports single-arg parse the way Opt does" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Clara::Opt supports accept-many lambdas" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Clara::Opt supports accept-many lambdas/Parsing fails on multiple options without accept_many" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Clara::Opt supports accept-many lambdas/Parsing succeeds on multiple options with accept_many" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ColourGuard behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ColourGuard behaviour/ColourGuard is disengaged by default" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ColourGuard behaviour/ColourGuard is engaged by op&lt;&lt;" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ColourGuard behaviour/ColourGuard can be engaged explicitly" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining MatchAllOfGeneric does not nest" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining MatchAnyOfGeneric does not nest" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining MatchNotOfGeneric does not nest" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining concrete matchers does not use templated matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining only templated matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining templated and concrete matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Combining templated matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Commas in various macros are allowed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparing (and stringifying) volatile pointers works" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparing function pointers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparison ops" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparison with explicitly convertible types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparisons between ints where one side is computed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparisons between unsigned ints and negative signed ints match c++ standard behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Comparisons with int literals don't warn when mixing signed/ unsigned" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed generic matchers shortcircuit" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed generic matchers shortcircuit/MatchAllOf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed generic matchers shortcircuit/MatchAnyOf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed matchers shortcircuit" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed matchers shortcircuit/MatchAllOf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Composed matchers shortcircuit/MatchAnyOf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ConcatGenerator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ConcatGenerator/Cat support single-generator construction" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ConcatGenerator/Iterating over multiple generators" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Contains string matcher" time="0.001" status="run">
+      <failure message="testStringForMatching(), ContainsSubstring( &quot;not there&quot;, Catch::CaseSensitive::No )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), ContainsSubstring( "not there", Catch::CaseSensitive::No ) )
+with expansion:
+  "this string contains 'abc' as a substring" contains: "not there" (case
+  insensitive)
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Copy and then generate a range" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Copy and then generate a range/from var and iterators" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Copy and then generate a range/From a temporary container" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Copy and then generate a range/Final validation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Cout stream properly declares it writes to stdout" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Custom exceptions can be translated when testing for nothrow" time="0.001" status="run">
+      <error message="throwCustom()" type="REQUIRE_NOTHROW">
+FAILED:
+  REQUIRE_NOTHROW( throwCustom() )
+custom exception - not std
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Custom exceptions can be translated when testing for throwing as something else" time="0.001" status="run">
+      <error message="throwCustom(), std::exception" type="REQUIRE_THROWS_AS">
+FAILED:
+  REQUIRE_THROWS_AS( throwCustom(), std::exception )
+custom exception - not std
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Custom std-exceptions can be custom translated" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+custom std exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Default scale is invisible to comparison" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Delayed unscoped message clearing does not catch newly inserted messages" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+b
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Directly creating an EnumInfo" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Empty generators can SKIP in constructor" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+This generator is empty
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Empty stream name opens cout stream" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="EndsWith string matcher" time="0.001" status="run">
+      <failure message="testStringForMatching(), EndsWith( &quot;Substring&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), EndsWith( "Substring" ) )
+with expansion:
+  "this string contains 'abc' as a substring" ends with: "Substring"
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Enum backed by larger underlying type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Enums can quickly have stringification enabled using CATCH_REGISTER_ENUM" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Enums in namespaces can quickly have stringification enabled using CATCH_REGISTER_ENUM" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Epsilon only applies to Approx's value" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Equality checks that should fail" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="data.int_seven == 6" type="CHECK">
+FAILED:
+  CHECK( data.int_seven == 6 )
+with expansion:
+  7 == 6
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Equality checks that should succeed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Equals" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Equals string matcher" time="0.001" status="run">
+      <failure message="testStringForMatching(), Equals( &quot;this string contains 'ABC' as a substring&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), Equals( "this string contains 'ABC' as a substring" ) )
+with expansion:
+  "this string contains 'abc' as a substring" equals: "this string contains
+  'ABC' as a substring"
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Exception as a value (e.g. in REQUIRE_THROWS_MATCHES) can be stringified" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception matchers that fail/No exception" time="0.001" status="run">
+      <failure message="doesNotThrow(), SpecialException, ExceptionMatcher{ 1 }" type="CHECK_THROWS_MATCHES">
+FAILED:
+  CHECK_THROWS_MATCHES( doesNotThrow(), SpecialException, ExceptionMatcher{ 1 } )
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Exception matchers that fail/Type mismatch" time="0.001" status="run">
+      <error message="throwsAsInt( 1 ), SpecialException, ExceptionMatcher{ 1 }" type="CHECK_THROWS_MATCHES">
+FAILED:
+  CHECK_THROWS_MATCHES( throwsAsInt( 1 ), SpecialException, ExceptionMatcher{ 1 } )
+Unknown exception
+at Matchers.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Exception matchers that fail/Contents are wrong" time="0.001" status="run">
+      <failure message="throwsSpecialException( 3 ), SpecialException, ExceptionMatcher{ 1 }" type="CHECK_THROWS_MATCHES">
+FAILED:
+  CHECK_THROWS_MATCHES( throwsSpecialException( 3 ), SpecialException, ExceptionMatcher{ 1 } )
+with expansion:
+  SpecialException::what special exception has value of 1
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Exception matchers that succeed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception message can be matched" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception messages can be tested for" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception messages can be tested for/exact match" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception messages can be tested for/different case" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception messages can be tested for/wildcarded" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exception thrown inside stringify does not fail the test" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Exceptions matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Expected exceptions that don't throw or unexpected exceptions fail the test" time="0.001" status="run">
+      <error message="thisThrows(), std::string" type="CHECK_THROWS_AS">
+FAILED:
+  CHECK_THROWS_AS( thisThrows(), std::string )
+expected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="FAIL aborts the test" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+This is a failure
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="FAIL can be nested in assertion" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+Throw a Catch::TestFailureException
+at AssertionHandler.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="FAIL does not require an argument" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="FAIL_CHECK does not abort the test" time="0.001" status="run">
+      <failure type="FAIL_CHECK">
+FAILED:
+This is a failure
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Factorials are computed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Filter generator throws exception for empty generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="FixedValuesGenerator can be skipped forward" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/Relative" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/Relative/Some subnormal values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/Margin" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/ULPs" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/Composed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/Constructor validation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: double/IsNaN" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/Relative" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/Relative/Some subnormal values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/Margin" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/ULPs" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/Composed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/Constructor validation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Floating point matchers: float/IsNaN" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="GENERATE can combine literals and generators" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite/concat generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite/take generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite/chunk generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite/map" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generator adapters properly handle isFinite/filter" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Filtering by predicate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Filtering by predicate/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Filtering by predicate/Throws if there are no matching values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Shortening a range" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Transforming elements" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Transforming elements/Same type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Transforming elements/Different type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Transforming elements/Different deduced type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Repeating a generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Chunking a generator into sized pieces" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Chunking a generator into sized pieces/Number of elements in source is divisible by chunk size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Chunking a generator into sized pieces/Number of elements in source is not divisible by chunk size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Chunking a generator into sized pieces/Chunk size of zero" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- adapters/Chunking a generator into sized pieces/Throws on too small generators" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- simple" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- simple/one" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators -- simple/two" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators can be skipped forward" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Single value" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Preset values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Generator combinator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Explicitly typed generator sequence" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Filter generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Filter generator/Simple filtering" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Filter generator/Filter out multiple elements at the start and end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Filter generator/Throws on construction if it can't get initial element" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Filter generator/Out-of-line predicates are copied into the generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Take generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Take generator/Take less" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Take generator/Take more" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Map with explicit return type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Map with deduced return type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Repeat" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Repeat/Singular repeat" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Repeat/Actual repeat" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive auto step" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive auto step/Integer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative auto step" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative auto step/Integer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Integer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Integer/Exact" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Integer/Slightly over end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Integer/Slightly under end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Floating Point" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Floating Point/Exact" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Floating Point/Slightly over end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Positive manual step/Floating Point/Slightly under end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative manual step" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative manual step/Integer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative manual step/Integer/Exact" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative manual step/Integer/Slightly over end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Generators internals/Range/Negative manual step/Integer/Slightly under end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Greater-than inequalities with different epsilons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashers with different seed produce different hash with same test case" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashers with same seed produce same hash" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashing different test cases produces different result" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashing different test cases produces different result/Different test name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashing different test cases produces different result/Different classname" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashing different test cases produces different result/Different tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Hashing test case produces same hash across multiple calls" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="INFO and UNSCOPED_INFO can stream multiple arguments" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+Show infos!
+This info has multiple parts.
+This unscoped info has multiple parts.
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="INFO and WARN do not abort tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="INFO gets logged on failure" time="0.001" status="run">
+      <failure message="a == 1" type="REQUIRE">
+FAILED:
+  REQUIRE( a == 1 )
+with expansion:
+  2 == 1
+this message should be logged
+so should this
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="INFO gets logged on failure, even if captured before successful assertions" time="0.001" status="run">
+      <failure message="a == 1" type="CHECK">
+FAILED:
+  CHECK( a == 1 )
+with expansion:
+  2 == 1
+this message may be logged later
+this message should be logged
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="INFO is reset for each loop" time="0.001" status="run">
+      <failure message="i &lt; 10" type="REQUIRE">
+FAILED:
+  REQUIRE( i &lt; 10 )
+with expansion:
+  10 &lt; 10
+current counter 10
+i := 10
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Incomplete AssertionHandler" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="Dummy" type="REQUIRE">
+FAILED:
+  REQUIRE( Dummy )
+Exception translation was disabled by CATCH_CONFIG_FAST_COMPILE
+at AssertionHandler.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Inequality checks that should fail" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="data.int_seven != 7" type="CHECK">
+FAILED:
+  CHECK( data.int_seven != 7 )
+with expansion:
+  7 != 7
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Inequality checks that should succeed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Newly constructed JsonWriter does nothing" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Calling writeObject will create an empty pair of braces" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Calling writeObject with key will create an object to write the value" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/nesting objects" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Calling writeArray will create an empty pair of brackets" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Calling writeArray creates array to write the values to" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Moved from JsonObjectWriter shall not insert superfluous brace" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Moved from JsonArrayWriter shall not insert superfluous bracket" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter/Custom class shall be quoted" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/Quote in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/Backslash in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/Forward slash in a string is **not** escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/Backspace in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/Formfeed in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/linefeed in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/carriage return in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/tab in a string is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter escapes characters in strings properly/combination of characters is escaped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - double/NaN" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - double/Pos nf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - double/Neg inf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - float/NaN" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - float/Pos nf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes non-finite FP using Python spelling - float/Neg inf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="JsonWriter serializes numbers independently of the global locale" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Lambdas in assertions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Less-than inequalities with different epsilons" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="ManuallyRegistered" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="MapGenerator can be skipped forward efficiently" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="MapGenerator can be skipped forward efficiently/via calls to next()" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="MapGenerator can be skipped forward efficiently/via calls to skipToNthElement()" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="MapGenerator can handle not default constructible types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Matchers can be (AllOf) composed with the &amp;&amp; operator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Matchers can be (AnyOf) composed with the || operator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Matchers can be composed with both &amp;&amp; and ||" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Matchers can be composed with both &amp;&amp; and || - failing" time="0.001" status="run">
+      <failure message="testStringForMatching(), ( ContainsSubstring( &quot;string&quot; ) || ContainsSubstring( &quot;different&quot; ) ) &amp;&amp; ContainsSubstring( &quot;random&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), ( ContainsSubstring( "string" ) || ContainsSubstring( "different" ) ) &amp;&amp; ContainsSubstring( "random" ) )
+with expansion:
+  "this string contains 'abc' as a substring" ( ( contains: "string" or
+  contains: "different" ) and contains: "random" )
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Matchers can be negated (Not) with the ! operator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Matchers can be negated (Not) with the ! operator - failing" time="0.001" status="run">
+      <failure message="testStringForMatching(), !ContainsSubstring( &quot;substring&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), !ContainsSubstring( "substring" ) )
+with expansion:
+  "this string contains 'abc' as a substring" not contains: "substring"
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/1" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/1/A" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/2" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/2/A" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/1" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/1/B" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/2" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mayfail test case with nested sections/2/B" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Mismatching exception messages failing the test" time="0.001" status="run">
+      <failure message="thisThrows(), &quot;should fail&quot;" type="REQUIRE_THROWS_WITH">
+FAILED:
+  REQUIRE_THROWS_WITH( thisThrows(), "should fail" )
+with expansion:
+  "expected exception" equals: "should fail"
+at Exception.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Multireporter calls reporters and listeners in correct order" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Multireporter updates ReporterPreferences properly" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Multireporter updates ReporterPreferences properly/Adding listeners" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Multireporter updates ReporterPreferences properly/Adding reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Nested generators and captured variables" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Nice descriptive name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Non-std exceptions can be translated" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+custom exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Objects that evaluated in boolean contexts can be checked" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Optionally static assertions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Ordering comparison checks that should fail" time="0.001" status="run">
+      <failure message="data.int_seven > 7" type="CHECK">
+FAILED:
+  CHECK( data.int_seven > 7 )
+with expansion:
+  7 > 7
+at Condition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Ordering comparison checks that should succeed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Our PCG implementation provides expected results for known seeds" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Our PCG implementation provides expected results for known seeds/Default seeded" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Our PCG implementation provides expected results for known seeds/Specific seed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Output from all sections is reported/one" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+Message from section one
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Output from all sections is reported/two" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+Message from section two
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Overloaded comma or address-of operators are not used" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parse uints" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parse uints/proper inputs" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parse uints/Bad inputs" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsed tags are matched case insensitive" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Only section specs leads to old filter behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generator specs enable new filter behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generator specs do not accept stringish arguments" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generator specs accept star as argument" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generator specs do not accept negative numbers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generic path spec enables new filter behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generic path spec for generator is validated" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Generic path spec without colon is rejected" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Using both section and generator filters creates filter stack" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing path filter specs/Section/generator filters are whitespace trimmed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/shard-count" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/Negative shard count reports error" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/Zero shard count reports error" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/shard-index" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/Negative shard index reports error" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing sharding-related cli flags/Shard index 0 is accepted" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing tags with non-alphabetical characters is pass-through" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing warnings" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing warnings/NoAssertions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing warnings/NoTests is no longer supported" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Parsing warnings/Combining multiple warnings" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Pointers can be compared to null" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Precision of floating point stringification can be set" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Precision of floating point stringification can be set/Floats" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Precision of floating point stringification can be set/Double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Predicate matcher can accept const char*" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/empty args don't cause a crash" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/default - no arguments" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/test lists" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/test lists/Specify one test case using" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/test lists/Specify one test case exclusion using exclude:" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/test lists/Specify one test case exclusion using ~" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/-r/console" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/-r/xml" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/--reporter/junit" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/must match one of the available ones" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/With output file" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/With Windows-like absolute path as output file" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/Multiple reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/Multiple reporters/All with output files" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/Multiple reporters/Mixed output files and default output" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/reporter/Multiple reporters/cannot have multiple reporters with default output" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/debugger" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/debugger/-b" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/debugger/--break" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/abort" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/abort/-a aborts after first failure" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/abort/-x 2 aborts after two failures" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/abort/-x must be numeric" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/wait-for-keypress" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/wait-for-keypress/Accepted options" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/wait-for-keypress/invalid options are reported" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/nothrow" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/nothrow/-e" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/nothrow/--nothrow" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/output filename" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/output filename/-o filename" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/output filename/--out" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/combinations" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/combinations/Single character flags can be combined" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode/without option" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode/default" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode/ansi" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode/none" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/colour-mode/error" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/samples" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/samples must be greater than zero" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/samples must be parseable" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/resamples" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/confidence-interval" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/no-analysis" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Process can be configured on command line/Benchmark options/warmup-time" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Product with differing arities - std::tuple&lt;int, double, float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Product with differing arities - std::tuple&lt;int, double>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Product with differing arities - std::tuple&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Random seed generation accepts known methods" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Random seed generation reports unknown methods" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="RandomGenerator reports itself as infinite - float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="RandomGenerator reports itself as infinite - int" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="RandomGenerator reports itself as infinite - long double" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Range type with sentinel" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reconstruction should be based on stringification: #914" time="0.001" status="run">
+      <failure message="truthy(false)" type="CHECK">
+FAILED:
+  CHECK( truthy(false) )
+with expansion:
+  Hey, its truthy!
+at Decomposition.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Regex string matcher" time="0.001" status="run">
+      <failure message="testStringForMatching(), Matches( &quot;this STRING contains 'abc' as a substring&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), Matches( "this STRING contains 'abc' as a substring" ) )
+with expansion:
+  "this string contains 'abc' as a substring" matches "this STRING contains
+  'abc' as a substring" case sensitively
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Registering reporter with '::' in name fails" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Regression test #1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="RepeatGenerator refuses infinite generators" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/Automake reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/Automake reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/Automake reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/compact reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/compact reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/compact reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/console reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/console reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/console reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JSON reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JSON reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JSON reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JUnit reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JUnit reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/JUnit reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/SonarQube reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/SonarQube reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/SonarQube reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TAP reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TAP reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TAP reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TeamCity reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TeamCity reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/TeamCity reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/XML reporter lists tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/XML reporter lists reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reporter's write listings to provided stream/XML reporter lists tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Reproducer for #2309 - a very long description past 80 chars (default console width) with a late colon : blablabla" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="SUCCEED counts as a test pass" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="SUCCEED does not require an argument" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Fixture" name="Scenario: BDD tests requiring Fixtures to provide commonly-accessed data or methods" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Fixture" name="Scenario: BDD tests requiring Fixtures to provide commonly-accessed data or methods/Given: No operations precede me" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Fixture" name="Scenario: BDD tests requiring Fixtures to provide commonly-accessed data or methods/Given: No operations precede me/When: We get the count" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Fixture" name="Scenario: BDD tests requiring Fixtures to provide commonly-accessed data or methods/Given: No operations precede me/When: We get the count/Then: Subsequently values are higher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing/Given: This stuff exists" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing/Given: This stuff exists/And given: And some assumption" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing/Given: This stuff exists/And given: And some assumption/When: I do this" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing/Given: This stuff exists/And given: And some assumption/When: I do this/Then: it should do this" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Do that thing with the thing/Given: This stuff exists/And given: And some assumption/When: I do this/Then: it should do this/And: do that" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: This is a really long scenario name to see how the list command deals with wrapping" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: This is a really long scenario name to see how the list command deals with wrapping/Given: A section name that is so long that it cannot fit in a single console width" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: This is a really long scenario name to see how the list command deals with wrapping/Given: A section name that is so long that it cannot fit in a single console width/When: The test headers are printed as part of the normal running of the scenario" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: This is a really long scenario name to see how the list command deals with wrapping/Given: A section name that is so long that it cannot fit in a single console width/When: The test headers are printed as part of the normal running of the scenario/Then: The, deliberately very long and overly verbose (you see what I did there?) section names must wrap, along with an indent" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: it is made larger" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: it is made larger/Then: the size and capacity go up" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: it is made larger/Then: the size and capacity go up/And when: it is made smaller again" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: it is made larger/Then: the size and capacity go up/And when: it is made smaller again/Then: the size goes down but the capacity stays the same" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: we reserve more space" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scenario: Vector resizing affects size and capacity/Given: an empty vector/When: we reserve more space/Then: The capacity is increased but the size remains the same" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Scoped message applies to all assertions in scope" time="0.001" status="run">
+      <failure message="false" type="CHECK">
+FAILED:
+  CHECK( false )
+This will be reported multiple times
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Scoped messages do not leave block with an exception" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+Should be in scope at the end
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Scoped messages outlive section end" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+Should survive a section end
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Scoped messages outlive section end/Dummy section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Sends stuff to stdout and stderr" time="0.001" status="run">
+      <system-out>
+A string sent directly to stdout
+      </system-out>
+      <system-err>
+A string sent directly to stderr
+A string sent to stderr via clog
+      </system-err>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Some simple comparisons between doubles" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Standard output from all sections is reported" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Standard output from all sections is reported/one" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Standard output from all sections is reported/two" time="0.001" status="run">
+      <system-out>
+Message from section one
+Message from section two
+      </system-out>
+    </testcase>
+    <testcase classname="SelfTest.global" name="StartsWith string matcher" time="0.001" status="run">
+      <failure message="testStringForMatching(), StartsWith( &quot;This String&quot; )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( testStringForMatching(), StartsWith( "This String" ) )
+with expansion:
+  "this string contains 'abc' as a substring" starts with: "This String"
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Static arrays are convertible to string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Static arrays are convertible to string/Single item" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Static arrays are convertible to string/Multiple" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Static arrays are convertible to string/Non-trivial inner items" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="String matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Empty string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/From string literal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/From sub-string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Copy construction is shallow" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Copy assignment is shallow" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/zero-based substring" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/non-zero-based substring" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/Pointer values of substring refs should also match" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/Past the end substring" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/Substring off the end are trimmed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Substrings/substring start after the end is empty" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/Comparisons are deep" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/from std::string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/from std::string/implicitly constructed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/from std::string/explicitly constructed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/from std::string/assigned" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/to std::string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/to std::string/explicitly constructed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/to std::string/assigned" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/std::string += StringRef" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef/StringRef + StringRef" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef at compilation time" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef at compilation time/Simple constructors" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="StringRef at compilation time/UDL construction" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying char arrays with statically known sizes - char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying char arrays with statically known sizes - signed char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying char arrays with statically known sizes - unsigned char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying std::chrono::duration helpers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying std::chrono::duration with weird ratios" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Stringifying std::chrono::time_point&lt;system_clock>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tabs and newlines show in output" time="0.001" status="run">
+      <failure message="s1 == s2" type="CHECK">
+FAILED:
+  CHECK( s1 == s2 )
+with expansion:
+  "if ($b == 10) {
+  		$a	= 20;
+  }"
+  ==
+  "if ($b == 10) {
+  	$a = 20;
+  }
+  "
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Tag alias can be registered against tag patterns" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tag alias can be registered against tag patterns/The same tag alias can only be registered once" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tag alias can be registered against tag patterns/Tag aliases must be of the form [@name]" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tags with spaces and non-alphanumerical characters are accepted" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TakeGenerator can be skipped forward" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TakeGenerator can be skipped forward/take is shorter than underlying" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TakeGenerator can be skipped forward/take is longer than underlying" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="Template test case method with test types specified inside std::tuple - MyTypes - 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="Template test case method with test types specified inside std::tuple - MyTypes - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.Template_Fixture" name="Template test case method with test types specified inside std::tuple - MyTypes - 2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside non-copyable and non-movable std::tuple - NonCopyableAndNonMovableTypes - 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside non-copyable and non-movable std::tuple - NonCopyableAndNonMovableTypes - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside non-default-constructible std::tuple - MyNonDefaultConstructibleTypes - 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside non-default-constructible std::tuple - MyNonDefaultConstructibleTypes - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside std::tuple - MyTypes - 0" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside std::tuple - MyTypes - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Template test case with test types specified inside std::tuple - MyTypes - 2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - float/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - int/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::string/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTest: vectors can be sized and resized - std::tuple&lt;int,float>/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: compiles with a single int parameter - 1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: compiles with a single int parameter - 3" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: compiles with a single int parameter - 6" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: compiles with two type parameters - int,int" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - (std::tuple&lt;int, float>), 6/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - float,4/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - int,5/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="TemplateTestSig: vectors can be sized and resized - std::string,15/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Test case with identical tags keeps just one" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Test case with one argument" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Test enum bit values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Test with special, characters &quot;in name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Testing checked-if" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Testing checked-if 2" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Testing checked-if 3" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Testing checked-if 4" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+Uncaught exception should fail!
+at Misc.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Testing checked-if 5" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+Uncaught exception should fail!
+at Misc.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="The NO_FAIL macro reports a failure but does not fail the test" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="The default listing implementation write to provided stream" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="The default listing implementation write to provided stream/Listing tags" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="The default listing implementation write to provided stream/Listing reporters" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="The default listing implementation write to provided stream/Listing tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="The default listing implementation write to provided stream/Listing listeners" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="This test 'should' fail but doesn't" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Thrown string literals are translated" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+For some reason someone is throwing a string literal!
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Tracker" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/successfully close one section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/fail one section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/fail one section/re-enter after failed section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/fail one section/re-enter after failed section and find next section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/successfully close one section, then find another" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/successfully close one section, then find another/Re-enter - skips S1 and enters S2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/successfully close one section, then find another/Re-enter - skips S1 and enters S2/Successfully close S2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/successfully close one section, then find another/Re-enter - skips S1 and enters S2/fail S2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Tracker/open a nested section" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Trim strings" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Container conversions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Container conversions/Two equal containers of different container types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Container conversions/Two equal containers of different container types (differ in array N)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Container conversions/Two equal containers of different container types and value types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Container conversions/Two equal containers, one random access, one not" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Value type" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Value type/Two equal containers of different value types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Value type/Two non-equal containers of different value types" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Ranges with begin that needs ADL" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Custom predicate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Type conversions of RangeEquals and similar/Custom predicate/Two equal non-empty containers (close enough)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Unexpected exceptions can be translated" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+3.14000000000000012
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Unscoped capture outlives scope" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+i := 1
+j := 2
+i + j := 3
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Unscoped capture outlives scope/A" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Upcasting special member functions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Upcasting special member functions/Move constructor" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Upcasting special member functions/move assignment" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher/Type requires ADL found begin and end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllMatch range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Basic usage/All true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Basic usage/Empty evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Basic usage/One false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Basic usage/All false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Contained type is convertible to bool" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Contained type is convertible to bool/All true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Contained type is convertible to bool/One false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Contained type is convertible to bool/All false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AllTrue range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher/Type requires ADL found begin and end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyMatch range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Basic usage/All true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Basic usage/Empty evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Basic usage/One true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Basic usage/All false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Contained type is convertible to bool" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Contained type is convertible to bool/All true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Contained type is convertible to bool/One true evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Contained type is convertible to bool/All false evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of AnyTrue range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher/Type requires ADL found begin and end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneMatch range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Basic usage/All true evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Basic usage/Empty evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Basic usage/One true evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Basic usage/All false evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Contained type is convertible to bool" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Contained type is convertible to bool/All true evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Contained type is convertible to bool/One true evaluates to false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Contained type is convertible to bool/All false evaluates to true" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Shortcircuiting" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Shortcircuiting/All are read" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of NoneTrue range matcher/Shortcircuiting/Short-circuited" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Empty container matches empty container" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Empty container does not match non-empty container" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Two equal 1-length non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Two equal-sized, equal, non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Two equal-sized, non-equal, non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Basic usage/Two non-equal-sized, non-empty containers (with same first elements)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Custom predicate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Custom predicate/Two equal non-empty containers (close enough)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Custom predicate/Two non-equal non-empty containers (close enough)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Ranges that need ADL begin/end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Compare against std::initializer_list" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Check short-circuiting behaviour" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Check short-circuiting behaviour/Check short-circuits on failure" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of RangeEquals range matcher/Check short-circuiting behaviour/All elements are checked on success" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Empty container matches empty container" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Empty container does not match non-empty container" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Two equal 1-length non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Two equal-sized, equal, non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Two equal-sized, non-equal, non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Basic usage/Two non-equal-sized, non-empty containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Custom predicate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Custom predicate/Two equal non-empty containers (close enough)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Custom predicate/Two non-equal non-empty containers (close enough)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Ranges that need ADL begin/end" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of UnorderedRangeEquals range matcher/Compare against std::initializer_list" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of the SizeIs range matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of the SizeIs range matcher/Some with stdlib containers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of the SizeIs range matcher/Type requires ADL found size free function" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Usage of the SizeIs range matcher/Type has size member" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Use a custom approx" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Variadic macros" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Variadic macros/Section with one argument" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher/Empty vector is roughly equal to an empty vector" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher/Vectors with elements" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher/Vectors with elements/A vector is approx equal to itself" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher/Vectors with elements/Different length" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher/Vectors with elements/Same length, different elements" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher -- failing" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher -- failing/Empty and non empty vectors are not approx equal" time="0.001" status="run">
+      <failure message="empty, Approx( t1 )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( empty, Approx( t1 ) )
+with expansion:
+  {  } is approx: { 1.0, 2.0 }
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Vector Approx matcher -- failing/Just different vectors" time="0.001" status="run">
+      <failure message="v1, Approx( v2 )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( v1, Approx( v2 ) )
+with expansion:
+  { 2.0, 4.0, 6.0 } is approx: { 1.0, 3.0, 5.0 }
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Vector matchers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers/Contains (element)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers/Contains (vector)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers/Contains (element), composed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers/Equals" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers/UnorderedEquals" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers that fail" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="Vector matchers that fail/Contains (element)" time="0.001" status="run">
+      <failure message="v, VectorContains( -1 )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( v, VectorContains( -1 ) )
+with expansion:
+  { 1, 2, 3 } Contains: -1
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Vector matchers that fail/Contains (vector)" time="0.001" status="run">
+      <failure message="empty, Contains( v )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( empty, Contains( v ) )
+with expansion:
+  {  } Contains: { 1, 2, 3 }
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Vector matchers that fail/Equals" time="0.001" status="run">
+      <failure message="v, Equals( v2 )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( v, Equals( v2 ) )
+with expansion:
+  { 1, 2, 3 } Equals: { 1, 2 }
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="Vector matchers that fail/UnorderedEquals" time="0.001" status="run">
+      <failure message="v, UnorderedEquals( empty )" type="CHECK_THAT">
+FAILED:
+  CHECK_THAT( v, UnorderedEquals( empty ) )
+with expansion:
+  { 1, 2, 3 } UnorderedEquals: {  }
+at Matchers.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When checked exceptions are thrown they can be expected or unexpected" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown directly they are always failures" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+unexpected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown during a CHECK the test should continue" time="0.001" status="run">
+      <error message="thisThrows() == 0" type="CHECK">
+FAILED:
+  CHECK( thisThrows() == 0 )
+expected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown during a REQUIRE the test should abort fail" time="0.001" status="run">
+      <error message="thisThrows() == 0" type="REQUIRE">
+FAILED:
+  REQUIRE( thisThrows() == 0 )
+expected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown from functions they are always failures" time="0.001" status="run">
+      <error message="thisThrows() == 0" type="CHECK">
+FAILED:
+  CHECK( thisThrows() == 0 )
+expected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown from sections they are always failures/section name" time="0.001" status="run">
+      <error message="{Unknown expression after the reported line}">
+FAILED:
+  {Unknown expression after the reported line}
+unexpected exception
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="When unchecked exceptions are thrown, but caught, they do not affect the test" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="X/level/0/a" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="X/level/0/b" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="X/level/1/a" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="X/level/1/b" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/normal string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/empty string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with ampersand" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with less-than" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with greater-than" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with quotes" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with control char (1)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlEncode/string with control char (x7F)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="XmlWriter writes boolean attributes as true/false" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="a succeeding test can still be skipped" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="analyse no analysis" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="array&lt;int, N> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="benchmark function call" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="benchmark function call/without chronometer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="benchmark function call/with chronometer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="boolean member" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="bootstrap keeps the interval inside the resample" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="bootstrap keeps the interval inside the resample/no spread in the jackknife estimates" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="bootstrap keeps the interval inside the resample/every resampled estimate below the point estimate" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="cat generator" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="cat generator/Simple usage" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="cat generator/Used in map" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="checkedElse" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="checkedElse, failing" time="0.001" status="run">
+      <failure message="testCheckedElse( false )" type="REQUIRE">
+FAILED:
+  REQUIRE( testCheckedElse( false ) )
+with expansion:
+  false
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="checkedIf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="checkedIf, failing" time="0.001" status="run">
+      <failure message="testCheckedIf( false )" type="REQUIRE">
+FAILED:
+  REQUIRE( testCheckedIf( false ) )
+with expansion:
+  false
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="classify_outliers" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/none" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/low severe" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/low mild" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/high mild" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/high severe" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="classify_outliers/mixed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="comparisons between const int variables" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="comparisons between int variables" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="convertToBits" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="dynamic skipping works with generators" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+skipping because answer = 41
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="empty tags are not allowed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="erfc_inv" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="estimate_clock_resolution" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="even more nested SECTION tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="even more nested SECTION tests/c" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="even more nested SECTION tests/c/d (leaf)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="even more nested SECTION tests/c/e (leaf)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="even more nested SECTION tests/f (leaf)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="failed assertions before SKIP cause test case to fail" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure message="3 == 4" type="CHECK">
+FAILED:
+  CHECK( 3 == 4 )
+at Skip.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="failing for some generator values causes entire test case to fail" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+at Skip.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="failing in some unskipped sections causes entire test case to fail/skipped" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="failing in some unskipped sections causes entire test case to fail/not skipped" time="0.001" status="run">
+      <skipped message="TEST_CASE tagged with !mayfail"/>
+      <failure type="FAIL">
+FAILED:
+at Skip.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="first tag" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="has printf" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="is_unary_function" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="just failure" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+Previous info should not be seen
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="just failure after unscoped info" time="0.001" status="run">
+      <failure type="FAIL">
+FAILED:
+previous unscoped info SHOULD not be seen
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="just info" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="just unscoped info" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="long long" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 0" time="0.001" status="run">
+      <failure message="b > a" type="CHECK">
+FAILED:
+  CHECK( b > a )
+with expansion:
+  0 > 1
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 1" time="0.001" status="run">
+      <failure message="b > a" type="CHECK">
+FAILED:
+  CHECK( b > a )
+with expansion:
+  1 > 1
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 3" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 4" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 5" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 6" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 7" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 8" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped SECTION tests/b is currently: 9" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="looped tests" time="0.001" status="run">
+      <failure message="( fib[i] % 2 ) == 0" type="CHECK">
+FAILED:
+  CHECK( ( fib[i] % 2 ) == 0 )
+with expansion:
+  1 == 0
+Testing if fib[0] (1) is even
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="makeStream recognizes %debug stream name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="make_unique reimplementation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="make_unique reimplementation/From lvalue copies" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="make_unique reimplementation/From rvalue moves" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="make_unique reimplementation/Variadic constructor" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="mean" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="measure" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="mix info, unscoped info and warning" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests/equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests/equal/doesn't equal" time="0.001" status="run">
+      <failure message="a == b" type="REQUIRE">
+FAILED:
+  REQUIRE( a == b )
+with expansion:
+  1 == 2
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests/doesn't equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests/doesn't equal/not equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="more nested SECTION tests/doesn't equal/less than" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested SECTION tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested SECTION tests/doesn't equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested SECTION tests/doesn't equal/not equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested sections can be skipped dynamically at runtime/A" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested sections can be skipped dynamically at runtime/B2" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested sections can be skipped dynamically at runtime/B2/B1" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="nested sections can be skipped dynamically at runtime/B2/B" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="nested sections can be skipped dynamically at runtime/B" time="0.001" status="run">
+      <system-out>
+a!
+b1!
+!
+      </system-out>
+    </testcase>
+    <testcase classname="SelfTest.global" name="non streamable - with conv. op" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="non-copyable objects" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="normal_quantile" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="not allowed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="not prints unscoped info from previous failures" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+this SHOULD be seen
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="null strings" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="null_ptr" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="pair&lt;pair&lt;int,const char *,pair&lt;std::string,int> > -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="parseEnums" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="parseEnums/No enums" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="parseEnums/One enum value" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="parseEnums/Multiple enum values" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="pointer to class" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="print unscoped info if passing unscoped info is printed" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="prints unscoped info on failure" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+this SHOULD be seen
+this SHOULD also be seen
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="prints unscoped info only for the first assertion" time="0.001" status="run">
+      <failure message="false" type="CHECK">
+FAILED:
+  CHECK( false )
+this SHOULD be seen only ONCE
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="random SECTION tests" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="random SECTION tests/doesn't equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="random SECTION tests/not equal" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace single char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace two chars" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace first char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace last char" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace all chars" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/replace no chars" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/no replace in already-replaced string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/no replace in already-replaced string/lengthening" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/no replace in already-replaced string/shortening" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="replaceInPlace/escape '" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="request an unknown %-starting stream fails" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="resolution" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="run_for_at_least, chronometer" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="run_for_at_least, int" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="second tag" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="sections can be skipped dynamically at runtime" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="sections can be skipped dynamically at runtime/not skipped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="sections can be skipped dynamically at runtime/skipped" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="sections can be skipped dynamically at runtime/also not skipped" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="send a single char to INFO" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+3
+at Misc.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="sends information to INFO" time="0.001" status="run">
+      <failure message="false" type="REQUIRE">
+FAILED:
+  REQUIRE( false )
+hi
+i := 7
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="shortened hide tags are split apart" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="skipped tests can optionally provide a reason" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+skipping because answer = 43
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="splitString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stacks unscoped info in loops" time="0.001" status="run">
+      <failure message="false" type="CHECK">
+FAILED:
+  CHECK( false )
+Count 1 to 3...
+1
+2
+3
+at Message.tests.cpp:42
+      </failure>
+    </testcase>
+    <testcase classname="SelfTest.global" name="startsWith" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::map is convertible string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::map is convertible string/empty" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::map is convertible string/single item" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::map is convertible string/several items" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::pair&lt;int,const std::string> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::pair&lt;int,std::string> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::set is convertible string" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::set is convertible string/empty" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::set is convertible string/single item" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::set is convertible string/several items" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="std::vector&lt;std::pair&lt;std::string,int> > -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stdout and stderr streams have %-starting name" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify ranges" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( has_maker )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( has_maker_and_operator )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( has_neither )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( has_operator )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( has_template_operator )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( vectors&lt;has_maker> )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( vectors&lt;has_maker_and_operator> )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="stringify( vectors&lt;has_operator> )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="strlen3" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="system_clock timepoint with non-default duration" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tables" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tags with dots in later positions are not parsed as hidden" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tests can be skipped dynamically at runtime" time="0.001" status="run">
+      <skipped type="SKIP">
+SKIPPED
+at Skip.tests.cpp:42
+      </skipped>
+    </testcase>
+    <testcase classname="SelfTest.global" name="thrown std::strings are translated" time="0.001" status="run">
+      <error type="TEST_CASE">
+FAILED:
+Why would you throw a std::string?
+at Exception.tests.cpp:42
+      </error>
+    </testcase>
+    <testcase classname="SelfTest.global" name="toLower( char )" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toLower( char )/ASCII letters are lowercased" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toLower( char )/Chars outside 'A'-'Z' are left alone" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toLower( char )/Non-ASCII chars are left alone" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toLower( char )/Is usable in constant expressions" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString on const wchar_t const pointer returns the string contents" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString on const wchar_t pointer returns the string contents" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString on wchar_t const pointer returns the string contents" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString on wchar_t returns the string contents" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString(enum class w/operator&lt;&lt;)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString(enum class)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString(enum w/operator&lt;&lt;)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="toString(enum)" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tuple&lt;>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tuple&lt;float,int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tuple&lt;int>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tuple&lt;string,string>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="tuple&lt;tuple&lt;int>,tuple&lt;>,float>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="uniform samples" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="uniform_integer_distribution can return the bounds" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Default constructed unique_ptr is empty" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Take ownership of allocation" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Take ownership of allocation/Plain reset deallocates" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Take ownership of allocation/Reset replaces ownership" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Release releases ownership" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Move constructor" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/Move assignment" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="unique_ptr reimplementation: basic functionality/free swap" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vec&lt;vec&lt;string,alloc>> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vector&lt;bool> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vector&lt;int,allocator> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vector&lt;int> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vector&lt;string> -> toString" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized/resizing bigger changes size and capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized/resizing smaller changes size but not capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized/resizing smaller changes size but not capacity/We can use the 'swap trick' to reset the capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized/reserving bigger changes capacity but not size" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="vectors can be sized and resized/reserving smaller does not change size or capacity" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="warmup" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="weighted_average_quantile" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="xmlentitycheck" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="xmlentitycheck/embedded xml: &lt;test>it should be possible to embed xml characters, such as &lt;, &quot; or &amp;, or even whole &lt;xml>documents&lt;/xml> within an attribute&lt;/test>" time="0.001" status="run"/>
+    <testcase classname="SelfTest.global" name="xmlentitycheck/encoded chars: these should all be encoded: &amp;&amp;&amp;&quot;&quot;&quot;&lt;&lt;&lt;&amp;&quot;&lt;&lt;&amp;&quot;" time="0.001" status="run"/>
+    <system-out>
+This would not be caught previously
+A string sent directly to stdout
+Message from section one
+Message from section two
+a!
+b1!
+!
+    </system-out>
+    <system-err>
+Nor would this
+A string sent directly to stderr
+A string sent to stderr via clog
+    </system-err>
+  </testsuite>
+</testsuites>

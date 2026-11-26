@@ -501,7 +501,7 @@ fn detach_prints_only_the_id_and_misplaced_flags_are_flagged() {
     );
     // Round 11: refused, not run with the flag passed to the command.
     let o = prova(&d, &["run", "--", "true", "--detach"]);
-    assert_eq!(o.status.code(), Some(4));
+    assert_eq!(o.status.code(), Some(2), "a usage error (ADR 0038 §5)");
     assert!(String::from_utf8_lossy(&o.stderr).contains("--detach comes after `--`"));
 }
 
@@ -1071,6 +1071,34 @@ fn a_cancelled_run_has_no_test_outcome_in_the_list() {
     );
 }
 
+/// ADR 0038 section 3: a test that failed before the cancel keeps its
+/// failure output, as in a run that ended (real `go test -v` lines, then a
+/// hang that is cancelled).
+#[test]
+fn a_cancelled_run_keeps_the_output_of_the_test_that_failed() {
+    let d = workspace("cancel-keeps");
+    let id = detach(
+        &d,
+        &[],
+        "printf '=== RUN   TestDiv\\n    calc_test.go:17: Div(8, 2) = 16, want 4\\n--- FAIL: TestDiv (0.00s)\\n=== RUN   TestHang\\n'; sleep 30",
+    );
+    let first = prova(
+        &d,
+        &["wait", &id, "--until", "first-failure", "--max-wait", "20s"],
+    );
+    assert!(stdout(&first).contains("TestDiv"), "{}", stdout(&first));
+    prova(&d, &["cancel", &id]);
+    let done = prova(&d, &["wait", &id, "--until", "done", "--max-wait", "20s"]);
+    assert!(stdout(&done).contains("cancelled"), "{}", stdout(&done));
+    let o = prova(&d, &["output", &id, "--test", "TestDiv"]);
+    assert!(
+        stdout(&o).contains("Div(8, 2) = 16, want 4"),
+        "{}{}",
+        stdout(&o),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 /// Round 14: a wait that ended on its budget named the hung test without
 /// saying how long it had been running; the stall default for a suite of
 /// no declared size (60 s) outlasted two 30 s waits.
@@ -1590,4 +1618,24 @@ fn a_stall_is_counted_from_the_last_cpu_use_not_the_busy_window() {
         "last CPU at ~2 s, stall-after 2 s: reported at {elapsed} ms: {s}"
     );
     prova(&d, &["cancel", &id]);
+}
+
+/// Release candidate: `prova output` began with "[... 1 lines elided ...]"
+/// and `--tail 200` did not show that line, nor say it was never kept.
+#[test]
+fn output_tail_says_which_lines_were_not_kept() {
+    let d = workspace("tail-not-kept");
+    let s = json(&prova(&d, &["run", "--json", "--", "sh", "-c", "seq 1 21"]));
+    let run = s["run"].as_str().unwrap();
+    let out = stdout(&prova(&d, &["output", run, "--tail", "200"]));
+    assert!(out.contains("line 21\n") || out.contains("21\n"), "{out}");
+    assert!(
+        out.contains("1 line(s) of this run's output were not kept"),
+        "{out}"
+    );
+    // A short tail stays just the lines.
+    assert_eq!(
+        stdout(&prova(&d, &["output", run, "--tail", "1"])).trim(),
+        "21"
+    );
 }

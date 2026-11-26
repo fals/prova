@@ -380,7 +380,11 @@ fn failure_name(f: &prova_core::engine::Failure) -> String {
 
 pub fn named(test: &str, place: Option<&str>) -> String {
     match place {
-        Some(p) => format!("{} ({})", clean(test), clean(p)),
+        Some(p) => format!(
+            "{} {}",
+            clean(test),
+            prova_core::model::place_label(&clean(p))
+        ),
         None => clean(test),
     }
 }
@@ -433,8 +437,15 @@ fn context(f: &prova_core::engine::Failure) -> String {
 }
 
 pub fn test_stats(s: &prova_core::analysis::TestStats) {
+    let command = s.suite_command.as_deref().map_or(String::new(), |c| {
+        let c = clean(c);
+        match c.char_indices().nth(60) {
+            Some((i, _)) => format!(": {}...", &c[..i]),
+            None => format!(": {c}"),
+        }
+    });
     println!(
-        "{}  (suite {})",
+        "{}  (suite {}{command})",
         named(&s.display, s.place.as_deref()),
         s.suite
     );
@@ -979,13 +990,19 @@ pub fn experiment_with_next(
             (s, _) => s.to_uppercase(),
         };
         println!(
-            "{head}  {} vs {}  ({} + {} trials, target {} per arm, max {})",
+            "{head}  {} vs {}  ({} + {} trials, target {} per arm, max {}{} {})",
             c.candidate,
             c.baseline,
             c.baseline_trials,
             c.candidate_trials,
             c.target_trials,
-            c.max_trials
+            c.max_trials,
+            if c.status == "running" {
+                "; running for"
+            } else {
+                ", took"
+            },
+            format_duration(std::time::Duration::from_millis(c.elapsed_ms))
         );
         if let Some(res) = &c.result {
             if let Some(reason) = res["reason"].as_str() {
@@ -1103,10 +1120,16 @@ pub fn experiment_with_next(
         };
         println!("next: {next}");
     } else {
-        println!(
-            "no comparison yet; next: prova exp candidate {}",
-            r.experiment
-        );
+        match &r.pending_candidate {
+            Some(c) => println!(
+                "no comparison yet; next: prova exp run {} (candidate {c})",
+                r.experiment
+            ),
+            None => println!(
+                "no comparison yet; next: prova exp candidate {}",
+                r.experiment
+            ),
+        }
     }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).

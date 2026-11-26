@@ -558,6 +558,32 @@ fn csharp() {
     );
 }
 
+/// ADR 0038 section 2 with the real tool: `dotnet test` starts build servers
+/// and test hosts that outlive it; a passing run must not be called
+/// unverified because of them (they let go of the output).
+#[test]
+#[ignore = "large: needs docker and NuGet access"]
+fn csharp_pass_is_verified_despite_dotnet_helper_processes() {
+    let tag = image("dotnet");
+    let d = copy_fixture("csharp-dotnet");
+    let o = in_container(
+        &tag,
+        &d,
+        "dotnet build -nologo -v q",
+        "prova run --json -- dotnet test --no-build --filter 'FullyQualifiedName!~Divides'",
+    );
+    let s = json_last_line(&o);
+    assert_eq!(s["outcome"], "passed", "{s}");
+    // Plain `dotnet test` output names no test, so the pass is unverified
+    // for that reason; what matters here is that dotnet's helper processes
+    // (build server, node reuse) are not taken for one holding the output.
+    assert!(
+        !s["warnings"].to_string().contains("holding the output")
+            && !s["warnings"].to_string().contains("still holds the output"),
+        "{s}"
+    );
+}
+
 #[test]
 #[ignore = "large: needs docker"]
 fn python_experiments() {

@@ -1,5 +1,6 @@
 //! Code identity, recorded environment and machine fingerprint (ADR 0006).
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -27,6 +28,7 @@ pub const DEFAULT_ENV: &[&str] = &[
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let out = Command::new("git")
+        .arg("--no-optional-locks")
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -36,9 +38,11 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
-/// Caches that running tests writes into the tree (bytecode and tool
+/// Caches that running tests write into the tree (bytecode and tool
 /// caches). They are not code: a project that forgot to ignore them must
-/// not get a new code identity after every test run.
+/// not get a new code identity after every test run. They apply to
+/// untracked content only: a tracked file under `pkg/target/` is source and
+/// every change to it counts (ADR 0038 section 1).
 const CACHES: &[&str] = &[
     ":(exclude,glob)**/__pycache__/**",
     // Bytecode is a cache only inside __pycache__ (above): a `json.pyc` next
@@ -69,11 +73,11 @@ const CACHES: &[&str] = &[
     // Core dumps from a crashing test (round 9).
     ":(exclude,glob)**/core",
     ":(exclude,glob)**/core.[0-9]*",
-    // prova's own config and folder are not the code under test: adding
-    // prova.toml must not make the same code look like a new version.
-    ":(exclude,top)prova.toml",
-    ":(exclude,top,glob).prova/**",
 ];
+
+/// prova's own config and folder are not the code under test: adding
+/// prova.toml must not make the same code look like a new version.
+const PROVA_OWN: &[&str] = &[":(exclude,top)prova.toml", ":(exclude,top,glob).prova/**"];
 
 /// The project a directory belongs to: the nearest directory holding
 /// `prova.toml` at or below the git work tree's root, else the git work
@@ -105,53 +109,466 @@ pub fn repo_root(dir: &Path) -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// `tree:<12>` for a clean checkout, `tree:<12>+dirty:<12>` with uncommitted
-/// changes, `nogit` outside git. Two runs are "same code" only when equal.
+/// `tree:<12>`: the git tree id the working content has (ADR 0038 section 1).
+/// Equal content is equal code, whether committed or not. `nogit` outside
+/// git. A repository whose object format is not sha1 keeps the older
+/// `tree:<12>+dirty:<12>` form when it has uncommitted changes.
 pub fn code_identity(dir: &Path) -> String {
-    // The repository's, whatever directory the run started in (ADR 0035
-    // section 1).
-    let top = repo_root(dir);
-    let dir = top.as_path();
+    // The whole repository's, whatever directory the run started in, also
+    // a project directory below the root (ADR 0035 section 1): status and
+    // the tree listing both speak in paths from the git root.
+    let Some(top) = git(dir, &["rev-parse", "--show-toplevel"])
+        .map(|t| String::from_utf8_lossy(&t).trim().to_owned())
+        .filter(|t| !t.is_empty())
+    else {
+        return "nogit".into();
+    };
+    let dir = Path::new(&top);
     let Some(tree) = git(dir, &["rev-parse", "HEAD^{tree}"]) else {
         return "nogit".into();
     };
     let tree = String::from_utf8_lossy(&tree).trim().to_owned();
     let short = &tree[..tree.len().min(12)];
-    let with_caches_excluded = |args: &[&'static str]| -> Vec<&'static str> {
-        let mut v = args.to_vec();
-        v.push("--");
-        v.push(":/");
-        v.extend_from_slice(CACHES);
-        v
-    };
-    let status = git(
-        dir,
-        &with_caches_excluded(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
-    )
-    .unwrap_or_default();
+    let status = work_status(dir);
     if status.is_empty() {
         return format!("tree:{short}");
     }
-    let mut material =
-        git(dir, &with_caches_excluded(&["diff", "HEAD", "--binary"])).unwrap_or_default();
+    let sha1 = git(dir, &["rev-parse", "--show-object-format"])
+        .is_none_or(|f| String::from_utf8_lossy(&f).trim() == "sha1");
+    if sha1 && let Some((id, dirty_subs)) = working_tree_id(dir, &status) {
+        if dirty_subs.is_empty() {
+            return format!("tree:{}", &id[..12]);
+        }
+        // A submodule with uncommitted content has no commit to point at:
+        // its own content identity joins the id.
+        let sub = sha256_hex(
+            dirty_subs
+                .join(
+                    "
+",
+                )
+                .as_bytes(),
+        );
+        return format!("tree:{}+sub:{}", &id[..12], &sub[..12]);
+    }
+    format!("tree:{short}+dirty:{}", legacy_dirty_hash(dir))
+}
+
+/// Status records (`XY path`, NUL separated) of every tracked change plus
+/// the untracked files that are neither ignored nor caches.
+fn work_status(dir: &Path) -> Vec<u8> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=no",
+        // Untracked files inside a submodule are its content too: without
+        // this, `--untracked-files=no` hides such a submodule.
+        "--ignore-submodules=none",
+        "--",
+        ":/",
+    ];
+    args.extend_from_slice(PROVA_OWN);
+    let mut status = git(dir, &args).unwrap_or_default();
+    status.extend(untracked_records(dir));
+    status
+}
+
+/// `?? path` records of the untracked, not ignored files outside caches.
+fn untracked_records(dir: &Path) -> Vec<u8> {
+    let mut args = vec![
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--full-name",
+        "--",
+        ":/",
+    ];
+    args.extend_from_slice(PROVA_OWN);
+    args.extend_from_slice(CACHES);
+    let mut records = Vec::new();
+    for name in git(dir, &args)
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty())
+    {
+        records.extend_from_slice(b"?? ");
+        records.extend_from_slice(name);
+        records.push(0);
+    }
+    records
+}
+
+/// One entry of a git tree: octal mode without leading zeros, hex object id.
+#[derive(Clone)]
+struct Entry {
+    mode: String,
+    id: String,
+}
+
+/// Largest changed file hashed for the tree id; beyond it the hashed
+/// fallback form is used, as it always capped.
+const MAX_HASHED_FILE: u64 = 16 * 1024 * 1024;
+
+/// The id git would give a tree holding HEAD's content with the changes in
+/// `status` applied from the work tree. Writes no object: blobs and trees
+/// are only hashed (`git hash-object` without `-w`). A submodule is its HEAD
+/// commit; the second value lists `path=identity` of submodules whose work
+/// tree has uncommitted content. `None` when the id cannot be computed
+/// without side effects: a changed path with a `filter` attribute (git-lfs's
+/// clean filter would copy the file into `.git/lfs`), a changed file over
+/// 16 MB, or anything unusual.
+fn working_tree_id(top: &Path, status: &[u8]) -> Option<(String, Vec<String>)> {
+    // dir ("" for the root) -> name -> entry, from HEAD.
+    let mut dirs: HashMap<String, BTreeMap<String, Entry>> = HashMap::new();
+    dirs.insert(String::new(), BTreeMap::new());
+    let listing = git(top, &["ls-tree", "-r", "-t", "-z", "--full-tree", "HEAD"])?;
+    for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rec = std::str::from_utf8(rec).ok()?;
+        let (meta, path) = rec.split_once('\t')?;
+        let mut f = meta.split(' ');
+        let mode = f.next()?.trim_start_matches('0').to_owned();
+        let kind = f.next()?;
+        let id = f.next()?.to_owned();
+        if kind == "tree" {
+            dirs.entry(path.to_owned()).or_default();
+        }
+        let (parent, name) = split_path(path);
+        dirs.entry(parent.to_owned())
+            .or_default()
+            .insert(name.to_owned(), Entry { mode, id });
+    }
+
+    // Paths the status names; a rename lists the old path as a second field.
+    let mut paths: Vec<&str> = Vec::new();
+    let mut fields = status.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let Some(f) = fields.next() {
+        let f = std::str::from_utf8(f).ok()?;
+        let (xy, path) = (f.get(..2)?, f.get(3..)?);
+        if xy.contains('R') || xy.contains('C') {
+            paths.push(std::str::from_utf8(fields.next()?).ok()?);
+        }
+        // A trailing slash is a nested repository, left as it is.
+        if !path.ends_with('/') {
+            paths.push(path);
+        }
+    }
+
+    // Current state of each path in the work tree.
+    let mut files: Vec<(&str, &str)> = Vec::new();
+    let mut symlinks: Vec<(&str, String)> = Vec::new();
+    let mut gitlinks: Vec<(&str, String)> = Vec::new();
+    let mut dirty_subs: Vec<String> = Vec::new();
+    for p in &paths {
+        if p.contains('\n') {
+            return None;
+        }
+        let Ok(m) = std::fs::symlink_metadata(top.join(p)) else {
+            continue;
+        };
+        if m.is_dir() && top.join(p).join(".git").exists() {
+            // A submodule: git commits its HEAD commit.
+            let sub = top.join(p);
+            let head = git(&sub, &["rev-parse", "HEAD"])?;
+            let head = String::from_utf8_lossy(&head).trim().to_owned();
+            let own = code_identity(&sub);
+            let own_tree = git(&sub, &["rev-parse", "HEAD^{tree}"])?;
+            let clean = own == format!("tree:{}", &String::from_utf8_lossy(&own_tree).trim()[..12]);
+            if !clean {
+                dirty_subs.push(format!("{p}={own}"));
+            }
+            gitlinks.push((p, head));
+        } else if m.file_type().is_symlink() {
+            let target = std::fs::read_link(top.join(p)).ok()?;
+            symlinks.push((p, target.to_string_lossy().into_owned()));
+        } else if m.is_file() {
+            if m.len() > MAX_HASHED_FILE {
+                return None;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if m.permissions().mode() & 0o100 != 0 {
+                "100755"
+            } else {
+                "100644"
+            };
+            files.push((p, mode));
+        }
+    }
+    let file_paths: Vec<&str> = files.iter().map(|f| f.0).collect();
+    if has_filter(top, &file_paths)? {
+        return None;
+    }
+    let file_ids = hash_files(top, &file_paths)?;
+
+    // Removals first so that a file becoming a directory (or back) is
+    // replaced, not deleted after being set.
+    for p in &paths {
+        let (parent, name) = split_path(p);
+        if let Some(d) = dirs.get_mut(parent) {
+            d.remove(name);
+        }
+    }
+    let mut set = |p: &str, mode: &str, id: String| {
+        let (parent, name) = split_path(p);
+        let mut dir = parent;
+        loop {
+            dirs.entry(dir.to_owned()).or_default();
+            if dir.is_empty() {
+                break;
+            }
+            dir = split_path(dir).0;
+        }
+        dirs.entry(parent.to_owned()).or_default().insert(
+            name.to_owned(),
+            Entry {
+                mode: mode.to_owned(),
+                id,
+            },
+        );
+    };
+    for ((p, mode), id) in files.iter().zip(file_ids) {
+        set(p, mode, id);
+    }
+    for (p, head) in gitlinks {
+        set(p, "160000", head);
+    }
+    for (p, target) in symlinks {
+        let args = ["hash-object", "-t", "blob", "--no-filters", "--stdin"];
+        set(p, "120000", git_hash(top, &args, target.as_bytes())?);
+    }
+
+    // Rebuild the directories from a touched path up to the root, deepest
+    // level first, one `git hash-object` per level; every other directory
+    // keeps HEAD's id.
+    let mut dirty: Vec<&str> = Vec::new();
+    for p in &paths {
+        let mut d = split_path(p).0;
+        loop {
+            if !dirty.contains(&d) {
+                dirty.push(d);
+            }
+            if d.is_empty() {
+                break;
+            }
+            d = split_path(d).0;
+        }
+    }
+    let depth = |d: &str| {
+        if d.is_empty() {
+            0
+        } else {
+            d.matches('/').count() + 1
+        }
+    };
+    let deepest = dirty.iter().map(|d| depth(d)).max().unwrap_or(0);
+    let mut root = None;
+    for level in (0..=deepest).rev() {
+        let at: Vec<&str> = dirty
+            .iter()
+            .copied()
+            .filter(|d| depth(d) == level)
+            .collect();
+        let mut hashed: Vec<&str> = Vec::new();
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        for d in &at {
+            let entries = dirs.get(*d).cloned().unwrap_or_default();
+            if entries.is_empty() && !d.is_empty() {
+                // An emptied directory vanishes, unless a file now has its name.
+                let (parent, name) = split_path(d);
+                let parent_dir = dirs.entry(parent.to_owned()).or_default();
+                if parent_dir.get(name).is_some_and(|e| e.mode == "40000") {
+                    parent_dir.remove(name);
+                }
+            } else {
+                hashed.push(d);
+                bodies.push(tree_body(&entries)?);
+            }
+        }
+        let ids = hash_tree_bodies(top, &bodies)?;
+        for (d, id) in hashed.into_iter().zip(ids) {
+            if d.is_empty() {
+                root = Some(id);
+            } else {
+                let (parent, name) = split_path(d);
+                dirs.entry(parent.to_owned()).or_default().insert(
+                    name.to_owned(),
+                    Entry {
+                        mode: "40000".into(),
+                        id,
+                    },
+                );
+            }
+        }
+    }
+    Some((root?, dirty_subs))
+}
+
+fn split_path(p: &str) -> (&str, &str) {
+    p.rsplit_once('/').unwrap_or(("", p))
+}
+
+/// The body of a tree object for `entries`: git sorts a directory as if its
+/// name had a trailing slash.
+fn tree_body(entries: &BTreeMap<String, Entry>) -> Option<Vec<u8>> {
+    let mut sorted: Vec<(&String, &Entry)> = entries.iter().collect();
+    sorted.sort_by_key(|(name, e)| {
+        let mut k = name.as_bytes().to_vec();
+        if e.mode == "40000" {
+            k.push(b'/');
+        }
+        k
+    });
+    let mut body = Vec::new();
+    for (name, e) in sorted {
+        body.extend_from_slice(e.mode.as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&hex_to_bytes(&e.id)?);
+    }
+    Some(body)
+}
+
+/// Tree object ids for `bodies`, in one `git hash-object -t tree
+/// --stdin-paths` (never `-w`). Bodies are binary, so each goes through a
+/// file in a private temporary directory outside the repository.
+fn hash_tree_bodies(top: &Path, bodies: &[Vec<u8>]) -> Option<Vec<String>> {
+    if bodies.is_empty() {
+        return Some(Vec::new());
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "prova-trees-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp).ok()?;
+    let ids = (|| {
+        let mut input = String::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let f = tmp.join(i.to_string());
+            std::fs::write(&f, body).ok()?;
+            input.push_str(f.to_str()?);
+            input.push('\n');
+        }
+        let out = git_hash(
+            top,
+            &["hash-object", "-t", "tree", "--stdin-paths"],
+            input.as_bytes(),
+        )?;
+        let ids: Vec<String> = out.lines().map(str::to_owned).collect();
+        (ids.len() == bodies.len()).then_some(ids)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    ids
+}
+
+fn hex_to_bytes(h: &str) -> Option<Vec<u8>> {
+    (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// `git hash-object` (never `-w`) with `input` on stdin; the output, trimmed.
+fn git_hash(top: &Path, args: &[&str], input: &[u8]) -> Option<String> {
+    let mut child = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .current_dir(top)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    // Written on its own thread: the output may fill its pipe meanwhile.
+    let out = std::thread::scope(|s| {
+        s.spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(input);
+        });
+        child.wait_with_output().ok()
+    })?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Whether any of `paths` has a `filter` attribute. `hash-object` runs
+/// clean filters like `git add`, and git-lfs's copies the content into
+/// `.git/lfs/objects`: prova writes nothing into the repository, so such a
+/// state gets the hashed fallback form instead.
+fn has_filter(top: &Path, paths: &[&str]) -> Option<bool> {
+    if paths.is_empty() {
+        return Some(false);
+    }
+    let mut child = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["check-attr", "-z", "filter", "--stdin"])
+        .current_dir(top)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = paths.join("\0") + "\0";
+    let out = std::thread::scope(|s| {
+        s.spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(input.as_bytes());
+        });
+        child.wait_with_output().ok()
+    })?;
+    if !out.status.success() {
+        return None;
+    }
+    // Records: path NUL attribute NUL value NUL.
+    let mut fields = out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty());
+    while let (Some(_), Some(_), Some(value)) = (fields.next(), fields.next(), fields.next()) {
+        if value != b"unspecified" && value != b"unset" {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Blob ids of work tree files in one process, with the filters `git add`
+/// would apply (none: `has_filter` ruled them out).
+fn hash_files(top: &Path, paths: &[&str]) -> Option<Vec<String>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let input = paths.join("\n") + "\n";
+    let out = git_hash(top, &["hash-object", "--stdin-paths"], input.as_bytes())?;
+    let ids: Vec<String> = out.lines().map(str::to_owned).collect();
+    (ids.len() == paths.len()).then_some(ids)
+}
+
+/// The identity of a dirty tree whose tree id cannot be computed: a hash of
+/// the diff and the untracked files' content.
+fn legacy_dirty_hash(dir: &Path) -> String {
+    let mut diff = vec!["diff", "HEAD", "--binary", "--", ":/"];
+    diff.extend_from_slice(PROVA_OWN);
+    let mut material = git(dir, &diff).unwrap_or_default();
     // Untracked files: hash their content so edits change the identity.
-    let untracked = git(
-        dir,
-        &with_caches_excluded(&[
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--full-name",
-        ]),
-    )
-    .unwrap_or_default();
-    let root = git(dir, &["rev-parse", "--show-toplevel"])
-        .map(|r| String::from_utf8_lossy(&r).trim().to_owned())
-        .unwrap_or_default();
+    let mut args = vec![
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--full-name",
+        "--",
+        ":/",
+    ];
+    args.extend_from_slice(PROVA_OWN);
+    args.extend_from_slice(CACHES);
+    let untracked = git(dir, &args).unwrap_or_default();
     for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         material.extend_from_slice(name);
-        let path = Path::new(&root).join(String::from_utf8_lossy(name).as_ref());
+        let path = dir.join(String::from_utf8_lossy(name).as_ref());
         // Regular files only (no FIFOs or devices via symlinks), size-capped.
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() && m.len() <= 16 * 1024 * 1024 => {
@@ -165,7 +582,7 @@ pub fn code_identity(dir: &Path) -> String {
             Err(_) => {}
         }
     }
-    format!("tree:{short}+dirty:{}", &sha256_hex(&material)[..12])
+    sha256_hex(&material)[..12].to_owned()
 }
 
 /// Variables that change between shells and sessions without changing what

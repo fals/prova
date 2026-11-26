@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "prova-adapters"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prova-core",
  "quick-xml",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "prova-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "prova-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "flate2",
  "rusqlite",

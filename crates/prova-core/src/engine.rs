@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::config::{CommandSpec, RunSpec};
@@ -1221,6 +1222,9 @@ fn observe_child(
             Ok(false)
         };
     let mut cancelled_late = drain(sup, &mut open_streams, observer)?;
+    // Output still open after the drain: a process the command started holds
+    // stdout or stderr and could still print results (ADR 0038 section 2).
+    let output_still_open = open_streams > 0;
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
     if !leaked.is_empty() && !cancelled_late {
         process::kill_group(pgid);
@@ -1285,6 +1289,22 @@ fn observe_child(
                 .then(|| "terminated by signal".to_owned()),
         ),
     };
+    // ADR 0038 section 2: the command exited 0 while its output was still
+    // open: a process it started holds it and could still print results,
+    // so the pass is unverified. A leaked process that detached from the
+    // output (a build server) leaves it closed and the pass stands. One
+    // that left the process group (`setsid`) is not listed, nor killed.
+    if status == Status::Finished && exit_code == Some(0) && output_still_open {
+        let message = if leaked.is_empty() {
+            "a process prova could not find (it left the run's process group) still holds the output after the command exited 0: results it would have printed were never seen".to_owned()
+        } else {
+            format!(
+                "a process it started was still running and holding the output when the command exited 0 ({} killed): results it would have printed were never seen",
+                leaked.len()
+            )
+        };
+        sup.emit(EventKind::RunWarning { message });
+    }
     // ADR 0017: the verdict is decided from all the evidence.
     let not_passed = report.not_passed;
     let mut contradictions = report.contradictions;
@@ -1720,6 +1740,20 @@ fn observe_child(
             "{PYTEST_NO_TEST} (exit {code}: usage error, e.g. a selection or option pytest rejected); no test failed"
         ));
     }
+    // The runner itself is missing (`python3 -m pytest` without pytest,
+    // exit 1): no test ran, and none failed (ADR 0017, like exit 127).
+    if let Some(code) = exit_code
+        && code != 0
+        && reason.is_none()
+        && status == Status::Finished
+        && observed == 0
+        && let Some(tool) = sup.tail.iter().find_map(|l| runner_missing(l))
+    {
+        reason = Some(format!(
+            "{RUNNER_MISSING} (`{}`; exit {code}), and no test ran",
+            tool.chars().take(60).collect::<String>()
+        ));
+    }
     if !contradictions.is_empty() {
         let _ = sup.lifecycle.contradict();
         reason.get_or_insert_with(|| contradictions.join("; "));
@@ -1734,7 +1768,7 @@ fn observe_child(
     if outcome == Outcome::Failed
         && reason
             .as_deref()
-            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST))
+            .is_some_and(|r| r.starts_with(PYTEST_NO_TEST) || r.starts_with(RUNNER_MISSING))
     {
         outcome = Outcome::Errored;
     }
@@ -1924,6 +1958,68 @@ fn observe_child(
 
 /// The reason prefix of a pytest run that ran no test (exit 4 or 5).
 pub const PYTEST_NO_TEST: &str = "pytest ran no test";
+
+/// The reason prefix of a run that needed a command that was not there.
+pub const RUNNER_MISSING: &str = "a command the run needed was not found";
+
+/// The command or module a line says is missing, when the line has the shape
+/// a shell or Python prints for it (and not a test's own output that merely
+/// ends in "not found"): `sh: 1: pytest: command not found`,
+/// `bash: line 3: x: command not found`, `x: command not found`, dash's
+/// `sh: 1: x: not found`, `python3: No module named pytest`, and a
+/// container client's `exec: "x": executable file not found in $PATH`.
+fn runner_missing(line: &str) -> Option<String> {
+    let l = line.trim();
+    let word = |w: &str| {
+        (!w.is_empty() && !w.contains(char::is_whitespace) && !w.contains(':'))
+            .then(|| w.to_owned())
+    };
+    let shell = |w: &str| {
+        matches!(
+            w.rsplit('/').next(),
+            Some("sh" | "bash" | "dash" | "zsh" | "ksh")
+        )
+    };
+    let number = |w: &str| {
+        let n = w.strip_prefix("line ").unwrap_or(w);
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    };
+    if let Some(body) = l.strip_suffix(": command not found") {
+        let segs: Vec<&str> = body.split(": ").collect();
+        return match segs.as_slice() {
+            [tool] => word(tool),
+            [sh, tool] if shell(sh) => word(tool),
+            [sh, n, tool] if shell(sh) && number(n) => word(tool),
+            _ => None,
+        };
+    }
+    if let Some(body) = l.strip_suffix(": not found") {
+        // dash: `sh: 1: tool: not found`.
+        let segs: Vec<&str> = body.split(": ").collect();
+        return match segs.as_slice() {
+            [sh, n, tool] if shell(sh) && number(n) => word(tool),
+            _ => None,
+        };
+    }
+    if let Some((who, module)) = l.split_once(": No module named ")
+        && who.rsplit('/').next().is_some_and(|w| w.contains("python"))
+        && !who.contains(char::is_whitespace)
+    {
+        let module = module.trim().trim_matches('\'');
+        for m in ["pytest", "unittest"] {
+            if module == m || module.starts_with(&format!("{m}.")) {
+                return Some(m.to_owned());
+            }
+        }
+    }
+    if l.contains("executable file not found in $PATH")
+        && (l.starts_with("docker:") || l.starts_with("podman:") || l.starts_with("Error response"))
+        && let Some(tool) = l.split("exec: \"").nth(1).and_then(|r| r.split('"').next())
+    {
+        return Some(tool.to_owned());
+    }
+    None
+}
 
 /// A line pytest prints when it ran no test: usage errors and empty
 /// collections.
@@ -2915,6 +3011,37 @@ pub fn unverified_runs(
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
 fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
+    flaky_passed_as_of(store, row, &row.id, 50)
+}
+
+/// The tests that passed in `run` and were already known flaky when it
+/// started: flaky as of the suite's run before it, over its whole history
+/// (none when it has no earlier run). A run whose own result makes a test
+/// flaky is not a pass of a known flaky test. Matched by test identity
+/// (name and place), not by name.
+pub fn known_flaky_passed(store: &Store, run: &str) -> Result<Vec<String>> {
+    let row = store.run(run)?;
+    let prev: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT id FROM runs WHERE suite = ?1 AND created_ms < (SELECT created_ms FROM runs WHERE id = ?2)
+              ORDER BY created_ms DESC LIMIT 1",
+            rusqlite::params![row.suite, row.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match prev {
+        Some(prev) => flaky_passed_as_of(store, &row, &prev, i64::MAX as usize),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn flaky_passed_as_of(
+    store: &Store,
+    row: &RunRow,
+    as_of: &str,
+    window: usize,
+) -> Result<Vec<String>> {
     let passed: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t.id FROM attempts a JOIN tests t ON t.id = a.test_id
@@ -2931,7 +3058,7 @@ fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     if passed.is_empty() {
         return Ok(out);
     }
-    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), 50, Some(&row.id))? {
+    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), window, Some(as_of))? {
         // The same test (name and place) passed in this run.
         if !out.contains(&f.display)
             && crate::analysis::shared_ids(store, &f.test_id)?
@@ -3227,10 +3354,15 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
-                // Only this suite's own tests can be "not run" here.
+                // Only a test this suite ran in an earlier run, at the
+                // quarantined place, can be "not run" here (ADR 0037).
                 let known: bool = store.conn().query_row(
-                    "SELECT EXISTS (SELECT 1 FROM tests WHERE display = ?1 AND suite = ?2)",
-                    rusqlite::params![name, row.suite],
+                    "SELECT EXISTS (SELECT 1 FROM tests t JOIN attempts a ON a.test_id = t.id
+                      WHERE t.display = ?1 AND t.suite = ?2
+                        AND a.run_id IN (SELECT id FROM runs WHERE created_ms <
+                              (SELECT created_ms FROM runs WHERE id = ?3))
+                        AND (?4 IS NULL OR t.file = ?4))",
+                    rusqlite::params![name, row.suite, run, q.file],
                     |r| r.get(0),
                 )?;
                 if !known {
@@ -4004,5 +4136,41 @@ mod hang_hint_tests {
         let only: crate::config::Config =
             toml::from_str("[suite.make]\nrun = \"make test\"\n").unwrap();
         assert!(super::direct_suite_hint(&only, "make", "make").is_none());
+    }
+}
+
+#[cfg(test)]
+mod runner_missing_tests {
+    use super::runner_missing;
+
+    #[test]
+    fn shell_shaped_not_found_lines_are_a_missing_command() {
+        for l in [
+            "sh: 1: pytest: command not found",
+            "bash: line 1: pytest: command not found",
+            "/bin/bash: line 3: pytest: command not found",
+            "bash: pytest: command not found",
+            "pytest: command not found",
+            "sh: 1: gsed: not found",
+            "/usr/bin/python3: No module named pytest",
+            "python3: No module named 'pytest'",
+            "python: No module named unittest",
+        ] {
+            assert!(runner_missing(l).is_some(), "{l}");
+        }
+    }
+
+    #[test]
+    fn test_output_that_says_not_found_is_not_a_missing_command() {
+        for l in [
+            "user 42: not found",
+            "FAILED tests/test_a.py::test_x - KeyError: key: not found",
+            "assertion failed: item not found",
+            "test lookup::missing ... FAILED: row 7: not found",
+            "E       ModuleNotFoundError: No module named 'pytest_cov_missing'",
+            "error: file: not found in the manifest",
+        ] {
+            assert!(runner_missing(l).is_none(), "{l}");
+        }
     }
 }

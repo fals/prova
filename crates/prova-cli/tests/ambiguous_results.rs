@@ -113,6 +113,9 @@ fn unplaced_same_name_results_are_one_failed_result_with_no_history() {
         out2.contains("cannot tell apart") && out2.contains("without `--quiet`"),
         "{out2}"
     );
+    // Three crates ran it: three results, and a place shown once in parentheses.
+    assert!(out2.contains("3 results named"), "{out2}");
+    assert!(!out2.contains("(("), "{out2}");
     // The first run's pass is no history of a failing result.
     assert!(
         !out2.contains("passed before") && !out2.contains("new failure"),
@@ -127,6 +130,10 @@ fn unplaced_same_name_results_are_one_failed_result_with_no_history() {
     // History of the name shows no pass for the run where one failed.
     let h = text(&prova(&d, &["history", "tests::same"]));
     assert!(!h.contains(&format!("{r2} passed")), "{h}");
+    assert!(
+        !h.contains("(("),
+        "a place that is already parenthesised: {h}"
+    );
     // The diff does not say one test is still failing.
     let df = text(&prova(&d, &["diff", &r2, &r3]));
     assert!(!df.contains("still failing"), "{df}");
@@ -174,6 +181,8 @@ fn pytest_sessions_with_no_rootdir_are_one_failed_result_with_no_history() {
         out2.contains("cannot tell apart") && out2.contains("pytest with `-v`"),
         "{out2}"
     );
+    // Three sessions, three results: the short summary repeats one.
+    assert!(out2.contains("3 results named"), "{out2}");
     assert!(!out2.contains("passed before"), "{out2}");
     let (r3, out3, c3) = run(&d, "fpf");
     assert_eq!(c3, 1, "{out3}");
@@ -182,6 +191,10 @@ fn pytest_sessions_with_no_rootdir_are_one_failed_result_with_no_history() {
     }
     let h = text(&prova(&d, &["history", "tests.test_a::test_same"]));
     assert!(!h.contains(&format!("{r2} passed")), "{h}");
+    assert!(
+        !h.contains("(("),
+        "a place that is already parenthesised: {h}"
+    );
     let df = text(&prova(&d, &["diff", &r2, &r3]));
     assert!(!df.contains("still failing"), "{df}");
 }
