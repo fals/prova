@@ -19,7 +19,9 @@ shipped binary has passed on its own platform.
    bump it (and the `vX.Y.Z` pins in README, getting started and
    `llms.txt`, and, for a new minor or major version, the `version` of the
    internal `prova-*` dependencies in `crates/*/Cargo.toml`) in a PR before
-   tagging; the release refuses a mismatch.
+   tagging. The release workflow refuses a tag that differs from the
+   `Cargo.toml` version; it does not check the doc pins or the internal
+   dependency versions, so check them in the PR.
 
 ## Tag
 

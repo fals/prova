@@ -1,6 +1,6 @@
 # 0017: No false passes: a pass needs evidence
 
-Status: Accepted (2026-11-22). Amends [0004](0004-liveness-and-fail-fast.md) (how the run outcome is decided; exit codes keep their meaning) and [0013](0013-black-box-adoption.md) (what each fidelity level may conclude).
+Status: Accepted (2026-11-22). Amends [0004](0004-liveness-and-fail-fast.md) (how the run outcome is decided; exit codes keep their meaning) and [0013](0013-black-box-adoption.md) (what each fidelity level may conclude). Amended by [0038](0038-same-content-same-code-and-stricter-outcomes.md).
 
 ## Context
 
