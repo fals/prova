@@ -66,10 +66,12 @@ fn new_exp(d: &Path, extra: &[&str]) {
         "e",
         "--hypothesis",
         "h",
+        // Enough trials that one slow trial per arm cannot lift the exact
+        // Mann-Whitney p over alpha (arm64 CI: 5 + 5 gave p = 0.065).
         "--trials",
-        "5",
+        "8",
         "--max-trials",
-        "6",
+        "10",
         "--warmup",
         "0",
         "--guardrail",
