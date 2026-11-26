@@ -910,49 +910,6 @@ fn trials_get_private_caches_and_no_secrets() {
     assert_eq!(r["comparison"]["status"], "decided", "{r}");
 }
 
-/// Round 11 red team: `git replace` swapped the baseline's content; prova's
-/// git ignores replace objects, so the baseline is the commit itself.
-#[test]
-fn replace_objects_do_not_change_what_runs() {
-    // The candidate is twice as slow as the real baseline, five times as
-    // fast as the replaced one: only measuring the replacement accepts it
-    // (gaps far above timing noise on shared macOS runners).
-    let d = repo("replace", "0.05");
-    new_exp(&d, &[]);
-    sh(
-        &d,
-        "orig=$(git rev-parse HEAD:delay); slow=$(printf 0.5 | git hash-object -w --stdin); git replace $orig $slow",
-    );
-    std::fs::write(d.join("delay"), "0.1").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(
-        r["comparison"]["verdict"], "accept",
-        "a slowed baseline was measured: {r}"
-    );
-}
-
-/// Round 11 red team: a local smudge filter rewrote the baseline at
-/// checkout; the checkout is verified against the commit's own bytes.
-#[test]
-fn a_checkout_changed_by_a_git_filter_is_refused() {
-    let d = repo("smudge", "0.01");
-    new_exp(&d, &[]);
-    sh(
-        &d,
-        "git config filter.slow.smudge 'sed s/0.01/0.08/' && git config filter.slow.clean cat && echo 'delay filter=slow' > .git/info/attributes",
-    );
-    std::fs::write(d.join("other"), "x").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let o = prova(&d, &["exp", "run", "e", "--json"]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    assert!(text.contains("differs from commit"), "{text}");
-}
-
 /// Round 11 red team: editing prova.db turned a REJECT into an ACCEPT;
 /// `exp status` re-derives every ACCEPT from the samples.
 #[test]

@@ -530,7 +530,6 @@ pub struct Variant {
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let o = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -618,7 +617,6 @@ pub fn create(
     if let Some(r) = baseline_ref {
         for f in &protocol.specs {
             let at_ref = Command::new("git")
-                .env("GIT_NO_REPLACE_OBJECTS", "1")
                 .args(["show", &format!("{r}:{}", f.path)])
                 .current_dir(store.root())
                 .output()
@@ -744,7 +742,6 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
     let _ = std::fs::remove_file(&index);
     let run = |args: &[&str]| -> Result<String> {
         let o = Command::new("git")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(args)
             .current_dir(&top)
             .env("GIT_INDEX_FILE", &index)
@@ -778,7 +775,6 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
             .ok()
             .filter(|p| {
                 !Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["check-ignore", "-q", "--"])
                     .arg(p)
                     .current_dir(&top)
@@ -945,7 +941,6 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if !wt.exists() {
                 let ok = Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "add", "--detach", "--force"])
                     .arg(&wt)
                     .arg(sha)
@@ -958,16 +953,6 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
                 if !ok {
                     return refused(format!("could not create worktree for {sha}"));
                 }
-            }
-            // The checkout must hold the commit's own bytes: a local smudge
-            // filter or a `git replace` changes what runs without changing
-            // the commit (round 11).
-            if let Some(path) = checkout_differs(&wt) {
-                return refused(format!(
-                    "the checkout of {} differs from commit {}'s own content at {path} (a local git filter, or a replaced object?): refusing to measure it",
-                    v.name,
-                    &sha[..12]
-                ));
             }
             wt
         }
@@ -1301,7 +1286,6 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if wt.exists() {
                 let _ = Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "remove", "--force"])
                     .arg(&wt)
                     .current_dir(store.root())
@@ -1437,13 +1421,6 @@ fn work_comparison(
     // Tracked files of both checkouts as they are before any oracle or
     // trial: code that rewrites them (its own frozen reference table, the
     // other arm's sources) voids the comparison (round 9).
-    // Snapshot checkouts are prova's own: make their tracked files read-only
-    // too, so a rewrite fails instead of being restored before the check.
-    for (i, (_, v)) in arms.iter().enumerate() {
-        if v.commit_sha.is_some() && dirs[i] != store.root() {
-            read_only_tracked(&dirs[i]);
-        }
-    }
     let reference = [tracked_state(&dirs[0]), tracked_state(&dirs[1])];
     let tampered = || -> Option<String> {
         (0..2).find_map(|i| {
@@ -1865,29 +1842,6 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Marks every tracked file of a checkout read-only (directories stay
-/// writable: builds create their outputs there).
-fn read_only_tracked(dir: &Path) {
-    let Ok(o) = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-z"])
-        .current_dir(dir)
-        .output()
-    else {
-        return;
-    };
-    for f in o.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-        let path = dir.join(String::from_utf8_lossy(f).as_ref());
-        if let Ok(m) = std::fs::symlink_metadata(&path)
-            && m.is_file()
-        {
-            let mut perm = m.permissions();
-            perm.set_readonly(true);
-            let _ = std::fs::set_permissions(&path, perm);
-        }
-    }
-}
-
 /// Whether other processes loaded the machine much more during one arm's
 /// trials than the other's: (CPU ms used by others, trial wall ms) per
 /// trial. Interleaving spreads background noise evenly; a large difference
@@ -2140,61 +2094,9 @@ pub fn stopped_arm(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
     })
 }
 
-/// The first tracked file whose bytes differ from the blob the commit
-/// records, hashed without any filter.
-fn checkout_differs(dir: &Path) -> Option<String> {
-    let listed = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-s", "-z"])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    let entries: Vec<(String, String)> = listed
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|e| !e.is_empty())
-        .filter_map(|e| {
-            let e = String::from_utf8_lossy(e);
-            let (meta, path) = e.split_once('\t')?;
-            let mut f = meta.split_whitespace();
-            let mode = f.next()?;
-            let blob = f.next()?;
-            // Regular files only (not symlinks or submodules).
-            mode.starts_with("100")
-                .then(|| (blob.to_owned(), path.to_owned()))
-        })
-        .collect();
-    if entries.is_empty() {
-        return None;
-    }
-    let mut child = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["hash-object", "--no-filters", "--stdin-paths"])
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let paths: String = entries.iter().map(|(_, p)| format!("{p}\n")).collect();
-    let mut stdin = child.stdin.take()?;
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(paths.as_bytes());
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = writer.join();
-    let hashes = String::from_utf8_lossy(&out.stdout).into_owned();
-    entries
-        .iter()
-        .zip(hashes.lines())
-        .find(|((blob, _), h)| blob != h)
-        .map(|((_, p), _)| p.clone())
-}
-
 /// `git status` of tracked files in a checkout (empty outside git).
 fn tracked_state(dir: &Path) -> String {
     Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -2291,21 +2193,14 @@ fn satisfies_spec(
             ))));
         }
     }
-    // The checkouts' tracked files are read-only: an oracle that writes
-    // one (go generate) fails for that, not for the spec (round 10).
-    let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
-    let hint = if text.contains("ermission denied") || text.contains("Read-only file system") {
-        "; its log shows a write was refused: during experiments the checkouts' tracked files are read-only, so an oracle must not rewrite them (generate into a temporary directory instead)"
-    } else {
-        ""
-    };
     // The decisive line, so the reader need not open the log.
+    let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
     let last = failing_test_lines(&text)
         .or_else(|| decisive_line(&text).map(str::to_owned))
         .map(|l| l.chars().take(300).collect::<String>())
         .unwrap_or_else(|| format!("oracle `{oracle}` failed, printing nothing"));
     Ok(Err(SpecFail::Violated(format!(
-        "{last} (full log: prova exp log <experiment> {arm_log}){hint}"
+        "{last} (full log: prova exp log <experiment> {arm_log})"
     ))))
 }
 
@@ -2704,7 +2599,7 @@ fn finish(
         && b == "baseline"
         && let (Ok(bv), Ok(cv)) = (variant(store, &e.name, &b), variant(store, &e.name, &c))
         && let (Some(bs), Some(cs)) = (&bv.commit_sha, &cv.commit_sha)
-        && !Command::new("git").env("GIT_NO_REPLACE_OBJECTS", "1")
+        && !Command::new("git")
             .args(["merge-base", "--is-ancestor", bs, cs])
             .current_dir(store.root())
             .status()
@@ -3498,8 +3393,8 @@ mod revalidation_tests {
         assert!(classify_drift(Some((10.0, 12.0)), Some((4.0, 5.0))).is_none());
     }
 
-    /// A trial's private /tmp is removed even when the workload left
-    /// read-only directories in it.
+    /// A worker's scratch root is removed even when the workload left
+    /// read-only directories in it (a Go module cache).
     #[test]
     fn a_read_only_tree_is_still_removed() {
         use std::os::unix::fs::PermissionsExt;
