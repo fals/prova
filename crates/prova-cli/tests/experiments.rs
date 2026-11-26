@@ -1621,3 +1621,18 @@ fn status_with_a_recorded_candidate_says_to_run_it() {
         "{out}"
     );
 }
+
+/// Release candidate: `exp wait --help` and `exp status --help` did not say
+/// what their exit codes mean (1 for a REJECT).
+#[test]
+fn exp_wait_and_status_help_say_their_exit_codes() {
+    let d = repo("help-exit", "0.01");
+    for sub in ["wait", "status"] {
+        let o = prova(&d, &["exp", sub, "--help"]);
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(
+            out.contains("Exit codes:") && out.contains("1 REJECT") && out.contains("5 still running"),
+            "{sub}: {out}"
+        );
+    }
+}

@@ -710,7 +710,10 @@ Examples:
   prova exp wait speed --max-wait 1h     as long as the comparison needs
 The 9 minute limit is only the foreground `exp run` budget: `exp wait` takes
 any --max-wait, so one command (in the background if your tool calls are
-short) replaces a polling loop. Exit 5 means still running: wait again.")]
+short) replaces a polling loop.
+Exit codes: 0 ACCEPT (or no comparison yet), 1 REJECT or any other verdict
+that is not an accept, 3 cancelled, 4 the comparison failed, 5 still running:
+wait again.")]
     Wait {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
@@ -731,7 +734,10 @@ Examples:
   prova exp status speed --json
   prova exp status speed --comparison 6ddda6cb   an older comparison
 `prova exp protocol` changes the protocol (before the first trial); it is
-not how to read it.")]
+not how to read it.
+Exit codes: 0 ACCEPT, no comparison yet, or a REJECT after a candidate was
+accepted as best; 1 REJECT with no accepted best; 3 cancelled; 4 the
+comparison failed; 5 still running.")]
     Status {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
