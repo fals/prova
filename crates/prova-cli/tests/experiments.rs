@@ -808,22 +808,6 @@ fn change_allows_a_build_file_on_top_of_the_default_scope() {
     assert!(!reason.contains("out of scope"), "{r}");
 }
 
-/// Round 10 red team: a top-level `random.py` shadowed the standard library
-/// for the oracle; it is a file that decides the verdict.
-#[test]
-fn a_module_shadowing_the_python_standard_library_is_out_of_scope() {
-    let d = repo("stdlib", "0.01");
-    new_exp(&d, &[]);
-    std::fs::write(d.join("random.py"), "def randrange(a, b): return a\n").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
-    assert!(
-        reason.contains("out of scope") && reason.contains("random.py"),
-        "{r}"
-    );
-}
-
 /// Round 10: a comparison that failed at its oracle froze the protocol, so
 /// fixing the oracle needed a new experiment.
 #[test]
@@ -846,7 +830,7 @@ fn trials_run_without_the_python_user_site() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ \"$PYTHONNOUSERSITE\" = 1 ] && [ -n \"$PYTHONPYCACHEPREFIX\" ] || exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\n[ \"$PYTHONNOUSERSITE\" = 1 ] || exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(

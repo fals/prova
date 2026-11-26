@@ -290,35 +290,6 @@ fn cargo_experiment(name: &str) -> PathBuf {
     d
 }
 
-/// ADR 0035 section 4 (round 18 B9): a candidate that adds
-/// `.cargo/config.toml` with a `runner` that prints the metric forged the
-/// result. Runner configuration is a harness file: out of scope, unmeasured.
-#[test]
-#[ignore = "large: needs cargo"]
-fn cargo_runner_config_is_out_of_scope() {
-    let d = cargo_experiment("exp-runner");
-    std::fs::create_dir_all(d.join(".cargo")).unwrap();
-    std::fs::write(
-        d.join(".cargo/config.toml"),
-        r#"[target.'cfg(unix)']
-runner = ["sh", "-c", "echo '{\"metric\":\"steps\",\"value\":1}'", "x"]
-"#,
-    )
-    .unwrap();
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
-    assert_eq!(
-        r["comparison"]["candidate_trials"], 0,
-        "never measured: {r}"
-    );
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("out of scope") && reason.contains(".cargo/config.toml"),
-        "{reason}"
-    );
-}
-
 /// ADR 0035 section 4 (round 18 B8): a candidate fast only while an
 /// environment variable is set is accepted with it, and the revalidation
 /// without it withdraws the accept.

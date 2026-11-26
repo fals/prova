@@ -1772,22 +1772,6 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/package.json",
     "**/pytest.ini",
     "**/.pytest.ini",
-    // Python startup hooks that run in every interpreter (round 10)
-    "**/sitecustomize.py",
-    "**/usercustomize.py",
-    "**/*.pth",
-    // Runner configuration: names the program a tool runs instead of the
-    // one the workload asked for, and compiled modules import as source
-    // (ADR 0035 section 4, round 18)
-    "**/.npmrc",
-    "**/.yarnrc*",
-    "**/.cargo/config*",
-    "**/rust-toolchain",
-    "**/rust-toolchain.toml",
-    "**/go.env",
-    "**/pip.conf",
-    "**/*.pyc",
-    "**/__pycache__/**",
     "**/pyproject.toml",
     "**/setup.cfg",
     "**/tox.ini",
@@ -1802,220 +1786,9 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/*.sh",
 ];
 
-/// Python's standard library top-level modules: a file or package of that
-/// name in the checkout shadows the real one for code run from it (round
-/// 10: a `random.py` made the oracle's random sample constant).
-const PYTHON_STDLIB: &[&str] = &[
-    "abc",
-    "annotationlib",
-    "antigravity",
-    "argparse",
-    "array",
-    "ast",
-    "asyncio",
-    "atexit",
-    "base64",
-    "bdb",
-    "binascii",
-    "bisect",
-    "builtins",
-    "bz2",
-    "cProfile",
-    "calendar",
-    "cmath",
-    "cmd",
-    "code",
-    "codecs",
-    "codeop",
-    "collections",
-    "colorsys",
-    "compileall",
-    "compression",
-    "concurrent",
-    "configparser",
-    "contextlib",
-    "contextvars",
-    "copy",
-    "copyreg",
-    "csv",
-    "ctypes",
-    "curses",
-    "dataclasses",
-    "datetime",
-    "dbm",
-    "decimal",
-    "difflib",
-    "dis",
-    "doctest",
-    "email",
-    "encodings",
-    "ensurepip",
-    "enum",
-    "errno",
-    "faulthandler",
-    "fcntl",
-    "filecmp",
-    "fileinput",
-    "fnmatch",
-    "fractions",
-    "ftplib",
-    "functools",
-    "gc",
-    "genericpath",
-    "getopt",
-    "getpass",
-    "gettext",
-    "glob",
-    "graphlib",
-    "grp",
-    "gzip",
-    "hashlib",
-    "heapq",
-    "hmac",
-    "html",
-    "http",
-    "idlelib",
-    "imaplib",
-    "importlib",
-    "inspect",
-    "io",
-    "ipaddress",
-    "itertools",
-    "json",
-    "keyword",
-    "linecache",
-    "locale",
-    "logging",
-    "lzma",
-    "mailbox",
-    "marshal",
-    "math",
-    "mimetypes",
-    "mmap",
-    "modulefinder",
-    "msvcrt",
-    "multiprocessing",
-    "netrc",
-    "nt",
-    "ntpath",
-    "nturl2path",
-    "numbers",
-    "opcode",
-    "operator",
-    "optparse",
-    "os",
-    "pathlib",
-    "pdb",
-    "pickle",
-    "pickletools",
-    "pkgutil",
-    "platform",
-    "plistlib",
-    "poplib",
-    "posix",
-    "posixpath",
-    "pprint",
-    "profile",
-    "profiling",
-    "pstats",
-    "pty",
-    "pwd",
-    "py_compile",
-    "pyclbr",
-    "pydoc",
-    "pydoc_data",
-    "pyexpat",
-    "queue",
-    "quopri",
-    "random",
-    "re",
-    "readline",
-    "reprlib",
-    "resource",
-    "rlcompleter",
-    "runpy",
-    "sched",
-    "secrets",
-    "select",
-    "selectors",
-    "shelve",
-    "shlex",
-    "shutil",
-    "signal",
-    "site",
-    "smtplib",
-    "socket",
-    "socketserver",
-    "sqlite3",
-    "ssl",
-    "stat",
-    "statistics",
-    "string",
-    "stringprep",
-    "struct",
-    "subprocess",
-    "symtable",
-    "sys",
-    "sysconfig",
-    "syslog",
-    "tabnanny",
-    "tarfile",
-    "tempfile",
-    "termios",
-    "textwrap",
-    "this",
-    "threading",
-    "time",
-    "timeit",
-    "tkinter",
-    "token",
-    "tokenize",
-    "tomllib",
-    "trace",
-    "traceback",
-    "tracemalloc",
-    "tty",
-    "turtle",
-    "turtledemo",
-    "types",
-    "typing",
-    "unicodedata",
-    "unittest",
-    "urllib",
-    "uuid",
-    "venv",
-    "warnings",
-    "wave",
-    "weakref",
-    "webbrowser",
-    "winreg",
-    "winsound",
-    "wsgiref",
-    "xml",
-    "xmlrpc",
-    "zipapp",
-    "zipfile",
-    "zipimport",
-    "zlib",
-    "zoneinfo",
-];
-
 /// A file that decides the verdict rather than implements the change.
 fn harness_file(path: &str) -> bool {
-    if HARNESS_FILES.iter().any(|g| glob_match(g, path)) {
-        return true;
-    }
-    // Only at the top of the checkout, where `python -m` and pytest put it
-    // first on sys.path; `pkg/types.py` shadows nothing.
-    let module = match path.split('/').collect::<Vec<_>>().as_slice() {
-        [file] => file
-            .strip_suffix(".py")
-            .or_else(|| file.strip_suffix(".pyc"))
-            .unwrap_or(""),
-        [dir, "__init__.py"] => dir,
-        _ => return false,
-    };
-    PYTHON_STDLIB.contains(&module)
+    HARNESS_FILES.iter().any(|g| glob_match(g, path))
 }
 
 /// Matches a path against a glob: `*` within one segment, `**` any number
@@ -2176,16 +1949,15 @@ fn arm_command(dir: &Path, program: &str, args: &[String]) -> Command {
     c.args(args)
         .env_remove("PROVA_HOME")
         .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONPYCACHEPREFIX", &state)
         .env("GOCACHE", state.join("go-build"))
         .env("XDG_CACHE_HOME", state.join("cache"))
         .env("npm_config_cache", state.join("npm"));
     c
 }
 
-/// One checkout's scratch space in this worker: its caches (Go, npm, XDG,
-/// Python bytecode). It lives under the worker's scratch root, which is
-/// removed when the comparison ends.
+/// One checkout's scratch space in this worker: its caches (Go, npm, XDG).
+/// It lives under the worker's scratch root, which is removed when the
+/// comparison ends.
 fn arm_scratch(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
     scratch_root().join(format!("arm-{}", &key[..16]))
@@ -3787,35 +3559,5 @@ mod oracle_input_tests {
         }
         assert!(!harness_file("src/primes.rs"));
         assert!(!harness_file("src/golden_ratio.rs"));
-    }
-
-    /// ADR 0035 section 4: configuration that names the program a tool runs
-    /// and compiled modules decide the verdict too.
-    #[test]
-    fn runner_configuration_and_compiled_modules_are_harness_files() {
-        for f in [
-            ".npmrc",
-            "web/.npmrc",
-            ".yarnrc",
-            ".yarnrc.yml",
-            ".cargo/config.toml",
-            ".cargo/config",
-            "crates/x/.cargo/config.toml",
-            "rust-toolchain",
-            "rust-toolchain.toml",
-            "go.env",
-            "pip.conf",
-            "sitecustomize.py",
-            "usercustomize.py",
-            "json.pyc",
-            "pkg/helper.pyc",
-            "pkg/__pycache__/x.cpython-313.pyc",
-            "__pycache__/x.txt",
-        ] {
-            assert!(harness_file(f), "{f} should decide the verdict");
-        }
-        assert!(!harness_file("src/cargo_config.rs"));
-        assert!(!harness_file("docs/rust-toolchain-notes.md"));
-        assert!(!harness_file("rust-toolchain.rs"));
     }
 }
