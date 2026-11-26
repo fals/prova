@@ -167,6 +167,10 @@ impl<'a> Names<'a> {
     /// name is not shared.
     pub fn place(&self, display: &str, file: Option<&str>) -> Option<String> {
         let file = file.filter(|f| !f.is_empty() && !f.starts_with("(package pending)"))?;
+        // An ambiguous result is its run's own: never the same as another's.
+        if file.starts_with(crate::model::AMBIGUOUS_PLACE) {
+            return Some(file.to_owned());
+        }
         let shared = *self
             .shared
             .borrow_mut()
@@ -1087,7 +1091,9 @@ pub struct RunDiff {
 fn final_outcomes(store: &Store, run: &str) -> Result<BTreeMap<String, (Outcome, Option<u64>)>> {
     let mut stmt = store.conn().prepare(
         "SELECT t.display, a.outcome, a.duration_ms, t.file FROM attempts a JOIN tests t ON t.id = a.test_id
-         WHERE a.run_id = ?1 ORDER BY a.attempt",
+         WHERE a.run_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
+         ORDER BY a.attempt",
     )?;
     let rows = stmt.query_map(params![run], |r| {
         Ok((
