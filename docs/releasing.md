@@ -17,7 +17,9 @@ shipped binary has passed on its own platform.
    Any blocker or false pass means no tag: fix it, then start this step again. Record the candidate's run ids in the release PR.
 4. The version in `Cargo.toml` (`[workspace.package]`) is the one to tag:
    bump it (and the `vX.Y.Z` pins in README, getting started and
-   `llms.txt`) in a PR before tagging; the release refuses a mismatch.
+   `llms.txt`, and, for a new minor or major version, the `version` of the
+   internal `prova-*` dependencies in `crates/*/Cargo.toml`) in a PR before
+   tagging; the release refuses a mismatch.
 
 ## Tag
 
