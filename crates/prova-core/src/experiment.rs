@@ -94,10 +94,6 @@ pub struct Protocol {
     /// to the default (round 10: allowing go.mod narrowed it to go.mod).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scope_only: bool,
-    /// Trials and oracle may use the network (a sandboxed arm has only
-    /// loopback otherwise).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_network: bool,
 }
 
 /// A specification file: path relative to the repository root, sha256.
@@ -938,9 +934,6 @@ struct TrialResult {
     foreign_ms: f64,
     /// CPU (ms) the trial's own processes used.
     own_ms: f64,
-    /// Files the workload left in its private /tmp (relative paths): what it
-    /// wrote outside the checkout and could read back in a later iteration.
-    tmp_left: Vec<String>,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -1004,29 +997,11 @@ fn run_trial(
     count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
-    // The trial's private /tmp is a host directory, so what is left in it
-    // can be seen afterwards (ADR 0035 section 4). The guard removes it on
-    // every way out of this function.
-    let tmp = sandbox_available()
-        .then(|| arm_scratch(dir).join(format!("tmp-{}", crate::ids::new_run_id())))
-        .filter(|t| private_dir(t).is_ok())
-        .map(Scratch);
-    let mut cmd = sandboxed_in(
-        dir,
-        &p.command[0],
-        &p.command[1..],
-        p.allow_network,
-        None,
-        tmp.as_ref().map(|t| t.0.as_path()),
-    );
+    let mut cmd = arm_command(dir, &p.command[0], &p.command[1..]);
     cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // The workload must not reach prova's own store (round 9).
-        .env_remove("PROVA_HOME")
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
         .process_group(0);
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
@@ -1045,7 +1020,6 @@ fn run_trial(
                 leaked: vec![],
                 foreign_ms: 0.0,
                 own_ms: 0.0,
-                tmp_left: vec![],
             });
         }
     };
@@ -1126,12 +1100,6 @@ fn run_trial(
         log.write_all(&e)?;
         text.push_str(&String::from_utf8_lossy(&e));
     }
-    let tmp_left = tmp.as_ref().map_or_else(Vec::new, |t| files_under(&t.0));
-    if let Some(t) = tmp
-        && let Err(e) = t.remove()
-    {
-        writeln!(log, "prova: could not remove the trial's private /tmp: {e}")?;
-    }
     let metrics = parse(&text);
     let primary_lines = count(&text)
         .into_iter()
@@ -1145,20 +1113,12 @@ fn run_trial(
         leaked,
         foreign_ms,
         own_ms: cpu_after.1.saturating_sub(cpu_before.1) as f64 * 10.0,
-        tmp_left,
     })
 }
 
-/// A directory removed when dropped (a trial's private /tmp, a worker's
-/// scratch root), on every way out, whatever permissions the workload left.
+/// A worker's scratch root, removed when dropped, on every way out,
+/// whatever permissions the workload left.
 struct Scratch(PathBuf);
-
-impl Scratch {
-    /// Removes it, reporting a failure.
-    fn remove(&self) -> std::result::Result<(), String> {
-        remove_tree(&self.0)
-    }
-}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -1192,46 +1152,6 @@ fn remove_tree(root: &Path) -> std::result::Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
-}
-
-/// What the candidate's trials left in their private /tmp that the
-/// baseline's did not, when it matters: files written outside the checkout
-/// can be read back by the next iteration. What both arms leave (a JVM's
-/// hsperfdata, pytest's directory) is the tools', and is not reported;
-/// full relative paths are compared with digit runs normalised.
-fn tmp_caveat(left: &[Vec<String>; 2]) -> Option<String> {
-    // Digit runs (pids, numbered directories) are normalised; nothing else.
-    let norm = |p: &String| -> String {
-        let mut out = String::new();
-        let mut digits = false;
-        for ch in p.chars() {
-            if ch.is_ascii_digit() {
-                if !digits {
-                    out.push('#');
-                }
-                digits = true;
-            } else {
-                digits = false;
-                out.push(ch);
-            }
-        }
-        out
-    };
-    let theirs: std::collections::BTreeSet<String> = left[0].iter().map(norm).collect();
-    let only: Vec<String> = left[1]
-        .iter()
-        .filter(|p| !theirs.contains(&norm(p)))
-        .cloned()
-        .collect();
-    if only.is_empty() {
-        return None;
-    }
-    let names: Vec<&str> = only.iter().take(3).map(String::as_str).collect();
-    Some(format!(
-        "a trial wrote files outside the checkout, in its private /tmp: the candidate's trials left {} file(s) (e.g. {}) that the baseline's did not; a workload that keeps results there and reads them back in the next iteration measures its cache, not its code: read the candidate's diff",
-        only.len(),
-        names.join(", ")
-    ))
 }
 
 /// For an ACCEPT against something other than the original baseline: the
@@ -1280,33 +1200,6 @@ fn against_original(
                 short(cand)
             )
         }))
-}
-
-/// Regular files below a directory (relative paths, sorted, at most 1000).
-fn files_under(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut todo = vec![root.to_path_buf()];
-    while let Some(d) = todo.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let Ok(t) = e.file_type() else { continue };
-            if t.is_dir() {
-                todo.push(e.path());
-            } else if out.len() < 1000 {
-                out.push(
-                    e.path()
-                        .strip_prefix(root)
-                        .unwrap_or(&e.path())
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 fn fingerprint() -> String {
@@ -1457,9 +1350,6 @@ fn work_comparison(
     // Primary-metric lines per trial, per arm; and the first leaked process.
     let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
-    // Files each arm's measured trials left in their private /tmp (the most
-    // any one trial left).
-    let tmp_files: std::cell::RefCell<[Vec<String>; 2]> = Default::default();
     // CPU other processes used per trial, per arm, with the trial's wall time.
     let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     // The trial's own CPU, with its wall time: a process stopped from
@@ -1483,10 +1373,6 @@ fn work_comparison(
             lines.borrow_mut()[i].push(r.primary_lines);
             foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
             own.borrow_mut()[i].push((r.own_ms, r.wall_ms));
-            let mut t = tmp_files.borrow_mut();
-            if r.tmp_left.len() > t[i].len() {
-                t[i] = r.tmp_left.clone();
-            }
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1530,10 +1416,7 @@ fn work_comparison(
     if let Some(setup) = &p.setup {
         for (i, (arm, _)) in arms.iter().enumerate() {
             let log = private_file(&logs.join(format!("setup-{}.log", arm.as_str())))?;
-            let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()], true)
-                .env_remove("PROVA_HOME")
-                .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONPYCACHEPREFIX", arm_scratch(&dirs[i]))
+            let ok = arm_command(&dirs[i], "sh", &["-c".to_owned(), setup.clone()])
                 .current_dir(&dirs[i])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -1809,9 +1692,6 @@ fn work_comparison(
                 ));
             }
         }
-        if let Some(c) = tmp_caveat(&tmp_files.borrow()) {
-            caveats.push(c);
-        }
         // A win this large against the original baseline is as suspect as
         // one against the best (ADR 0035 section 4: a cache in /tmp took a
         // candidate from 152x over the best to 4100x over the baseline).
@@ -1831,16 +1711,6 @@ fn work_comparison(
         if !caveats.is_empty() {
             result["caveats"] = serde_json::json!(caveats);
         }
-        // Say how isolated the arms were (ADR 0024).
-        result["sandbox"] = serde_json::json!(if sandbox_available() {
-            if overlay_available() {
-                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; the oracle ran on a throwaway view of the checkout, so nothing it wrote reached the trials"
-            } else {
-                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; this system cannot show the oracle a throwaway checkout, so what it wrote in the checkout stayed for the trials"
-            }
-        } else {
-            "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files, and what the oracle wrote in a checkout stayed for the trials; read the candidate's diff"
-        });
         // Say that the specification was checked, not only when it failed
         // (ADR 0018): both arms satisfied it before any trial ran.
         if let Some(oracle) = &p.oracle {
@@ -2296,160 +2166,26 @@ pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String
     ))
 }
 
-/// Whether trials can run in a bubblewrap sandbox here (ADR 0024).
-pub fn sandbox_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        cfg!(target_os = "linux")
-            && Command::new("bwrap")
-                .args([
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--dev",
-                    "/dev",
-                    "--proc",
-                    "/proc",
-                    "--unshare-pid",
-                    "true",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-    })
-}
-
-/// Whether the sandbox can show a checkout through a throwaway overlay, so
-/// that nothing a command writes there survives it (ADR 0032).
-fn overlay_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if !sandbox_available() {
-            return false;
-        }
-        let base = std::env::temp_dir().join(format!("prova-overlay-probe-{}", std::process::id()));
-        let (lower, upper, work) = (base.join("lower"), base.join("upper"), base.join("work"));
-        let made = [&lower, &upper, &work]
-            .iter()
-            .all(|d| std::fs::create_dir_all(d).is_ok());
-        let ok = made
-            && Command::new("bwrap")
-                .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
-                .arg("--bind")
-                .arg(&base)
-                .arg(&base)
-                .arg("--overlay-src")
-                .arg(&lower)
-                .arg("--overlay")
-                .arg(&upper)
-                .arg(&work)
-                .arg(&lower)
-                .args(["--unshare-pid", "--", "true"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-        let _ = remove_tree(&base);
-        ok
-    })
-}
-
-/// A command for one arm, sandboxed when bubblewrap works (ADR 0024): the
-/// whole filesystem read-only except the arm's own checkout, its private
-/// state (caches, bytecode), a private /tmp and the toolchain caches builds
-/// must write; its own process namespace, which dies with prova. The other
-/// arm's checkout, prova's store and the user's files cannot be changed.
-fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Command {
-    sandboxed_in(dir, program, args, network, None, None)
-}
-
-/// `sandboxed`, with the checkout shown through an overlay whose writes go
-/// to `overlay` (an empty directory `up` and `work` live in): what the
-/// command writes in the checkout is visible to it and to nobody after it
-/// (ADR 0032). Without bubblewrap and overlay support: as `sandboxed`.
-fn sandboxed_in(
-    dir: &Path,
-    program: &str,
-    args: &[String],
-    network: bool,
-    overlay: Option<&Path>,
-    tmp: Option<&Path>,
-) -> Command {
+/// A command for one arm with its own caches: nothing one arm compiles is
+/// read by the other. The workload must not reach prova's own store (round
+/// 9) or Python's user site.
+fn arm_command(dir: &Path, program: &str, args: &[String]) -> Command {
     let state = arm_scratch(dir);
     let _ = std::fs::create_dir_all(&state);
-    let mut c = if sandbox_available() {
-        let mut c = Command::new("bwrap");
-        c.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
-        // A private /tmp: a fresh tmpfs, or a host directory of its own that
-        // the caller looks at when the command ends.
-        match tmp {
-            Some(t) => c.arg("--bind").arg(t).arg("/tmp"),
-            None => c.args(["--tmpfs", "/tmp"]),
-        };
-        match overlay.filter(|_| overlay_available()) {
-            Some(o) => {
-                c.arg("--bind").arg(o).arg(o);
-                c.arg("--overlay-src").arg(dir);
-                c.arg("--overlay")
-                    .arg(o.join("up"))
-                    .arg(o.join("work"))
-                    .arg(dir);
-            }
-            None => {
-                c.arg("--bind").arg(dir).arg(dir);
-            }
-        }
-        c.arg("--bind").arg(&state).arg(&state);
-        // Shared toolchain caches stay read-only (round 11: a candidate
-        // patched the baseline's compiled test in the shared Go build
-        // cache); each arm writes its own caches, set below.
-        c.args(["--unshare-pid", "--die-with-parent", "--new-session"]);
-        if !network {
-            // Loopback only: no accomplice on the network or the host.
-            c.arg("--unshare-net");
-        }
-        c.arg("--").arg(program).args(args);
-        c.env("TMPDIR", "/tmp");
-        c
-    } else {
-        let mut c = Command::new(program);
-        c.args(args);
-        c
-    };
-    // Per-arm caches, sandboxed or not: nothing one arm compiles is read
-    // by the other.
-    c.env("GOCACHE", state.join("go-build"))
+    let mut c = Command::new(program);
+    c.args(args)
+        .env_remove("PROVA_HOME")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONPYCACHEPREFIX", &state)
+        .env("GOCACHE", state.join("go-build"))
         .env("XDG_CACHE_HOME", state.join("cache"))
         .env("npm_config_cache", state.join("npm"));
-    // The session's secrets are none of the workload's business (round 11).
-    for (k, _) in std::env::vars() {
-        let u = k.to_ascii_uppercase();
-        if [
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "API_KEY",
-            "CREDENTIAL",
-            "COOKIE",
-        ]
-        .iter()
-        .any(|w| u.contains(w))
-        {
-            c.env_remove(&k);
-        }
-    }
     c
 }
 
 /// One checkout's scratch space in this worker: its caches (Go, npm, XDG,
-/// and the private bytecode cache Python reads `.pyc` files from, so one
-/// planted in a checkout's `__pycache__` is never used, round 10) and its
-/// trials' private `/tmp`. It lives under the worker's scratch root, which
-/// is removed when the comparison ends.
+/// Python bytecode). It lives under the worker's scratch root, which is
+/// removed when the comparison ends.
 fn arm_scratch(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
     scratch_root().join(format!("arm-{}", &key[..16]))
@@ -2464,7 +2200,6 @@ fn scratch_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<(PathBuf, Option<std::fs::File>)> = std::sync::OnceLock::new();
     let (root, _lock) = ROOT.get_or_init(|| {
         let tmp = std::env::temp_dir();
-        // Absolute: the sandbox binds it at its own path.
         let base = std::path::absolute(&tmp).unwrap_or(tmp);
         let id = new_run_id();
         let root = base.join(format!("prova-scratch-{id}"));
@@ -2684,52 +2419,6 @@ fn checkout_differs(dir: &Path) -> Option<String> {
         .map(|((_, p), _)| p.clone())
 }
 
-/// Deletes an overlay's scratch directory. The kernel makes `work/work` with
-/// no permissions at all, which `remove_dir_all` cannot enter.
-fn remove_scratch(scratch: &Path) {
-    let _ = remove_tree(scratch);
-}
-
-/// The first tracked file of the checkout that an overlay's upper layer
-/// holds, i.e. one the sandboxed command wrote.
-fn rewritten_tracked(dir: &Path, upper: &Path) -> Option<String> {
-    let listed = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-z"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let tracked: std::collections::BTreeSet<String> = listed
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|f| !f.is_empty())
-        .map(|f| String::from_utf8_lossy(f).into_owned())
-        .collect();
-    let mut found: Option<String> = None;
-    let mut stack = vec![upper.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let path = e.path();
-            let Ok(m) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if m.is_dir() {
-                stack.push(path);
-            } else if let Ok(rel) = path.strip_prefix(upper) {
-                let rel = rel.to_string_lossy().into_owned();
-                if tracked.contains(&rel) && found.as_ref().is_none_or(|f| rel < *f) {
-                    found = Some(rel);
-                }
-            }
-        }
-    }
-    found
-}
-
 /// `git status` of tracked files in a checkout (empty outside git).
 fn tracked_state(dir: &Path) -> String {
     Command::new("git")
@@ -2773,44 +2462,14 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    // The oracle runs the candidate's own code as the same user: whatever it
-    // writes in the checkout must not outlive it, or the code could leave
-    // the trials a measurement, a marker or a binary of its choosing
-    // (ADR 0032). Only its exit status and its log, which prova holds, count.
-    let scratch = logs.join(format!("oracle-{}-scratch", arm.as_str()));
-    remove_scratch(&scratch);
-    let isolated = overlay_available()
-        && std::fs::create_dir_all(scratch.join("up")).is_ok()
-        && std::fs::create_dir_all(scratch.join("work")).is_ok();
-    let status = sandboxed_in(
-        dir,
-        "sh",
-        &["-c".to_owned(), oracle.clone()],
-        p.allow_network,
-        isolated.then_some(scratch.as_path()),
-        None,
-    )
-    .env_remove("PROVA_HOME")
-    .env("PYTHONNOUSERSITE", "1")
-    .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
-    .current_dir(dir)
-    .stdin(Stdio::null())
-    .stdout(log.try_clone()?)
-    .stderr(log)
-    .status()
-    .ok();
+    let status = arm_command(dir, "sh", &["-c".to_owned(), oracle.clone()])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()
+        .ok();
     let ok = status.is_some_and(|s| s.success());
-    // Tracked files the oracle rewrote exist only in the overlay: say so, as
-    // the checkout-wide check does where there is none.
-    let rewrote = isolated
-        .then(|| rewritten_tracked(dir, &scratch.join("up")))
-        .flatten();
-    remove_scratch(&scratch);
-    if let Some(f) = rewrote {
-        return Ok(Err(SpecFail::Violated(format!(
-            "the oracle rewrote the tracked file {f}: code that rewrites the checkout (its spec, its reference data, the other arm) cannot be judged"
-        ))));
-    }
     // A process the oracle leaves behind would run into the trials and be
     // blamed on them (round 10: a daemon from the candidate's oracle was
     // reported as the baseline trial's leak).
@@ -3870,7 +3529,6 @@ mod revalidation_tests {
             oracle: None,
             scope: Vec::new(),
             scope_only: false,
-            allow_network: false,
         }
     }
 
@@ -4025,40 +3683,6 @@ mod revalidation_tests {
             other.contains("allow them with `--change <path>`"),
             "{other}"
         );
-    }
-
-    #[test]
-    fn files_left_in_the_private_tmp_are_reported() {
-        assert!(tmp_caveat(&[vec![], vec![]]).is_none());
-        let c = tmp_caveat(&[vec![], vec!["cache/a".into(), "b".into()]]).unwrap();
-        assert!(
-            c.contains("candidate's trials left 2 file(s) (e.g. cache/a, b)"),
-            "{c}"
-        );
-        // Files both arms leave (a JVM's hsperfdata, pytest's directory) say
-        // nothing about the candidate.
-        let shared = tmp_caveat(&[
-            vec!["hsperfdata_u/11".into()],
-            vec!["hsperfdata_u/22".into()],
-        ]);
-        assert!(shared.is_none(), "{shared:?}");
-        let c = tmp_caveat(&[
-            vec!["hsperfdata_u/11".into()],
-            vec!["hsperfdata_u/22".into(), "cache/a".into()],
-        ])
-        .unwrap();
-        assert!(c.contains("left 1 file(s) (e.g. cache/a)"), "{c}");
-        // A cache under a directory the baseline also creates is reported.
-        let c = tmp_caveat(&[
-            vec![".cache/x".into(), "pytest-of-u/pytest-3/a".into()],
-            vec![
-                ".cache/x".into(),
-                ".cache/results".into(),
-                "pytest-of-u/pytest-4/a".into(),
-            ],
-        ])
-        .unwrap();
-        assert!(c.contains("left 1 file(s) (e.g. .cache/results)"), "{c}");
     }
 
     /// A revalidation that cannot say anything about the candidate (the

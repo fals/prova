@@ -635,33 +635,13 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::write(d.join("leak"), "").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let sandboxed = r["comparison"]["result"]["sandbox"]
-        .as_str()
-        .is_some_and(|s| s.starts_with("bubblewrap"));
-    if sandboxed {
-        // ADR 0024: the process dies with the trial's sandbox; nothing runs on.
-        // The namespace is torn down asynchronously: wait (bounded) for it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let left = loop {
-            let o = Command::new("pgrep")
-                .args(["-fx", "sleep 37.125"])
-                .output()
-                .unwrap();
-            if o.stdout.is_empty() || std::time::Instant::now() > deadline {
-                break o.stdout;
-            }
-            std::thread::yield_now();
-        };
-        assert!(left.is_empty(), "left running: {r}");
-    } else {
-        assert_eq!(r["comparison"]["status"], "failed", "{r}");
-        let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-        assert!(
-            // The leftover may not have exec'd `sleep` yet (sh, setsid).
-            reason.contains("left process"),
-            "{reason}"
-        );
-    }
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        // The leftover may not have exec'd `sleep` yet (sh, setsid).
+        reason.contains("left process"),
+        "{reason}"
+    );
 }
 
 /// Round 8: a spec edited but not committed was frozen as edited, and every
@@ -1351,79 +1331,6 @@ fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
     );
 }
 
-/// ADR 0032 (oracle forging): the candidate's code runs inside the oracle, as
-/// the same user. It used that to plant a file in its checkout that the
-/// baseline's own workload reads, so the trials measured a number the code
-/// never produced. The oracle now runs on a throwaway view of the checkout.
-/// Medium: needs a repository, bubblewrap and the binary; a smaller test
-/// cannot start the sandbox.
-#[test]
-fn a_candidate_cannot_plant_files_during_the_oracle_for_the_trials() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, the oracle is not isolated (ADR 0032)");
-        return;
-    }
-    let d = std::env::temp_dir().join(format!("prova-exp-plant-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("steps"), "100").unwrap();
-    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
-    std::fs::write(d.join("impl"), "echo 42\n").unwrap();
-    std::fs::write(
-        d.join("work.sh"),
-        "#!/bin/sh\nif [ -f planted ]; then cat planted; else echo \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$(cat steps)}\"; fi\n",
-    )
-    .unwrap();
-    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
-    sh(
-        &d,
-        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
-    );
-    let o = prova(
-        &d,
-        &[
-            "exp",
-            "new",
-            "e",
-            "--hypothesis",
-            "fewer steps, same answer",
-            "--metric",
-            "steps",
-            "--better",
-            "lower",
-            "--min-effect",
-            "10%",
-            "--trials",
-            "5",
-            "--max-trials",
-            "5",
-            "--warmup",
-            "0",
-            "--spec",
-            "spec.txt",
-            "--oracle",
-            "test \"$(sh ./impl)\" = 42 && echo 'test spec::answer ... ok'",
-            "--",
-            "./work.sh",
-        ],
-    );
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    // Same steps, same answer; but while the oracle runs this code leaves a
-    // faked measurement behind for the workload to find.
-    std::fs::write(
-        d.join("impl"),
-        "echo '{\"metric\":\"steps\",\"value\":10}' > planted\necho 42\n",
-    )
-    .unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
-    assert_eq!(
-        r["comparison"]["result"]["primary"]["candidate_median"], 100.0,
-        "the trials must measure the code, not the planted file: {r}"
-    );
-}
-
 /// A repository whose candidate (the file `cand`) cuts the workload's steps
 /// from 100 to 40 while `KNOB` is set: accepted as `c1` on the first run.
 /// `SLOW` triples both arms (a throttled machine); `REWRITE_CAND` and
@@ -1550,66 +1457,6 @@ fn tampering_in_a_revalidation_withdraws_the_accept() {
     ));
     assert_eq!(v["best"], "baseline", "{v}");
     assert!(v.to_string().contains("changed tracked files"), "{v}");
-}
-
-/// ADR 0035 section 4 (round 18 M1): a candidate that keeps results in
-/// /tmp between iterations measured its cache. The trial's private /tmp is
-/// looked at when the trial ends and the verdict says what was left there.
-/// Medium: needs bubblewrap, a repository and the binary.
-#[test]
-fn files_a_trial_leaves_in_its_private_tmp_are_reported() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, /tmp is not private");
-        return;
-    }
-    let d = std::env::temp_dir().join(format!("prova-exp-tmpleft-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(
-        d.join("work.sh"),
-        "#!/bin/sh\nif [ -f cand ]; then echo cached > /tmp/results-cache; fi\nsleep $(cat delay)\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":100}\"\n",
-    )
-    .unwrap();
-    std::fs::write(d.join("delay"), "0.01").unwrap();
-    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
-    sh(
-        &d,
-        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
-    );
-    let o = prova(
-        &d,
-        &[
-            "exp",
-            "new",
-            "e",
-            "--hypothesis",
-            "h",
-            "--metric",
-            "steps",
-            "--better",
-            "lower",
-            "--min-effect",
-            "10%",
-            "--trials",
-            "5",
-            "--max-trials",
-            "5",
-            "--warmup",
-            "0",
-            "--",
-            "./work.sh",
-        ],
-    );
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    std::fs::write(d.join("cand"), "x").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let caveats = r["comparison"]["result"]["caveats"].to_string();
-    assert!(
-        caveats.contains("wrote files outside the checkout, in its private /tmp")
-            && caveats.contains("results-cache"),
-        "{r}"
-    );
 }
 
 /// Why medium: the scratch space is real directories that a real worker

@@ -1004,9 +1004,6 @@ pub fn experiment_with_next(
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
             }
-            if let Some(sb) = res["sandbox"].as_str() {
-                println!("sandbox: {}", clean(sb));
-            }
             for c in res["caveats"].as_array().into_iter().flatten() {
                 println!("caveat: {}", clean(c.as_str().unwrap_or("")));
             }

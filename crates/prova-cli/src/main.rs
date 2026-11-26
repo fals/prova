@@ -588,10 +588,6 @@ struct ProtocolArgs {
     /// With --change: the candidate may change only those paths.
     #[arg(long = "change-only", requires = "scope")]
     scope_only: bool,
-    /// Let trials and the oracle use the network (by default a sandboxed
-    /// arm has only loopback).
-    #[arg(long)]
-    allow_network: bool,
 }
 
 #[derive(Subcommand)]
@@ -988,7 +984,6 @@ fn protocol_from(
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
         scope_only: a.scope_only,
-        allow_network: a.allow_network,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,

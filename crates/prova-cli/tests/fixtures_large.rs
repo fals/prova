@@ -340,30 +340,6 @@ fn cargo_env_dependent_speedup_is_withdrawn_on_revalidation() {
     assert!(v.to_string().contains("withdrawn"), "{v}");
 }
 
-/// ADR 0035 section 4 (round 18 M1): a candidate that caches results in the
-/// temp directory between iterations gets the private-/tmp caveat.
-#[test]
-#[ignore = "large: needs cargo and bubblewrap"]
-fn cargo_results_cached_in_tmp_are_reported() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, /tmp is not private");
-        return;
-    }
-    let d = cargo_experiment("exp-tmp");
-    write_main(
-        &d,
-        "std::fs::write(std::env::temp_dir().join(\"results-cache\"), \"x\").unwrap();",
-        "100",
-    );
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    let caveats = r["comparison"]["result"]["caveats"].to_string();
-    assert!(
-        caveats.contains("private /tmp") && caveats.contains("results-cache"),
-        "{r}"
-    );
-}
-
 // ------------------------------------------------------------- docker
 
 fn docker(args: &[&str]) -> Output {
