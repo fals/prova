@@ -3254,10 +3254,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
-                // Only this suite's own tests can be "not run" here.
+                // Only a test this suite ran in an earlier run, at the
+                // quarantined place, can be "not run" here (ADR 0037).
                 let known: bool = store.conn().query_row(
-                    "SELECT EXISTS (SELECT 1 FROM tests WHERE display = ?1 AND suite = ?2)",
-                    rusqlite::params![name, row.suite],
+                    "SELECT EXISTS (SELECT 1 FROM tests t JOIN attempts a ON a.test_id = t.id
+                      WHERE t.display = ?1 AND t.suite = ?2 AND a.run_id <> ?3
+                        AND (?4 IS NULL OR t.file = ?4))",
+                    rusqlite::params![name, row.suite, run, q.file],
                     |r| r.get(0),
                 )?;
                 if !known {

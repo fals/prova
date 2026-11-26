@@ -663,3 +663,52 @@ fn r18_an_unknown_place_never_borrows_the_history_of_a_shared_name() {
     );
     assert!(!out.contains("only known flaky"), "{out}");
 }
+
+/// Release candidate: `quarantined: tests::same (calc) not run` appeared in
+/// runs of an ad hoc suite that never ran the quarantined place's test, only
+/// a test of that name with no known place. Only a suite that has run the
+/// test before can have left it out. Why medium: needs a quarantine and the
+/// stored history of two suites.
+#[test]
+fn r18_a_quarantine_is_not_not_run_in_a_suite_that_never_ran_its_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = workspace("qadhoc");
+    std::fs::create_dir_all(d.join("rc")).unwrap();
+    let script = d.join("rc/cargo");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{BUSY}\nprintf '%s\\n' '    Starting 1 test across 1 binary' '        FAIL [   0.004s] calc tests::flaky' '     Summary [   0.020s] 1 test run'\nexit 100\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.s]\nrun = \"./rc/cargo nextest run\"\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "s"]);
+    let o = prova(
+        &d,
+        &[
+            "quarantine",
+            "add",
+            "tests::flaky",
+            "--in",
+            "calc",
+            "--reason",
+            "r",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let cmd = format!(
+        "{BUSY} printf '%s\\n' 'running 1 test' 'test tests::flaky ... ok' '' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'"
+    );
+    // The first run puts the name in the ad hoc suite's history; the second
+    // is where "not run" used to be said.
+    for _ in 0..2 {
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
+        assert!(!out.contains("quarantined:"), "{out}");
+    }
+}
