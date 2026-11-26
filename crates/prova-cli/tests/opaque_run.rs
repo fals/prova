@@ -964,19 +964,21 @@ fn a_subtest_has_history() {
 /// The whole run is their phase. Medium: real processes, sampled over time.
 // Linux only: macOS samples through `ps` and `lsof`, which on CI runners
 // can take longer than this 3 s run allows for two samples (main 3c8473a);
-// tests/sizes.rs covers macOS with longer runs.
+// tests/sizes.rs covers macOS with longer runs. bash's `$SECONDS` keeps the
+// run busy without forking: `$(date +%s)` forked a shell the sampler could
+// catch, making the test "medium" (main CI eb24731, failed twice).
 #[cfg(target_os = "linux")]
 #[test]
 fn tests_known_only_from_result_files_get_a_size() {
     let d = workspace("file-sizes");
     let script = |extra: &str| {
         format!(
-            "echo building; end=$(($(date +%s) + 3)); while [ $(date +%s) -lt $end ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
+            "echo building; while [ $SECONDS -lt 4 ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
         )
     };
     prova(
         &d,
-        &["run", "--until", "done", "--", "sh", "-c", &script("")],
+        &["run", "--until", "done", "--", "bash", "-c", &script("")],
     );
     let h = stdout(&prova(&d, &["history", "C::a"]));
     assert!(h.contains("size: small?"), "{h}");
@@ -988,7 +990,7 @@ fn tests_known_only_from_result_files_get_a_size() {
             "--until",
             "done",
             "--",
-            "sh",
+            "bash",
             "-c",
             &script("sleep 1.2;"),
         ],
