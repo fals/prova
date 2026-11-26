@@ -983,13 +983,19 @@ pub fn experiment_with_next(
             (s, _) => s.to_uppercase(),
         };
         println!(
-            "{head}  {} vs {}  ({} + {} trials, target {} per arm, max {})",
+            "{head}  {} vs {}  ({} + {} trials, target {} per arm, max {}{} {})",
             c.candidate,
             c.baseline,
             c.baseline_trials,
             c.candidate_trials,
             c.target_trials,
-            c.max_trials
+            c.max_trials,
+            if c.status == "running" {
+                "; running for"
+            } else {
+                ", took"
+            },
+            format_duration(std::time::Duration::from_millis(c.elapsed_ms))
         );
         if let Some(res) = &c.result {
             if let Some(reason) = res["reason"].as_str() {

@@ -2439,6 +2439,8 @@ pub struct ComparisonReport {
     pub candidate_trials: u32,
     pub target_trials: u32,
     pub max_trials: u32,
+    /// From the comparison's start to its end, or to now while it runs.
+    pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
 }
@@ -2492,6 +2494,12 @@ pub fn comparison_report(store: &Store, e: &Experiment, id: &str) -> Result<Comp
             |r| r.get::<_, i64>(0),
         )? as u32)
     };
+    let (created_ms, ended_ms): (i64, Option<i64>) = store.conn().query_row(
+        "SELECT created_ms, ended_ms FROM comparisons WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let end = ended_ms.unwrap_or_else(|| now_ms() as i64);
     Ok(ComparisonReport {
         id: id.to_owned(),
         baseline,
@@ -2502,6 +2510,7 @@ pub fn comparison_report(store: &Store, e: &Experiment, id: &str) -> Result<Comp
         candidate_trials: count("candidate")?,
         target_trials: e.protocol.trials,
         max_trials: e.protocol.max_trials,
+        elapsed_ms: (end - created_ms).max(0) as u64,
         result: result.and_then(|r| serde_json::from_str(&r).ok()),
     })
 }

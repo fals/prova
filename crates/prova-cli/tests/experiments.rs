@@ -1631,8 +1631,24 @@ fn exp_wait_and_status_help_say_their_exit_codes() {
         let o = prova(&d, &["exp", sub, "--help"]);
         let out = String::from_utf8_lossy(&o.stdout).into_owned();
         assert!(
-            out.contains("Exit codes:") && out.contains("1 REJECT") && out.contains("5 still running"),
+            out.contains("Exit codes:")
+                && out.contains("1 REJECT")
+                && out.contains("5 still running"),
             "{sub}: {out}"
         );
     }
+}
+
+/// Release candidate: `exp status` did not say how long a comparison took.
+#[test]
+fn status_says_how_long_the_comparison_took() {
+    let d = repo("duration", "0.05");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    prova(&d, &["exp", "run", "e", "--json"]);
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.contains(", took "), "{out}");
+    let j = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    assert!(j["comparison"]["elapsed_ms"].as_u64().unwrap() > 0, "{j}");
 }
