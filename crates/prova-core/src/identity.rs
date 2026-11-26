@@ -162,6 +162,9 @@ fn work_status(dir: &Path) -> Vec<u8> {
         "--porcelain=v1",
         "-z",
         "--untracked-files=no",
+        // Untracked files inside a submodule are its content too: without
+        // this, `--untracked-files=no` hides such a submodule.
+        "--ignore-submodules=none",
         "--",
         ":/",
     ];
