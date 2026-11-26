@@ -691,21 +691,57 @@ fn an_unfinished_line_is_in_the_live_output() {
     prova(&d, &["cancel", &id]);
 }
 
+/// The processes carrying the run's id in their environment: the command
+/// and what it started, never the supervisor.
+#[cfg(target_os = "linux")]
+fn run_processes(run: &str, not: u64) -> Vec<u64> {
+    let want = format!("PROVA_RUN_ID={run}");
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u64>().ok())
+        .filter(|pid| *pid != not)
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == want.as_bytes()))
+        })
+        .collect()
+}
+
 /// Round 9: when the supervisor died, the command ran on and `cancel` said
-/// only "already aborted".
+/// only "already aborted". #125: the supervisor is killed the moment the
+/// command exists (before it could have flushed anything), so nothing but
+/// the run's own start record can find the command again. Bounded waits;
+/// the run's processes are found by the run id they carry.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dead_supervisor_does_not_leave_the_command_running() {
     let d = workspace("deadsup");
     let id = detach(&d, &[], "exec sleep 31.4159");
-    let runs: serde_json::Value =
-        serde_json::from_str(&stdout(&prova(&d, &["status", "--json"]))).unwrap();
-    let sup = runs
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["id"] == id)
-        .and_then(|r| r["supervisor_pid"].as_u64())
-        .expect("supervisor pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let sup = loop {
+        let runs: serde_json::Value =
+            serde_json::from_str(&stdout(&prova(&d, &["status", "--json"]))).unwrap();
+        let pid = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .and_then(|r| r["supervisor_pid"].as_u64());
+        match pid {
+            Some(pid) => break pid,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            None => panic!("the run never recorded its supervisor"),
+        }
+    };
+    while run_processes(&id, sup).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !run_processes(&id, sup).is_empty(),
+        "the command never started"
+    );
     std::process::Command::new("kill")
         .args(["-9", &sup.to_string()])
         .status()
@@ -716,18 +752,17 @@ fn a_dead_supervisor_does_not_leave_the_command_running() {
         && std::fs::read_to_string(format!("/proc/{sup}/stat")).is_ok_and(|s| !s.contains(") Z "))
         && std::time::Instant::now() < deadline
     {
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     prova(&d, &["status"]); // reaps the orphan
-    let left = std::process::Command::new("pgrep")
-        .args(["-f", "sleep 31.4159"])
-        .output()
-        .unwrap();
-    assert!(
-        left.stdout.is_empty(),
-        "left running: {}",
-        String::from_utf8_lossy(&left.stdout)
-    );
+    // The command dies of the signal the reap sends: wait (bounded) for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut left = run_processes(&id, sup);
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        left = run_processes(&id, sup);
+    }
+    assert!(left.is_empty(), "left running: {left:?}");
 }
 
 /// Round 9: `--select` with a command said "give either a suite name or a
@@ -1217,9 +1252,8 @@ fn fake_docker(d: &Path) -> (String, PathBuf) {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {k}; exit 0;; ps) cat {d}/ps.out 2>/dev/null; exit 0;; inspect) cat {d}/inspect.json 2>/dev/null || echo '[]'; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
-            k = killed.display(),
-            d = d.display()
+            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {k}; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
+            k = killed.display()
         ),
     )
     .unwrap();
@@ -1284,83 +1318,47 @@ fn cancel_stops_a_named_container_of_the_run() {
     assert!(s.to_string().contains("pv-x"), "{s}");
 }
 
-/// Round 16: a client with no --name or --cidfile (`./dev` wrappers) leaked
-/// its container. The one running container that mounts the run's
-/// directory and was created after the run started is the run's: killed.
+/// ADR 0037: a run killed at `kill_after` stops the container its client
+/// named too, written `--name=x`; a `--name` in the container's own command
+/// names nothing. Why medium: a real supervisor and a fake client.
 #[cfg(target_os = "linux")]
 #[test]
-fn cancel_stops_the_one_container_that_mounts_the_run_directory() {
-    let d = workspace("cancel-container-mount");
+fn kill_after_stops_the_named_container_and_only_that() {
+    let d = workspace("killafter-container");
     let (path, killed) = fake_docker(&d);
-    std::fs::write(
-        d.join("ps.out"),
-        "aaa111bbb222\nold000old000\nother00other\n",
-    )
-    .unwrap();
-    let mount = |id: &str, created: &str, src: &str| {
-        format!(
-            r#"{{"Id":"{id}ffffffff","Created":"{created}","Mounts":[{{"Type":"bind","Source":"{src}"}}]}}"#
+    let run = |args: &[&str]| {
+        let _ = std::fs::remove_file(&killed);
+        let mut a = vec![
+            "run",
+            "--kill-after",
+            "2s",
+            "--json",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+        ];
+        a.extend_from_slice(args);
+        let o = Command::new(PROVA)
+            .args(a)
+            .current_dir(&d)
+            .env("PROVA_HOME", home_of(&d))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        (
+            json(&o),
+            std::fs::read_to_string(&killed).unwrap_or_default(),
         )
     };
-    let cwd = d.canonicalize().unwrap();
-    std::fs::write(
-        d.join("inspect.json"),
-        format!(
-            "[{},{},{}]",
-            mount(
-                "aaa111bbb222",
-                "2999-01-01T00:00:00.5Z",
-                cwd.to_str().unwrap()
-            ),
-            mount(
-                "old000old000",
-                "2000-01-01T00:00:00Z",
-                cwd.to_str().unwrap()
-            ),
-            mount("other00other", "2999-01-01T00:00:00Z", "/elsewhere"),
-        ),
-    )
-    .unwrap();
-    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert_eq!(
-        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
-        "kill aaa111bbb222",
-        "{s}"
-    );
+    let (s, k) = run(&["--name=pv-y", "img", "t"]);
+    assert_eq!(k.trim(), "kill pv-y", "{s}");
+    let (s, k) = run(&["img", "t", "--name", "not-a-container"]);
+    assert!(k.is_empty(), "killed {k:?} the command never named: {s}");
 }
 
-/// Several containers could be the run's: none is killed, the warning names
-/// the exact commands.
-#[cfg(target_os = "linux")]
-#[test]
-fn cancel_names_the_candidates_when_several_containers_could_be_the_run() {
-    let d = workspace("cancel-container-many");
-    let (path, killed) = fake_docker(&d);
-    std::fs::write(d.join("ps.out"), "aaa111bbb222\nccc333ddd444\n").unwrap();
-    let cwd = d.canonicalize().unwrap();
-    let one = |id: &str| {
-        format!(
-            r#"{{"Id":"{id}ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}"#,
-            cwd.display()
-        )
-    };
-    std::fs::write(
-        d.join("inspect.json"),
-        format!("[{},{}]", one("aaa111bbb222"), one("ccc333ddd444")),
-    )
-    .unwrap();
-    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
-    assert!(!killed.exists(), "{s}");
-    let text = s.to_string();
-    assert!(
-        text.contains("`docker kill aaa111bbb222`") && text.contains("`docker kill ccc333ddd444`"),
-        "{text}"
-    );
-}
-
-/// Without a name or cidfile the container cannot be attributed: prova
-/// does not guess, it says what to check.
+/// Without a name or cidfile the container is not known: prova does not
+/// guess, it says it may still run and how to stop it.
 #[cfg(target_os = "linux")]
 #[test]
 fn cancel_warns_when_the_container_cannot_be_attributed() {
@@ -1372,175 +1370,10 @@ fn cancel_warns_when_the_container_cannot_be_attributed() {
     let text = s.to_string();
     assert!(
         text.contains("does not stop its container")
+            && text.contains("may still run")
             && text.contains("docker ps")
-            && text.contains("clock is behind"),
+            && text.contains("--name"),
         "{text}"
-    );
-}
-
-/// Probe B7 (round 18): runs A and B in one directory, a container created
-/// after both started: cancelling B must not kill what may be A's. Medium:
-/// needs two live supervisors and the fake client.
-#[cfg(target_os = "linux")]
-#[test]
-fn cancel_does_not_kill_a_container_another_live_run_could_own() {
-    let d = workspace("cancel-container-rival");
-    let (path, killed) = fake_docker(&d);
-    let cwd = d.canonicalize().unwrap();
-    std::fs::write(d.join("ps.out"), "aaa111bbb222\n").unwrap();
-    std::fs::write(
-        d.join("inspect.json"),
-        format!(
-            r#"[{{"Id":"aaa111bbb222ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}]"#,
-            cwd.display()
-        ),
-    )
-    .unwrap();
-    let start = || {
-        let o = Command::new(PROVA)
-            .args([
-                "run", "--detach", "--json", "--", "docker", "run", "--rm", "img", "t",
-            ])
-            .current_dir(&d)
-            .env("PROVA_HOME", home_of(&d))
-            .env("PATH", &path)
-            .output()
-            .unwrap();
-        json(&o)["run"].as_str().unwrap().to_owned()
-    };
-    let a = start();
-    let b = start();
-    let _ga = CancelOnDrop(&d, a.clone());
-    let _gb = CancelOnDrop(&d, b.clone());
-    for id in [&a, &b] {
-        for _ in 0..40 {
-            let w = json(&prova(&d, &["wait", id, "--max-wait", "500ms", "--json"]));
-            if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
-                break;
-            }
-        }
-    }
-    assert!(prova(&d, &["cancel", &b]).status.success());
-    let s = json(&prova(
-        &d,
-        &["wait", &b, "--until", "done", "--max-wait", "20s", "--json"],
-    ));
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert!(!killed.exists(), "killed another run's container: {s}");
-    let text = s.to_string();
-    assert!(
-        text.contains(&format!("could also belong to run {a}"))
-            && text.contains("docker kill aaa111bbb222"),
-        "{text}"
-    );
-}
-
-/// Review of round 18: a live run of another kind in the directory
-/// (`prova run small`) cannot own a container; it must not stop the cancel
-/// of a container run from killing its own container.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_live_run_that_is_not_a_container_run_does_not_hold_back_the_cancel() {
-    let d = workspace("cancel-container-plain-rival");
-    let (path, killed) = fake_docker(&d);
-    let cwd = d.canonicalize().unwrap();
-    std::fs::write(d.join("ps.out"), "aaa111bbb222\n").unwrap();
-    std::fs::write(
-        d.join("inspect.json"),
-        format!(
-            r#"[{{"Id":"aaa111bbb222ffff","Created":"2999-01-01T00:00:00Z","Mounts":[{{"Type":"bind","Source":"{}"}}]}}]"#,
-            cwd.display()
-        ),
-    )
-    .unwrap();
-    let o = Command::new(PROVA)
-        .args(["run", "--detach", "--json", "--", "sleep", "60"])
-        .current_dir(&d)
-        .env("PROVA_HOME", home_of(&d))
-        .output()
-        .unwrap();
-    let plain = json(&o)["run"].as_str().unwrap().to_owned();
-    let _guard = CancelOnDrop(&d, plain);
-    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert_eq!(
-        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
-        "kill aaa111bbb222",
-        "a run that is no container run held the cancel back: {s}"
-    );
-}
-
-/// A rival container run whose argv has a word with a space
-/// (`sh -c "pytest -q"`) and whose own container exists does not contest the
-/// container of another run: the rival's command is read as words, not as
-/// the quoted text `display` prints. Why medium: two live runs, a fake
-/// container client and the store, through the CLI.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_rival_with_a_quoted_word_and_its_own_container_does_not_contest() {
-    let d = workspace("cancel-container-quoted-rival");
-    let (path, killed) = fake_docker(&d);
-    let cwd = d.canonicalize().unwrap();
-    let mount = |id: &str, created: &str, cmd: &str| {
-        format!(
-            r#"{{"Id":"{id}ffff","Created":"{created}","Config":{{"Image":"img"}},{cmd},"Mounts":[{{"Type":"bind","Source":"{}"}}]}}"#,
-            cwd.display()
-        )
-    };
-    std::fs::write(d.join("ps.out"), "aaa111bbb222\nbbb222ccc333\n").unwrap();
-    std::fs::write(
-        d.join("inspect.json"),
-        format!(
-            "[{},{}]",
-            mount(
-                "aaa111bbb222",
-                "2999-01-01T00:00:00Z",
-                r#""Path":"sh","Args":["-c","pytest -q"]"#
-            ),
-            mount(
-                "bbb222ccc333",
-                "2999-01-01T00:00:01Z",
-                r#""Path":"t","Args":[]"#
-            ),
-        ),
-    )
-    .unwrap();
-    let o = Command::new(PROVA)
-        .args([
-            "run",
-            "--detach",
-            "--json",
-            "--",
-            "docker",
-            "run",
-            "--rm",
-            "img",
-            "sh",
-            "-c",
-            "pytest -q",
-        ])
-        .current_dir(&d)
-        .env("PROVA_HOME", home_of(&d))
-        .env("PATH", &path)
-        .output()
-        .unwrap();
-    let rival = json(&o)["run"].as_str().unwrap().to_owned();
-    let _guard = CancelOnDrop(&d, rival.clone());
-    for _ in 0..40 {
-        let w = json(&prova(
-            &d,
-            &["wait", &rival, "--max-wait", "500ms", "--json"],
-        ));
-        if w["status"] == "running" && w["counts"]["passed"].as_u64().unwrap_or(0) > 0 {
-            break;
-        }
-    }
-    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert_eq!(
-        std::fs::read_to_string(&killed).unwrap_or_default().trim(),
-        "kill bbb222ccc333",
-        "a rival with its own container contested the cancel: {s}"
     );
 }
 

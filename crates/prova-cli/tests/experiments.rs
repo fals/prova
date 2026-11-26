@@ -83,9 +83,10 @@ fn new_exp(d: &Path, extra: &[&str]) {
 
 #[test]
 fn faster_candidate_is_accepted_and_becomes_best() {
-    let d = repo("accept", "0.3");
+    // Gaps wide against a slow arm64 or macOS runner (ADR 0037 cleanup).
+    let d = repo("accept", "0.8");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.05").unwrap();
+    std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
     let r = json(&o);
@@ -111,7 +112,8 @@ fn faster_candidate_is_accepted_and_becomes_best() {
 
 #[test]
 fn same_code_is_not_an_improvement() {
-    let d = repo("noeffect", "0.02");
+    // Long enough that process start noise is small against the delay.
+    let d = repo("noeffect", "0.3");
     new_exp(&d, &["--min-effect", "20%"]);
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
@@ -365,9 +367,29 @@ fn a_broken_edit_after_an_accept_is_rejected_and_the_best_still_runs_as_recorded
 
 #[test]
 fn edits_after_recording_do_not_change_what_is_measured() {
-    // A gap far above process start-up jitter (shared macOS runners).
+    // A gap far above process start-up jitter (shared macOS runners), and
+    // enough trials that one slow trial per arm cannot lift p over alpha
+    // (arm64 CI: 6 + 6 trials with one outlier each gave p = 0.065).
     let d = repo("snap-edit", "0.3");
-    new_exp(&d, &[]);
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "new",
+            "e",
+            "--hypothesis",
+            "h",
+            "--trials",
+            "10",
+            "--max-trials",
+            "12",
+            "--warmup",
+            "0",
+            "--",
+            "./work.sh",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     std::fs::write(d.join("delay"), "0.5").unwrap(); // edited after recording
@@ -635,33 +657,13 @@ fn a_trial_that_leaves_a_process_behind_voids_the_comparison() {
     std::fs::write(d.join("leak"), "").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let sandboxed = r["comparison"]["result"]["sandbox"]
-        .as_str()
-        .is_some_and(|s| s.starts_with("bubblewrap"));
-    if sandboxed {
-        // ADR 0024: the process dies with the trial's sandbox; nothing runs on.
-        // The namespace is torn down asynchronously: wait (bounded) for it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let left = loop {
-            let o = Command::new("pgrep")
-                .args(["-fx", "sleep 37.125"])
-                .output()
-                .unwrap();
-            if o.stdout.is_empty() || std::time::Instant::now() > deadline {
-                break o.stdout;
-            }
-            std::thread::yield_now();
-        };
-        assert!(left.is_empty(), "left running: {r}");
-    } else {
-        assert_eq!(r["comparison"]["status"], "failed", "{r}");
-        let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-        assert!(
-            // The leftover may not have exec'd `sleep` yet (sh, setsid).
-            reason.contains("left process"),
-            "{reason}"
-        );
-    }
+    assert_eq!(r["comparison"]["status"], "failed", "{r}");
+    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
+    assert!(
+        // The leftover may not have exec'd `sleep` yet (sh, setsid).
+        reason.contains("left process"),
+        "{reason}"
+    );
 }
 
 /// Round 8: a spec edited but not committed was frozen as edited, and every
@@ -744,9 +746,10 @@ fn a_workload_that_rewrites_tracked_files_voids_the_comparison() {
 /// `--against` and became best; `exp best` took any variant.
 #[test]
 fn only_the_baseline_or_a_kept_variant_can_be_the_reference() {
-    let d = repo("against", "0.01");
+    // Wide gaps: the slow variant must be rejected on any runner.
+    let d = repo("against", "0.05");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.08").unwrap();
+    std::fs::write(d.join("delay"), "0.5").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
@@ -754,7 +757,7 @@ fn only_the_baseline_or_a_kept_variant_can_be_the_reference() {
     );
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
-    std::fs::write(d.join("delay"), "0.01").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "noop"])
             .status
@@ -828,22 +831,6 @@ fn change_allows_a_build_file_on_top_of_the_default_scope() {
     assert!(!reason.contains("out of scope"), "{r}");
 }
 
-/// Round 10 red team: a top-level `random.py` shadowed the standard library
-/// for the oracle; it is a file that decides the verdict.
-#[test]
-fn a_module_shadowing_the_python_standard_library_is_out_of_scope() {
-    let d = repo("stdlib", "0.01");
-    new_exp(&d, &[]);
-    std::fs::write(d.join("random.py"), "def randrange(a, b): return a\n").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap_or("");
-    assert!(
-        reason.contains("out of scope") && reason.contains("random.py"),
-        "{r}"
-    );
-}
-
 /// Round 10: a comparison that failed at its oracle froze the protocol, so
 /// fixing the oracle needed a new experiment.
 #[test]
@@ -866,7 +853,7 @@ fn trials_run_without_the_python_user_site() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\n[ \"$PYTHONNOUSERSITE\" = 1 ] && [ -n \"$PYTHONPYCACHEPREFIX\" ] || exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\n[ \"$PYTHONNOUSERSITE\" = 1 ] || exit 3\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -899,16 +886,16 @@ fn trials_run_without_the_python_user_site() {
 }
 
 /// Round 11 red team: the shared Go build cache let a candidate patch the
-/// baseline's compiled test; secrets reached trials. Each arm gets its own
-/// caches, and secret-named variables are removed.
+/// baseline's compiled test. Each arm gets its own caches; the session's
+/// environment is otherwise the workload's (ADR 0037: no secret stripping).
 #[test]
-fn trials_get_private_caches_and_no_secrets() {
+fn trials_get_private_caches_and_the_sessions_environment() {
     let d = std::env::temp_dir().join(format!("prova-exp-caches-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\ncase \"$GOCACHE\" in */prova-scratch-*/arm-*) ;; *) exit 3;; esac\n[ -z \"$MY_API_TOKEN\" ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\ncase \"$GOCACHE\" in */prova-scratch-*/arm-*) ;; *) exit 3;; esac\n[ \"$MY_API_TOKEN\" = s3cret ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
@@ -944,78 +931,6 @@ fn trials_get_private_caches_and_no_secrets() {
     assert!(run(&["exp", "candidate", "e"]).status.success());
     let r = json(&run(&["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["status"], "decided", "{r}");
-}
-
-/// Round 11 red team: `git replace` swapped the baseline's content; prova's
-/// git ignores replace objects, so the baseline is the commit itself.
-#[test]
-fn replace_objects_do_not_change_what_runs() {
-    // The candidate is twice as slow as the real baseline, five times as
-    // fast as the replaced one: only measuring the replacement accepts it
-    // (gaps far above timing noise on shared macOS runners).
-    let d = repo("replace", "0.05");
-    new_exp(&d, &[]);
-    sh(
-        &d,
-        "orig=$(git rev-parse HEAD:delay); slow=$(printf 0.5 | git hash-object -w --stdin); git replace $orig $slow",
-    );
-    std::fs::write(d.join("delay"), "0.1").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(
-        r["comparison"]["verdict"], "accept",
-        "a slowed baseline was measured: {r}"
-    );
-}
-
-/// Round 11 red team: a local smudge filter rewrote the baseline at
-/// checkout; the checkout is verified against the commit's own bytes.
-#[test]
-fn a_checkout_changed_by_a_git_filter_is_refused() {
-    let d = repo("smudge", "0.01");
-    new_exp(&d, &[]);
-    sh(
-        &d,
-        "git config filter.slow.smudge 'sed s/0.01/0.08/' && git config filter.slow.clean cat && echo 'delay filter=slow' > .git/info/attributes",
-    );
-    std::fs::write(d.join("other"), "x").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let o = prova(&d, &["exp", "run", "e", "--json"]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    assert!(text.contains("differs from commit"), "{text}");
-}
-
-/// Round 11 red team: editing prova.db turned a REJECT into an ACCEPT;
-/// `exp status` re-derives every ACCEPT from the samples.
-#[test]
-fn an_edited_verdict_shows_in_status() {
-    // Clearly slower, so the honest verdict is never an accept.
-    let d = repo("edited", "0.05");
-    new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.1").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
-    let db = std::fs::read_dir(home_of(&d).join("repos"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("prova.db");
-    let ok = Command::new("sqlite3")
-        .arg(&db)
-        .arg("UPDATE comparisons SET verdict = 'accept'; UPDATE experiments SET best = 'c1';")
-        .status();
-    if ok.is_err() {
-        return; // no sqlite3 here: nothing to edit with
-    }
-    let s = String::from_utf8_lossy(&prova(&d, &["exp", "status", "e"]).stdout).into_owned();
-    assert!(s.contains("the record was changed"), "{s}");
 }
 
 /// Usability round: an oracle that cannot run (command not found) said the
@@ -1221,10 +1136,11 @@ fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
 fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
     // Delays long against process start noise (macOS CI: a 20 ms arm
     // measured 43 ms, then 92 ms, and the comparison was void), with wide
-    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive).
-    let d = repo("notbest", "0.6");
+    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive): the best is 5x
+    // faster than the baseline, the middle one 2x.
+    let d = repo("notbest", "0.8");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.1").unwrap();
+    std::fs::write(d.join("delay"), "0.15").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "fast"])
             .status
@@ -1234,7 +1150,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
         "fast"
     );
-    std::fs::write(d.join("delay"), "0.25").unwrap();
+    std::fs::write(d.join("delay"), "0.4").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "mid"])
             .status
@@ -1253,7 +1169,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         "{t}"
     );
     // A discard names its reference.
-    std::fs::write(d.join("delay"), "1.2").unwrap();
+    std::fs::write(d.join("delay"), "1.6").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
@@ -1351,90 +1267,16 @@ fn an_implausibly_large_win_is_warned_about_on_its_own_line() {
     );
 }
 
-/// ADR 0032 (oracle forging): the candidate's code runs inside the oracle, as
-/// the same user. It used that to plant a file in its checkout that the
-/// baseline's own workload reads, so the trials measured a number the code
-/// never produced. The oracle now runs on a throwaway view of the checkout.
-/// Medium: needs a repository, bubblewrap and the binary; a smaller test
-/// cannot start the sandbox.
-#[test]
-fn a_candidate_cannot_plant_files_during_the_oracle_for_the_trials() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, the oracle is not isolated (ADR 0032)");
-        return;
-    }
-    let d = std::env::temp_dir().join(format!("prova-exp-plant-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("steps"), "100").unwrap();
-    std::fs::write(d.join("spec.txt"), "answer = 42\n").unwrap();
-    std::fs::write(d.join("impl"), "echo 42\n").unwrap();
-    std::fs::write(
-        d.join("work.sh"),
-        "#!/bin/sh\nif [ -f planted ]; then cat planted; else echo \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$(cat steps)}\"; fi\n",
-    )
-    .unwrap();
-    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
-    sh(
-        &d,
-        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
-    );
-    let o = prova(
-        &d,
-        &[
-            "exp",
-            "new",
-            "e",
-            "--hypothesis",
-            "fewer steps, same answer",
-            "--metric",
-            "steps",
-            "--better",
-            "lower",
-            "--min-effect",
-            "10%",
-            "--trials",
-            "5",
-            "--max-trials",
-            "5",
-            "--warmup",
-            "0",
-            "--spec",
-            "spec.txt",
-            "--oracle",
-            "test \"$(sh ./impl)\" = 42 && echo 'test spec::answer ... ok'",
-            "--",
-            "./work.sh",
-        ],
-    );
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    // Same steps, same answer; but while the oracle runs this code leaves a
-    // faked measurement behind for the workload to find.
-    std::fs::write(
-        d.join("impl"),
-        "echo '{\"metric\":\"steps\",\"value\":10}' > planted\necho 42\n",
-    )
-    .unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    assert_ne!(r["comparison"]["verdict"], "accept", "{r}");
-    assert_eq!(
-        r["comparison"]["result"]["primary"]["candidate_median"], 100.0,
-        "the trials must measure the code, not the planted file: {r}"
-    );
-}
-
 /// A repository whose candidate (the file `cand`) cuts the workload's steps
 /// from 100 to 40 while `KNOB` is set: accepted as `c1` on the first run.
-/// `SLOW` triples both arms (a throttled machine); `REWRITE_CAND` and
-/// `REWRITE_BASE` make that arm's workload rewrite a tracked file.
+/// `REWRITE_CAND` makes the candidate's workload rewrite a tracked file.
 fn knob_accepted(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-exp-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\nv=100\nif [ -f cand ] && [ -n \"$KNOB\" ]; then v=40; fi\nif [ -n \"$SLOW\" ]; then v=$((v*3)); fi\nif { [ -n \"$REWRITE_CAND\" ] && [ -f cand ]; } || { [ -n \"$REWRITE_BASE\" ] && [ ! -f cand ]; }; then chmod u+w table 2>/dev/null; echo 2 >> table; fi\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$v}\"\n",
+        "#!/bin/sh\nv=100\nif [ -f cand ] && [ -n \"$KNOB\" ]; then v=40; fi\nif [ -n \"$REWRITE_CAND\" ] && [ -f cand ]; then chmod u+w table 2>/dev/null; echo 2 >> table; fi\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":$v}\"\n",
     )
     .unwrap();
     std::fs::write(d.join("table"), "1\n").unwrap();
@@ -1491,51 +1333,20 @@ fn prova_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     c.output().unwrap()
 }
 
-/// ADR 0035 section 4 (round 18 B8): a candidate that is fast only under a
-/// condition of the first run was accepted; the revalidation measured the
-/// ordinary result, the candidate's own median moved 2.5x while the
-/// baseline's did not, and the accept survived. A drift that is the
-/// candidate's own withdraws the accept.
+/// A candidate that is fast only under a condition of the first run is
+/// accepted; the revalidation measures the ordinary result, which is no
+/// improvement, and the accept is withdrawn.
 /// Medium: needs a repository, the binary and two comparisons.
 #[test]
-fn a_void_revalidation_withdraws_the_accept() {
+fn a_revalidation_that_does_not_hold_withdraws_the_accept() {
     let d = knob_accepted("voidrv");
     let v = json(&prova(&d, &["exp", "revalidate", "e", "--json"]));
-    assert_eq!(v["comparison"]["status"], "failed", "{v}");
+    assert_ne!(v["comparison"]["verdict"], "accept", "{v}");
     assert_eq!(
         v["best"], "baseline",
-        "a void revalidation must withdraw the accept: {v}"
+        "a revalidation that does not hold must withdraw the accept: {v}"
     );
     assert!(v.to_string().contains("withdrawn"), "{v}");
-}
-
-/// Noise must never withdraw a real accept: a machine that got 3x slower
-/// for both arms moves both medians alike (the candidate/baseline ratio is
-/// the same), so the revalidation is inconclusive and the accept stands.
-#[test]
-fn a_slower_machine_for_both_arms_keeps_the_accept() {
-    let d = knob_accepted("slowrv");
-    let v = json(&prova_env(
-        &d,
-        &["exp", "revalidate", "e", "--json"],
-        &[("KNOB", "1"), ("SLOW", "1")],
-    ));
-    assert_eq!(v["best"], "c1", "noise must not withdraw the accept: {v}");
-    assert!(v.to_string().contains("inconclusive"), "{v}");
-}
-
-/// Only the candidate's own offence withdraws its accept: a baseline trial
-/// that rewrites tracked files leaves the revalidation inconclusive.
-#[test]
-fn a_baseline_that_tampers_in_a_revalidation_keeps_the_accept() {
-    let d = knob_accepted("tamperbase");
-    let v = json(&prova_env(
-        &d,
-        &["exp", "revalidate", "e", "--json"],
-        &[("KNOB", "1"), ("REWRITE_BASE", "1")],
-    ));
-    assert_eq!(v["best"], "c1", "{v}");
-    assert!(v.to_string().contains("inconclusive"), "{v}");
 }
 
 /// A workload that rewrites tracked files during the revalidation is the
@@ -1550,66 +1361,6 @@ fn tampering_in_a_revalidation_withdraws_the_accept() {
     ));
     assert_eq!(v["best"], "baseline", "{v}");
     assert!(v.to_string().contains("changed tracked files"), "{v}");
-}
-
-/// ADR 0035 section 4 (round 18 M1): a candidate that keeps results in
-/// /tmp between iterations measured its cache. The trial's private /tmp is
-/// looked at when the trial ends and the verdict says what was left there.
-/// Medium: needs bubblewrap, a repository and the binary.
-#[test]
-fn files_a_trial_leaves_in_its_private_tmp_are_reported() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, /tmp is not private");
-        return;
-    }
-    let d = std::env::temp_dir().join(format!("prova-exp-tmpleft-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(
-        d.join("work.sh"),
-        "#!/bin/sh\nif [ -f cand ]; then echo cached > /tmp/results-cache; fi\nsleep $(cat delay)\necho \"{\\\"metric\\\":\\\"steps\\\",\\\"value\\\":100}\"\n",
-    )
-    .unwrap();
-    std::fs::write(d.join("delay"), "0.01").unwrap();
-    std::fs::write(d.join(".gitignore"), ".prova/\n").unwrap();
-    sh(
-        &d,
-        "chmod +x work.sh && git init -q && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base",
-    );
-    let o = prova(
-        &d,
-        &[
-            "exp",
-            "new",
-            "e",
-            "--hypothesis",
-            "h",
-            "--metric",
-            "steps",
-            "--better",
-            "lower",
-            "--min-effect",
-            "10%",
-            "--trials",
-            "5",
-            "--max-trials",
-            "5",
-            "--warmup",
-            "0",
-            "--",
-            "./work.sh",
-        ],
-    );
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    std::fs::write(d.join("cand"), "x").unwrap();
-    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
-    let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
-    let caveats = r["comparison"]["result"]["caveats"].to_string();
-    assert!(
-        caveats.contains("wrote files outside the checkout, in its private /tmp")
-            && caveats.contains("results-cache"),
-        "{r}"
-    );
 }
 
 /// Why medium: the scratch space is real directories that a real worker
@@ -1664,4 +1415,190 @@ fn a_comparison_reclaims_its_scratch_space() {
             .collect();
         assert!(kept.is_empty(), "left in {}: {kept:?}", x.display());
     }
+}
+
+/// An experiment with two comparisons: the first fails (its trial prints a
+/// marker and exits 3, so its log is kept), the second measures a faster
+/// candidate. Returns the repository and the first comparison's id.
+fn failed_then_decided(name: &str) -> (PathBuf, String) {
+    let d = repo(name, "0.1");
+    // The workload script is a harness file: allow changing it here.
+    new_exp(&d, &["--change", "**"]);
+    assert!(
+        prova(&d, &["exp", "protocol", "e", "--warmup", "1"])
+            .status
+            .success()
+    );
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\necho boom-marker >&2\nexit 3\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let first = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(first["comparison"]["status"], "failed", "{first}");
+    let old = first["comparison"]["id"].as_str().unwrap().to_owned();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nsleep 0.01\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let second = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(second["comparison"]["status"], "decided", "{second}");
+    (d, old)
+}
+
+/// #120 B: the decisions name older comparisons, and what they kept must be
+/// readable once a newer one has started. Medium: two real comparisons.
+#[test]
+fn an_older_comparisons_log_and_status_are_readable_after_a_newer_one() {
+    let (d, old) = failed_then_decided("oldlog");
+    let latest = prova(&d, &["exp", "log", "e"]);
+    assert!(
+        !String::from_utf8_lossy(&latest.stdout).contains("boom-marker"),
+        "the default stays the latest comparison"
+    );
+    let o = prova(&d, &["exp", "log", "e", "--comparison", &old]);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("boom-marker"), "{text}");
+    let one = prova(&d, &["exp", "log", "e", "2", "--comparison", &old]);
+    assert!(String::from_utf8_lossy(&one.stdout).contains("boom-marker"));
+    let s = json(&prova(
+        &d,
+        &["exp", "status", "e", "--comparison", &old, "--json"],
+    ));
+    assert_eq!(s["comparison"]["id"], old.as_str(), "{s}");
+    assert_eq!(s["comparison"]["status"], "failed", "{s}");
+    assert!(
+        s["logs"].as_str().unwrap().contains(&old),
+        "the hint to read its logs names the comparison: {s}"
+    );
+    let bad = prova(
+        &d,
+        &["exp", "status", "e", "--comparison", "nope", "--json"],
+    );
+    assert!(!bad.status.success());
+}
+
+/// #120 C: an agent waits for a long comparison with one command; the bound
+/// is its own, not 9 minutes. A short experiment stands in for a long one.
+#[test]
+fn exp_wait_accepts_a_long_max_wait() {
+    let d = repo("longwait", "0.02");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let started = json(&prova(&d, &["exp", "run", "e", "--detach", "--json"]));
+    assert!(started["comparison"].is_string(), "{started}");
+    let o = prova(&d, &["exp", "wait", "e", "--max-wait", "1h", "--json"]);
+    let r = json(&o);
+    assert_eq!(r["comparison"]["status"], "decided", "{r}");
+    assert_ne!(o.status.code(), Some(5), "{r}");
+}
+
+/// #120 A: the evidence behind every verdict, through prova.
+/// Medium: two real comparisons, one with a warmup and a failed trial.
+#[test]
+fn exp_export_prints_the_trials_and_samples_of_every_comparison() {
+    let (d, old) = failed_then_decided("export");
+    let before = prova(&d, &["exp", "status", "e", "--json"]).stdout;
+    let o = prova(&d, &["exp", "export", "e"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let x = json(&o);
+    assert_eq!(x["schema"], "prova.exp-export.v1", "{x}");
+    assert_eq!(x["experiment"], "e");
+    assert_eq!(x["partial"], false, "{x}");
+    assert_eq!(x["protocol"]["better"], "lower", "{x}");
+    assert!(x["protocol_hash"].is_string(), "{x}");
+    let cs = x["comparisons"].as_array().unwrap();
+    assert_eq!(cs.len(), 2, "{x}");
+    assert_eq!(cs[0]["id"], old.as_str());
+    let first = cs[0]["trials"].as_array().unwrap();
+    assert_eq!(
+        first.len(),
+        2,
+        "the candidate's warmup failed and stopped it: {x}"
+    );
+    assert_eq!(first[0]["state"], "complete");
+    assert_eq!(first[1]["state"], "failed");
+    assert_eq!(first[1]["warmup"], true, "the warmup is marked: {x}");
+    assert_eq!(first[1]["exit_code"], 3);
+    assert_eq!(cs[0]["status"], "failed");
+    let ok = cs[1]["trials"].as_array().unwrap();
+    assert!(ok.iter().any(|t| t["warmup"] == true), "{x}");
+    let scored: Vec<_> = ok.iter().filter(|t| t["warmup"] == false).collect();
+    assert!(scored.len() >= 10, "5 per arm at least: {x}");
+    for arm in ["baseline", "candidate"] {
+        assert!(scored.iter().any(|t| t["arm"] == arm), "{arm}: {x}");
+    }
+    let sample = &scored[0]["samples"][0];
+    assert!(
+        scored[0]["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["metric"] == "mem_kb" && s["value"] == 100.0),
+        "{x}"
+    );
+    assert!(
+        sample["metric"].is_string() && sample["value"].is_number(),
+        "{x}"
+    );
+    assert!(cs[1]["verdict"].is_string(), "{x}");
+    assert!(cs[1]["result"]["primary"].is_object(), "{x}");
+    assert_eq!(x["decisions"].as_array().unwrap().len(), 2, "{x}");
+    // One comparison, to a file; reading it changes nothing.
+    let file = d.join("out.json");
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "export",
+            "e",
+            "--comparison",
+            &old,
+            "--output",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let one: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(one["comparisons"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["comparisons"][0]["id"], old.as_str());
+    assert_eq!(one["decisions"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(prova(&d, &["exp", "status", "e", "--json"]).stdout, before);
+    assert!(
+        !prova(&d, &["exp", "export", "e", "--comparison", "nope"])
+            .status
+            .success()
+    );
+}
+
+/// #120 A: while a comparison runs the export is partial, read-only, and
+/// leaves the comparison running. Medium: a real detached worker.
+#[test]
+fn exp_export_while_a_comparison_runs_is_partial() {
+    let d = repo("exportrun", "0.3");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    assert!(prova(&d, &["exp", "run", "e", "--detach"]).status.success());
+    let x = json(&prova(&d, &["exp", "export", "e"]));
+    assert_eq!(x["partial"], true, "{x}");
+    assert_eq!(x["comparisons"][0]["status"], "running", "{x}");
+    let s = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    assert_eq!(s["comparison"]["status"], "running", "{s}");
+    assert!(prova(&d, &["exp", "cancel", "e"]).status.success());
+    let done = json(&prova(
+        &d,
+        &["exp", "wait", "e", "--max-wait", "1m", "--json"],
+    ));
+    assert_eq!(done["comparison"]["status"], "cancelled", "{done}");
+    let x = json(&prova(&d, &["exp", "export", "e"]));
+    assert_eq!(x["partial"], false, "{x}");
 }

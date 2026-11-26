@@ -290,35 +290,6 @@ fn cargo_experiment(name: &str) -> PathBuf {
     d
 }
 
-/// ADR 0035 section 4 (round 18 B9): a candidate that adds
-/// `.cargo/config.toml` with a `runner` that prints the metric forged the
-/// result. Runner configuration is a harness file: out of scope, unmeasured.
-#[test]
-#[ignore = "large: needs cargo"]
-fn cargo_runner_config_is_out_of_scope() {
-    let d = cargo_experiment("exp-runner");
-    std::fs::create_dir_all(d.join(".cargo")).unwrap();
-    std::fs::write(
-        d.join(".cargo/config.toml"),
-        r#"[target.'cfg(unix)']
-runner = ["sh", "-c", "echo '{\"metric\":\"steps\",\"value\":1}'", "x"]
-"#,
-    )
-    .unwrap();
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
-    assert_eq!(
-        r["comparison"]["candidate_trials"], 0,
-        "never measured: {r}"
-    );
-    let reason = r["comparison"]["result"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("out of scope") && reason.contains(".cargo/config.toml"),
-        "{reason}"
-    );
-}
-
 /// ADR 0035 section 4 (round 18 B8): a candidate fast only while an
 /// environment variable is set is accepted with it, and the revalidation
 /// without it withdraws the accept.
@@ -338,30 +309,6 @@ fn cargo_env_dependent_speedup_is_withdrawn_on_revalidation() {
     let v = json_last_line(&host(&d, &["exp", "revalidate", "e", "--json"], &[]));
     assert_eq!(v["best"], "baseline", "the accept must be withdrawn: {v}");
     assert!(v.to_string().contains("withdrawn"), "{v}");
-}
-
-/// ADR 0035 section 4 (round 18 M1): a candidate that caches results in the
-/// temp directory between iterations gets the private-/tmp caveat.
-#[test]
-#[ignore = "large: needs cargo and bubblewrap"]
-fn cargo_results_cached_in_tmp_are_reported() {
-    if !prova_core::experiment::sandbox_available() {
-        eprintln!("skipped: no bubblewrap here, /tmp is not private");
-        return;
-    }
-    let d = cargo_experiment("exp-tmp");
-    write_main(
-        &d,
-        "std::fs::write(std::env::temp_dir().join(\"results-cache\"), \"x\").unwrap();",
-        "100",
-    );
-    assert!(host(&d, &["exp", "candidate", "e"], &[]).status.success());
-    let r = json_last_line(&host(&d, &["exp", "run", "e", "--json"], &[]));
-    let caveats = r["comparison"]["result"]["caveats"].to_string();
-    assert!(
-        caveats.contains("private /tmp") && caveats.contains("results-cache"),
-        "{r}"
-    );
 }
 
 // ------------------------------------------------------------- docker
@@ -534,7 +481,7 @@ fn check_native(
     let out = String::from_utf8_lossy(&o.stdout);
     let docs: Vec<serde_json::Value> = out
         .lines()
-        .filter(|l| l.starts_with('{'))
+        .filter(|l| l.starts_with(['{', '[']))
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     assert!(
@@ -553,7 +500,8 @@ fn check_native(
         .unwrap();
     assert!(f["message"].as_str().unwrap_or("").contains(said), "{s}");
     // The 1.5 s test carries its own duration, from the stream.
-    let hist = &docs[docs.len() - 1];
+    // `history --json` is an array with one entry per suite.
+    let hist = &docs[docs.len() - 1][0];
     let p50 = hist["p50_ms"].as_u64().unwrap_or(0);
     assert!((1400..5000).contains(&p50), "slow test timed: {hist}");
 }
@@ -958,55 +906,25 @@ impl Drop for DevWorld {
     }
 }
 
-/// Round 18 (blocker): `prova cancel` missed the run's container behind a
-/// wrapper that quotes its command (`sh -c "$*"`), so a hung suite kept a
-/// container running after the cancel. Large: only a real docker shows the
-/// words docker keeps for the container's command.
+/// A wrapper that starts its container without `--name` (`./dev`): the
+/// cancel does not guess which container is the run's. It kills nothing and
+/// says the container may still run and how to stop it. Large: only a real
+/// docker shows the container outlives the cancelled client.
 #[test]
-#[ignore = "large: needs docker (the cancel must find a container started by a wrapper script)"]
-fn cancel_stops_the_container_a_quoting_wrapper_started() {
+#[ignore = "large: needs docker (a cancel through a wrapper must not guess its container)"]
+fn cancel_through_a_wrapper_kills_no_container_and_says_how_to_stop_it() {
     let w = DevWorld::new("wrapper-cancel");
     let run = w.start_hanging();
     w.wait_stall(&run);
     assert_eq!(w.containers().len(), 1, "the run's container is up");
     let s = w.cancel_and_wait(&run);
     assert_eq!(s["status"], "cancelled", "{s}");
+    assert_eq!(w.containers().len(), 1, "prova guessed a container: {s}");
+    let text = s.to_string();
     assert!(
-        w.containers().is_empty(),
-        "container left running after cancel: {:?}\n{s}",
-        w.containers()
+        text.contains("may still run") && text.contains("docker ps") && text.contains("--name"),
+        "{text}"
     );
-}
-
-/// Round 18 (blocker): with two runs of one directory live, a cancel of one
-/// killed the other's container. A cancel kills the container created for
-/// the run (the other run already has its own, created before it) and
-/// nothing else: the other run keeps running until it is cancelled too. The
-/// case where a container could be either run's (contested, kill nothing) is
-/// a race with docker's own latency and is tested in medium, with a fake client.
-#[test]
-#[ignore = "large: needs docker (two live runs of one directory, one container each)"]
-fn cancel_does_not_kill_the_container_of_another_live_run() {
-    let w = DevWorld::new("wrapper-two-runs");
-    let a = w.start_hanging();
-    w.wait_stall(&a);
-    let a_container = w.containers();
-    assert_eq!(a_container.len(), 1, "A's container");
-    let b = w.start_hanging();
-    w.wait_stall(&b);
-    assert_eq!(w.containers().len(), 2, "one container per run");
-    let s = w.cancel_and_wait(&b);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert_eq!(
-        w.containers(),
-        a_container,
-        "cancelling B must leave A's container and only it: {s}"
-    );
-    let other = json_last_line(&w.prova(&["status", &a, "--json"], &[]));
-    assert_eq!(other["status"], "running", "{other}");
-    let s = w.cancel_and_wait(&a);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert!(w.containers().is_empty(), "{:?}\n{s}", w.containers());
 }
 
 /// Round 18: the first `--until first-failure` wait through a container
@@ -1093,72 +1011,6 @@ fn said(o: &Output) -> String {
     )
 }
 
-/// Round 18 (rust-make BLOCKER B2): in a real two-crate workspace both
-/// crates have `tests::flaky_clock`; under quiet `cargo test` a failure
-/// names no crate. geo's failure is told by its panic path, named with its
-/// crate, and never takes calc's failing history.
-#[test]
-#[ignore = "large: needs cargo, compiles a two-crate workspace"]
-fn rust_workspace_quiet_failures_keep_their_crates() {
-    let lib = |krate: &str| {
-        format!(
-            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn flaky_clock() {{\n        assert!(std::env::var(\"FAIL\").as_deref() != Ok(\"{krate}\"), \"clock tick landed on a bad boundary\");\n    }}\n}}\n"
-        )
-    };
-    let (calc_lib, geo_lib) = (lib("calc"), lib("geo"));
-    let d = repo_with(
-        "rustws",
-        &[
-            (
-                "Cargo.toml",
-                "[workspace]\nresolver = \"2\"\nmembers = [\"calc\", \"geo\"]\n",
-            ),
-            (
-                "calc/Cargo.toml",
-                "[package]\nname = \"calc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            ("calc/src/lib.rs", &calc_lib),
-            (
-                "geo/Cargo.toml",
-                "[package]\nname = \"geo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            ("geo/src/lib.rs", &geo_lib),
-            ("Makefile", "test:\n\tcargo test --quiet --no-fail-fast\n"),
-            (".gitignore", "target\n"),
-        ],
-    );
-    let target = format!("{}.target", d.display());
-    let _cleanup = Cleanup(vec![d.clone(), home_of(&d), PathBuf::from(&target)]);
-    let env_for = |fail: &'static str| [("FAIL", fail), ("CARGO_TARGET_DIR", target.as_str())];
-    // calc's own test fails twice: it has a failing history of its own.
-    for _ in 0..2 {
-        let o = host(&d, &["run", "--", "make", "test"], &env_for("calc"));
-        let out = said(&o);
-        assert!(
-            out.contains("flaky_clock"),
-            "calc's failure is named: {out}"
-        );
-    }
-    // geo's test of the same name fails: its own place, its own history.
-    let o = host(&d, &["run", "--", "make", "test"], &env_for("geo"));
-    let out = said(&o);
-    assert!(
-        out.contains("(geo)"),
-        "geo's failure names its crate: {out}"
-    );
-    assert!(
-        out.lines()
-            .find(|l| l.trim_start().starts_with("FAIL "))
-            .is_some_and(|l| l.contains("[first time seen") && !l.contains("FLAKY")),
-        "geo's failure borrowed calc's history: {out}"
-    );
-    let h = said(&host(&d, &["history", "tests::flaky_clock"], &[]));
-    assert!(
-        h.contains("(calc)") && h.contains("(geo)"),
-        "each crate's test is its own in history: {h}"
-    );
-}
-
 /// Round 18 (ts-vitest BLOCKER): `cd packages/b && prova run` named tests
 /// relative to packages/b, merging them with the other package's tests of
 /// the same name. Real Vitest in the node image: the names carry the path
@@ -1202,80 +1054,5 @@ fn typescript_packages_started_from_a_subdirectory_keep_repository_names() {
         history.contains("packages/a/src/calc.test.ts")
             && history.contains("packages/b/src/calc.test.ts"),
         "the two packages' same-named tests stay apart: {out}"
-    );
-}
-
-/// Round 18 (probe M1): pytest through docker with `-w` in two directories
-/// of one repository. The rootdir pytest prints is the container's path; the
-/// client's mount maps it back under the repository, so the same-named tests
-/// stay two tests.
-#[test]
-#[ignore = "large: needs docker"]
-fn python_container_workdirs_keep_same_named_tests_apart() {
-    let t = "import os\n\n\ndef test_flaky():\n    assert not os.environ.get(\"BAD\")\n";
-    let d = repo_with(
-        "pyworkdirs",
-        &[("tests/a/test_x.py", t), ("tests/b/test_x.py", t)],
-    );
-    let _cleanup = Cleanup(vec![d.clone(), home_of(&d)]);
-    let tag = image("python");
-    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
-    let gid = String::from_utf8(Command::new("id").arg("-g").output().unwrap().stdout).unwrap();
-    let user = format!("{}:{}", uid.trim(), gid.trim());
-    let mount = format!("{}:/w", d.display());
-    let pid = std::process::id();
-    let run = |sub: &str, bad: &str| {
-        let workdir = format!("/w/tests/{sub}");
-        let name = format!("prova-r18-py-{pid}-{sub}");
-        let bad_env = format!("BAD={bad}");
-        let o = host(
-            &d,
-            &[
-                "run",
-                "--",
-                "docker",
-                "run",
-                "--rm",
-                "--name",
-                &name,
-                "--user",
-                &user,
-                "-e",
-                "HOME=/tmp/home",
-                "-e",
-                &bad_env,
-                "-v",
-                &mount,
-                "-w",
-                &workdir,
-                &tag,
-                "python3",
-                "-m",
-                "pytest",
-                "-v",
-                "-p",
-                "no:cacheprovider",
-            ],
-            &[],
-        );
-        // Whatever happened, the named container does not outlive the test.
-        let _ = docker(&["rm", "-f", &name]);
-        said(&o)
-    };
-    let a = run("a", "");
-    assert!(a.contains("PASSED"), "{a}");
-    let b = run("b", "1");
-    assert!(
-        b.contains("tests.b.test_x"),
-        "b's test is named by its own directory: {b}"
-    );
-    assert!(
-        b.contains("first time seen") && !b.contains("FLAKY"),
-        "b's failure took a's history: {b}"
-    );
-    let h = said(&host(&d, &["history", "test_flaky"], &[]));
-    assert!(
-        h.contains("tests.a.test_x") && h.contains("tests.b.test_x"),
-        "two tests in history: {h}"
     );
 }

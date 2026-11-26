@@ -1,7 +1,7 @@
 //! Medium tests for ADR 0027 (usability round 13): quarantine of known-flaky
 //! tests, the warning for a flaky test left out of the command, and slow
-//! tests. Real runs are needed: both come from the store's history across
-//! suites. A medium test because a smaller one cannot run the CLI end to end.
+//! tests. Real runs are needed: both come from the store's history of a
+//! suite. A medium test because a smaller one cannot run the CLI end to end.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -214,21 +214,24 @@ fn quarantine_list_remove_and_unknown_tests() {
     assert!(out.contains("known flaky"), "{out}");
 }
 
-/// Round 13: excluding the flaky test in the command gave a clean verified
-/// pass, because the new suite had no history of its own. ADR 0034: a
-/// quarantine does not excuse it; the warning stays.
+/// Round 13, ADR 0037: excluding the flaky test in the command of its suite
+/// gave a clean verified pass. ADR 0034: a quarantine does not excuse it; the
+/// warning stays. Another suite never knew the test: nothing to warn about.
 #[test]
-fn leaving_a_known_flaky_test_out_of_another_suite_is_warned_about() {
+fn leaving_a_known_flaky_test_out_of_its_suite_is_warned_about() {
     let d = workspace("leftout");
     flaky_history(&d);
     let out = text(&run(&d, "stable", "pass"));
+    assert!(!out.contains("did not run"), "{out}");
+    put(&d, format!("[suite.make]\nrun = {:?}\n", without_x()));
+    let out = text(&run(&d, "make", "pass"));
     assert!(
         out.contains("PASSED (unverified")
             && out.contains("1 known flaky test(s) did not run: calc::x"),
         "{out}"
     );
     prova(&d, &["quarantine", "add", "calc::x", "--reason", "clock"]);
-    let out = text(&run(&d, "stable", "pass"));
+    let out = text(&run(&d, "make", "pass"));
     assert!(
         out.contains("PASSED (unverified") && out.contains("did not run: calc::x"),
         "{out}"

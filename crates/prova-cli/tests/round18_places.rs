@@ -132,158 +132,6 @@ fn r18_pytest_ids_run_from_a_subdirectory_carry_its_path() {
     assert!(out.contains("FAIL pkg.tests.test_x::test_a"), "{out}");
 }
 
-/// What quiet `cargo test` prints for one failing unit test: no crate, only
-/// the panic message's path.
-fn quiet_cargo_failure(crate_dir: &str) -> String {
-    format!(
-        "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at {crate_dir}/src/lib.rs:29:9:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
-    )
-}
-
-/// Review of PR 115 (A): a panic path is a place only when it lies inside
-/// the repository, outside `.cargo/`, and the file holds the test's own
-/// function. A panic in a dependency, in a helper crate, or in the library
-/// code an integration test calls leaves the place unknown: the failure
-/// borrows no crate's history and is named with no crate. Why medium: the
-/// files are found on disk.
-#[test]
-fn r18_a_panic_path_that_is_not_the_tests_own_file_leaves_the_place_unknown() {
-    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, String);
-    let cases: [Case; 4] = [
-        (
-            "dependency under .cargo",
-            vec![
-                (
-                    ".cargo/registry/src/x/foo-1.0/Cargo.toml",
-                    "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n",
-                ),
-                (
-                    ".cargo/registry/src/x/foo-1.0/src/lib.rs",
-                    "fn flaky_clock() {}\n",
-                ),
-            ],
-            ".cargo/registry/src/x/foo-1.0/src/lib.rs".to_owned(),
-        ),
-        (
-            "helper crate",
-            vec![
-                (
-                    "testutil/Cargo.toml",
-                    "[package]\nname = \"testutil\"\nversion = \"0.1.0\"\n",
-                ),
-                ("testutil/src/lib.rs", "pub fn helper() {}\n"),
-            ],
-            "testutil/src/lib.rs".to_owned(),
-        ),
-        (
-            "integration test panicking in library code",
-            vec![
-                (
-                    "calc/Cargo.toml",
-                    "[package]\nname = \"calc\"\nversion = \"0.1.0\"\n",
-                ),
-                ("calc/src/lib.rs", "pub fn helper() {}\n"),
-                ("calc/tests/it.rs", "#[test]\nfn flaky_clock() {}\n"),
-            ],
-            "calc/src/lib.rs".to_owned(),
-        ),
-        (
-            "outside the repository",
-            vec![],
-            String::new(), // filled in below: a sibling directory
-        ),
-    ];
-    for (i, (what, files, path)) in cases.into_iter().enumerate() {
-        let d = workspace(&format!("panicpath{i}"));
-        for krate in ["geo", "alpha"] {
-            std::fs::create_dir_all(d.join(krate).join("src")).unwrap();
-            std::fs::write(
-                d.join(krate).join("Cargo.toml"),
-                format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
-            )
-            .unwrap();
-            std::fs::write(d.join(krate).join("src/lib.rs"), "fn flaky_clock() {}\n").unwrap();
-        }
-        let mut path = path;
-        if files.is_empty() {
-            let outside = PathBuf::from(format!("{}.dep", d.display()));
-            std::fs::create_dir_all(outside.join("src")).unwrap();
-            std::fs::write(
-                outside.join("Cargo.toml"),
-                "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
-            )
-            .unwrap();
-            std::fs::write(outside.join("src/lib.rs"), "fn flaky_clock() {}\n").unwrap();
-            path = format!("{}/src/lib.rs", outside.display());
-        }
-        for (f, c) in &files {
-            let p = d.join(f);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, c).unwrap();
-        }
-        let at = |p: &str| {
-            format!(
-                "{BUSY} printf '%s\\n' '.F' 'tests::flaky_clock --- FAILED' '' 'failures:' '' '---- tests::flaky_clock stdout ----' \"thread 'tests::flaky_clock' panicked at {p}:29:9:\" 'boom' '' 'failures:' '    tests::flaky_clock' '' 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
-            )
-        };
-        // geo's own failure: the history a misplaced one would borrow.
-        for h in ["geo", "alpha"] {
-            prova(
-                &d,
-                &["run", "--", "sh", "-c", &at(&format!("{h}/src/lib.rs"))],
-            );
-        }
-        let out = text(&prova(&d, &["run", "--", "sh", "-c", &at(&path)]));
-        let line = out
-            .lines()
-            .find(|l| l.trim_start().starts_with("FAIL "))
-            .unwrap_or_else(|| panic!("{what}: no FAIL line: {out}"));
-        assert!(
-            line.contains("[first time seen")
-                && !line.contains("FLAKY")
-                && !line.contains("flaky_clock ("),
-            "{what}: the place stays unknown: {out}"
-        );
-    }
-}
-
-/// Round 18 (rust-make): quiet `cargo test` names `tests::flaky_clock` with
-/// no crate, and geo's real failure took calc's history (FLAKY). The panic
-/// message's path gives the crate. Why medium: the crate is found on disk.
-#[test]
-fn r18_a_quiet_cargo_failure_is_told_by_its_panic_path_and_never_borrows() {
-    let d = workspace("quietcargo");
-    for krate in ["calc", "geo"] {
-        std::fs::create_dir_all(d.join(krate).join("src")).unwrap();
-        std::fs::write(
-            d.join(krate).join("Cargo.toml"),
-            format!("[package]\nname = \"{krate}\"\nversion = \"0.1.0\"\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            d.join(krate).join("src/lib.rs"),
-            "#[test]\nfn flaky_clock() {}\n",
-        )
-        .unwrap();
-    }
-    let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("calc")]);
-    let out = text(&o);
-    assert!(out.contains("FAIL tests::flaky_clock"), "{out}");
-    let o = prova(&d, &["run", "--", "sh", "-c", &quiet_cargo_failure("geo")]);
-    let out = text(&o);
-    assert!(
-        out.lines()
-            .find(|l| l.trim_start().starts_with("FAIL "))
-            .is_some_and(|l| l.contains("[first time seen") && !l.contains("FLAKY")),
-        "geo's failure borrowed calc's history: {out}"
-    );
-    let all = text(&prova(&d, &["history", "tests::flaky_clock"]));
-    assert!(
-        all.contains("(calc)") && all.contains("(geo)"),
-        "each crate's test is its own: {all}"
-    );
-}
-
 /// Round 18 (go-make): `go test -json -count=4` with FAIL, FAIL, FAIL, PASS
 /// was "broken, not flaky" in history; the `-v` text said FLAKY. Why
 /// medium: the label comes from stored attempts.
@@ -590,9 +438,12 @@ fn r18_flaky_and_history_agree_when_failures_run_on() {
     let fail = go(
         "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- FAIL: TestM (0.00s)'",
     );
-    prova(&d, &["run", "--", "sh", "-c", &mixed]);
+    // One command (history is per suite): the file `state` switches it.
+    let cmd = format!("if [ -f state ]; then {fail}; else {mixed}; fi");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    std::fs::write(d.join("state"), "").unwrap();
     for n in 0..6 {
-        prova(&d, &["run", "--", "sh", "-c", &fail]);
+        prova(&d, &["run", "--", "sh", "-c", &cmd]);
         let h = text(&prova(&d, &["history", "TestM"]));
         let f = text(&prova(&d, &["flaky"]));
         assert_eq!(
@@ -639,62 +490,22 @@ fn r18_a_failure_of_unknown_place_is_no_quarantined_place_failing() {
     );
 }
 
-/// Round 18 (probe M1): pytest through a container client with `-w
-/// /w/tests/b` named `test_x::test_flaky` for the tests of `tests/a` and
-/// `tests/b` alike. The rootdir the output prints is the container's path:
-/// the client's `-v host:container` mount maps it under the repository.
+/// Round 18 (probe M1), ADR 0037: pytest through a container client prints
+/// the container's rootdir. prova does not map mounts: the place is unknown,
+/// said so, and two directories' tests of one id never share a history.
 #[test]
-fn r18_pytest_in_a_container_workdir_is_placed_by_the_mount() {
+fn r18_pytest_in_a_container_has_an_unknown_place() {
     let d = workspace("pycontainer");
     for sub in ["a", "b"] {
-        std::fs::create_dir_all(d.join("tests").join(sub)).unwrap();
-        std::fs::write(d.join("tests").join(sub).join("test_x.py"), "").unwrap();
-    }
-    let run = |sub: &str| {
-        format!(
+        let cmd = format!(
             "{BUSY} : docker run --rm -v {d}:/w -w /w/tests/{sub} img pytest -v; printf '%s\\n' 'rootdir: /w/tests/{sub}' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1",
             d = d.display()
-        )
-    };
-    let a = text(&prova(&d, &["run", "--", "sh", "-c", &run("a")]));
-    assert!(a.contains("FAIL tests.a.test_x::test_flaky"), "{a}");
-    let b = text(&prova(&d, &["run", "--", "sh", "-c", &run("b")]));
-    assert!(b.contains("FAIL tests.b.test_x::test_flaky"), "{b}");
-    assert!(b.contains("first time seen") && !b.contains("FLAKY"), "{b}");
-}
-
-/// Review of PR 115 (F): the client's mounts are read in their quoted
-/// spellings (`-v "$PWD":/w`, `--mount ...,source="$(pwd)",target=/w`), and
-/// only between `docker run` and the image: pytest's own `-w` after the
-/// image is no workdir. Why medium: the files are found on disk.
-#[test]
-fn r18_container_mounts_in_quoted_spellings_place_pytest_ids() {
-    let d = workspace("pyquoted");
-    for sub in ["a", "b"] {
-        std::fs::create_dir_all(d.join("tests").join(sub)).unwrap();
-        std::fs::write(d.join("tests").join(sub).join("test_x.py"), "").unwrap();
-    }
-    let out =
-        "'rootdir: /w/tests/b' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='";
-    for mount in [
-        r#"-v "$PWD":/w"#,
-        r#"--mount type=bind,source="$(pwd)",target=/w"#,
-    ] {
-        let cmd = format!(
-            "{BUSY} : docker run --rm {mount} -w /w/tests/b img pytest -v; printf '%s\\n' {out}; exit 1"
         );
-        let b = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
-        assert!(
-            b.contains("FAIL tests.b.test_x::test_flaky"),
-            "{mount}: {b}"
-        );
+        let o = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
+        assert!(o.contains("rootdir is outside the repository"), "{o}");
+        assert!(!o.contains("tests.a.") && !o.contains("tests.b."), "{o}");
+        assert!(o.contains("first time seen") && !o.contains("FLAKY"), "{o}");
     }
-    // pytest's `-w` after the image is not the client's workdir.
-    let cmd = format!(
-        "{BUSY} : docker run --rm img pytest -v -w /w/tests/a; printf '%s\\n' 'test_x.py::test_flaky FAILED [100%]' '=== 1 failed in 0.01s ==='; exit 1"
-    );
-    let o = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
-    assert!(!o.contains("tests.a.test_x"), "{o}");
 }
 
 /// Review of PR 115 (G): a Go module's root package has no `/` or `.` in
@@ -816,25 +627,6 @@ fn r18_one_earlier_pass_is_too_little_to_call_a_failure_environment_dependent() 
     assert!(out.contains("FAIL calc::e"), "{out}");
     assert!(!out.contains("environment-dependent"), "{out}");
     assert!(out.contains("too little history"), "{out}");
-}
-
-/// Round 18 (ts-vitest): "this code passed in suite a" for a suite that did
-/// not run the failing test at all. Why medium: three stored runs.
-#[test]
-fn r18_another_suite_that_never_ran_the_test_says_nothing_about_it() {
-    let d = workspace("elsewhere");
-    let failing = format!(
-        "{BUSY} printf '%s\\n' 'test a::t1 ... FAILED' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101"
-    );
-    let other = format!(
-        "{BUSY} printf '%s\\n' 'test b::other ... ok' '' 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
-    );
-    prova(&d, &["run", "--", "sh", "-c", &failing]);
-    let o = prova(&d, &["run", "--", "sh", "-c", &other]);
-    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
-    let o = text(&prova(&d, &["run", "--", "sh", "-c", &failing]));
-    assert!(o.contains("FAIL a::t1"), "{o}");
-    assert!(!o.contains("this code passed in suite"), "{o}");
 }
 
 /// A name of unknown place that two known places share is none of theirs:

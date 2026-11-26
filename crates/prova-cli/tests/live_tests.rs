@@ -135,8 +135,13 @@ fn quiet_output_says_what_prova_could_not_see() {
     let script = "echo '.F.'; echo 'm::b --- FAILED'; echo 'test result: FAILED. 2 passed; 1 failed; 0 ignored'; exit 101";
     let s = json(&prova(&d, &["run", "--json", "--", "sh", "-c", script]));
     assert_eq!(s["counts"]["failed"], 1);
-    let note = s["notes"][0].as_str().expect("note about hidden tests");
-    assert!(note.contains("reported 3 tests but prova saw 1"), "{note}");
+    let notes = s["notes"].as_array().expect("notes");
+    assert!(
+        notes.iter().any(|n| n
+            .as_str()
+            .is_some_and(|n| n.contains("reported 3 tests but prova saw 1"))),
+        "{s}"
+    );
 }
 
 #[test]

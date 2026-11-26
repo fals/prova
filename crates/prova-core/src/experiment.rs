@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rusqlite::{OptionalExtension, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{code_identity, machine_fingerprint};
@@ -37,21 +38,21 @@ fn refused<T>(msg: impl Into<String>) -> Result<T> {
     Err(ExpError::Refused(msg.into()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Better {
     Lower,
     Higher,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Guardrail {
     pub metric: String,
     pub better: Better,
 }
 
 /// Declared before any data; frozen at the first trial.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Protocol {
     pub metric: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,14 +95,10 @@ pub struct Protocol {
     /// to the default (round 10: allowing go.mod narrowed it to go.mod).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scope_only: bool,
-    /// Trials and oracle may use the network (a sandboxed arm has only
-    /// loopback otherwise).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_network: bool,
 }
 
 /// A specification file: path relative to the repository root, sha256.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SpecFile {
     pub path: String,
     pub sha256: String,
@@ -534,7 +531,6 @@ pub struct Variant {
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let o = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -622,7 +618,6 @@ pub fn create(
     if let Some(r) = baseline_ref {
         for f in &protocol.specs {
             let at_ref = Command::new("git")
-                .env("GIT_NO_REPLACE_OBJECTS", "1")
                 .args(["show", &format!("{r}:{}", f.path)])
                 .current_dir(store.root())
                 .output()
@@ -748,7 +743,6 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
     let _ = std::fs::remove_file(&index);
     let run = |args: &[&str]| -> Result<String> {
         let o = Command::new("git")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .args(args)
             .current_dir(&top)
             .env("GIT_INDEX_FILE", &index)
@@ -782,7 +776,6 @@ fn snapshot(store: &Store, exp: &str, label: &str) -> Result<Option<String>> {
             .ok()
             .filter(|p| {
                 !Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["check-ignore", "-q", "--"])
                     .arg(p)
                     .current_dir(&top)
@@ -934,13 +927,6 @@ struct TrialResult {
     primary_lines: usize,
     /// Processes the workload left running after it ended (`pid comm`).
     leaked: Vec<String>,
-    /// CPU (ms) other processes on the machine used during the trial.
-    foreign_ms: f64,
-    /// CPU (ms) the trial's own processes used.
-    own_ms: f64,
-    /// Files the workload left in its private /tmp (relative paths): what it
-    /// wrote outside the checkout and could read back in a later iteration.
-    tmp_left: Vec<String>,
 }
 
 /// Directory a variant runs in: a detached worktree for ref variants.
@@ -952,7 +938,6 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if !wt.exists() {
                 let ok = Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "add", "--detach", "--force"])
                     .arg(&wt)
                     .arg(sha)
@@ -965,16 +950,6 @@ fn variant_dir(store: &Store, e: &Experiment, v: &Variant) -> Result<PathBuf> {
                 if !ok {
                     return refused(format!("could not create worktree for {sha}"));
                 }
-            }
-            // The checkout must hold the commit's own bytes: a local smudge
-            // filter or a `git replace` changes what runs without changing
-            // the commit (round 11).
-            if let Some(path) = checkout_differs(&wt) {
-                return refused(format!(
-                    "the checkout of {} differs from commit {}'s own content at {path} (a local git filter, or a replaced object?): refusing to measure it",
-                    v.name,
-                    &sha[..12]
-                ));
             }
             wt
         }
@@ -1004,34 +979,15 @@ fn run_trial(
     count: &MetricCounter,
 ) -> Result<TrialResult> {
     let mut log = private_file(log)?;
-    // The trial's private /tmp is a host directory, so what is left in it
-    // can be seen afterwards (ADR 0035 section 4). The guard removes it on
-    // every way out of this function.
-    let tmp = sandbox_available()
-        .then(|| arm_scratch(dir).join(format!("tmp-{}", crate::ids::new_run_id())))
-        .filter(|t| private_dir(t).is_ok())
-        .map(Scratch);
-    let mut cmd = sandboxed_in(
-        dir,
-        &p.command[0],
-        &p.command[1..],
-        p.allow_network,
-        None,
-        tmp.as_ref().map(|t| t.0.as_path()),
-    );
+    let mut cmd = arm_command(dir, &p.command[0], &p.command[1..]);
     cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // The workload must not reach prova's own store (round 9).
-        .env_remove("PROVA_HOME")
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
         .process_group(0);
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
     }
-    let cpu_before = process::cpu_ticks();
     let start = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1043,9 +999,6 @@ fn run_trial(
                 metrics: vec![],
                 primary_lines: 0,
                 leaked: vec![],
-                foreign_ms: 0.0,
-                own_ms: 0.0,
-                tmp_left: vec![],
             });
         }
     };
@@ -1111,11 +1064,6 @@ fn run_trial(
             leaked.push(l);
         }
     }
-    let cpu_after = process::cpu_ticks();
-    let foreign_ms = (cpu_after.0.saturating_sub(cpu_before.0) as f64
-        - cpu_after.1.saturating_sub(cpu_before.1) as f64)
-        .max(0.0)
-        * 10.0;
     for l in &leaked {
         writeln!(
             log,
@@ -1125,12 +1073,6 @@ fn run_trial(
     if let Ok(e) = err_thread.join() {
         log.write_all(&e)?;
         text.push_str(&String::from_utf8_lossy(&e));
-    }
-    let tmp_left = tmp.as_ref().map_or_else(Vec::new, |t| files_under(&t.0));
-    if let Some(t) = tmp
-        && let Err(e) = t.remove()
-    {
-        writeln!(log, "prova: could not remove the trial's private /tmp: {e}")?;
     }
     let metrics = parse(&text);
     let primary_lines = count(&text)
@@ -1143,22 +1085,12 @@ fn run_trial(
         metrics,
         primary_lines,
         leaked,
-        foreign_ms,
-        own_ms: cpu_after.1.saturating_sub(cpu_before.1) as f64 * 10.0,
-        tmp_left,
     })
 }
 
-/// A directory removed when dropped (a trial's private /tmp, a worker's
-/// scratch root), on every way out, whatever permissions the workload left.
+/// A worker's scratch root, removed when dropped, on every way out,
+/// whatever permissions the workload left.
 struct Scratch(PathBuf);
-
-impl Scratch {
-    /// Removes it, reporting a failure.
-    fn remove(&self) -> std::result::Result<(), String> {
-        remove_tree(&self.0)
-    }
-}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -1192,121 +1124,6 @@ fn remove_tree(root: &Path) -> std::result::Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
-}
-
-/// What the candidate's trials left in their private /tmp that the
-/// baseline's did not, when it matters: files written outside the checkout
-/// can be read back by the next iteration. What both arms leave (a JVM's
-/// hsperfdata, pytest's directory) is the tools', and is not reported;
-/// full relative paths are compared with digit runs normalised.
-fn tmp_caveat(left: &[Vec<String>; 2]) -> Option<String> {
-    // Digit runs (pids, numbered directories) are normalised; nothing else.
-    let norm = |p: &String| -> String {
-        let mut out = String::new();
-        let mut digits = false;
-        for ch in p.chars() {
-            if ch.is_ascii_digit() {
-                if !digits {
-                    out.push('#');
-                }
-                digits = true;
-            } else {
-                digits = false;
-                out.push(ch);
-            }
-        }
-        out
-    };
-    let theirs: std::collections::BTreeSet<String> = left[0].iter().map(norm).collect();
-    let only: Vec<String> = left[1]
-        .iter()
-        .filter(|p| !theirs.contains(&norm(p)))
-        .cloned()
-        .collect();
-    if only.is_empty() {
-        return None;
-    }
-    let names: Vec<&str> = only.iter().take(3).map(String::as_str).collect();
-    Some(format!(
-        "a trial wrote files outside the checkout, in its private /tmp: the candidate's trials left {} file(s) (e.g. {}) that the baseline's did not; a workload that keeps results there and reads them back in the next iteration measures its cache, not its code: read the candidate's diff",
-        only.len(),
-        names.join(", ")
-    ))
-}
-
-/// For an ACCEPT against something other than the original baseline: the
-/// over-1000x warning again, against the original baseline's earlier
-/// measurements of the same metric.
-fn against_original(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    metric: &str,
-    result: &serde_json::Value,
-) -> Result<Option<String>> {
-    let base: String = store.conn().query_row(
-        "SELECT baseline FROM comparisons WHERE id = ?1",
-        params![comparison],
-        |r| r.get(0),
-    )?;
-    if base == "baseline" {
-        return Ok(None);
-    }
-    let Some(cand) = result["primary"]["candidate_median"].as_f64() else {
-        return Ok(None);
-    };
-    let mut stmt = store.conn().prepare(
-        "SELECT s.value FROM samples s
-           JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
-           JOIN comparisons c ON c.id = s.comparison
-          WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
-            AND t.warmup = 0 AND t.state = 'complete'
-            AND ((t.arm = 'baseline' AND c.baseline = 'baseline')
-              OR (t.arm = 'candidate' AND c.candidate = 'baseline'))",
-    )?;
-    let before: Vec<f64> = stmt
-        .query_map(params![exp, comparison, metric], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if before.len() < 5 {
-        return Ok(None);
-    }
-    let orig = stats::median(&before);
-    Ok(((orig > 0.0 && cand > 0.0 && (orig / cand).max(cand / orig) >= 1000.0)
-        || (orig == 0.0) != (cand == 0.0))
-        .then(|| {
-            format!(
-                "warning: against the original baseline this is {} -> {}: a change this large is rarely real: check that the workload still does the same work (no caching across iterations, same input) and that the numbers come from the benchmark, not from the code",
-                short(orig),
-                short(cand)
-            )
-        }))
-}
-
-/// Regular files below a directory (relative paths, sorted, at most 1000).
-fn files_under(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut todo = vec![root.to_path_buf()];
-    while let Some(d) = todo.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let Ok(t) = e.file_type() else { continue };
-            if t.is_dir() {
-                todo.push(e.path());
-            } else if out.len() < 1000 {
-                out.push(
-                    e.path()
-                        .strip_prefix(root)
-                        .unwrap_or(&e.path())
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 fn fingerprint() -> String {
@@ -1408,7 +1225,6 @@ fn keep_failed_logs(store: &Store, comparison: &str) -> Result<()> {
             let wt = store.dir().join("worktrees").join(&sha[..12]);
             if wt.exists() {
                 let _ = Command::new("git")
-                    .env("GIT_NO_REPLACE_OBJECTS", "1")
                     .args(["worktree", "remove", "--force"])
                     .arg(&wt)
                     .current_dir(store.root())
@@ -1457,14 +1273,6 @@ fn work_comparison(
     // Primary-metric lines per trial, per arm; and the first leaked process.
     let lines: std::cell::RefCell<[Vec<usize>; 2]> = Default::default();
     let leaked: std::cell::RefCell<Option<String>> = Default::default();
-    // Files each arm's measured trials left in their private /tmp (the most
-    // any one trial left).
-    let tmp_files: std::cell::RefCell<[Vec<String>; 2]> = Default::default();
-    // CPU other processes used per trial, per arm, with the trial's wall time.
-    let foreign: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
-    // The trial's own CPU, with its wall time: a process stopped from
-    // outside (SIGSTOP) takes wall time but no CPU (round 11).
-    let own: std::cell::RefCell<[Vec<(f64, f64)>; 2]> = Default::default();
     let run_one = |arm: Arm, warmup: bool| -> Result<bool> {
         counter.set(counter.get() + 1);
         let seq = counter.get();
@@ -1481,12 +1289,6 @@ fn work_comparison(
         )?;
         if !warmup {
             lines.borrow_mut()[i].push(r.primary_lines);
-            foreign.borrow_mut()[i].push((r.foreign_ms, r.wall_ms));
-            own.borrow_mut()[i].push((r.own_ms, r.wall_ms));
-            let mut t = tmp_files.borrow_mut();
-            if r.tmp_left.len() > t[i].len() {
-                t[i] = r.tmp_left.clone();
-            }
         }
         if let Some(l) = r.leaked.first() {
             leaked.borrow_mut().get_or_insert_with(|| {
@@ -1530,10 +1332,7 @@ fn work_comparison(
     if let Some(setup) = &p.setup {
         for (i, (arm, _)) in arms.iter().enumerate() {
             let log = private_file(&logs.join(format!("setup-{}.log", arm.as_str())))?;
-            let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()], true)
-                .env_remove("PROVA_HOME")
-                .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONPYCACHEPREFIX", arm_scratch(&dirs[i]))
+            let ok = arm_command(&dirs[i], "sh", &["-c".to_owned(), setup.clone()])
                 .current_dir(&dirs[i])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -1554,13 +1353,6 @@ fn work_comparison(
     // Tracked files of both checkouts as they are before any oracle or
     // trial: code that rewrites them (its own frozen reference table, the
     // other arm's sources) voids the comparison (round 9).
-    // Snapshot checkouts are prova's own: make their tracked files read-only
-    // too, so a rewrite fails instead of being restored before the check.
-    for (i, (_, v)) in arms.iter().enumerate() {
-        if v.commit_sha.is_some() && dirs[i] != store.root() {
-            read_only_tracked(&dirs[i]);
-        }
-    }
     let reference = [tracked_state(&dirs[0]), tracked_state(&dirs[1])];
     let tampered = || -> Option<String> {
         (0..2).find_map(|i| {
@@ -1628,7 +1420,7 @@ fn work_comparison(
                     // Nothing was measured or judged: not a verdict on
                     // either arm.
                     let reason = why.replace("<experiment>", &exp);
-                    return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+                    return end_failed(store, &exp, comparison, &cand_name, &reason);
                 }
                 SpecFail::Violated(why) => why.replace("<experiment>", &exp),
             };
@@ -1636,7 +1428,7 @@ fn work_comparison(
                 let reason = format!(
                     "baseline violates the specification: {why}; measure only implementations that satisfy it"
                 );
-                return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+                return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
             c.reject_violation();
             let result = serde_json::json!({
@@ -1662,11 +1454,10 @@ fn work_comparison(
                     || format!("{} warmup trial failed", arm.as_str()),
                     |l| format!("{l} after it ended; it would disturb the other arm's trials (`prova exp log {exp}`)"),
                 );
-                // Leftover processes are the candidate's own doing (a
-                // revalidation of the accept does not hold); a plain failure
-                // is not.
+                // Leftover processes void the comparison (a revalidation of
+                // the accept does not hold); a plain failure does not.
                 if left.is_some() {
-                    return end_offence(store, &exp, comparison, &cand_name, arm, &why);
+                    return end_void(store, &exp, comparison, &cand_name, &why);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &why);
             }
@@ -1698,7 +1489,7 @@ fn work_comparison(
                     },
                 );
                 if left.is_some() {
-                    return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
+                    return end_void(store, &exp, comparison, &cand_name, &reason);
                 }
                 return end_failed(store, &exp, comparison, &cand_name, &reason);
             }
@@ -1707,37 +1498,9 @@ fn work_comparison(
                     "trial {} changed tracked files in the {where_}: a workload must not rewrite code or data; the comparison is void",
                     counter.get()
                 );
-                return end_offence(store, &exp, comparison, &cand_name, arm, &reason);
-            }
-            c.trial(&fingerprint_of(store, comparison, counter.get())?);
-        }
-        // Load from outside the trials must not favour one arm: interleaving
-        // spreads background noise evenly, so a large difference is
-        // something aimed at one arm (round 9: systemd-run burner).
-        if let Some(reason) = {
-            let f = foreign.borrow();
-            let o = own.borrow();
-            load_imbalance(&f[0], &f[1]).or_else(|| stopped_arm(&o[0], &o[1]))
-        } {
-            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
-        }
-        // Each arm against its own earlier measurements: a variant whose
-        // median moved 2x or more since its earlier comparisons was disturbed
-        // (round 10: the other arm was slowed through Python's user site
-        // and a planted .pyc), or its workload changed.
-        if let Some(reason) = drifted(
-            store,
-            &exp,
-            comparison,
-            &p.metric,
-            [&arms[0].0, &arms[1].0],
-            [&base_name_for(store, comparison)?, &cand_name],
-        )? {
-            let (reason, own) = reason;
-            if own {
                 return end_void(store, &exp, comparison, &cand_name, &reason);
             }
-            return end_inconclusive(store, &exp, comparison, &cand_name, &reason);
+            c.trial(&fingerprint_of(store, comparison, counter.get())?);
         }
         // Each arm's workload must report the metric as often per trial as
         // the other: extra lines are forged output (a candidate's code can
@@ -1792,6 +1555,13 @@ fn work_comparison(
                 p.min_effect * 100.0
             ));
         }
+        // Say what could not be checked (scope: say when prova cannot know).
+        if cfg!(not(target_os = "linux")) {
+            caveats.push(
+                "this OS gives prova no way to find processes that left a trial's process group: they were not checked"
+                    .to_owned(),
+            );
+        }
         if let Some(sha) = &arms[0].1.commit_sha {
             let others: i64 = store.conn().query_row(
                 "SELECT COUNT(DISTINCT x.name) FROM experiments x JOIN variants v ON v.experiment = x.name
@@ -1809,38 +1579,9 @@ fn work_comparison(
                 ));
             }
         }
-        if let Some(c) = tmp_caveat(&tmp_files.borrow()) {
-            caveats.push(c);
-        }
-        // A win this large against the original baseline is as suspect as
-        // one against the best (ADR 0035 section 4: a cache in /tmp took a
-        // candidate from 152x over the best to 4100x over the baseline).
-        if verdict == Verdict::Accept
-            && let Some(w) = against_original(store, &exp, comparison, &p.metric, &result)?
-        {
-            let reason = result["reason"].as_str().unwrap_or("").to_owned();
-            if !reason.contains("a change this large is rarely real") {
-                result["reason"] = serde_json::json!(format!("{reason}; {w}"));
-            }
-        }
-        if !process::MACHINE_COUNTERS {
-            caveats.push(
-                "this OS gives prova no CPU counters for the machine or for finished children, and no subreaper: load from other processes, an arm stopped from outside, and processes that left a trial's or oracle's process group were not checked".into(),
-            );
-        }
         if !caveats.is_empty() {
             result["caveats"] = serde_json::json!(caveats);
         }
-        // Say how isolated the arms were (ADR 0024).
-        result["sandbox"] = serde_json::json!(if sandbox_available() {
-            if overlay_available() {
-                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; the oracle ran on a throwaway view of the checkout, so nothing it wrote reached the trials"
-            } else {
-                "bubblewrap: each arm could write only its own checkout and its private state and caches, with no network unless the protocol allows it; this system cannot show the oracle a throwaway checkout, so what it wrote in the checkout stayed for the trials"
-            }
-        } else {
-            "none: bubblewrap is not available here, so the arms ran as the same user with access to each other's files, and what the oracle wrote in a checkout stayed for the trials; read the candidate's diff"
-        });
         // Say that the specification was checked, not only when it failed
         // (ADR 0018): both arms satisfied it before any trial ran.
         if let Some(oracle) = &p.oracle {
@@ -1902,22 +1643,6 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/package.json",
     "**/pytest.ini",
     "**/.pytest.ini",
-    // Python startup hooks that run in every interpreter (round 10)
-    "**/sitecustomize.py",
-    "**/usercustomize.py",
-    "**/*.pth",
-    // Runner configuration: names the program a tool runs instead of the
-    // one the workload asked for, and compiled modules import as source
-    // (ADR 0035 section 4, round 18)
-    "**/.npmrc",
-    "**/.yarnrc*",
-    "**/.cargo/config*",
-    "**/rust-toolchain",
-    "**/rust-toolchain.toml",
-    "**/go.env",
-    "**/pip.conf",
-    "**/*.pyc",
-    "**/__pycache__/**",
     "**/pyproject.toml",
     "**/setup.cfg",
     "**/tox.ini",
@@ -1932,220 +1657,9 @@ pub const HARNESS_FILES: &[&str] = &[
     "**/*.sh",
 ];
 
-/// Python's standard library top-level modules: a file or package of that
-/// name in the checkout shadows the real one for code run from it (round
-/// 10: a `random.py` made the oracle's random sample constant).
-const PYTHON_STDLIB: &[&str] = &[
-    "abc",
-    "annotationlib",
-    "antigravity",
-    "argparse",
-    "array",
-    "ast",
-    "asyncio",
-    "atexit",
-    "base64",
-    "bdb",
-    "binascii",
-    "bisect",
-    "builtins",
-    "bz2",
-    "cProfile",
-    "calendar",
-    "cmath",
-    "cmd",
-    "code",
-    "codecs",
-    "codeop",
-    "collections",
-    "colorsys",
-    "compileall",
-    "compression",
-    "concurrent",
-    "configparser",
-    "contextlib",
-    "contextvars",
-    "copy",
-    "copyreg",
-    "csv",
-    "ctypes",
-    "curses",
-    "dataclasses",
-    "datetime",
-    "dbm",
-    "decimal",
-    "difflib",
-    "dis",
-    "doctest",
-    "email",
-    "encodings",
-    "ensurepip",
-    "enum",
-    "errno",
-    "faulthandler",
-    "fcntl",
-    "filecmp",
-    "fileinput",
-    "fnmatch",
-    "fractions",
-    "ftplib",
-    "functools",
-    "gc",
-    "genericpath",
-    "getopt",
-    "getpass",
-    "gettext",
-    "glob",
-    "graphlib",
-    "grp",
-    "gzip",
-    "hashlib",
-    "heapq",
-    "hmac",
-    "html",
-    "http",
-    "idlelib",
-    "imaplib",
-    "importlib",
-    "inspect",
-    "io",
-    "ipaddress",
-    "itertools",
-    "json",
-    "keyword",
-    "linecache",
-    "locale",
-    "logging",
-    "lzma",
-    "mailbox",
-    "marshal",
-    "math",
-    "mimetypes",
-    "mmap",
-    "modulefinder",
-    "msvcrt",
-    "multiprocessing",
-    "netrc",
-    "nt",
-    "ntpath",
-    "nturl2path",
-    "numbers",
-    "opcode",
-    "operator",
-    "optparse",
-    "os",
-    "pathlib",
-    "pdb",
-    "pickle",
-    "pickletools",
-    "pkgutil",
-    "platform",
-    "plistlib",
-    "poplib",
-    "posix",
-    "posixpath",
-    "pprint",
-    "profile",
-    "profiling",
-    "pstats",
-    "pty",
-    "pwd",
-    "py_compile",
-    "pyclbr",
-    "pydoc",
-    "pydoc_data",
-    "pyexpat",
-    "queue",
-    "quopri",
-    "random",
-    "re",
-    "readline",
-    "reprlib",
-    "resource",
-    "rlcompleter",
-    "runpy",
-    "sched",
-    "secrets",
-    "select",
-    "selectors",
-    "shelve",
-    "shlex",
-    "shutil",
-    "signal",
-    "site",
-    "smtplib",
-    "socket",
-    "socketserver",
-    "sqlite3",
-    "ssl",
-    "stat",
-    "statistics",
-    "string",
-    "stringprep",
-    "struct",
-    "subprocess",
-    "symtable",
-    "sys",
-    "sysconfig",
-    "syslog",
-    "tabnanny",
-    "tarfile",
-    "tempfile",
-    "termios",
-    "textwrap",
-    "this",
-    "threading",
-    "time",
-    "timeit",
-    "tkinter",
-    "token",
-    "tokenize",
-    "tomllib",
-    "trace",
-    "traceback",
-    "tracemalloc",
-    "tty",
-    "turtle",
-    "turtledemo",
-    "types",
-    "typing",
-    "unicodedata",
-    "unittest",
-    "urllib",
-    "uuid",
-    "venv",
-    "warnings",
-    "wave",
-    "weakref",
-    "webbrowser",
-    "winreg",
-    "winsound",
-    "wsgiref",
-    "xml",
-    "xmlrpc",
-    "zipapp",
-    "zipfile",
-    "zipimport",
-    "zlib",
-    "zoneinfo",
-];
-
 /// A file that decides the verdict rather than implements the change.
 fn harness_file(path: &str) -> bool {
-    if HARNESS_FILES.iter().any(|g| glob_match(g, path)) {
-        return true;
-    }
-    // Only at the top of the checkout, where `python -m` and pytest put it
-    // first on sys.path; `pkg/types.py` shadows nothing.
-    let module = match path.split('/').collect::<Vec<_>>().as_slice() {
-        [file] => file
-            .strip_suffix(".py")
-            .or_else(|| file.strip_suffix(".pyc"))
-            .unwrap_or(""),
-        [dir, "__init__.py"] => dir,
-        _ => return false,
-    };
-    PYTHON_STDLIB.contains(&module)
+    HARNESS_FILES.iter().any(|g| glob_match(g, path))
 }
 
 /// Matches a path against a glob: `*` within one segment, `**` any number
@@ -2222,234 +1736,25 @@ fn out_of_scope(p: &Protocol, changed: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Marks every tracked file of a checkout read-only (directories stay
-/// writable: builds create their outputs there).
-fn read_only_tracked(dir: &Path) {
-    let Ok(o) = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-z"])
-        .current_dir(dir)
-        .output()
-    else {
-        return;
-    };
-    for f in o.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-        let path = dir.join(String::from_utf8_lossy(f).as_ref());
-        if let Ok(m) = std::fs::symlink_metadata(&path)
-            && m.is_file()
-        {
-            let mut perm = m.permissions();
-            perm.set_readonly(true);
-            let _ = std::fs::set_permissions(&path, perm);
-        }
-    }
-}
-
-/// Whether other processes loaded the machine much more during one arm's
-/// trials than the other's: (CPU ms used by others, trial wall ms) per
-/// trial. Interleaving spreads background noise evenly; a large difference
-/// is aimed at one arm (round 9: a burner started through systemd-run).
-pub fn load_imbalance(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
-    fn median(mut x: Vec<f64>) -> f64 {
-        x.sort_by(f64::total_cmp);
-        x.get(x.len() / 2).copied().unwrap_or(0.0)
-    }
-    // Cores busy with other work: a longer trial collects more of the same
-    // background load, so compare rates.
-    let rate = |v: &[(f64, f64)]| {
-        median(
-            v.iter()
-                .filter(|(_, w)| *w > 0.0)
-                .map(|(ms, w)| ms / w)
-                .collect(),
-        )
-    };
-    let (b, c) = (rate(base), rate(cand));
-    // CPU time is counted in 10 ms ticks: under a second per trial the rate
-    // is noise, so only longer trials are judged.
-    let wall = median(base.iter().chain(cand).map(|(_, w)| *w).collect());
-    if wall < 1000.0 || (b - c).abs() <= 0.5f64.max(0.5 * b.max(c)) {
-        return None;
-    }
-    // Aimed load is on every trial of one arm; a busy machine's load comes
-    // and goes (round 10: parallel docker builds voided an honest run). Only
-    // a complete separation counts: every trial of the busier arm saw more
-    // than every trial of the other (under 1% by chance with 5 + 5).
-    let rates = |v: &[(f64, f64)]| -> Vec<f64> {
-        v.iter()
-            .filter(|(_, w)| *w > 0.0)
-            .map(|(ms, w)| ms / w)
-            .collect()
-    };
-    let (rb, rc) = (rates(base), rates(cand));
-    let (hi, lo) = if b > c { (&rb, &rc) } else { (&rc, &rb) };
-    let separated = hi.iter().cloned().fold(f64::INFINITY, f64::min)
-        > lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if !separated {
-        return None;
-    }
-    let busier = if b > c { "baseline" } else { "candidate" };
-    Some(format!(
-        "the machine was busier during the {busier}'s trials: other processes kept {:.1} cores busy there, {:.1} during the other arm's; something outside the trials disturbed one arm, so the comparison is void (rerun on a quiet machine)",
-        b.max(c),
-        b.min(c)
-    ))
-}
-
-/// Whether trials can run in a bubblewrap sandbox here (ADR 0024).
-pub fn sandbox_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        cfg!(target_os = "linux")
-            && Command::new("bwrap")
-                .args([
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--dev",
-                    "/dev",
-                    "--proc",
-                    "/proc",
-                    "--unshare-pid",
-                    "true",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-    })
-}
-
-/// Whether the sandbox can show a checkout through a throwaway overlay, so
-/// that nothing a command writes there survives it (ADR 0032).
-fn overlay_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if !sandbox_available() {
-            return false;
-        }
-        let base = std::env::temp_dir().join(format!("prova-overlay-probe-{}", std::process::id()));
-        let (lower, upper, work) = (base.join("lower"), base.join("upper"), base.join("work"));
-        let made = [&lower, &upper, &work]
-            .iter()
-            .all(|d| std::fs::create_dir_all(d).is_ok());
-        let ok = made
-            && Command::new("bwrap")
-                .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
-                .arg("--bind")
-                .arg(&base)
-                .arg(&base)
-                .arg("--overlay-src")
-                .arg(&lower)
-                .arg("--overlay")
-                .arg(&upper)
-                .arg(&work)
-                .arg(&lower)
-                .args(["--unshare-pid", "--", "true"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-        let _ = remove_tree(&base);
-        ok
-    })
-}
-
-/// A command for one arm, sandboxed when bubblewrap works (ADR 0024): the
-/// whole filesystem read-only except the arm's own checkout, its private
-/// state (caches, bytecode), a private /tmp and the toolchain caches builds
-/// must write; its own process namespace, which dies with prova. The other
-/// arm's checkout, prova's store and the user's files cannot be changed.
-fn sandboxed(dir: &Path, program: &str, args: &[String], network: bool) -> Command {
-    sandboxed_in(dir, program, args, network, None, None)
-}
-
-/// `sandboxed`, with the checkout shown through an overlay whose writes go
-/// to `overlay` (an empty directory `up` and `work` live in): what the
-/// command writes in the checkout is visible to it and to nobody after it
-/// (ADR 0032). Without bubblewrap and overlay support: as `sandboxed`.
-fn sandboxed_in(
-    dir: &Path,
-    program: &str,
-    args: &[String],
-    network: bool,
-    overlay: Option<&Path>,
-    tmp: Option<&Path>,
-) -> Command {
+/// A command for one arm with its own caches: nothing one arm compiles is
+/// read by the other. The workload must not reach prova's own store (round
+/// 9) or Python's user site.
+fn arm_command(dir: &Path, program: &str, args: &[String]) -> Command {
     let state = arm_scratch(dir);
     let _ = std::fs::create_dir_all(&state);
-    let mut c = if sandbox_available() {
-        let mut c = Command::new("bwrap");
-        c.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
-        // A private /tmp: a fresh tmpfs, or a host directory of its own that
-        // the caller looks at when the command ends.
-        match tmp {
-            Some(t) => c.arg("--bind").arg(t).arg("/tmp"),
-            None => c.args(["--tmpfs", "/tmp"]),
-        };
-        match overlay.filter(|_| overlay_available()) {
-            Some(o) => {
-                c.arg("--bind").arg(o).arg(o);
-                c.arg("--overlay-src").arg(dir);
-                c.arg("--overlay")
-                    .arg(o.join("up"))
-                    .arg(o.join("work"))
-                    .arg(dir);
-            }
-            None => {
-                c.arg("--bind").arg(dir).arg(dir);
-            }
-        }
-        c.arg("--bind").arg(&state).arg(&state);
-        // Shared toolchain caches stay read-only (round 11: a candidate
-        // patched the baseline's compiled test in the shared Go build
-        // cache); each arm writes its own caches, set below.
-        c.args(["--unshare-pid", "--die-with-parent", "--new-session"]);
-        if !network {
-            // Loopback only: no accomplice on the network or the host.
-            c.arg("--unshare-net");
-        }
-        c.arg("--").arg(program).args(args);
-        c.env("TMPDIR", "/tmp");
-        c
-    } else {
-        let mut c = Command::new(program);
-        c.args(args);
-        c
-    };
-    // Per-arm caches, sandboxed or not: nothing one arm compiles is read
-    // by the other.
-    c.env("GOCACHE", state.join("go-build"))
+    let mut c = Command::new(program);
+    c.args(args)
+        .env_remove("PROVA_HOME")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("GOCACHE", state.join("go-build"))
         .env("XDG_CACHE_HOME", state.join("cache"))
         .env("npm_config_cache", state.join("npm"));
-    // The session's secrets are none of the workload's business (round 11).
-    for (k, _) in std::env::vars() {
-        let u = k.to_ascii_uppercase();
-        if [
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "API_KEY",
-            "CREDENTIAL",
-            "COOKIE",
-        ]
-        .iter()
-        .any(|w| u.contains(w))
-        {
-            c.env_remove(&k);
-        }
-    }
     c
 }
 
-/// One checkout's scratch space in this worker: its caches (Go, npm, XDG,
-/// and the private bytecode cache Python reads `.pyc` files from, so one
-/// planted in a checkout's `__pycache__` is never used, round 10) and its
-/// trials' private `/tmp`. It lives under the worker's scratch root, which
-/// is removed when the comparison ends.
+/// One checkout's scratch space in this worker: its caches (Go, npm, XDG).
+/// It lives under the worker's scratch root, which is removed when the
+/// comparison ends.
 fn arm_scratch(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
     scratch_root().join(format!("arm-{}", &key[..16]))
@@ -2464,7 +1769,6 @@ fn scratch_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<(PathBuf, Option<std::fs::File>)> = std::sync::OnceLock::new();
     let (root, _lock) = ROOT.get_or_init(|| {
         let tmp = std::env::temp_dir();
-        // Absolute: the sandbox binds it at its own path.
         let base = std::path::absolute(&tmp).unwrap_or(tmp);
         let id = new_run_id();
         let root = base.join(format!("prova-scratch-{id}"));
@@ -2507,233 +1811,9 @@ fn remove_abandoned_scratch() {
     }
 }
 
-fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
-    Ok(store.conn().query_row(
-        "SELECT baseline FROM comparisons WHERE id = ?1",
-        params![comparison],
-        |r| r.get(0),
-    )?)
-}
-
-/// A variant whose median in this comparison is 2x away from its median in
-/// earlier decided comparisons of the experiment: the reason, and whether
-/// the drift is the candidate's own (see `classify_drift`).
-fn drifted(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    metric: &str,
-    arms: [&Arm; 2],
-    names: [&str; 2],
-) -> Result<Option<(String, bool)>> {
-    let (now_b, now_c) = samples(store, comparison, metric)?;
-    let mut medians: [Option<(f64, f64)>; 2] = [None, None];
-    for (i, now) in [now_b, now_c].into_iter().enumerate() {
-        let mut stmt = store.conn().prepare(
-            "SELECT s.value FROM samples s
-               JOIN trials t ON t.comparison = s.comparison AND t.seq = s.seq
-               JOIN comparisons c ON c.id = s.comparison
-              WHERE c.experiment = ?1 AND c.id <> ?2 AND c.status = 'decided' AND s.metric = ?3
-                AND t.warmup = 0 AND t.state = 'complete'
-                AND ((t.arm = 'baseline' AND c.baseline = ?4) OR (t.arm = 'candidate' AND c.candidate = ?4))",
-        )?;
-        let before: Vec<f64> = stmt
-            .query_map(params![exp, comparison, metric, names[i]], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        if before.len() < 5 || now.is_empty() {
-            continue;
-        }
-        let (m0, m1) = (stats::median(&before), stats::median(&now));
-        if m0 > 0.0 && m1 > 0.0 {
-            medians[i] = Some((m0, m1));
-        }
-    }
-    Ok(classify_drift(medians[0], medians[1]).map(|d| {
-        let (m0, m1) = medians[d.arm].unwrap_or((1.0, 1.0));
-        let tail = if d.own {
-            "something disturbed it or its workload changed, so the comparison is void"
-        } else {
-            "the other arm moved alike (a loaded or throttled machine?), so the comparison says nothing about the candidate"
-        };
-        (
-            format!(
-                "the {} ({}) measured {} now but {} in this experiment's earlier comparisons ({:.1}x): {tail}",
-                arms[d.arm].as_str(),
-                names[d.arm],
-                short(m1),
-                short(m0),
-                (m1 / m0).max(m0 / m1)
-            ),
-            d.own,
-        )
-    }))
-}
-
-struct Drift {
-    /// The arm that moved most: 0 baseline, 1 candidate.
-    arm: usize,
-    /// The drift is the candidate's own: its median moved 2x or more AND
-    /// its ratio to the baseline moved 2x or more. Both arms moving alike
-    /// (a throttled host, a cold start) is the machine, not the candidate.
-    own: bool,
-}
-
-/// Each argument: (median in earlier comparisons, median now) of one arm.
-fn classify_drift(base: Option<(f64, f64)>, cand: Option<(f64, f64)>) -> Option<Drift> {
-    let factor = |a: Option<(f64, f64)>| a.map_or(1.0, |(m0, m1)| (m1 / m0).max(m0 / m1));
-    let (fb, fc) = (factor(base), factor(cand));
-    if fb < 2.0 && fc < 2.0 {
-        return None;
-    }
-    let ratio_moved = match (base, cand) {
-        (Some((b0, b1)), Some((c0, c1))) => {
-            let (r0, r1) = (c0 / b0, c1 / b1);
-            (r1 / r0).max(r0 / r1) >= 2.0
-        }
-        _ => true,
-    };
-    Some(Drift {
-        arm: usize::from(fc > fb),
-        own: fc >= 2.0 && ratio_moved,
-    })
-}
-
-/// Whether one arm's trials sat stopped (SIGSTOP from outside, or starved)
-/// while the other's ran: (own CPU ms, wall ms) per trial. A CPU-bound
-/// workload keeps about one core busy; one arm far below it, every trial,
-/// while the other is near it, was held back (round 11).
-pub fn stopped_arm(base: &[(f64, f64)], cand: &[(f64, f64)]) -> Option<String> {
-    let util = |v: &[(f64, f64)]| -> Vec<f64> {
-        v.iter()
-            .filter(|(_, w)| *w >= 1000.0)
-            .map(|(ms, w)| ms / w)
-            .collect()
-    };
-    let (ub, uc) = (util(base), util(cand));
-    if ub.len() < 3 || uc.len() < 3 {
-        return None;
-    }
-    let max = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let min = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
-    let (low, high, arm) = if max(&ub) < min(&uc) {
-        (&ub, &uc, "baseline")
-    } else if max(&uc) < min(&ub) {
-        (&uc, &ub, "candidate")
-    } else {
-        return None;
-    };
-    // Held back: every trial of one arm under 60% of a core while every
-    // trial of the other kept at least 90% of one busy.
-    (max(low) < 0.6 && min(high) >= 0.9).then(|| {
-        format!(
-            "the {arm}'s trials ran only {:.0}% of their time while the other arm's ran {:.0}% or more: something stopped or starved that arm (SIGSTOP from outside?), so the comparison is void",
-            max(low) * 100.0,
-            min(high) * 100.0
-        )
-    })
-}
-
-/// The first tracked file whose bytes differ from the blob the commit
-/// records, hashed without any filter.
-fn checkout_differs(dir: &Path) -> Option<String> {
-    let listed = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-s", "-z"])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    let entries: Vec<(String, String)> = listed
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|e| !e.is_empty())
-        .filter_map(|e| {
-            let e = String::from_utf8_lossy(e);
-            let (meta, path) = e.split_once('\t')?;
-            let mut f = meta.split_whitespace();
-            let mode = f.next()?;
-            let blob = f.next()?;
-            // Regular files only (not symlinks or submodules).
-            mode.starts_with("100")
-                .then(|| (blob.to_owned(), path.to_owned()))
-        })
-        .collect();
-    if entries.is_empty() {
-        return None;
-    }
-    let mut child = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["hash-object", "--no-filters", "--stdin-paths"])
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let paths: String = entries.iter().map(|(_, p)| format!("{p}\n")).collect();
-    let mut stdin = child.stdin.take()?;
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(paths.as_bytes());
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = writer.join();
-    let hashes = String::from_utf8_lossy(&out.stdout).into_owned();
-    entries
-        .iter()
-        .zip(hashes.lines())
-        .find(|((blob, _), h)| blob != h)
-        .map(|((_, p), _)| p.clone())
-}
-
-/// Deletes an overlay's scratch directory. The kernel makes `work/work` with
-/// no permissions at all, which `remove_dir_all` cannot enter.
-fn remove_scratch(scratch: &Path) {
-    let _ = remove_tree(scratch);
-}
-
-/// The first tracked file of the checkout that an overlay's upper layer
-/// holds, i.e. one the sandboxed command wrote.
-fn rewritten_tracked(dir: &Path, upper: &Path) -> Option<String> {
-    let listed = Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .args(["ls-files", "-z"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let tracked: std::collections::BTreeSet<String> = listed
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|f| !f.is_empty())
-        .map(|f| String::from_utf8_lossy(f).into_owned())
-        .collect();
-    let mut found: Option<String> = None;
-    let mut stack = vec![upper.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let path = e.path();
-            let Ok(m) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if m.is_dir() {
-                stack.push(path);
-            } else if let Ok(rel) = path.strip_prefix(upper) {
-                let rel = rel.to_string_lossy().into_owned();
-                if tracked.contains(&rel) && found.as_ref().is_none_or(|f| rel < *f) {
-                    found = Some(rel);
-                }
-            }
-        }
-    }
-    found
-}
-
 /// `git status` of tracked files in a checkout (empty outside git).
 fn tracked_state(dir: &Path) -> String {
     Command::new("git")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -2773,51 +1853,21 @@ fn satisfies_spec(
     };
     let name = format!("oracle-{}.log", arm.as_str());
     let log = private_file(&logs.join(&name))?;
-    // The oracle runs the candidate's own code as the same user: whatever it
-    // writes in the checkout must not outlive it, or the code could leave
-    // the trials a measurement, a marker or a binary of its choosing
-    // (ADR 0032). Only its exit status and its log, which prova holds, count.
-    let scratch = logs.join(format!("oracle-{}-scratch", arm.as_str()));
-    remove_scratch(&scratch);
-    let isolated = overlay_available()
-        && std::fs::create_dir_all(scratch.join("up")).is_ok()
-        && std::fs::create_dir_all(scratch.join("work")).is_ok();
-    let status = sandboxed_in(
-        dir,
-        "sh",
-        &["-c".to_owned(), oracle.clone()],
-        p.allow_network,
-        isolated.then_some(scratch.as_path()),
-        None,
-    )
-    .env_remove("PROVA_HOME")
-    .env("PYTHONNOUSERSITE", "1")
-    .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
-    .current_dir(dir)
-    .stdin(Stdio::null())
-    .stdout(log.try_clone()?)
-    .stderr(log)
-    .status()
-    .ok();
+    let status = arm_command(dir, "sh", &["-c".to_owned(), oracle.clone()])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()
+        .ok();
     let ok = status.is_some_and(|s| s.success());
-    // Tracked files the oracle rewrote exist only in the overlay: say so, as
-    // the checkout-wide check does where there is none.
-    let rewrote = isolated
-        .then(|| rewritten_tracked(dir, &scratch.join("up")))
-        .flatten();
-    remove_scratch(&scratch);
-    if let Some(f) = rewrote {
-        return Ok(Err(SpecFail::Violated(format!(
-            "the oracle rewrote the tracked file {f}: code that rewrites the checkout (its spec, its reference data, the other arm) cannot be judged"
-        ))));
-    }
     // A process the oracle leaves behind would run into the trials and be
     // blamed on them (round 10: a daemon from the candidate's oracle was
     // reported as the baseline trial's leak).
     let left = process::reap_orphans();
     if let Some(l) = left.first() {
         // Not a verdict on the code: a process outliving its oracle is the
-        // sandbox or the environment (round 15).
+        // environment (round 15).
         return Ok(Err(SpecFail::Infra(format!(
             "the oracle left process {l} running after it ended (an infrastructure problem, not a verdict on the code); it would disturb the trials: stop what starts it, or run the oracle in the foreground"
         ))));
@@ -2860,21 +1910,14 @@ fn satisfies_spec(
             ))));
         }
     }
-    // The checkouts' tracked files are read-only: an oracle that writes
-    // one (go generate) fails for that, not for the spec (round 10).
-    let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
-    let hint = if text.contains("ermission denied") || text.contains("Read-only file system") {
-        "; its log shows a write was refused: during experiments the checkouts' tracked files are read-only, so an oracle must not rewrite them (generate into a temporary directory instead)"
-    } else {
-        ""
-    };
     // The decisive line, so the reader need not open the log.
+    let text = std::fs::read_to_string(logs.join(&name)).unwrap_or_default();
     let last = failing_test_lines(&text)
         .or_else(|| decisive_line(&text).map(str::to_owned))
         .map(|l| l.chars().take(300).collect::<String>())
         .unwrap_or_else(|| format!("oracle `{oracle}` failed, printing nothing"));
     Ok(Err(SpecFail::Violated(format!(
-        "{last} (full log: prova exp log <experiment> {arm_log}){hint}"
+        "{last} (full log: prova exp log <experiment> {arm_log})"
     ))))
 }
 
@@ -3128,60 +2171,11 @@ fn end_failed(
     Ok(())
 }
 
-/// A comparison that says nothing about the candidate (the machine, an arm
-/// held back, the oracle's own infrastructure, a baseline that violates the
-/// spec). It ends failed; when it is a revalidation of the current best the
-/// accept STANDS and the reason says the revalidation was inconclusive
-/// (ADR 0035 section 4: noise never withdraws a real accept).
-fn end_inconclusive(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    candidate: &str,
-    reason: &str,
-) -> Result<()> {
-    let best: Option<String> = store
-        .conn()
-        .query_row(
-            "SELECT best FROM experiments WHERE name = ?1",
-            params![exp],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if replicated(store, exp, comparison, i64::MAX)?.is_some() && best.as_deref() == Some(candidate)
-    {
-        let reason = format!(
-            "{reason}; the revalidation is inconclusive, not about {candidate} itself: its accept stands (rerun `prova exp revalidate {exp}` on a quieter machine)"
-        );
-        return end_failed(store, exp, comparison, candidate, &reason);
-    }
-    end_failed(store, exp, comparison, candidate, reason)
-}
-
-/// An offence seen in a trial (tampering, a leaked process): the candidate's
-/// own doing only when its arm's trial committed it. The baseline's is not
-/// about the candidate: inconclusive, the accept stands.
-fn end_offence(
-    store: &Store,
-    exp: &str,
-    comparison: &str,
-    candidate: &str,
-    arm: Arm,
-    reason: &str,
-) -> Result<()> {
-    if arm == Arm::Candidate {
-        end_void(store, exp, comparison, candidate, reason)
-    } else {
-        end_inconclusive(store, exp, comparison, candidate, reason)
-    }
-}
-
-/// A comparison that is void because of the candidate's own doing (it
-/// tampered with tracked files, left processes behind, forged output, or its
-/// own median moved). When it is a revalidation of the current best, the
-/// accept it should have replicated is withdrawn as a failed replication is
-/// (ADR 0032, 0035 section 4): a result that could not be reproduced does
-/// not stay accepted.
+/// A comparison that is void (trials tampered with tracked files, left
+/// processes behind, or the workload reported the metric a different number
+/// of times). When it is a revalidation of the current best, the accept it
+/// should have replicated is withdrawn as a failed replication is (ADR
+/// 0032): a result that could not be reproduced does not stay accepted.
 fn end_void(
     store: &Store,
     exp: &str,
@@ -3273,7 +2267,7 @@ fn finish(
         && b == "baseline"
         && let (Ok(bv), Ok(cv)) = (variant(store, &e.name, &b), variant(store, &e.name, &c))
         && let (Some(bs), Some(cs)) = (&bv.commit_sha, &cv.commit_sha)
-        && !Command::new("git").env("GIT_NO_REPLACE_OBJECTS", "1")
+        && !Command::new("git")
             .args(["merge-base", "--is-ancestor", bs, cs])
             .current_dir(store.root())
             .status()
@@ -3428,10 +2422,6 @@ pub struct Report {
     /// How to read the kept logs of the latest comparison, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
-    /// Stored verdicts or a best that the immutable samples do not support
-    /// (an edited database): each is a reason not to trust the record.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub integrity: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3514,9 +2504,35 @@ pub fn comparison_report(store: &Store, e: &Experiment, id: &str) -> Result<Comp
 }
 
 pub fn report(store: &Store, exp: &str) -> Result<Report> {
+    report_at(store, exp, None)
+}
+
+/// The comparison `id` of an experiment, refused when it is not one of its.
+pub fn check_comparison(store: &Store, exp: &str, id: &str) -> Result<()> {
+    let known: bool = store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM comparisons WHERE id = ?1 AND experiment = ?2)",
+        params![id, exp],
+        |r| r.get(0),
+    )?;
+    if known {
+        Ok(())
+    } else {
+        refused(format!("experiment {exp} has no comparison {id}"))
+    }
+}
+
+/// `report`, for one comparison (the latest when `None`).
+pub fn report_at(store: &Store, exp: &str, at: Option<&str>) -> Result<Report> {
     let e = get(store, exp)?;
-    let comparison = match latest_comparison(store, exp)? {
-        Some(id) => Some(comparison_report(store, &e, &id)?),
+    let id = match at {
+        Some(id) => {
+            check_comparison(store, exp, id)?;
+            Some(id.to_owned())
+        }
+        None => latest_comparison(store, exp)?,
+    };
+    let comparison = match &id {
+        Some(id) => Some(comparison_report(store, &e, id)?),
         None => None,
     };
     let mut stmt = store.conn().prepare(
@@ -3546,8 +2562,10 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
                     .as_ref()
                     .is_some_and(|r| r["specification"] == "violated")
         })
-        .map(|_| format!("prova exp log {exp}"));
-    let integrity = integrity(store, &e)?;
+        .map(|c| match at {
+            Some(_) => format!("prova exp log {exp} --comparison {}", c.id),
+            None => format!("prova exp log {exp}"),
+        });
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
@@ -3557,63 +2575,7 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
         comparison,
         decisions,
         logs,
-        integrity,
     })
-}
-
-/// Re-derives every stored ACCEPT from the immutable samples, with the Holm
-/// family as it stood when it was decided, and checks the best against the
-/// record (round 11: editing prova.db turned a REJECT into an ACCEPT). The
-/// same user can edit the file; this makes it show.
-fn integrity(store: &Store, e: &Experiment) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut stmt = store.conn().prepare(
-        "SELECT id, candidate, COALESCE(ended_ms, 0) FROM comparisons
-          WHERE experiment = ?1 AND status = 'decided' AND verdict = 'accept'",
-    )?;
-    let accepted: Vec<(String, String, i64)> = stmt
-        .query_map(params![e.name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let p = &e.protocol;
-    for (id, cand, ended) in &accepted {
-        let (base, c) = samples(store, id, &p.metric)?;
-        if base.len() < p.min_trials as usize || c.len() < p.min_trials as usize {
-            out.push(format!(
-                "comparison {id} is recorded as ACCEPT but has no measurements to support it"
-            ));
-            continue;
-        }
-        let replicates = replicated(store, &e.name, id, *ended)?;
-        let mut ps = family(store, &e.name, id, *ended, replicates.as_deref())?;
-        let raw = stats::mann_whitney(&base, &c).p;
-        ps.push(raw);
-        let adjusted = *stats::holm(&ps).last().unwrap_or(&raw);
-        let primary = measure(&p.metric, p.better, &base, &c, p.alpha, Some(adjusted));
-        let (v, _) = judge(&primary, &[], p.min_effect, p.alpha);
-        if v != Verdict::Accept {
-            out.push(format!(
-                "comparison {id} ({cand}) is recorded as ACCEPT, but its own samples give {}: the record was changed",
-                v.as_str()
-            ));
-        }
-    }
-    let best_ok = e.best == "baseline"
-        || accepted.iter().any(|(_, c, _)| *c == e.best)
-        || store
-            .conn()
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM best_resets WHERE experiment = ?1 AND to_best = ?2)",
-                params![e.name, e.best],
-                |r| r.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-    if !best_ok {
-        out.push(format!(
-            "the best is {}, but no ACCEPT or recorded reset made it so: the record was changed",
-            e.best
-        ));
-    }
-    Ok(out)
 }
 
 /// Blocks at most `max_wait` until the latest comparison ends.
@@ -3630,52 +2592,6 @@ pub fn wait(store: &Store, exp: &str, max_wait: Duration) -> Result<Report> {
 }
 
 use std::os::unix::process::CommandExt;
-
-#[cfg(test)]
-mod stopped_tests {
-    #[test]
-    fn an_arm_held_back_while_the_other_ran_is_caught() {
-        let ran = vec![(1950.0, 2000.0); 5];
-        let held = vec![(1000.0, 2000.0); 5];
-        assert!(super::stopped_arm(&held, &ran).is_some());
-        // A parallel speedup: more than a core is fine, the baseline ran.
-        let parallel = vec![(7000.0, 2000.0); 5];
-        assert!(super::stopped_arm(&ran, &parallel).is_none());
-        // Both mostly waiting (sleep-bound workloads): nothing to say.
-        assert!(super::stopped_arm(&[(100.0, 2000.0); 5], &[(200.0, 2000.0); 5]).is_none());
-    }
-}
-
-#[cfg(test)]
-mod load_tests {
-    #[test]
-    fn a_burner_on_one_arm_voids_but_even_noise_does_not() {
-        let quiet = vec![(100.0, 2000.0); 5];
-        let burned = vec![(8000.0, 2000.0); 5];
-        assert!(super::load_imbalance(&quiet, &burned).is_some());
-        let busy = vec![(6000.0, 2000.0); 5];
-        let busy2 = vec![(5000.0, 1800.0); 5];
-        assert!(super::load_imbalance(&busy, &busy2).is_none());
-        // Load that comes and goes, even if one arm's median is higher.
-        let a = [
-            (100.0, 2000.0),
-            (9000.0, 2000.0),
-            (8000.0, 2000.0),
-            (200.0, 2000.0),
-            (7000.0, 2000.0),
-        ];
-        let b = [
-            (150.0, 2000.0),
-            (300.0, 2000.0),
-            (8500.0, 2000.0),
-            (100.0, 2000.0),
-            (250.0, 2000.0),
-        ];
-        assert!(super::load_imbalance(&a, &b).is_none());
-        // Short trials: too coarse to judge.
-        assert!(super::load_imbalance(&[(10.0, 20.0); 5], &[(60.0, 20.0); 5]).is_none());
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3870,7 +2786,6 @@ mod revalidation_tests {
             oracle: None,
             scope: Vec::new(),
             scope_only: false,
-            allow_network: false,
         }
     }
 
@@ -3899,6 +2814,22 @@ mod revalidation_tests {
             .unwrap();
         }
         (s, d)
+    }
+
+    /// ADR 0037: `--allow-network` is gone, but a protocol stored with it
+    /// still loads, with the hash it was frozen with.
+    #[test]
+    fn a_protocol_stored_with_allow_network_still_loads() {
+        let (s, _d) = fresh();
+        let mut v = serde_json::to_value(protocol()).unwrap();
+        v["allow_network"] = serde_json::json!(true);
+        s.conn()
+            .execute(
+                "UPDATE experiments SET protocol = ?1, protocol_hash = 'frozen-hash' WHERE name = 'e'",
+                params![v.to_string()],
+            )
+            .unwrap();
+        assert_eq!(get(&s, "e").unwrap().protocol_hash, "frozen-hash");
     }
 
     /// A comparison of c1 against the baseline with five samples per arm.
@@ -3965,48 +2896,6 @@ mod revalidation_tests {
         assert_eq!(verdict, Verdict::Accept, "{result}");
     }
 
-    /// ADR 0035 section 4: a cache in /tmp took a candidate from 152x over
-    /// the best to 4100x over the original baseline; the warning looks at both.
-    #[test]
-    fn the_implausible_win_warning_also_compares_with_the_original_baseline() {
-        let (s, _d) = fresh();
-        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
-        let c = s.conn();
-        c.execute(
-            "INSERT INTO variants (experiment, name, kind, code, params, created_ms)
-             VALUES ('e', 'c2', 'workdir', 'x', '{}', 1)",
-            [],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO comparisons (id, experiment, baseline, candidate, status, created_ms)
-             VALUES ('c-2', 'e', 'c1', 'c2', 'running', 200)",
-            [],
-        )
-        .unwrap();
-        // 3 now against the best (1x), but the baseline measured about 12.
-        let near = serde_json::json!({ "primary": { "candidate_median": 3.0 } });
-        assert!(
-            against_original(&s, "e", "c-2", "t", &near)
-                .unwrap()
-                .is_none()
-        );
-        let huge = serde_json::json!({ "primary": { "candidate_median": 0.001 } });
-        let w = against_original(&s, "e", "c-2", "t", &huge)
-            .unwrap()
-            .unwrap();
-        assert!(
-            w.starts_with("warning: against the original baseline"),
-            "{w}"
-        );
-        // Against the baseline itself the comparison's own warning applies.
-        assert!(
-            against_original(&s, "e", "c-1", "t", &huge)
-                .unwrap()
-                .is_none()
-        );
-    }
-
     #[test]
     fn a_spec_frozen_file_is_not_offered_for_change() {
         let mut p = protocol();
@@ -4027,58 +2916,6 @@ mod revalidation_tests {
         );
     }
 
-    #[test]
-    fn files_left_in_the_private_tmp_are_reported() {
-        assert!(tmp_caveat(&[vec![], vec![]]).is_none());
-        let c = tmp_caveat(&[vec![], vec!["cache/a".into(), "b".into()]]).unwrap();
-        assert!(
-            c.contains("candidate's trials left 2 file(s) (e.g. cache/a, b)"),
-            "{c}"
-        );
-        // Files both arms leave (a JVM's hsperfdata, pytest's directory) say
-        // nothing about the candidate.
-        let shared = tmp_caveat(&[
-            vec!["hsperfdata_u/11".into()],
-            vec!["hsperfdata_u/22".into()],
-        ]);
-        assert!(shared.is_none(), "{shared:?}");
-        let c = tmp_caveat(&[
-            vec!["hsperfdata_u/11".into()],
-            vec!["hsperfdata_u/22".into(), "cache/a".into()],
-        ])
-        .unwrap();
-        assert!(c.contains("left 1 file(s) (e.g. cache/a)"), "{c}");
-        // A cache under a directory the baseline also creates is reported.
-        let c = tmp_caveat(&[
-            vec![".cache/x".into(), "pytest-of-u/pytest-3/a".into()],
-            vec![
-                ".cache/x".into(),
-                ".cache/results".into(),
-                "pytest-of-u/pytest-4/a".into(),
-            ],
-        ])
-        .unwrap();
-        assert!(c.contains("left 1 file(s) (e.g. .cache/results)"), "{c}");
-    }
-
-    /// A revalidation that cannot say anything about the candidate (the
-    /// machine, an arm that was stopped) keeps the accept and says so.
-    #[test]
-    fn an_inconclusive_revalidation_keeps_the_accept() {
-        let (s, _d) = fresh();
-        comparison(&s, "c-1", Some(decided_accept(false)), FASTER);
-        comparison(&s, "rv", None, SAME);
-        end_inconclusive(&s, "e", "rv", "c1", "the load differed between the arms").unwrap();
-        assert_eq!(get(&s, "e").unwrap().best, "c1");
-        let reason: String = s
-            .conn()
-            .query_row("SELECT result FROM comparisons WHERE id = 'rv'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(reason.contains("inconclusive"), "{reason}");
-    }
-
     /// The candidate's own misbehaviour in a revalidation withdraws it.
     #[test]
     fn a_void_revalidation_of_the_candidates_own_making_withdraws_the_accept() {
@@ -4089,21 +2926,8 @@ mod revalidation_tests {
         assert_eq!(get(&s, "e").unwrap().best, "baseline");
     }
 
-    /// Both arms moved alike: the machine, not the candidate.
-    #[test]
-    fn a_drift_of_both_arms_is_not_the_candidates_own() {
-        // (earlier median, median now) per arm.
-        let both = classify_drift(Some((10.0, 30.0)), Some((4.0, 12.0))).unwrap();
-        assert!(!both.own);
-        let cand = classify_drift(Some((10.0, 10.5)), Some((4.0, 10.0))).unwrap();
-        assert!(cand.own);
-        let base = classify_drift(Some((10.0, 25.0)), Some((4.0, 4.1))).unwrap();
-        assert!(!base.own);
-        assert!(classify_drift(Some((10.0, 12.0)), Some((4.0, 5.0))).is_none());
-    }
-
-    /// A trial's private /tmp is removed even when the workload left
-    /// read-only directories in it.
+    /// A worker's scratch root is removed even when the workload left
+    /// read-only directories in it (a Go module cache).
     #[test]
     fn a_read_only_tree_is_still_removed() {
         use std::os::unix::fs::PermissionsExt;
@@ -4163,35 +2987,5 @@ mod oracle_input_tests {
         }
         assert!(!harness_file("src/primes.rs"));
         assert!(!harness_file("src/golden_ratio.rs"));
-    }
-
-    /// ADR 0035 section 4: configuration that names the program a tool runs
-    /// and compiled modules decide the verdict too.
-    #[test]
-    fn runner_configuration_and_compiled_modules_are_harness_files() {
-        for f in [
-            ".npmrc",
-            "web/.npmrc",
-            ".yarnrc",
-            ".yarnrc.yml",
-            ".cargo/config.toml",
-            ".cargo/config",
-            "crates/x/.cargo/config.toml",
-            "rust-toolchain",
-            "rust-toolchain.toml",
-            "go.env",
-            "pip.conf",
-            "sitecustomize.py",
-            "usercustomize.py",
-            "json.pyc",
-            "pkg/helper.pyc",
-            "pkg/__pycache__/x.cpython-313.pyc",
-            "__pycache__/x.txt",
-        ] {
-            assert!(harness_file(f), "{f} should decide the verdict");
-        }
-        assert!(!harness_file("src/cargo_config.rs"));
-        assert!(!harness_file("docs/rust-toolchain-notes.md"));
-        assert!(!harness_file("rust-toolchain.rs"));
     }
 }

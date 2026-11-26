@@ -1,6 +1,6 @@
 # 0036: A flaky flip happens within one suite
 
-Status: Accepted (2026-11-26). Amends [0018](0018-honest-history-and-live-nextest.md) §1.
+Status: Accepted (2026-11-26). Amends [0018](0018-honest-history-and-live-nextest.md) §1. Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

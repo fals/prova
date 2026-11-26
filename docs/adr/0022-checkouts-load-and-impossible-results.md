@@ -1,6 +1,6 @@
 # 0022: Read-only checkouts, load checks and impossible results
 
-Status: Accepted (2026-11-23). Amends [0021](0021-verdicts-under-adversarial-candidates.md) (more defenses, and their limits), [0017](0017-no-false-passes.md) (what makes a pass unverified) and [0006](0006-identity-history-flakiness.md) (when a flaky test stops being dismissed).
+Status: Accepted (2026-11-23). Amends [0021](0021-verdicts-under-adversarial-candidates.md) (more defenses, and their limits), [0017](0017-no-false-passes.md) (what makes a pass unverified) and [0006](0006-identity-history-flakiness.md) (when a flaky test stops being dismissed). Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

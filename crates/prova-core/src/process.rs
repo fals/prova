@@ -134,11 +134,6 @@ pub fn sample_group(pgid: u32) -> GroupSample {
     .unwrap_or_default()
 }
 
-/// Whether this OS gives machine-wide CPU counters and orphan reaping:
-/// without them, experiments cannot see load from other processes, arms
-/// stopped from outside, or processes a trial left behind.
-pub const MACHINE_COUNTERS: bool = cfg!(target_os = "linux");
-
 /// Members of group `pgid` in `ps -o pid=,pgid=,stat=,time=` output; CPU
 /// time (`[[H:]M:]S.cc`) in ticks of 10 ms, as on Linux. Zombies are out.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -346,27 +341,13 @@ pub fn become_subreaper() {}
 /// behind by a workload.
 #[cfg(target_os = "linux")]
 pub fn reap_orphans() -> Vec<String> {
-    // A sandbox's own `bwrap` may still be tearing down after its child
-    // ended: wait briefly for it (bounded) instead of calling it a leftover.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while children_of_me()
-        .iter()
-        .any(|(_, comm, state)| comm == "bwrap" && state != "Z")
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
     let mut found = Vec::new();
     for (pid, comm, state) in children_of_me() {
         let Some(p) = Pid::from_raw(pid as i32) else {
             continue;
         };
         if state != "Z" {
-            // The sandbox is infrastructure, not the workload's leftover;
-            // it is still killed.
-            if comm != "bwrap" {
-                found.push(format!("{pid} {comm}"));
-            }
+            found.push(format!("{pid} {comm}"));
             // Its own group too: it may have started more.
             let _ = rustix::process::kill_process_group(p, Signal::KILL);
             let _ = rustix::process::kill_process(p, Signal::KILL);
@@ -414,39 +395,6 @@ fn children_of_me() -> Vec<(u32, String, String)> {
 #[cfg(not(target_os = "linux"))]
 pub fn reap_orphans() -> Vec<String> {
     Vec::new()
-}
-
-/// CPU ticks the whole machine spent busy, and those this process's
-/// waited-for children used: their difference over a trial is what other
-/// processes used meanwhile (round 9: load started outside the trial's tree,
-/// e.g. through systemd-run, slowed only the other arm).
-#[cfg(target_os = "linux")]
-pub fn cpu_ticks() -> (u64, u64) {
-    let busy = std::fs::read_to_string("/proc/stat")
-        .ok()
-        .and_then(|s| {
-            let l = s.lines().next()?.to_owned();
-            let f: Vec<u64> = l
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            // user nice system idle iowait irq softirq steal
-            Some(
-                f.iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != 3 && *i != 4)
-                    .map(|(_, v)| v)
-                    .sum(),
-            )
-        })
-        .unwrap_or(0);
-    (busy, children_ticks().unwrap_or(0))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn cpu_ticks() -> (u64, u64) {
-    (0, 0)
 }
 
 /// CPU ticks of this process's waited-for children, when the OS says.

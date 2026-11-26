@@ -66,7 +66,6 @@ pub fn observer_for(spec: &RunSpec, root: &Path, cwd: &Path) -> Box<dyn Observer
     // import path. go.mod names it, so both name a test alike (round 15).
     let mut live = recognize::Recognizers::default();
     live.set_places(cwd, &prova_core::identity::repo_root(cwd));
-    live.command = Some(spec.command.raw());
     live.go_module = std::fs::read_to_string(root.join("go.mod"))
         .ok()
         .and_then(|m| {
@@ -423,6 +422,13 @@ impl Observer for Ladder {
             .count() as u64;
         let seen =
             (self.live.seen.len() as u64 + self.live.repeats + file_only).saturating_sub(replaced);
+        for (name, n) in self.live.ambiguous_names() {
+            report.events.push(EventKind::RunNote {
+                message: format!(
+                    "{n} results named `{name}` that prova cannot tell apart (no place printed): recorded as one failed test with no history; run `cargo test` without `--quiet` (pytest with `-v` and its header) to tell them apart"
+                ),
+            });
+        }
         if !self.live.pytest_xpass.is_empty() {
             report.events.push(EventKind::RunNote {
                 message: format!(
@@ -482,7 +488,8 @@ impl Observer for Ladder {
             })
             .collect();
         outcomes.extend(finals.iter().map(|(k, o)| (k.clone(), *o)));
-        let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64;
+        let failed_seen = outcomes.values().filter(|o| o.is_failure()).count() as u64
+            + self.live.ambiguous_extra_failed();
         let failed_reported = self.live.failed_reported();
         if failed_reported > failed_seen {
             report.contradictions.push(format!(

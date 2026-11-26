@@ -1,6 +1,6 @@
 # 0021: Verdicts under careless or adversarial candidates; idle runtimes stall
 
-Status: Accepted (2026-11-23). Amends [0007](0007-experiments.md) and [0015](0015-spec-first-experiments.md) (what a candidate may change, what voids a comparison) and [0004](0004-liveness-and-fail-fast.md) (what counts as activity).
+Status: Accepted (2026-11-23). Amends [0007](0007-experiments.md) and [0015](0015-spec-first-experiments.md) (what a candidate may change, what voids a comparison) and [0004](0004-liveness-and-fail-fast.md) (what counts as activity). Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

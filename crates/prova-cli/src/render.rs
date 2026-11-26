@@ -339,15 +339,31 @@ pub fn slowest(rows: &[prova_core::analysis::SlowRow], json: bool) {
         println!("no test durations recorded yet");
         return;
     }
-    for r in rows {
+    let labels = suite_labels(rows.iter().map(|r| (clean(&r.test), r.suite.as_str())));
+    for (r, label) in rows.iter().zip(labels) {
         println!(
-            "p50 {:>7}  p95 {:>7}  {:3} runs  {}",
+            "p50 {:>7}  p95 {:>7}  {:3} runs  {label}",
             format_duration(std::time::Duration::from_millis(r.p50_ms)),
             format_duration(std::time::Duration::from_millis(r.p95_ms)),
             r.runs,
-            clean(&r.test)
         );
     }
+}
+
+/// Test names, each with `(suite X)` when the name is listed for several
+/// suites: one test per suite, whichever suite knows the name (ADR 0037).
+pub fn suite_labels<'a>(tests: impl Iterator<Item = (String, &'a str)>) -> Vec<String> {
+    let tests: Vec<(String, &str)> = tests.collect();
+    tests
+        .iter()
+        .map(|(name, suite)| {
+            if tests.iter().filter(|(n, _)| n == name).count() > 1 {
+                format!("{name}  (suite {suite})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
 }
 
 /// A test's name with its place when names collide: `tests::flaky (geo)`.
@@ -416,21 +432,11 @@ fn context(f: &prova_core::engine::Failure) -> String {
     format!(" [{}]", parts.join(", "))
 }
 
-pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
-    if json {
-        println!("{}", serde_json::to_string(s).unwrap_or_default());
-        return;
-    }
+pub fn test_stats(s: &prova_core::analysis::TestStats) {
     println!(
-        "{}  (suite{} {}{})",
+        "{}  (suite {})",
         named(&s.display, s.place.as_deref()),
-        if s.suites.len() > 1 { "s" } else { "" },
-        s.suites.join(", "),
-        if s.suites.len() > 1 {
-            "; history shared across them"
-        } else {
-            ""
-        }
+        s.suite
     );
     println!(
         "{} runs with a result, {} failed ({:.0}%), {} pass/fail switches, {} passed on retry, both passed and failed on {} code version(s) within one suite{}",
@@ -551,13 +557,7 @@ fn history_line(h: &serde_json::Value) -> String {
             p["code"].as_str().unwrap_or("")
         )),
         // "None of them passed" about zero runs reads as a verdict (round 9).
-        None if n > 0 => parts.push(match h["passed_elsewhere"].as_object() {
-            Some(o) => format!(
-                "none of them passed, but this code passed in suite {} (run {})",
-                o["suite"].as_str().unwrap_or("?"),
-                o["run"].as_str().unwrap_or("?")
-            ),
-            None => match h["unverified_passes"].as_u64().unwrap_or(0) {
+        None if n > 0 => parts.push(match h["unverified_passes"].as_u64().unwrap_or(0) {
                 0 if h["set_aside_passes"].as_array().is_some_and(|a| !a.is_empty()) => {
                     let a = h["set_aside_passes"].as_array().map(Vec::as_slice).unwrap_or_default();
                     format!(
@@ -569,7 +569,6 @@ fn history_line(h: &serde_json::Value) -> String {
                 0 => "none of them passed".into(),
                 // (round 12: "none of them passed; on this exact code: passed?")
                 u => format!("none of them passed verified ({u} passed with warnings: `prova status <run>` says why)"),
-            },
         }),
         None => {}
     }
@@ -1004,9 +1003,6 @@ pub fn experiment_with_next(
             if let Some(spec) = res["specification"].as_str().filter(|s| *s != "violated") {
                 println!("specification: {}", clean(spec));
             }
-            if let Some(sb) = res["sandbox"].as_str() {
-                println!("sandbox: {}", clean(sb));
-            }
             for c in res["caveats"].as_array().into_iter().flatten() {
                 println!("caveat: {}", clean(c.as_str().unwrap_or("")));
             }
@@ -1111,9 +1107,6 @@ pub fn experiment_with_next(
             "no comparison yet; next: prova exp candidate {}",
             r.experiment
         );
-    }
-    for w in &r.integrity {
-        println!("warning: {}", clean(w));
     }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).

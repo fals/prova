@@ -276,11 +276,6 @@ struct Supervisor<'a> {
     /// (once, as soon as the client is known: a wait reads it to give a
     /// stall the time it needs, ADR 0031 §4).
     container_noted: bool,
-    /// The run's working directory and start (ms since the epoch): a
-    /// container started without a name is found by what it mounts and when
-    /// it was created (round 16).
-    run_cwd: String,
-    run_started_ms: u64,
     /// Lifecycle keys of results re-keyed under another name (a Go test
     /// once its package is known): their outcome is the new key's.
     superseded: std::collections::BTreeSet<String>,
@@ -592,13 +587,11 @@ impl Supervisor<'_> {
     /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
     fn slow_budget(&self, test: &TestKey) -> (Duration, BudgetFrom) {
         let id = crate::store::test_id(&self.suite, test);
-        // The history is shared across suites (ADR 0018): a test this suite
-        // has not recorded yet may be known from another (round 9: 60 s
-        // default in `make` while `default` knew it takes 3 ms). Only the
-        // p95 is needed, and this runs once per test while recording: the
-        // full `stats` made a run with history cost milliseconds per test
-        // (issue 91).
-        match crate::analysis::usual_p95_ms(self.store, &id, &test.display()) {
+        // Only the p95 is needed, and this runs once per test while
+        // recording: the full `stats` made a run with history cost
+        // milliseconds per test (issue 91). A test this suite has not
+        // recorded yet has no history (ADR 0037).
+        match crate::analysis::usual_p95_ms(self.store, &id) {
             Ok(Some(p95)) => (
                 Duration::from_millis((p95 * 3).max(1000)),
                 BudgetFrom::History,
@@ -676,63 +669,9 @@ impl Supervisor<'_> {
         }
     }
 
-    /// The other live runs of this directory that go through a container
-    /// client, and so may own a container created after they started (ADR
-    /// 0035 §3). A run that is not one (`prova run small`), or whose
-    /// supervisor is gone, cannot own any.
-    fn live_rivals(&self) -> Vec<crate::resources::Rival> {
-        let rows: Vec<(String, i64, Option<i64>, String)> = (|| {
-            let mut stmt = self
-                .store
-                .conn()
-                .prepare(
-                    "SELECT id, started_ms, supervisor_pid, spec FROM runs
-                     WHERE id <> ?1 AND cwd = ?2 AND status = 'running' AND ended_ms IS NULL
-                       AND started_ms IS NOT NULL AND supervisor_pid IS NOT NULL",
-                )
-                .ok()?;
-            let rows = stmt
-                .query_map(rusqlite::params![self.run, self.run_cwd], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })
-                .ok()?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .ok()?;
-            Some(rows)
-        })()
-        .unwrap_or_default();
-        rows.into_iter()
-            .filter(|(_, _, pid, _)| pid.is_some_and(|p| crate::process::alive(p as u32)))
-            .filter_map(|(run, ms, _, spec)| {
-                let cmdline = serde_json::from_str::<RunSpec>(&spec)
-                    .ok()
-                    .map(|s| s.command.raw())
-                    .filter(|c| crate::resources::container_client_runs(c));
-                // A wrapper's client is only known from the note it emitted.
-                let noted = || {
-                    self.store
-                        .conn()
-                        .query_row(
-                            "SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'run_note'
-                               AND json_extract(payload, '$.message') LIKE 'the tests ran through `%'
-                             LIMIT 1",
-                            rusqlite::params![run],
-                            |_| Ok(()),
-                        )
-                        .is_ok()
-                };
-                (cmdline.is_some() || noted()).then(|| crate::resources::Rival {
-                    run,
-                    started_ms: ms.max(0) as u64,
-                    cmdline,
-                })
-            })
-            .collect()
-    }
-
     /// The run is being stopped: stopping a container client does not stop
     /// its container. A container the run named (`--name`, `--cidfile`) is
-    /// killed; any other is not attributable, so the run says to check.
+    /// killed; any other is not known, so the run says so and how to stop it.
     fn stop_container(&mut self) {
         let Some(client) = self.container else {
             return;
@@ -759,58 +698,9 @@ impl Supervisor<'_> {
                     ),
                 })
             }
-            _ if crate::resources::container_client_runs(&cmd) => {
-                let rivals = self.live_rivals();
-                let found = crate::resources::containers_of_run(
-                    client,
-                    &cmd,
-                    &self.run_cwd,
-                    self.run_started_ms,
-                    &rivals,
-                );
-                match found.as_slice() {
-                    // Another live run of this directory could own it too
-                    // (ADR 0035 §3): name it, kill nothing.
-                    [one] if one.contested() => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and the one running container that could be it ({}) could also belong to run {}, still live in this directory; if it is this run's: `{client} kill {}`",
-                            one.matched, one.rivals.join(", "), one.id
-                        ),
-                    }),
-                    [one] => {
-                        let id = &one.id;
-                        let ok = crate::resources::kill_container(client, id);
-                        let message = if ok {
-                            format!("stopped the container `{id}` with `{client} kill {id}` ({} and it was created after the run started; the `{client}` command had no --name or --cidfile)", one.matched)
-                        } else {
-                            format!("could not stop the container `{id}`: run `{client} kill {id}`")
-                        };
-                        if ok {
-                            self.emit(EventKind::RunNote { message });
-                        } else {
-                            self.emit(EventKind::RunWarning { message });
-                        }
-                    }
-                    [] => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and none could be told from the run (no --name or --cidfile; no running container of the client's image mounts this directory since the run started; a container daemon whose clock is behind this host's can also hide it); check `{client} ps` and stop it"
-                        ),
-                    }),
-                    many => self.emit(EventKind::RunWarning {
-                        message: format!(
-                            "the tests ran through `{client}`: stopping its client does not stop its container, and {} running containers could be it; stop the right one: {}",
-                            many.len(),
-                            many.iter()
-                                .map(|c| format!("`{client} kill {}`", c.id))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    }),
-                }
-            }
             _ => self.emit(EventKind::RunWarning {
                 message: format!(
-                    "the tests ran through `{client}`: stopping its client does not stop its container; check `{client} ps` and stop it"
+                    "the tests ran through `{client}`: stopping its client does not stop its container, and prova cannot tell which one is this run's, so the container may still run; stop it yourself (`{client} ps`, then `{client} kill <container>`); give the container `--name` (or `--cidfile`) and prova stops it"
                 ),
             }),
         }
@@ -998,8 +888,6 @@ pub fn supervise(store: &Store, run: &str, observer: &mut dyn Observer) -> Resul
         container: crate::resources::container_client(&spec.command.raw()),
         container_cmd: Some(spec.command.raw()),
         container_noted: false,
-        run_cwd: row.cwd.clone(),
-        run_started_ms: started_ms,
         superseded: Default::default(),
         phase: None,
         whole: None,
@@ -2517,27 +2405,9 @@ fn runner_failure_summary(line: &str) -> bool {
         || line == "[INFO] BUILD FAILURE"
 }
 
-/// Whether the tests of `run` share a test with any of `suites`: a suite
-/// that runs part of what another suite runs (0027 §6).
-fn overlaps(store: &Store, run: &str, suites: &[String]) -> Result<bool> {
-    for suite in suites {
-        let hit: bool = store.conn().query_row(
-            "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t1 ON t1.id = a.test_id
-                              JOIN tests t2 ON t2.display = t1.display
-                             WHERE a.run_id = ?1 AND t2.suite = ?2)",
-            rusqlite::params![run, suite],
-            |r| r.get(0),
-        )?;
-        if hit {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// The warning for known-flaky tests that have no result in this full run
-/// although this suite, or a suite sharing tests with it, ran them: leaving a
-/// flaky test out of the command proves nothing about it (ADR 0027 §6).
+/// The warning for known-flaky tests of this suite that have no result in
+/// this full run: leaving a flaky test out of the command proves nothing
+/// about it (ADR 0027 §6, ADR 0037: a flaky test is of one suite).
 /// Quarantined tests too: a quarantine never makes a run look better (0034).
 fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String>> {
     let ran: std::collections::BTreeSet<String> = {
@@ -2551,7 +2421,7 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         return Ok(None);
     }
     let mut left: Vec<String> = Vec::new();
-    for f in crate::analysis::flaky(store, None, 50)? {
+    for f in crate::analysis::flaky(store, Some(suite), 50)? {
         // A name recorded bare (`TestX`, text output before Go results were
         // qualified by package) is the test `pkg::TestX` this run has.
         if ran.contains(&f.display)
@@ -2560,16 +2430,7 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         {
             continue;
         }
-        // Another suite sharing tests with this one is evidence only when
-        // the flaky test's neighbours (its file, or its module) ran here: a
-        // suite that runs everything shares tests with a narrow one that
-        // never meant to run it (round 15: `small` warned about a flaky
-        // test of `medium`, because `spec` runs both).
-        if f.suites.iter().any(|s| s == suite)
-            || (overlaps(store, run, &f.suites)? && neighbour_ran(store, run, &f.display)?)
-        {
-            left.push(f.display);
-        }
+        left.push(f.display);
     }
     if left.is_empty() {
         return Ok(None);
@@ -2581,21 +2442,6 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
         if left.len() > 5 { ", ..." } else { "" }
     )))
-}
-
-/// Whether this run recorded a test of the same file (or, with no file, the
-/// same module path) as the test named `display`.
-fn neighbour_ran(store: &Store, run: &str, display: &str) -> Result<bool> {
-    Ok(store.conn().query_row(
-        "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
-                         WHERE a.run_id = ?1
-                           AND EXISTS (SELECT 1 FROM tests f WHERE f.display = ?2
-                                         AND ((f.file IS NOT NULL AND f.file = t.file)
-                                           OR (f.file IS NULL AND t.file IS NULL
-                                               AND f.path = t.path AND f.path <> '[]'))))",
-        rusqlite::params![run, display],
-        |r| r.get(0),
-    )?)
 }
 
 // ------------------------------------------------------------------ wait
@@ -3063,15 +2909,15 @@ pub fn unverified_runs(
     Ok(out)
 }
 
-/// Known flaky tests (as of the run) that passed in a finished run,
-/// quarantined ones included (ADR 0034): such a pass proves little (round 7). Read from the
+/// Known flaky tests (as of the run, in its suite) that passed in a finished
+/// run, quarantined ones included (ADR 0034): such a pass proves little (round 7). Read from the
 /// store alone; it once took a full summary of the run, whose history took
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
 fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     let passed: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
-            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+            "SELECT DISTINCT t.id FROM attempts a JOIN tests t ON t.id = a.test_id
               WHERE a.run_id = ?1 AND a.outcome = 'passed'
                 AND a.attempt = (SELECT MAX(b.attempt) FROM attempts b
                                   WHERE b.run_id = a.run_id AND b.test_id = a.test_id)
@@ -3085,8 +2931,13 @@ fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     if passed.is_empty() {
         return Ok(out);
     }
-    for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
-        if passed.contains(&f.display) && !out.contains(&f.display) {
+    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), 50, Some(&row.id))? {
+        // The same test (name and place) passed in this run.
+        if !out.contains(&f.display)
+            && crate::analysis::shared_ids(store, &f.test_id)?
+                .iter()
+                .any(|id| passed.contains(id))
+        {
             out.push(f.display);
         }
     }
@@ -3329,7 +3180,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         Vec::new()
     };
     // Quarantined tests of this run, with their result: relevant when they
-    // ran here, or their suite (or one sharing tests with this run) did.
+    // ran here, or this suite has run them before.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
     // While the run goes on, the quarantined tests with a result so far:
     // a "1 failed" that does not end a first-failure wait is explained
@@ -3355,9 +3206,8 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 .filter(|f| f.0.display() == *name && !f.0.place_unknown())
                 .filter(|f| match (f.0.place(), &q.file) {
                     (Some(p), Some(q)) => p == q,
-                    // A result of unknown place is not that place's when
-                    // the name is shared (ADR 0035 section 1).
-                    (None, Some(_)) => !q.ambiguous,
+                    // A result of unknown place is not that place's.
+                    (None, Some(_)) => false,
                     _ => true,
                 })
                 .map(|f| f.1.as_str().to_owned())
@@ -3377,14 +3227,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
-                let suites: Vec<String> = {
-                    let mut stmt = store
-                        .conn()
-                        .prepare("SELECT DISTINCT suite FROM tests WHERE display = ?1")?;
-                    stmt.query_map(rusqlite::params![name], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?
-                };
-                if !suites.contains(&row.suite) && !overlaps(store, run, &suites)? {
+                // Only this suite's own tests can be "not run" here.
+                let known: bool = store.conn().query_row(
+                    "SELECT EXISTS (SELECT 1 FROM tests WHERE display = ?1 AND suite = ?2)",
+                    rusqlite::params![name, row.suite],
+                    |r| r.get(0),
+                )?;
+                if !known {
                     continue;
                 }
             }
@@ -3829,33 +3678,6 @@ fn suite_history(store: &Store, row: &RunRow) -> Result<Option<serde_json::Value
         "same_failure_seen": same.len(),
         "same_failure_first_run": same.last().map(|r| r.id.clone()),
         "same_code_outcomes": same_code_outcomes,
-        // The same code may have passed in another suite (round 10: "none
-        // of them passed" read as a regression).
-        "passed_elsewhere": if last_passed.is_none() {
-            store
-                .conn()
-                .query_row(
-                    "SELECT id, suite FROM runs r WHERE code = ?1 AND code <> 'nogit' AND suite <> ?2
-                       AND status = 'finished' AND outcome = 'passed'
-                       AND json_extract(spec, '$.selection') IS NULL
-                       AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning')
-                       -- a suite that did not run the failing test says
-                       -- nothing about it (round 18)
-                       AND (NOT EXISTS (SELECT 1 FROM attempts fa WHERE fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored'))
-                            OR EXISTS (SELECT 1 FROM attempts pa JOIN tests pt ON pt.id = pa.test_id
-                                        JOIN tests ft ON ft.display = pt.display
-                                        JOIN attempts fa ON fa.test_id = ft.id
-                                       WHERE pa.run_id = r.id AND pa.outcome = 'passed'
-                                         AND fa.run_id = ?3 AND fa.outcome IN ('failed', 'errored')))
-                       AND r.exit_code = 0
-                     ORDER BY created_ms DESC LIMIT 1",
-                    rusqlite::params![row.code, row.suite, row.id],
-                    |r| Ok(serde_json::json!({ "run": r.get::<_, String>(0)?, "suite": r.get::<_, String>(1)? })),
-                )
-                .ok()
-        } else {
-            None
-        },
     })))
 }
 
@@ -3877,7 +3699,6 @@ mod quarantine_tests {
                         expires_ms: 1,
                         removed_ms: None,
                         file: None,
-                        ambiguous: false,
                     },
                 )
             })

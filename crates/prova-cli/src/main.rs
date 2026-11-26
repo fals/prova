@@ -588,10 +588,6 @@ struct ProtocolArgs {
     /// With --change: the candidate may change only those paths.
     #[arg(long = "change-only", requires = "scope")]
     scope_only: bool,
-    /// Let trials and the oracle use the network (by default a sandboxed
-    /// arm has only loopback).
-    #[arg(long)]
-    allow_network: bool,
 }
 
 #[derive(Subcommand)]
@@ -709,27 +705,41 @@ Example:
     },
     /// Wait for the running comparison, at most --max-wait.
     #[command(after_help = "\
-Example:
-  prova exp wait speed --max-wait 5m")]
+Examples:
+  prova exp wait speed --max-wait 5m
+  prova exp wait speed --max-wait 1h     as long as the comparison needs
+The 9 minute limit is only the foreground `exp run` budget: `exp wait` takes
+any --max-wait, so one command (in the background if your tool calls are
+short) replaces a polling loop. Exit 5 means still running: wait again.")]
     Wait {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
-        /// Wait at most this long.
+        /// Wait at most this long (any length, e.g. 1h).
         #[arg(long, value_name = "DURATION", default_value = "30s")]
         max_wait: String,
         /// JSON instead of text.
         #[arg(long)]
         json: bool,
     },
-    /// Show the experiment, latest comparison and decision log.
+    /// Show the experiment, latest comparison and decision log. Read the
+    /// frozen protocol, the verdict and its statistics from `--json`, never
+    /// from the database or the text.
     #[command(after_help = "\
-Example:
-  prova exp status speed")]
+Examples:
+  prova exp status speed
+  prova exp status speed --json
+  prova exp status speed --comparison 6ddda6cb   an older comparison
+`prova exp protocol` changes the protocol (before the first trial); it is
+not how to read it.")]
     Status {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
         name: String,
+        /// Show this comparison instead of the latest (an id from the
+        /// decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
         /// JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -749,12 +759,13 @@ Example:
   prova exp list        name, best variant, protocol hash, hypothesis")]
     List,
     /// Kept logs of what failed in the latest comparison (a trial, the
-    /// setup, the oracle).
+    /// setup, the oracle), or in the one `--comparison` names.
     #[command(after_help = "\
 Examples:
   prova exp log speed                    every kept log
   prova exp log speed oracle-candidate   one of them
-  prova exp log speed 3 --tail 20        trial 3, last 20 lines")]
+  prova exp log speed 3 --tail 20        trial 3, last 20 lines
+  prova exp log speed --comparison 6ddda6cb   an older comparison")]
     Log {
         /// Experiment name.
         #[arg(add = ArgValueCompleter::new(complete_experiments))]
@@ -764,6 +775,30 @@ Examples:
         /// Only the last N kept lines of each log.
         #[arg(long)]
         tail: Option<usize>,
+        /// Read this comparison instead of the latest (an id from the
+        /// decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
+    },
+    /// Print the evidence behind the verdicts as JSON (`prova.exp-export.v1`,
+    /// schema in schemas/exp-export.v1.json): the protocol, every
+    /// comparison with its trials (warmups and failed ones included) and
+    /// their samples, the decisions. Read-only; `partial` while a comparison
+    /// runs.
+    #[command(after_help = "\
+Examples:
+  prova exp export speed                          everything, to stdout
+  prova exp export speed --comparison 6ddda6cb --output evidence.json")]
+    Export {
+        /// Experiment name.
+        #[arg(add = ArgValueCompleter::new(complete_experiments))]
+        name: String,
+        /// Only this comparison (an id from the decision log).
+        #[arg(long, value_name = "ID")]
+        comparison: Option<String>,
+        /// Write the JSON to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
     /// Run a workload once and show the metrics prova reads from it
     /// (benchmark tools and JSON metric lines), to choose --metric.
@@ -988,7 +1023,6 @@ fn protocol_from(
         oracle: a.oracle.clone(),
         scope: a.scope.clone(),
         scope_only: a.scope_only,
-        allow_network: a.allow_network,
         kill_after_ms: parse_duration(&a.kill_after)
             .ok_or_else(|| anyhow!("invalid --kill-after"))?
             .as_millis() as u64,
@@ -1972,8 +2006,12 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             render::experiment(&r, json);
             Ok(exp_exit(&r))
         }
-        ExpCmd::Status { name, json } => {
-            let r = experiment::report(&store, &name)?;
+        ExpCmd::Status {
+            name,
+            comparison,
+            json,
+        } => {
+            let r = experiment::report_at(&store, &name, comparison.as_deref())?;
             render::experiment(&r, json);
             Ok(exp_status_exit(&r))
         }
@@ -2004,9 +2042,19 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
             println!("cancel requested for comparison {id}; it stops after the current trial");
             Ok(exit::PASSED)
         }
-        ExpCmd::Log { name, entry, tail } => {
-            let Some(c) = experiment::latest_comparison(&store, &name)? else {
-                bail!("experiment {name} has no comparison yet");
+        ExpCmd::Log {
+            name,
+            entry,
+            tail,
+            comparison,
+        } => {
+            let c = match comparison {
+                Some(id) => {
+                    experiment::check_comparison(&store, &name, &id)?;
+                    id
+                }
+                None => experiment::latest_comparison(&store, &name)?
+                    .ok_or_else(|| anyhow!("experiment {name} has no comparison yet"))?,
             };
             let kept = prova_core::output::comparison_excerpts(&store, &c)?;
             let shown: Vec<_> = kept
@@ -2032,6 +2080,22 @@ fn exp(cmd: ExpCmd) -> Result<u8> {
                     continue;
                 }
                 print!("{}", e.render());
+            }
+            Ok(exit::PASSED)
+        }
+        ExpCmd::Export {
+            name,
+            comparison,
+            output,
+        } => {
+            let x = prova_core::exp_export::export(&store, &name, comparison.as_deref())?;
+            let text = serde_json::to_string_pretty(&x)?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, format!("{text}\n"))?;
+                    println!("wrote {}", path.display());
+                }
+                None => println!("{text}"),
             }
             Ok(exit::PASSED)
         }
@@ -2977,34 +3041,6 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     .into());
                 }
             }
-            // One name in several places (two crates' `tests::flaky`) is
-            // several tests: each one's history, with its place.
-            if in_place.is_none() {
-                let mut by_place: std::collections::BTreeMap<String, Vec<_>> = Default::default();
-                for t in found
-                    .iter()
-                    .filter(|t| t.1 == test || found.iter().all(|f| f.1 == t.1))
-                {
-                    if let Some((Some(file), _)) = analysis::place_of_test(&store, &t.0)?
-                        && !file.starts_with("(package pending)")
-                    {
-                        by_place.entry(file).or_default().push(t.clone());
-                    }
-                }
-                if by_place.len() > 1 {
-                    for (i, group) in by_place.values().enumerate() {
-                        if i > 0 {
-                            println!();
-                        }
-                        let id = analysis::most_recent(&store, group)?;
-                        match analysis::stats(&store, &id, window)? {
-                            Some(s) => render::test_stats(&s, json),
-                            None => bail!("test disappeared"),
-                        }
-                    }
-                    return Ok(exit::PASSED);
-                }
-            }
             // Exact names win over partial ones (round 10: 16 matches for a
             // name that is exact in every suite, next to an old renamed one).
             // A name that is exact only in its last part (`TestMod` for
@@ -3025,65 +3061,122 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     found
                 }
             };
-            let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
-            // Same name in several suites: take the one that ran most recently.
-            let displays: std::collections::BTreeSet<&str> =
-                found.iter().map(|t| t.1.as_str()).collect();
-            let pick = match (exact.as_slice(), found.as_slice()) {
-                ([one], _) => one.0.clone(),
-                ([], [one]) => one.0.clone(),
-                (_, [_, ..]) if displays.len() == 1 => analysis::most_recent(&store, &found)?,
-                // Several names, one test: they share one history (round 6).
-                (_, [first, ..])
-                    if {
-                        let shared = analysis::shared_ids(&store, &first.0)?;
-                        found.iter().all(|f| shared.contains(&f.0))
-                    } =>
-                {
-                    analysis::most_recent(&store, &found)?
-                }
-                (_, []) => {
-                    return Err(UsageError(format!(
-                        "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
-                    ))
-                    .into());
-                }
-                _ => {
-                    // One line per name, its suites together: a name listed
-                    // once per suite read as tests no name could tell apart
-                    // (round 15).
-                    let names = analysis::Names::new(&store);
-                    let mut by_name: std::collections::BTreeMap<String, Vec<&str>> =
-                        Default::default();
-                    for (id, display, suite) in &found {
-                        let file = analysis::place_of_test(&store, id)?.and_then(|p| p.0);
-                        by_name
-                            .entry(names.name(display, file.as_deref()))
-                            .or_default()
-                            .push(suite);
-                    }
-                    // An empty name asks for the list (as the help says).
-                    if test.is_empty() {
-                        println!("{} tests prova knows:", by_name.len());
-                    } else {
-                        println!("{} tests match {test:?}; be more specific:", by_name.len());
-                    }
-                    for (display, suites) in by_name.iter().take(20) {
-                        println!("  {display}  (suite {})", suites.join(", "));
-                    }
-                    if by_name.len() > 20 {
-                        println!("  ... and {} more", by_name.len() - 20);
-                    }
-                    return Ok(if test.is_empty() {
-                        exit::PASSED
-                    } else {
-                        exit::USAGE
-                    });
-                }
+            if found.is_empty() {
+                return Err(UsageError(format!(
+                    "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                ))
+                .into());
+            }
+            // History is per suite (ADR 0037): one entry per suite that
+            // knows the test. Within a suite, one name in several places
+            // (two crates' `tests::flaky`) is several tests, each with its
+            // place; a bare and a qualified name of one test are one.
+            let mut by_suite: std::collections::BTreeMap<&str, Vec<&(String, String, String)>> =
+                Default::default();
+            for t in &found {
+                by_suite.entry(t.2.as_str()).or_default().push(t);
+            }
+            let mut picks: Vec<(String, String)> = Vec::new();
+            let display_of = |id: &str| {
+                found
+                    .iter()
+                    .find(|t| t.0 == id)
+                    .map(|t| t.1.clone())
+                    .unwrap_or_default()
             };
-            match analysis::stats_in_suite(&store, &pick, window, suite.as_deref())? {
-                Some(s) => render::test_stats(&s, json),
-                None => bail!("test disappeared"),
+            let mut ambiguous = false;
+            for group in by_suite.values() {
+                let group: Vec<(String, String, String)> =
+                    group.iter().map(|t| (*t).clone()).collect();
+                let mut by_place: std::collections::BTreeMap<
+                    String,
+                    Vec<(String, String, String)>,
+                > = Default::default();
+                let mut unknown: Vec<(String, String, String)> = Vec::new();
+                for t in &group {
+                    match analysis::place_of_test(&store, &t.0)? {
+                        Some((Some(file), _)) if !file.starts_with("(package pending)") => {
+                            by_place.entry(file).or_default().push(t.clone());
+                        }
+                        _ => unknown.push(t.clone()),
+                    }
+                }
+                // Tests of unknown place are one more place beside the known
+                // ones (a quiet `cargo test` next to a crate's `tests::x`).
+                if !by_place.is_empty() && !unknown.is_empty() {
+                    by_place.insert("unknown place".to_owned(), unknown);
+                }
+                let displays: std::collections::BTreeSet<&str> =
+                    group.iter().map(|t| t.1.as_str()).collect();
+                if by_place.len() > 1 && displays.len() == 1 {
+                    for places in by_place.values() {
+                        let id = analysis::most_recent(&store, places)?;
+                        picks.push((display_of(&id), id));
+                    }
+                } else if group.len() == 1 || displays.len() == 1 {
+                    let id = analysis::most_recent(&store, &group)?;
+                    picks.push((display_of(&id), id));
+                } else {
+                    // Several names, one test: they share one history (round 6).
+                    let shared = analysis::shared_ids(&store, &group[0].0)?;
+                    if group.iter().all(|f| shared.contains(&f.0)) {
+                        let id = analysis::most_recent(&store, &group)?;
+                        picks.push((display_of(&id), id));
+                    } else {
+                        ambiguous = true;
+                    }
+                }
+            }
+            // Suites keep their own history: different names are different
+            // tests, whichever suite knows them.
+            ambiguous |= picks.iter().any(|(d, _)| *d != picks[0].0);
+            if ambiguous {
+                // One line per name, its suites together: a name listed
+                // once per suite read as tests no name could tell apart
+                // (round 15).
+                let names = analysis::Names::new(&store);
+                let mut by_name: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+                for (id, display, suite) in &found {
+                    let file = analysis::place_of_test(&store, id)?.and_then(|p| p.0);
+                    by_name
+                        .entry(names.name(display, file.as_deref()))
+                        .or_default()
+                        .push(suite);
+                }
+                // An empty name asks for the list (as the help says).
+                if test.is_empty() {
+                    println!("{} tests prova knows:", by_name.len());
+                } else {
+                    println!("{} tests match {test:?}; be more specific:", by_name.len());
+                }
+                for (display, suites) in by_name.iter().take(20) {
+                    println!("  {display}  (suite {})", suites.join(", "));
+                }
+                if by_name.len() > 20 {
+                    println!("  ... and {} more", by_name.len() - 20);
+                }
+                return Ok(if test.is_empty() {
+                    exit::PASSED
+                } else {
+                    exit::USAGE
+                });
+            }
+            let mut all = Vec::new();
+            for (_, pick) in &picks {
+                match analysis::stats(&store, pick, window)? {
+                    Some(s) => all.push(s),
+                    None => bail!("test disappeared"),
+                }
+            }
+            if json {
+                // One array, one entry per suite, whatever their number.
+                println!("{}", serde_json::to_string(&all)?);
+            }
+            for (i, s) in all.iter().enumerate().filter(|_| !json) {
+                if i > 0 {
+                    println!();
+                }
+                render::test_stats(s);
             }
             // The exact match was shown: say what else the name matches
             // instead of hiding it (round 18: `flaky_clock` showed the
@@ -3157,7 +3250,13 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 // Columns named, and a quarantine shown (round 16).
                 let quarantined = prova_core::quarantine::in_force_at(&store, now_ms())?;
                 println!("fail%   retry-passes  code versions flipped  test");
-                for s in &list {
+                let labels = render::suite_labels(list.iter().map(|s| {
+                    (
+                        render::named(&s.display, s.place.as_deref()),
+                        s.suite.as_str(),
+                    )
+                }));
+                for (s, label) in list.iter().zip(labels) {
                     let covered = std::iter::once(&s.display).chain(&s.aliases).any(|n| {
                         let key = format!("{}\u{1f}{n}", s.place.as_deref().unwrap_or(""));
                         prova_core::quarantine::covers_key(&quarantined, &key).is_some()
@@ -3168,7 +3267,7 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                         s.failure_rate * 100.0,
                         s.passed_on_retry,
                         s.flips_on_same_code,
-                        render::named(&s.display, s.place.as_deref())
+                        label
                     );
                 }
             }
@@ -3604,8 +3703,9 @@ fn repeat_runs(
         }
         // A known flaky test that passed every time here proves little
         // (round 9: "every test passed every time" for a 22% flake).
-        for f in analysis::flaky(store, None, 50)? {
-            if let Some((p, 0)) = tally.get(&f.display)
+        let names = analysis::Names::new(store);
+        for f in analysis::flaky(store, Some(&request.suite), 50)? {
+            if let Some((p, 0)) = tally.get(&names.name(&f.display, f.place.as_deref()))
                 && *p > 0
             {
                 println!(

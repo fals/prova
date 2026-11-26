@@ -126,6 +126,11 @@ pub struct TestKey {
 /// another's of the same id (ADR 0031 section 2).
 pub const UNKNOWN_PLACE: &str = "(unknown directory)";
 
+/// Start of the `file` of a name whose results one run printed several times
+/// with no place to tell them apart: one result for the run, with a suffix
+/// of its own, so no other run's history is ever its history.
+pub const AMBIGUOUS_PLACE: &str = "(ambiguous in this run";
+
 impl TestKey {
     pub fn new(path: Vec<String>, name: impl Into<String>) -> TestKey {
         TestKey {
@@ -150,7 +155,10 @@ impl TestKey {
     /// in the name already.
     pub fn place(&self) -> Option<&str> {
         self.file.as_deref().filter(|f| {
-            !f.is_empty() && !f.starts_with("(package pending)") && !f.starts_with(UNKNOWN_PLACE)
+            !f.is_empty()
+                && !f.starts_with("(package pending)")
+                && !f.starts_with(UNKNOWN_PLACE)
+                && !f.starts_with(AMBIGUOUS_PLACE)
         })
     }
 

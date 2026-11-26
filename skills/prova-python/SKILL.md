@@ -33,14 +33,23 @@ Then:
   template has its own paths (`pytest tests/ -k {filter}`), those paths are
   collected as well and `-k` alone selects. Keep `-k {filter}` in the
   template; prova does the rest.
+- A test's place is the `rootdir:` line pytest prints (`-v`, or without
+  `-q`), relative to the repository. Run pytest from the project directory,
+  with no nested `cd` below the ini file. With `-q`, or pytest in a container
+  (its rootdir is a container path), the place is the directory the run
+  started in, or unknown; tests of unknown place keep a history only with
+  other runs of unknown place in the suite, and no quarantine covers them.
+  Prefer `-v`, so two directories' `test_calc.py::t` stay apart.
 - Use the project's virtualenv: `run = ".venv/bin/python -m pytest -v -rfE"`.
 - Fail fast in the fix loop: add `-x` to `select`.
 - Sizes are what a test uses, not how long it takes: a test that starts
   a server, a database or a subprocess, or opens a socket, is medium (large
   if it reaches another host). Mark those (`@pytest.mark.medium`) and run
   them as a separate suite with `-m medium`; a slow pure test stays small.
-- Through a wrapper (`./dev`, `docker compose run`, `nix develop -c`): prova
-  keeps the wrapper of your earlier runs in what `prova adopt` proposes. A
+- Through a wrapper (`./dev`, `docker compose run`, `nix develop -c`): when
+  your earlier run's command itself was the container client (`prova run --
+  docker run ... pytest`), `prova adopt` keeps that wrapper in what it
+  proposes; a wrapper hidden in a script is not seen. A
   wrapper that re-splits its arguments (`$*`) breaks a filter with spaces
   (`test_x[negative 2/-4]`): select with a `-k` substring that has none, or
   run the wrapper with the whole command as one quoted argument (`./dev
@@ -52,10 +61,10 @@ Then:
   run in a container are out of sight: their size is "unknown (ran through
   docker)" unless the suite declares it (`size = "small"` under
   `[suite.<name>]`), and then it reads "small (declared; out of sight)".
-  `prova cancel` stops the container named by `--name` or `--cidfile`, or the
-  one running container that mounts the working directory and was created
-  after the run started; if several qualify it prints their `docker kill`
-  commands. A container is not called stalled before 60 s of idle host
+  `prova cancel` stops the container named by `--name` or `--cidfile`; for any
+  other it kills nothing and says the container may still run (`docker ps`,
+  then `docker kill`): give it `--name` so prova stops it. A container is not
+  called stalled before 60 s of idle host
   processes: prova sees only its output.
 - pytest exit 4 with no test result (a selection or option it rejected) is
   not a test failure: prova reports it as errored and exits 4. `pytest-xdist` verbose lines (`[gw0] [ 33%] FAILED ...`) are read.

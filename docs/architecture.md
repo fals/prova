@@ -64,7 +64,7 @@ other command reads and writes the same store directly.
 | Home and identity | `crates/prova-core/src/home.rs`, `identity.rs` | where data lives, repository identity, code identity, run origin |
 | Output | `crates/prova-core/src/output.rs` | distilling a run's output into SQLite at its end; the 64 MB budget per repository |
 | Analysis | `crates/prova-core/src/analysis.rs` | history, flake statistics, run diffs, observed sizes |
-| Experiments | `crates/prova-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, checkouts, the bubblewrap sandbox for arms, trials, Mann-Whitney + Hodges-Lehmann verdicts; one hidden `prova __exp` worker per comparison |
+| Experiments | `crates/prova-core/src/experiment.rs`, `stats.rs`, `spec/experiment.qnt` | protocol, checkouts, trials, Mann-Whitney + Hodges-Lehmann verdicts, the evidence export (`exp_export.rs`); one hidden `prova __exp` worker per comparison |
 | Adapters | `crates/prova-adapters/src/` | recognizing live output, JUnit/TRX parsing, `prova adopt` detection (`adopt.rs`), opt-in injection recipes (`inject.rs`), benchmark metrics (`bench.rs`) |
 | CLI | `crates/prova-cli/src/main.rs`, `render.rs` | commands, exit codes, compact output |
 | MCP facade | `crates/prova-cli/src/mcp.rs` | five tools that call the CLI with `--json` |
@@ -144,7 +144,7 @@ flowchart BT
 - Live levels (2, 3) give the first failure while the run is still going.
 - Result files (1) fill in tests the live output did not show, and never double count.
 - When the framework's own totals exceed what prova saw (quiet output), the summary says so.
-- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command), `go-nocache`, `gotestsum-json` (gotestsum's event stream).
+- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command; no code runs in the test workers, so early failures arrive at Vitest's own reporting cadence), `go-nocache`, `gotestsum-json` (gotestsum's event stream).
 - Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output; their results become rows, and the file is not kept ([ADR 0016](adr/0016-distilled-output-no-log-files.md)).
 
 ## Liveness: slow, stalled, killed
@@ -236,7 +236,7 @@ like secrets are left out. Each failure in a summary carries context:
 
 | Tag | Meaning |
 |---|---|
-| `first time seen: no history yet` | no earlier result for this test anywhere |
+| `first time seen: no history yet` | no earlier result for this test in this suite |
 | `new failure` | its earlier results all passed |
 | `failed 3x before` | a known, pre-existing failure, whatever its message |
 | `has not passed yet` | earlier results exist, but none passed |
@@ -250,7 +250,7 @@ like secrets are left out. Each failure in a summary carries context:
 `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes` and
 `prova slowest` (p50 and p95 per test, worst first) read the same data; history
 also shows the test's size and why. A run that leaves a known-flaky test out
-(an exclude filter, a narrower suite sharing tests with the one that ran it)
+(an exclude filter, or a selection that leaves it out of its own suite)
 warns that it did not run and is unverified.
 
 `prova quarantine add <test> --reason ...` marks a known-flaky test
@@ -284,7 +284,7 @@ stateDiagram-v2
     Running --> Reject: worse, no practical effect, or guardrail regressed
     Running --> Invalid: trials on different machines
     Running --> Failed: a trial crashed, leaked a process or changed tracked files
-    Running --> Failed: load or a stop hit one arm, a variant drifted, metric counts differ
+    Running --> Failed: metric counts differ
     Accept --> [*]: candidate becomes the new best if it beats the current best
     Reject --> [*]
     Invalid --> [*]
@@ -292,7 +292,7 @@ stateDiagram-v2
 ```
 
 - **Scope.** By default a candidate may change anything but tests,
-  benchmarks, build and runner files. `--change <glob>` allows more paths;
+  benchmarks, build files and expected data. `--change <glob>` allows more paths;
   `--change-only` allows only those. A candidate out of scope is rejected
   before it is measured.
 - **Specification.** The candidate is rejected when its oracle fails a test
@@ -301,17 +301,17 @@ stateDiagram-v2
 - **Trials** run in pairs, and the pairs alternate which arm goes first
   (ABBA), so a drift within a pair does not favour one arm.
 - **Failed** covers a trial that crashed or left a process running, a trial
-  that changed tracked files, load from outside aimed at one arm, an arm
-  that was stopped or starved, a variant whose median drifted far from its
-  own history, and a workload that reported the metric a different number of
-  times per trial on each arm.
+  that changed tracked files, and a workload that reported the metric a
+  different number of times per trial on each arm.
 - **Accept.** The candidate becomes the new best only when it beats the
   current best; with `--against baseline` the best stays.
 
-A verdict says what it rests on: a `sandbox:` line (isolated or not), `caveat:`
-lines, and `specification: holds ...` (the same tests passed on each arm, or
-by exit code only). `prova exp status` re-derives every ACCEPT from its
-samples and warns when one no longer follows from them.
+A verdict says what it rests on: `caveat:` lines, and `specification:
+holds ...` (the same tests passed on each arm, or by exit code only).
+`prova exp export <exp>` prints the evidence behind it (`prova.exp-export.v1`,
+`schemas/exp-export.v1.json`): every comparison, trial (warmups and failed
+ones included) and sample, read-only, `partial` while a comparison runs;
+`exp log` and `exp status` take `--comparison <id>` for an older comparison.
 
 Every arm runs in its own detached worktree. A baseline is a git ref; a
 candidate is a snapshot commit of the working tree (tracked and untracked
@@ -320,25 +320,19 @@ so the user's branch, index and stash are untouched, and kept alive by
 `refs/prova/candidates/<experiment>/<label>`. What is measured is what was
 recorded, however the tree changes afterwards (`spec/experiment.qnt`,
 `measuredIsRecorded`). Files ignored by git are absent from worktrees: use the
-protocol's `--setup` to rebuild them. Each checkout is verified against the
-commit's own blobs: git replace objects are ignored, and a smudge filter that
-changes what runs is detected and refused.
+protocol's `--setup` to rebuild them.
 
-Arms are isolated from each other and from the user's files:
+Experiments defend against honest mistakes, not adversaries (ADR 0037): the
+arms run as the user, in their own checkouts, with the session's
+environment, and nothing is sandboxed.
 
-- When bubblewrap works, every trial, setup and oracle runs in a sandbox:
-  the whole filesystem read-only, shared toolchain caches included; the
-  arm's checkout, its private state directory and a private `/tmp` writable;
-  its own PID namespace; no network but loopback unless `--allow-network`
-  (setup keeps the network). Otherwise the verdict says the arms were not
-  isolated.
-- Each arm has its own build caches (`GOCACHE`, the XDG cache, npm's cache,
-  Python bytecode), and environment variables with secret-like names are
-  removed.
-- Tracked files in the checkouts are read-only, and re-checked after each
-  oracle run and each trial.
+- Each arm has its own build caches (`GOCACHE`, the XDG cache, npm's cache);
+  trials do not see `PROVA_HOME` or Python's user site.
+- Tracked files in the checkouts are re-checked after each oracle run and
+  each trial.
 - A foreground `prova exp run` waits at most 9 min, then prints the
-  `prova exp wait` command that continues.
+  `prova exp wait` command that continues; `prova exp wait --max-wait 1h`
+  takes any length.
 
 Statistics:
 exact Mann-Whitney U, Hodges-Lehmann interval, Holm correction across an
@@ -450,8 +444,8 @@ These are stable interfaces; changing them is a breaking change.
 | `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes`, `prova slowest [-n N]` | memory |
 | `prova quarantine add <test> --reason <text> [--days N]` / `list` / `remove <test>` | mark known-flaky tests, in the open (their failures still fail the run) |
 | `prova forget <run> --reason <text>` | take a run out of every test's history |
-| `prova exp new [--change <glob>] [--change-only] [--allow-network] ...` | declare an experiment |
-| `prova exp protocol\|candidate\|cancel\|list\|log\|metrics\|best\|revalidate\|wait\|status` | experiments |
+| `prova exp new [--change <glob>] [--change-only] ...` | declare an experiment |
+| `prova exp protocol\|candidate\|cancel\|list\|log\|export\|metrics\|best\|revalidate\|wait\|status` | experiments |
 | `prova exp run <exp> [--candidate <c>] [--against <variant>] [--detach]` | trials and a verdict |
 | `prova init`, `prova adopt [--write] [--verify <suite> --filter <test>]` | adoption |
 | `prova mcp` | MCP tools `run_start`, `run_wait`, `run_status`, `run_cancel`, `test_history` |
@@ -475,9 +469,9 @@ These are stable interfaces; changing them is a breaking change.
 Experiment commands: 0 accept (or no comparison yet), 1 reject, inconclusive
 or invalid, 3 cancelled, 4 failed, 5 still running.
 
-**History is per test, not per suite.** The same test (same file and full
-name) run by different suites shares one history; only runs that finished
-count. Runs with a warning ending "no evidence about the tests", and runs
+**History is per suite and test.** The same test run by different suites
+(or an ad hoc command) has one history in each, never a shared one (ADR
+0037); only runs that finished count. Runs with a warning ending "no evidence about the tests", and runs
 taken out with `prova forget`, count nowhere. Labels are listed under
 [Memory](#memory-history-and-flaky-tests). Rust test binaries are named by
 target, whichever runner reports them (cargo, nextest).

@@ -30,14 +30,20 @@ pub struct Recognizers {
     /// The repository root: names are read relative to it, whatever
     /// directory the run started in (ADR 0035 section 1).
     pub repo_root: Option<std::path::PathBuf>,
-    /// pytest's rootdir as its header printed it (`-q` prints none).
-    pytest_root: Option<std::path::PathBuf>,
-    /// The run's command line: a `cd` in it moves pytest, whose ids are
-    /// relative to the directory it runs in.
-    pub command: Option<String>,
-    /// Where pytest ran, as a path below the working directory (`sub2`):
-    /// put before its ids. Settled on the first id.
-    pytest_dir: std::cell::OnceCell<PytestDir>,
+    /// Where the last `rootdir:` header put pytest's ids (`-q` prints none):
+    /// each header starts its own session, so each is read on its own.
+    pytest_dir: PytestDir,
+    /// A pytest id was named, and one of them in an unknown place.
+    pytest_named: std::cell::Cell<bool>,
+    pytest_unknown: std::cell::Cell<bool>,
+    /// A `rootdir:` header was read; without one (`--no-header`, `-q`) the
+    /// place of a pytest id is only the start directory, a fallback.
+    pytest_rootdir_seen: bool,
+    /// Ids were named with no rootdir read: the place is that fallback.
+    pytest_unrooted: std::cell::Cell<bool>,
+    /// libtest results were read with no test binary named (quiet `cargo
+    /// test`): their names have no place.
+    libtest_unplaced: std::cell::Cell<bool>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
     /// failures it listed, and how many runs `--rerun-fails` made. A
     /// package green on its last run after failures means its failed tests
@@ -173,6 +179,9 @@ pub struct Recognizers {
     /// test itself (a pass or a failure plus an error): unique key -> the
     /// test had failed before the error. Tests, not report lines.
     pytest_doubles: BTreeMap<String, bool>,
+    /// Names printed with several different results and no place to tell
+    /// them apart (unique key -> the one result recorded for the run).
+    ambiguous: BTreeMap<String, Ambiguous>,
     /// pytest `XPASS`: tests expected to fail that passed (non-strict).
     pub pytest_xpass: Vec<String>,
     /// pytest's FAILURES / ERRORS section is being read: its blocks
@@ -260,6 +269,27 @@ pub struct Recognizers {
 
 /// A rerun test: its key, its section, and its attempts so far.
 type SurefireRerun = (TestKey, SurefireSection, Vec<(Outcome, Option<String>)>);
+
+/// The one result of a name whose results cannot be told apart: failed
+/// because one of them failed.
+struct Ambiguous {
+    /// The key it is recorded under (a place of its own to this run).
+    key: TestKey,
+    results: u64,
+    failed: u64,
+}
+
+/// A place no result of another run shares: the name is ambiguous in this run only.
+fn ambiguous_place() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!(
+        "{}, #{:06x})",
+        prova_core::model::AMBIGUOUS_PLACE,
+        (nanos ^ std::process::id()) & 0xff_ffff
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SurefireSection {
@@ -544,6 +574,29 @@ impl Recognizers {
         if let Some(n) = self.reruns.remove(&d) {
             return self.attempt_result(key, n + 1, outcome, duration_ms, message, level, out);
         }
+        // Results of one name with no place to tell them apart (quiet
+        // `cargo test`, pytest from several directories): one result for the
+        // run, failed if any failed, and no place of any other run's.
+        let unplaced = key.place_unknown()
+            || (key.file.is_none() && (self.libtest_unplaced.get() || self.pytest_unrooted.get()));
+        if unplaced && let Some(a) = self.ambiguous.get_mut(&d) {
+            a.results += 1;
+            self.repeats += 1;
+            if outcome.is_failure() {
+                a.failed += 1;
+                if let Some(m) = message {
+                    self.failure_fallback.push((a.key.clone(), m));
+                }
+            }
+            return;
+        }
+        if unplaced
+            && let Some((_, before)) = self.seen.get(&d)
+            && before.is_failure() != outcome.is_failure()
+        {
+            let before = *before;
+            return self.ambiguate(d, before, key, outcome, duration_ms, message, level, out);
+        }
         if let Some((_, before)) = self.seen.get(&d) {
             // A different result under the same name is another test (two
             // test binaries both with `tests::it_works`, round 12): keep it,
@@ -590,6 +643,81 @@ impl Recognizers {
             subtest,
             passed_in_iteration: false,
         });
+    }
+
+    /// A pass and a failure under one name with no place to tell them apart:
+    /// the name's one result for this run is the failure (never hidden behind
+    /// the pass), under a place no other run shares. The result already
+    /// recorded is superseded, so it is no history of any test.
+    #[allow(clippy::too_many_arguments)]
+    fn ambiguate(
+        &mut self,
+        d: String,
+        before: Outcome,
+        key: TestKey,
+        outcome: Outcome,
+        duration_ms: Option<u64>,
+        message: Option<String>,
+        level: Level,
+        out: &mut Vec<EventKind>,
+    ) {
+        let first = self
+            .seen_keys
+            .get(&d)
+            .cloned()
+            .unwrap_or_else(|| key.clone());
+        let mut one = first.clone();
+        one.file = Some(ambiguous_place());
+        let failure = if outcome.is_failure() {
+            outcome
+        } else {
+            before
+        };
+        for (k, _) in self
+            .failure_fallback
+            .iter_mut()
+            .chain(self.failure_output.iter_mut())
+        {
+            if *k == first {
+                *k = one.clone();
+            }
+        }
+        if outcome.is_failure()
+            && let Some(m) = &message
+        {
+            self.failure_fallback.push((one.clone(), m.clone()));
+        }
+        out.push(EventKind::TestFinished {
+            test: one.clone(),
+            attempt: 1,
+            outcome: failure,
+            duration_ms: if outcome.is_failure() {
+                duration_ms
+            } else {
+                None
+            },
+            message: if outcome.is_failure() { message } else { None },
+            source: level,
+            subtest: false,
+            passed_in_iteration: false,
+        });
+        // After the result it is replaced by: the store links the two.
+        out.push(EventKind::TestSuperseded {
+            test: first,
+            by: one.clone(),
+        });
+        lift(&mut self.level, level);
+        self.repeats += 1;
+        self.seen.insert(d.clone(), (one.display(), failure));
+        self.seen_keys.insert(d.clone(), one.clone());
+        self.ambiguous.insert(
+            d,
+            Ambiguous {
+                key: one,
+                results: 2,
+                failed: 1,
+            },
+        );
     }
 
     /// Framework summary lines: "test result: ok. 4 passed; 1 failed; 0 ignored"
@@ -890,6 +1018,20 @@ impl Recognizers {
         if self.no_tests_line.is_none() && PHRASES.iter().any(|p| t.contains(p)) {
             self.no_tests_line = Some(t.chars().take(200).collect());
         }
+    }
+
+    /// Names printed several times with no place to tell the results apart,
+    /// with how many results were counted (ADR 0037 section 2).
+    pub fn ambiguous_names(&self) -> Vec<(String, u64)> {
+        self.ambiguous
+            .values()
+            .map(|a| (a.key.display(), a.results))
+            .collect()
+    }
+
+    /// Failures beyond the one each ambiguous name records.
+    pub fn ambiguous_extra_failed(&self) -> u64 {
+        self.ambiguous.values().map(|a| a.failed - 1).sum()
     }
 
     /// Tests that errored in teardown after a failure, and after a pass:
@@ -1207,160 +1349,48 @@ impl Recognizers {
         }
     }
 
-    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header.
+    /// pytest's `rootdir: /abs/dir[, configfile: ...]` header. Its ids are
+    /// relative to the directory pytest ran in, which the output does not
+    /// print: the run's start directory, unless the rootdir lies below it
+    /// and the ids do not carry it (`cd a && pytest`), then the rootdir.
+    /// A rootdir outside the repository (a path inside a container) leaves
+    /// the place unknown, unless it holds the repository (a `prova.toml` in
+    /// a subproject).
     fn pytest_rootdir(&mut self, header: &str) {
+        self.pytest_rootdir_seen = true;
         let dir = header.split(", ").next().unwrap_or(header).trim();
-        self.pytest_root = Some(std::path::PathBuf::from(dir));
-    }
-
-    /// Where pytest ran. The terminal ids of pytest are relative to the
-    /// directory it runs in, not to its rootdir (`cwd_relative_nodeid`), and
-    /// `-q` prints no rootdir: the directory is the one that holds the id's
-    /// file. Without a `cd` in the command that is the working directory;
-    /// with one, its target; then the rootdir; then any directory below.
-    /// When these cannot tell, the place is unknown and said so.
-    fn pytest_dir(&self, id: &str) -> &PytestDir {
-        self.pytest_dir.get_or_init(|| {
-            let Some(cwd) = &self.cwd else {
-                return PytestDir::Prefix(String::new());
-            };
-            let file = id.split("::").next().unwrap_or(id);
-            // Either path may run through a symlink (macOS `/var` is
-            // `/private/var`): compare them resolved.
-            let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            let base = canon(cwd);
-            let has = |dir: &std::path::Path| dir.join(file).is_file();
-            let rel = |dir: &std::path::Path| {
-                canon(dir)
-                    .strip_prefix(&base)
-                    .ok()
-                    .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
-            };
-            // Through a container client the directory pytest ran in is the
-            // container's: the client's mount maps it under the repository.
-            if let Some(dir) = self.container_dir()
-                && has(&dir)
-                && let Some(p) = rel(&dir)
-            {
-                return PytestDir::Prefix(p);
-            }
-            let moved: Vec<String> = self
-                .command
-                .as_deref()
-                .map(cd_targets)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|t| {
-                    let dir = base.join(t);
-                    (dir.is_dir() && has(&dir)).then(|| rel(&dir)).flatten()
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            match moved.as_slice() {
-                [one] => return PytestDir::Prefix(one.clone()),
-                [] => {}
-                _ => return PytestDir::Unknown,
-            }
-            if has(&base) {
-                return PytestDir::Prefix(String::new());
-            }
-            if let Some(p) = self.pytest_root.as_deref().filter(|r| has(r)).and_then(rel) {
-                return PytestDir::Prefix(p);
-            }
-            let below = dirs_holding(&base, file);
-            match below.as_slice() {
-                [one] => return PytestDir::Prefix(rel(one).unwrap_or_default()),
-                [] => {}
-                _ => return PytestDir::Unknown,
-            }
-            // Nothing on disk to check (a container, another machine): the
-            // rootdir below the working directory, as before.
-            PytestDir::Prefix(
-                self.pytest_root
-                    .as_deref()
-                    .and_then(rel)
-                    .unwrap_or_default(),
-            )
-        })
-    }
-
-    /// The host directory a container client's `-w`/pytest's rootdir names:
-    /// the container path under one of the `-v host:container` mounts (or
-    /// `--mount src=..,dst=..`) of the command.
-    fn container_dir(&self) -> Option<std::path::PathBuf> {
-        let cwd = self.cwd.as_ref()?;
-        let cmd = self.command.as_deref()?;
-        // Words without their quotes: `-v "$PWD":/w` is `-v $PWD:/w`.
-        let all: Vec<String> = cmd
-            .split_whitespace()
-            .map(|w| {
-                w.chars()
-                    .filter(|c| *c != '"' && *c != '\'')
-                    .collect::<String>()
-            })
-            .filter(|w| !w.is_empty())
-            .collect();
-        // Only the client's own options count (`docker run ... IMAGE`):
-        // pytest's `-v` after the image is not a volume.
-        let words: Vec<&str> = docker_options(&all);
-        let host_of = |h: &str| {
-            let h = h
-                .replace("${PWD}", &cwd.to_string_lossy())
-                .replace("$PWD", &cwd.to_string_lossy())
-                .replace("$(pwd)", &cwd.to_string_lossy());
-            let p = std::path::PathBuf::from(&h);
-            if p.is_absolute() { p } else { cwd.join(p) }
+        let (Some(cwd), Some(repo)) = (self.cwd.as_ref(), self.repo_root.as_ref()) else {
+            self.pytest_dir = PytestDir::Start;
+            return;
         };
-        let mut mounts: Vec<(std::path::PathBuf, String)> = Vec::new();
-        let mut workdir: Option<String> = None;
-        for (i, w) in words.iter().enumerate() {
-            let next = words.get(i + 1).copied();
-            match *w {
-                "-v" | "--volume" => {
-                    if let Some((h, rest)) = next.and_then(|n| n.split_once(':')) {
-                        let c = rest.split(':').next().unwrap_or(rest);
-                        mounts.push((host_of(h), c.to_owned()));
-                    }
-                }
-                "-w" | "--workdir" => workdir = next.map(str::to_owned),
-                "--mount" => {
-                    let kv = |k: &[&str]| {
-                        next?.split(',').find_map(|p| {
-                            let (a, b) = p.split_once('=')?;
-                            k.contains(&a).then(|| b.to_owned())
-                        })
-                    };
-                    if let (Some(h), Some(c)) = (kv(&["src", "source"]), kv(&["dst", "target"])) {
-                        mounts.push((host_of(&h), c));
-                    }
-                }
-                other => {
-                    if let Some(v) = other
-                        .strip_prefix("--workdir=")
-                        .or_else(|| other.strip_prefix("-w="))
-                    {
-                        workdir = Some(v.to_owned());
-                    }
-                }
+        // Either path may run through a symlink (macOS `/var` is
+        // `/private/var`): compare them resolved.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let (root, cwd, repo) = (canon(std::path::Path::new(dir)), canon(cwd), canon(repo));
+        let rel = |p: &std::path::Path, base: &std::path::Path| {
+            p.strip_prefix(base)
+                .ok()
+                .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
+        };
+        self.pytest_dir = if let Some(in_repo) = rel(&root, &repo) {
+            match rel(&root, &cwd) {
+                Some(below) if !below.is_empty() => PytestDir::Below {
+                    from_start: below,
+                    from_repo: in_repo,
+                },
+                // The run's start directory, or a directory above it.
+                _ if cwd.starts_with(&root) => PytestDir::Start,
+                // Neither above nor below the start: pytest ran in it.
+                _ => PytestDir::Below {
+                    from_start: in_repo.clone(),
+                    from_repo: in_repo,
+                },
             }
-        }
-        let at = self
-            .pytest_root
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .or(workdir)?;
-        mounts
-            .iter()
-            .filter(|(_, c)| {
-                let c = c.trim_end_matches('/');
-                at == c || at.starts_with(&format!("{c}/"))
-            })
-            .max_by_key(|(_, c)| c.len())
-            .map(|(h, c)| {
-                let rest = at[c.trim_end_matches('/').len()..].trim_start_matches('/');
-                h.join(rest)
-            })
+        } else if repo.starts_with(&root) {
+            PytestDir::Start
+        } else {
+            PytestDir::Unknown
+        };
     }
 
     /// Whether Vitest's root lies below the working directory.
@@ -1370,7 +1400,7 @@ impl Recognizers {
 
     /// Whether a pytest test was named in this run.
     pub fn pytest_ran(&self) -> bool {
-        self.pytest_dir.get().is_some()
+        self.pytest_named.get()
     }
 
     /// A pytest node id as prova names it, from the working directory.
@@ -1378,21 +1408,33 @@ impl Recognizers {
         if !(id.contains("::") || id.ends_with(".py")) {
             return pytest_key(id);
         }
-        let start = self.start_prefix();
-        match self.pytest_dir(id) {
-            PytestDir::Prefix(p) if !p.is_empty() || !start.is_empty() => {
-                let dir = [start.as_str(), p.as_str()]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                pytest_key(&format!("{dir}/{id}"))
+        self.pytest_named.set(true);
+        if !self.pytest_rootdir_seen {
+            self.pytest_unrooted.set(true);
+        }
+        let from = |p: &str| {
+            if p.is_empty() {
+                pytest_key(id)
+            } else {
+                pytest_key(&format!("{p}/{id}"))
             }
-            PytestDir::Prefix(_) => pytest_key(id),
-            // Another directory's test of the same id must never be taken
-            // for this one: its place is marked, and no quarantine covers it.
+        };
+        match &self.pytest_dir {
+            PytestDir::Start => from(&self.start_prefix()),
+            PytestDir::Below {
+                from_start,
+                from_repo,
+            } => {
+                if id.starts_with(&format!("{from_start}/")) {
+                    from(&self.start_prefix())
+                } else {
+                    from(from_repo)
+                }
+            }
+            // The place is marked unknown and never shares a history or a
+            // quarantine.
             PytestDir::Unknown => {
+                self.pytest_unknown.set(true);
                 let mut key = pytest_key(id);
                 key.file = Some(prova_core::model::UNKNOWN_PLACE.to_owned());
                 key
@@ -2224,6 +2266,8 @@ impl Recognizers {
     // ------------------------------------------------------------- libtest
 
     fn libtest_key(&self, name: &str) -> TestKey {
+        self.libtest_unplaced
+            .set(self.libtest_unplaced.get() || self.libtest_binary.is_none());
         let (path, leaf) = split_rust_path(name);
         TestKey {
             file: self.libtest_binary.clone(),
@@ -2265,14 +2309,14 @@ impl Recognizers {
             r.strip_suffix(" stdout ----")
                 .or_else(|| r.strip_suffix(" stderr ----"))
         }) {
-            self.close_libtest_block(out);
+            self.close_libtest_block();
             self.libtest_block = Some((self.libtest_key(name.trim()), Vec::new()));
             return true;
         }
         if self.libtest_block.is_some() {
             let t = line.trim();
             if t == "failures:" || t.starts_with("test result:") {
-                self.close_libtest_block(out);
+                self.close_libtest_block();
             } else if let Some((_, lines)) = self.libtest_block.as_mut() {
                 lines.push(line.to_owned());
                 return true;
@@ -3445,96 +3489,15 @@ impl Recognizers {
         self.finished(key, Outcome::Failed, ms, msg, Level::Recognized, out);
     }
 
-    /// The failure block of a libtest test is over. A test whose place was
-    /// unknown (`cargo test --quiet` prints no `Running` line) is told by
-    /// the path its panic message names: that place replaces the unknown one
-    /// (ADR 0035 section 1), so another crate's test of the same name never
-    /// lends its history.
-    fn close_libtest_block(&mut self, out: &mut Vec<EventKind>) {
-        let Some((mut key, lines)) = self.libtest_block.take() else {
+    /// The failure block of a libtest test is over: its output is kept
+    /// with the test.
+    fn close_libtest_block(&mut self) {
+        let Some((key, lines)) = self.libtest_block.take() else {
             return;
         };
         let text = lines.join("\n").trim().to_owned();
-        if key.file.is_none()
-            && !self.holding
-            && let Some(place) = self.panic_place(&text, &key.name)
-            && let Some((_, Outcome::Failed | Outcome::Errored)) = self.seen.get(&key.unique())
-        {
-            let old = key.clone();
-            key.file = Some(place);
-            out.push(EventKind::TestFinished {
-                test: key.clone(),
-                attempt: 1,
-                outcome: Outcome::Failed,
-                duration_ms: None,
-                message: None,
-                source: Level::Recognized,
-                subtest: false,
-                passed_in_iteration: false,
-            });
-            out.push(EventKind::TestSuperseded {
-                test: old,
-                by: key.clone(),
-            });
-        }
         if !text.is_empty() {
             self.failure_output.push((key, text));
-        }
-    }
-
-    /// The place (test binary, as nextest names it) a panic message's path
-    /// gives: `geo/src/lib.rs` is `geo`, `geo/tests/it.rs` is `geo::it`.
-    /// `None` without the file on disk (a container) or a package around it.
-    fn panic_place(&self, text: &str, test: &str) -> Option<String> {
-        let path = text.lines().find_map(|l| {
-            let (_, rest) = l.split_once(" panicked at ")?;
-            let mut parts = rest.trim().trim_end_matches(':').rsplitn(3, ':');
-            let (_col, _line, file) = (parts.next()?, parts.next()?, parts.next()?);
-            Some(file.to_owned())
-        })?;
-        let bases = [self.cwd.as_ref(), self.repo_root.as_ref()];
-        let abs = bases
-            .into_iter()
-            .flatten()
-            .map(|b| b.join(&path))
-            .find(|p| p.is_file())?;
-        let stop = self.repo_root.as_ref().or(self.cwd.as_ref())?;
-        // Only a file of this repository's own code, not a dependency's, and
-        // only the file that holds the test itself: a panic inside a helper
-        // crate or library code names where the failure surfaced, not where
-        // the test lives. When unsure the place stays unknown.
-        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let abs = canon(&abs);
-        let stop = canon(stop);
-        let rel_to_repo = abs.strip_prefix(&stop).ok()?;
-        if rel_to_repo.components().any(|c| c.as_os_str() == ".cargo") {
-            return None;
-        }
-        let leaf = test.rsplit("::").next().unwrap_or(test);
-        let source = std::fs::read_to_string(&abs).ok()?;
-        if !source.contains(&format!("fn {leaf}(")) {
-            return None;
-        }
-        let mut dir = abs.parent()?.to_path_buf();
-        loop {
-            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
-                && let Some(name) = cargo_package_name(&toml)
-            {
-                let krate = name.replace('-', "_");
-                let rel = abs.strip_prefix(&dir).ok()?;
-                let mut comps = rel.components();
-                return match (comps.next(), comps.next(), comps.next()) {
-                    (Some(a), Some(b), None) if a.as_os_str() == "tests" => {
-                        let stem = std::path::Path::new(b.as_os_str()).file_stem()?;
-                        Some(format!("{krate}::{}", stem.to_string_lossy()))
-                    }
-                    (Some(a), ..) if a.as_os_str() == "src" => Some(krate),
-                    _ => None,
-                };
-            }
-            if dir == stop || !dir.pop() {
-                return None;
-            }
         }
     }
 
@@ -3559,6 +3522,14 @@ impl Recognizers {
         }
     }
 
+    /// A failure was recorded with no place: its history may be another
+    /// crate's test of the same name.
+    fn libtest_failed_unplaced(&self) -> bool {
+        self.seen_keys
+            .iter()
+            .any(|(d, k)| k.file.is_none() && self.seen.get(d).is_some_and(|(_, o)| o.is_failure()))
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
@@ -3567,9 +3538,14 @@ impl Recognizers {
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
-        if matches!(self.pytest_dir.get(), Some(PytestDir::Unknown)) {
+        if self.libtest_unplaced.get() && self.libtest_failed_unplaced() {
             gts.push(EventKind::RunNote {
-                message: "pytest's test ids are relative to the directory it ran in, and more than one directory holds that file: prova cannot tell which test is which. No quarantine covers them, and their history is kept apart. Run pytest from one directory, or give the file path from the working directory.".into(),
+                message: "this output names no test binary (quiet `cargo test`): prova cannot tell which crate a test is in, so tests of different crates with one name share a history here. Run `cargo test` without `--quiet` (or the nextest suite `prova adopt` proposes) to keep them apart.".into(),
+            });
+        }
+        if self.pytest_unknown.get() {
+            gts.push(EventKind::RunNote {
+                message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. They keep a history only with other runs of unknown place in this suite, and no quarantine covers them.".into(),
             });
         }
         self.gotestsum_reruns_passed(&mut gts);
@@ -3592,7 +3568,7 @@ impl Recognizers {
         }
         self.close_pass_output();
         self.close_libtest_running(&mut gts);
-        self.close_libtest_block(&mut gts);
+        self.close_libtest_block();
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
@@ -3863,126 +3839,20 @@ fn nextest_binary(id: &str) -> String {
     }
 }
 
-/// Where pytest ran, below the working directory (ADR 0031 section 2).
+/// Where pytest's ids start, read from its `rootdir:` header (ADR 0037).
+#[derive(Default)]
 enum PytestDir {
-    Prefix(String),
+    /// Ids are relative to the run's start directory.
+    #[default]
+    Start,
+    /// The rootdir lies below the start directory: ids carry `from_start`
+    /// when pytest ran at the start, else they are relative to the rootdir
+    /// (`from_repo`, below the repository root).
+    Below {
+        from_start: String,
+        from_repo: String,
+    },
     Unknown,
-}
-
-/// The words of a container client's own options in a command line: after
-/// `docker run` (or `podman run`/`exec`) up to the image. Empty without one.
-fn docker_options(words: &[String]) -> Vec<&str> {
-    // Options that take their value as the next word.
-    const VALUED: &[&str] = &[
-        "-v",
-        "--volume",
-        "-w",
-        "--workdir",
-        "--mount",
-        "-e",
-        "--env",
-        "-u",
-        "--user",
-        "--name",
-        "-p",
-        "--publish",
-        "--network",
-        "--net",
-        "--entrypoint",
-        "-h",
-        "--hostname",
-        "--env-file",
-        "--platform",
-        "--cpus",
-        "-m",
-        "--memory",
-        "--label",
-        "-l",
-        "--add-host",
-        "--tmpfs",
-        "--device",
-        "--group-add",
-        "--cap-add",
-        "--cap-drop",
-        "--security-opt",
-        "--shm-size",
-        "--ulimit",
-        "--pull",
-        "--restart",
-        "--runtime",
-    ];
-    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
-    let Some(at) = words
-        .iter()
-        .position(|w| matches!(base(w).as_str(), "docker" | "podman" | "nerdctl"))
-    else {
-        return Vec::new();
-    };
-    let mut rest = words[at + 1..].iter();
-    if !matches!(
-        rest.next().map(String::as_str),
-        Some("run" | "exec" | "create")
-    ) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    while let Some(w) = rest.next() {
-        if !w.starts_with('-') {
-            break; // the image
-        }
-        out.push(w.as_str());
-        if VALUED.contains(&w.as_str())
-            && let Some(v) = rest.next()
-        {
-            out.push(v.as_str());
-        }
-    }
-    out
-}
-
-/// The words after `cd` or `pushd` in a command line: where it may move.
-fn cd_targets(command: &str) -> Vec<String> {
-    prova_core::config::cd_targets(command)
-}
-
-/// The directories below `base` (a few levels, no hidden or vendored ones)
-/// that hold the file.
-fn dirs_holding(base: &std::path::Path, file: &str) -> Vec<std::path::PathBuf> {
-    const SKIP: &[&str] = &[
-        "node_modules",
-        "target",
-        "venv",
-        "site-packages",
-        "__pycache__",
-    ];
-    let mut found = Vec::new();
-    let mut level = vec![base.to_path_buf()];
-    for _ in 0..4 {
-        let mut next = Vec::new();
-        for dir in &level {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || SKIP.contains(&name.as_str()) {
-                    continue;
-                }
-                let path = e.path();
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    if path.join(file).is_file() {
-                        found.push(path.clone());
-                    }
-                    next.push(path);
-                }
-            }
-        }
-        level = next;
-        if found.len() > 1 {
-            break;
-        }
-    }
-    found
 }
 
 /// `name` of the `[package]` table of a Cargo.toml (a workspace-only
@@ -4147,8 +4017,83 @@ mod tests {
             .collect()
     }
 
+    /// Quiet `cargo test` prints no binary: results of one name from three
+    /// crates cannot be told apart. The run has one result of that name, a
+    /// failure when any failed, none of it history for another run (a place
+    /// of its own), and the name is listed as ambiguous (ADR 0037).
+    #[test]
+    fn same_name_with_no_place_is_one_result_failed_if_any_failed() {
+        for order in [
+            ["FAILED", "ok", "FAILED"],
+            ["ok", "FAILED", "FAILED"],
+            ["FAILED", "FAILED", "ok"],
+            ["ok", "ok", "FAILED"],
+            ["ok", "FAILED", "ok"],
+        ] {
+            let mut input = String::new();
+            for o in order {
+                input.push_str(&format!(
+                    "running 1 test\ntest tests::same ... {o}\n\ntest result: ok. 1 passed; 0 failed\n\n"
+                ));
+            }
+            let (r, ev) = feed_all(&input);
+            let done = finished(&ev);
+            assert_eq!(
+                done,
+                vec![("tests::same".to_owned(), Outcome::Failed)],
+                "{order:?}: {ev:?}"
+            );
+            let own_place = ev
+                .iter()
+                .filter_map(|e| match e {
+                    EventKind::TestFinished { test, .. } => test.file.as_deref(),
+                    _ => None,
+                })
+                .filter(|f| f.starts_with(prova_core::model::AMBIGUOUS_PLACE))
+                .count();
+            assert_eq!(own_place, 1, "{order:?}: {ev:?}");
+            // Equal results before a differing one cannot be counted apart
+            // from a summary line repeating one: at least two are known.
+            let named = r.ambiguous_names();
+            assert!(
+                named.len() == 1 && named[0].0 == "tests::same" && named[0].1 >= 2,
+                "{order:?}: {named:?}"
+            );
+        }
+    }
+
+    /// Passing results of one unplaced name are still one passing test.
+    #[test]
+    fn same_name_passing_everywhere_stays_one_pass() {
+        let (r, ev) =
+            feed_all("test tests::same ... ok\ntest tests::same ... ok\ntest tests::same ... ok\n");
+        assert_eq!(
+            finished(&ev),
+            vec![("tests::same".to_owned(), Outcome::Passed)]
+        );
+        assert!(r.ambiguous_names().is_empty());
+    }
+
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// RC acceptance (probe, 0.3.0): quiet `cargo test` names no crate, so
+    /// a failure in crate `a` read "failed 1x before" from crate `a0`'s
+    /// test of the same name. prova cannot tell them apart: it says so.
+    #[test]
+    fn a_quiet_cargo_failure_says_its_crate_is_unknown() {
+        let quiet_fail = "running 1 test\ntest tests::same ... FAILED\n\nfailures:\n    tests::same\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let note = |ev: &[EventKind]| {
+            ev.iter().any(|e| {
+                matches!(e, EventKind::RunNote { message } if message.contains("names no test binary"))
+            })
+        };
+        let (_, ev) = feed_all(quiet_fail);
+        assert!(note(&ev), "{ev:?}");
+        let quiet_pass = "running 1 test\ntest tests::same ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let (_, ev) = feed_all(quiet_pass);
+        assert!(!note(&ev), "no failure, no note: {ev:?}");
     }
 
     fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
@@ -5179,6 +5124,68 @@ mod tests {
                 "packages/b/src/calc.test.ts::adds".to_owned(),
                 Outcome::Failed
             )]
+        );
+    }
+
+    /// pytest's places from its printed rootdir, read from the output alone.
+    fn pytest_names(cwd: &str, repo: &str, lines: &[&str]) -> (Vec<String>, bool) {
+        let mut r = Recognizers::default();
+        r.set_places(std::path::Path::new(cwd), std::path::Path::new(repo));
+        let mut ev = Vec::new();
+        for l in lines {
+            ev.extend(r.line(l));
+        }
+        ev.extend(r.finish());
+        let note = ev.iter().any(|e| {
+            matches!(e, EventKind::RunNote { message } if message.contains("rootdir is outside"))
+        });
+        (finished(&ev).into_iter().map(|(n, _)| n).collect(), note)
+    }
+
+    /// Review of PR 126 (B): `cd a && pytest -v; cd b && pytest -v` from the
+    /// repository root: each rootdir is below the start directory and the ids
+    /// are bare. Two sessions in one run, two places.
+    #[test]
+    fn pytest_rootdir_below_the_start_directory_is_the_place_of_bare_ids() {
+        let (names, note) = pytest_names(
+            "/w",
+            "/w",
+            &[
+                "rootdir: /w/a",
+                "test_calc.py::t FAILED [100%]",
+                "rootdir: /w/b",
+                "test_calc.py::t FAILED [100%]",
+            ],
+        );
+        assert_eq!(names, vec!["a.test_calc::t", "b.test_calc::t"]);
+        assert!(!note);
+    }
+
+    /// `pytest -v sub/tests` from the root prints rootdir `sub` and ids that
+    /// already start with it: the place is the start directory, not `sub.sub`.
+    #[test]
+    fn pytest_ids_that_carry_the_rootdir_are_named_from_the_start_directory() {
+        let (names, _) = pytest_names(
+            "/w",
+            "/w",
+            &["rootdir: /w/sub", "sub/tests/test_calc.py::t FAILED [100%]"],
+        );
+        assert_eq!(names, vec!["sub.tests.test_calc::t"]);
+    }
+
+    /// A rootdir outside the repository is an unknown place unless it is an
+    /// ancestor of the repository root (a `prova.toml` in a subproject).
+    #[test]
+    fn pytest_rootdir_outside_the_repository_is_unknown_unless_an_ancestor() {
+        let line = "tests/test_calc.py::t FAILED [100%]";
+        let (_, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /w", line]);
+        assert!(!note, "an ancestor of the repository root");
+        let (names, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /w/proj/", line]);
+        assert!(!note && names == vec!["tests.test_calc::t"], "{names:?}");
+        let (_, note) = pytest_names("/w/proj", "/w/proj", &["rootdir: /elsewhere", line]);
+        assert!(
+            note,
+            "neither ancestor nor descendant of the repository root"
         );
     }
 

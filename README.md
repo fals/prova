@@ -10,6 +10,7 @@
 [Getting started](docs/getting-started.md) •
 [For agents](#for-agents) •
 [Architecture](docs/architecture.md) •
+[Scope](docs/scope.md) •
 [Vision](docs/vision.md)
 
 </div>
@@ -78,7 +79,7 @@ With Docker: the image `ghcr.io/fals/prova` holds only the static binary
 runs your project's own test command:
 
 ```dockerfile
-COPY --from=ghcr.io/fals/prova:v0.2.0 /prova /usr/local/bin/prova
+COPY --from=ghcr.io/fals/prova:v0.3.0 /prova /usr/local/bin/prova
 ```
 
 Release tarballs with checksums are on the

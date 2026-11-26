@@ -83,24 +83,54 @@ fn a_first_failure_without_history_is_not_called_new() {
 }
 
 #[test]
-fn history_is_shared_by_suites_that_run_the_same_test() {
+fn each_suite_has_its_own_history_of_the_same_test() {
     let d = workspace("shared");
     suites(&d);
     // Flaky in `make`: passes and fails on the same code.
     run(&d, "make", "pass");
     run(&d, "make", "fail");
-    // In `default` it is the same test: known flaky, not new.
+    // In `default` it is its own test: nothing known yet (ADR 0037).
     let out = run(&d, "default", "fail");
     assert!(
-        out.contains("FAIL calc::x [failed") && out.contains("FLAKY"),
+        out.contains("FAIL calc::x [first time seen") && !out.contains("FLAKY"),
         "{out}"
+    );
+    // `history` lists one entry per suite.
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("calc::x  (suite default)") && h.contains("calc::x  (suite make)"),
+        "{h}"
     );
     assert!(
-        !out.contains("new failure") && !out.contains("first time seen"),
-        "{out}"
+        h.contains("2 runs with a result, 1 failed")
+            && h.contains("1 runs with a result, 1 failed"),
+        "{h}"
     );
-    let h = text(&prova(&d, &["history", "calc::x"]));
-    assert!(h.contains("suites default, make"), "{h}");
+}
+
+/// Review of PR 126 (C), ADR 0037: `history --json` prints one JSON array,
+/// one entry per suite, also for a single suite (it printed one object per
+/// suite per line).
+#[test]
+fn history_json_is_one_array_with_an_entry_per_suite() {
+    let d = workspace("histjson");
+    suites(&d);
+    run(&d, "make", "pass");
+    let one = text(&prova(&d, &["history", "calc::x", "--json"]));
+    let one: serde_json::Value = serde_json::from_str(&one).unwrap();
+    assert_eq!(one.as_array().map(Vec::len), Some(1), "{one}");
+    assert_eq!(one[0]["suite"], "make", "{one}");
+    run(&d, "default", "fail");
+    let two = text(&prova(&d, &["history", "calc::x", "--json"]));
+    let two: serde_json::Value = serde_json::from_str(&two).unwrap();
+    let mut suites: Vec<&str> = two
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["suite"].as_str().unwrap())
+        .collect();
+    suites.sort_unstable();
+    assert_eq!(suites, ["default", "make"], "{two}");
 }
 
 #[test]
@@ -153,18 +183,18 @@ fn quiet_counts_never_contradict() {
     assert!(!out.contains("no test was observed"), "{out}");
 }
 
-/// Round 5: quiet `cargo test` names no binary and `go test` text names no
-/// package; their results are still the same tests as the full streams'.
+/// Round 5, ADR 0037: `go test` text names no package; within one suite its
+/// results are still the same tests as the full streams'. Another suite's
+/// pass is no evidence. (Quiet `cargo test` names no binary: it is no go.)
 #[test]
-fn quiet_and_text_runs_join_the_full_history() {
+fn text_runs_join_the_full_history_of_their_suite() {
     let d = workspace("join");
     std::fs::write(
         d.join("prova.toml"),
         concat!(
-            "[suite.rust_full]\nrun = \"echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; sh r.sh\"\n",
-            "[suite.rust_quiet]\nrun = \"sh r.sh\"\n",
-            "[suite.go_json]\nrun = \"sh g.sh\"\n",
-            "[suite.go_text]\nrun = \"echo '--- FAIL: TestDiv (0.00s)'; printf 'FAIL\\\\texample.com/calc\\\\t0.01s\\\\n'; exit 1\"\n",
+            "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; sh r.sh\"\n",
+            "[suite.rust_other]\nrun = \"sh r.sh\"\n",
+            "[suite.go]\nrun = \"if [ -f text ]; then echo '--- FAIL: TestDiv (0.00s)'; printf 'FAIL\\\\texample.com/calc\\\\t0.01s\\\\n'; exit 1; fi; sh g.sh\"\n",
         ),
     )
     .unwrap();
@@ -175,17 +205,22 @@ fn quiet_and_text_runs_join_the_full_history() {
     )
     .unwrap();
     std::fs::write(d.join("state"), "pass").unwrap();
-    prova(&d, &["run", "rust_full"]);
+    prova(&d, &["run", "rust"]);
+    std::fs::write(d.join("quiet"), "").unwrap();
     std::fs::write(d.join("state"), "fail").unwrap();
-    let out = text(&prova(&d, &["run", "rust_quiet"]));
+    let out = text(&prova(&d, &["run", "rust"]));
     assert!(
-        out.contains("FAIL tests::x [")
-            && out.contains("last passed at")
-            && !out.contains("first time seen"),
-        "quiet run knows the earlier pass: {out}"
+        out.contains("FAIL tests::x [first time seen"),
+        "a result of unknown binary shares no history with a known one: {out}"
     );
-    prova(&d, &["run", "go_json"]);
-    let out = text(&prova(&d, &["run", "go_text"]));
+    let out = text(&prova(&d, &["run", "rust_other"]));
+    assert!(
+        out.contains("FAIL tests::x [first time seen"),
+        "another suite's passes are no history: {out}"
+    );
+    prova(&d, &["run", "go"]);
+    std::fs::write(d.join("text"), "").unwrap();
+    let out = text(&prova(&d, &["run", "go"]));
     assert!(
         out.contains("TestDiv [")
             && out.contains("last passed at")
@@ -195,6 +230,48 @@ fn quiet_and_text_runs_join_the_full_history() {
     // Two names, one test: history answers instead of asking (round 6).
     let h = prova(&d, &["history", "TestDiv"]);
     assert!(h.status.success(), "{}", text(&h));
+}
+
+/// Review of PR 126 (C), ADR 0037: quiet `cargo test` names no binary, so
+/// its `tests::x` is a test of unknown place. The suite's one known place
+/// (`calc`) is not it: another crate's quiet failure was "failed 1x before".
+#[test]
+fn a_quiet_cargo_test_shares_no_history_with_a_known_binary() {
+    let d = workspace("quietcargo");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test tests::x ... FAILED'; exit 1\"\n",
+    )
+    .unwrap();
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(out.contains("FAIL tests::x"), "{out}");
+    std::fs::write(d.join("quiet"), "").unwrap();
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(
+        out.contains("FAIL tests::x [first time seen") && !out.contains("failed 1x before"),
+        "{out}"
+    );
+    // Quiet runs are of one place with each other.
+    let out = text(&prova(&d, &["run", "rust"]));
+    assert!(out.contains("failed 1x before"), "{out}");
+}
+
+/// Review of PR 126 (C): the quiet result and the known crate's `tests::x`
+/// are two tests; `history` shows both, not the most recent of the two.
+#[test]
+fn history_shows_a_test_of_unknown_place_beside_a_known_one() {
+    let d = workspace("quietcargohist");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test tests::x ... FAILED'; exit 1\"\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "rust"]);
+    std::fs::write(d.join("quiet"), "").unwrap();
+    prova(&d, &["run", "rust"]);
+    let h = text(&prova(&d, &["history", "tests::x", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&h).unwrap();
+    assert_eq!(v.as_array().map(Vec::len), Some(2), "{h}");
 }
 
 /// Round 5: a test cut off by a cancel kept a garbled duplicate identity,
@@ -258,9 +335,10 @@ fn a_failure_before_the_cancel_is_still_evidence() {
     assert!(h.contains("1 failed"), "{h}");
 }
 
-/// ADR 0036: a test that fails every time one way of running it and passes
-/// another way, on the same code, is not flaky (acceptance 2026-11-26: it
-/// was FLAKY and "nothing else failed"). Its pass elsewhere is still history.
+/// ADR 0036, 0037: a test that fails every time one way of running it and
+/// passes another way, on the same code, is not flaky (acceptance
+/// 2026-11-26: it was FLAKY and "nothing else failed"). Its pass elsewhere
+/// is no history of this suite: the failure is first time seen.
 #[test]
 fn a_pass_in_another_suite_is_not_flaky_evidence() {
     let d = workspace("flakyacross");
@@ -269,7 +347,7 @@ fn a_pass_in_another_suite_is_not_flaky_evidence() {
     run(&d, "make", "pass");
     let out = run(&d, "default", "fail");
     assert!(
-        out.contains("FAIL calc::x [new failure") && !out.contains("FLAKY"),
+        out.contains("FAIL calc::x [first time seen") && !out.contains("FLAKY"),
         "{out}"
     );
     assert!(!out.contains("only known flaky"), "{out}");
@@ -383,7 +461,7 @@ fn history_names_the_cut_short_runs_in_which_a_test_was_running() {
     );
     let j = text(&prova(&d, &["history", "TestHang", "--json"]));
     let j: serde_json::Value = serde_json::from_str(&j).unwrap();
-    assert_eq!(j["cut_short"][0]["run"], id.as_str(), "{j}");
+    assert_eq!(j[0]["cut_short"][0]["run"], id.as_str(), "{j}");
 }
 
 /// Round 8: result files arrive only at the end, so a hung xUnit/JUnit run
@@ -666,8 +744,8 @@ fn a_removed_test_is_reported_once() {
 #[test]
 fn results_faster_than_the_test_ever_ran_are_unverified() {
     let d = workspace("echoed");
-    // The test reports its own 0.6 s; faked, the line comes at once.
-    std::fs::write(d.join("r.sh"), "[ -f fake ] || { b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 0.6; }\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":0.6}'\n").unwrap();
+    // The test reports its own 2 s; faked, the line comes at once.
+    std::fs::write(d.join("r.sh"), "[ -f fake ] || { b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 2; }\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":2.0}'\n").unwrap();
     std::fs::write(d.join("prova.toml"), "[suite.t]\nrun = \"sh r.sh\"\n").unwrap();
     for _ in 0..2 {
         assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
@@ -749,30 +827,17 @@ fn a_short_streak_of_a_frequent_flake_is_still_flaky() {
 }
 
 /// Round 10: `@Disabled` on a test that passed before gave a clean pass in
-/// an ad-hoc run (its own command had no earlier pass to compare with).
+/// an ad-hoc run (the same command had an earlier pass to compare with).
 #[test]
-fn a_test_skipped_now_that_passed_in_another_command_is_unverified() {
+fn a_test_skipped_now_that_passed_in_the_same_command_is_unverified() {
     let d = workspace("skipadhoc");
-    prova(
-        &d,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            &format!("{WORK_SH}echo 'test calc::d ... ok'"),
-        ],
+    // The same command twice: an ad hoc command is its own suite.
+    let cmd = format!(
+        "{WORK_SH}echo 'test calc::a ... ok'; if [ -f state ]; then echo 'test calc::d ... ignored'; else echo 'test calc::d ... ok'; fi"
     );
-    let o = prova(
-        &d,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            &format!("{WORK_SH}echo 'test calc::a ... ok'; echo 'test calc::d ... ignored'"),
-        ],
-    );
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    std::fs::write(d.join("state"), "").unwrap();
+    let o = prova(&d, &["run", "--", "sh", "-c", &cmd]);
     let out = text(&o);
     assert!(
         out.contains("unverified") && out.contains("calc::d"),
@@ -929,17 +994,16 @@ fn bare_console_names_take_the_result_files_identity() {
     let trx = r#"<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><TestDefinitions><UnitTest name="Divide" id="1"><TestMethod className="P.CalcTests" name="Divide"/></UnitTest><UnitTest name="Divide" id="2"><TestMethod className="P.MathTests" name="Divide"/></UnitTest></TestDefinitions><Results><UnitTestResult testId="1" testName="Divide" outcome="Failed"/><UnitTestResult testId="2" testName="Divide" outcome="Passed"/></Results></TestRun>"#;
     std::fs::write(d.join("r.trx.src"), trx).unwrap();
     let busy = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done";
-    let lines = |first: &str, second: &str| {
-        format!(
-            "{busy}; printf '  {first} Divide [1 ms]\\n  {second} Divide [1 ms]\\n'; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
-        )
-    };
-    for (a, b) in [
-        ("Failed", "Passed"),
-        ("Passed", "Failed"),
-        ("Failed", "Passed"),
-    ] {
-        let out = text(&prova(&d, &["run", "--", "sh", "-c", &lines(a, b)]));
+    // One command (history is per suite); the file `state` swaps the order.
+    let cmd = format!(
+        "{busy}; if [ -f state ]; then printf '  Passed Divide [1 ms]\\n  Failed Divide [1 ms]\\n'; else printf '  Failed Divide [1 ms]\\n  Passed Divide [1 ms]\\n'; fi; mkdir -p TestResults; cp r.trx.src TestResults/r.trx; exit 1"
+    );
+    for flip in [false, true, false] {
+        let _ = std::fs::remove_file(d.join("state"));
+        if flip {
+            std::fs::write(d.join("state"), "").unwrap();
+        }
+        let out = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
         assert!(!out.contains("FLAKY"), "{out}");
         assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
     }
@@ -1206,4 +1270,108 @@ fn a_named_selection_must_run_the_test_it_names() {
         ),
         "{out}"
     );
+}
+
+/// Review of PR 126 (C): `slowest` and `flaky` listed a name once per suite
+/// without saying which suite each row was of (`sizes` did).
+#[test]
+fn flaky_names_its_suite_when_a_name_is_flaky_in_several() {
+    let d = workspace("flakysuites");
+    suites(&d);
+    for suite in ["make", "default"] {
+        run(&d, suite, "pass");
+        run(&d, suite, "fail");
+    }
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(
+        f.contains("calc::x  (suite make)") && f.contains("calc::x  (suite default)"),
+        "{f}"
+    );
+    run(&d, "make", "pass");
+    run(&d, "default", "pass");
+    let f = text(&prova(&d, &["flaky", "--suite", "make"]));
+    assert!(f.contains("calc::x") && !f.contains("(suite"), "{f}");
+}
+
+/// Why medium: durations are only believed when the run really took that
+/// long (ADR 0022), so each script sleeps.
+#[test]
+fn slowest_names_its_suite_when_a_name_is_in_several() {
+    let d = workspace("slowsuites");
+    let go = |n: &str| {
+        format!(
+            "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 1.7; echo '--- PASS: TestSlow ({n}s)'; echo 'PASS'; printf 'ok  \\texample.com/calc\\t0.01s\\n'"
+        )
+    };
+    std::fs::write(
+        d.join("prova.toml"),
+        format!(
+            "[suite.one]\nrun = {:?}\n\n[suite.two]\nrun = {:?}\n",
+            go("1.50"),
+            go("1.60")
+        ),
+    )
+    .unwrap();
+    prova(&d, &["run", "one"]);
+    prova(&d, &["run", "two"]);
+    let s = text(&prova(&d, &["slowest"]));
+    assert!(
+        s.contains("calc::TestSlow  (suite one)") && s.contains("calc::TestSlow  (suite two)"),
+        "{s}"
+    );
+}
+
+/// A test flaky in suite `make` only (it passed and failed on the same code).
+fn flaky_in_make_only(name: &str) -> PathBuf {
+    let d = workspace(name);
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(f.contains("calc::x"), "{f}");
+    d
+}
+
+/// Review of PR 126 (C), ADR 0037: `prova diff` called a fix "known flaky"
+/// from the flakiness another suite recorded for the same name.
+#[test]
+fn a_diff_does_not_call_a_fix_flaky_from_another_suites_history() {
+    let d = flaky_in_make_only("flakydiff");
+    run(&d, "default", "fail");
+    let failed = text(&prova(&d, &["status", "last", "--json"]));
+    let failed: serde_json::Value = serde_json::from_str(&failed).unwrap();
+    // A fix: other code, so the flip is no flake of this suite.
+    std::fs::write(d.join("fix.txt"), "fix").unwrap();
+    run(&d, "default", "pass");
+    let diff = text(&prova(
+        &d,
+        &["diff", failed["run"].as_str().unwrap(), "last"],
+    ));
+    assert!(
+        diff.contains("fixed") && !diff.contains("known flaky"),
+        "{diff}"
+    );
+}
+
+/// Review of PR 126 (C): a pass was "known flaky passed" (unverified) because
+/// another suite knew the test as flaky.
+#[test]
+fn a_pass_is_not_called_a_flaky_pass_from_another_suites_history() {
+    let d = flaky_in_make_only("flakypassx");
+    let out = run(&d, "default", "pass");
+    assert!(
+        !out.contains("known flaky") && !out.contains("unverified"),
+        "{out}"
+    );
+}
+
+/// Review of PR 126 (C): the `--repeat` note "history knows it as flaky"
+/// came from another suite's history.
+#[test]
+fn a_repeat_does_not_call_a_test_flaky_from_another_suites_history() {
+    let d = flaky_in_make_only("flakyrepeat");
+    std::fs::write(d.join("state"), "pass").unwrap();
+    let out = text(&prova(&d, &["run", "default", "--repeat", "2"]));
+    assert!(out.contains("2 run(s)"), "{out}");
+    assert!(!out.contains("history knows it as flaky"), "{out}");
 }

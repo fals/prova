@@ -18,7 +18,7 @@ set the variables on the `sh` side of the pipe:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fals/prova/main/install.sh \
-  | PROVA_VERSION=v0.2.0 PROVA_INSTALL_DIR=/usr/local/bin sh
+  | PROVA_VERSION=v0.3.0 PROVA_INSTALL_DIR=/usr/local/bin sh
 ```
 
 The tarballs and their checksums are also attached to each
@@ -26,7 +26,7 @@ The tarballs and their checksums are also attached to each
 
 ### Docker
 
-`ghcr.io/fals/prova` (tags `v0.2.0` and `latest`, amd64 and arm64) contains
+`ghcr.io/fals/prova` (tags `v0.3.0` and `latest`, amd64 and arm64) contains
 only the static binary: no shell and no toolchain. prova runs your
 project's own test command, so it must live where that toolchain is.
 `docker run ghcr.io/fals/prova` can therefore only print its version; to
@@ -35,13 +35,13 @@ use it, copy the binary into the image where your tests run
 
 ```dockerfile
 FROM rust:1.95            # your project's own build image
-COPY --from=ghcr.io/fals/prova:v0.2.0 /prova /usr/local/bin/prova
+COPY --from=ghcr.io/fals/prova:v0.3.0 /prova /usr/local/bin/prova
 ```
 
 To take the binary out of the image without a Dockerfile:
 
 ```sh
-id=$(docker create ghcr.io/fals/prova:v0.2.0)
+id=$(docker create ghcr.io/fals/prova:v0.3.0)
 docker cp "$id":/prova ~/.local/bin/prova
 docker rm "$id"
 ```
@@ -52,7 +52,7 @@ prova under you.
 ### From source
 
 ```sh
-cargo install --git https://github.com/fals/prova --tag v0.2.0 prova-cli
+cargo install --git https://github.com/fals/prova --tag v0.3.0 prova-cli
 ```
 
 ### Shell completion
@@ -78,13 +78,7 @@ see processes only).
 Some checks need counters macOS does not give: a pass whose command used
 no CPU at all is not flagged there; a quiet loop of commands that each
 last milliseconds can look idle and be reported as a stall; sizes have no
-process start times there; and experiments run without a sandbox or CPU
-counters (every verdict says which checks did not run).
-
-Experiments isolate each arm in a sandbox when
-[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) is
-installed; without it they still run, and every verdict says the arms were
-not isolated.
+process start times there.
 
 ## Five minutes on an existing project
 
@@ -135,7 +129,9 @@ Every test live with its duration (native level): Rust via cargo-nextest's
 libtest JSON (`prova adopt` proposes it when nextest 0.9.66+ is installed), Go via
 `go test -json`, Python via `inject = ["pytest-reportlog"]`, Vitest via
 `inject = ["vitest-stream"]` plus `--reporter=default --reporter="$PROVA_VITEST_REPORTER"`
-in the suite command.
+in the suite command (the reporter runs in Vitest's main process, so starts and
+early failures arrive at Vitest's own reporting cadence, at times a few seconds
+late).
 
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 prova or infrastructure error, 5 still running.
@@ -230,6 +226,7 @@ prova exp new speed --hypothesis "sieve beats trial division" \
 prova exp candidate speed
 prova exp run speed             # ABBA trials, Mann-Whitney + Hodges-Lehmann CI, verdict
 prova exp log speed             # what failed: a trial, the setup, the oracle
+prova exp export speed          # every trial and sample behind the verdicts, as JSON
 ```
 
 Native benchmark output is read directly (`go test -bench`, criterion,
@@ -239,12 +236,12 @@ accuracy or throughput, `--setup "npm ci"` when the checkouts need
 dependencies installed: it runs once in each variant's checkout (the
 baseline's and the candidate's snapshots), with network.
 
-By default a candidate may change anything but tests, benchmarks, build and
-runner files. When the change needs one of those (a new dependency in
+By default a candidate may change anything but tests, benchmarks, build files and
+expected data. When the change needs one of those (a new dependency in
 `go.mod`), allow it with `--change go.mod` (a glob, repeatable);
 `--change-only` limits the candidate to those paths. Trials and the oracle
-run without network (loopback only) when the arms are sandboxed; pass
-`--allow-network` when the workload or the oracle needs it.
+see the session's environment; arms are not sandboxed (ADR 0037), so read
+the candidate's diff.
 
 An ACCEPT makes the candidate the new best only if it beats the current
 best. To go back after one that turned out wrong:

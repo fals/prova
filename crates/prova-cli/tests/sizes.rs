@@ -185,7 +185,7 @@ fn a_child_started_at_once_is_the_tests() {
     // As runners do: something printed before the test starts.
     suite(
         &d,
-        "echo running 1 test\nspin 1\nS m::kid\nsleep 1.6\nOK m::kid\n",
+        "echo running 1 test\nspin 2\nS m::kid\nsleep 1.6\nOK m::kid\n",
         None,
     );
     let run = runs(&d, 0, 1);

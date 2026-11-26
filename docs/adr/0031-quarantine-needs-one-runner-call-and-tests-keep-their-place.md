@@ -1,6 +1,6 @@
 # 0031: A quarantine needs one test-runner call; a test keeps its place; a hang in a container is named in the first wait
 
-Status: Accepted (2026-11-25). Amends [0030](0030-nothing-after-the-summary-and-named-selections.md) §1 to §4, [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) §1 and §3, and [0027](0027-quarantine-and-slow-tests.md) §4. §1 superseded by [0034](0034-a-quarantine-never-turns-a-failed-run-green.md): a quarantine never turns a failed run green.
+Status: Accepted (2026-11-25). Amends [0030](0030-nothing-after-the-summary-and-named-selections.md) §1 to §4, [0029](0029-quarantine-accounts-for-every-error-and-hangs-in-the-first-wait.md) §1 and §3, and [0027](0027-quarantine-and-slow-tests.md) §4. §1 superseded by [0034](0034-a-quarantine-never-turns-a-failed-run-green.md): a quarantine never turns a failed run green. Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 
