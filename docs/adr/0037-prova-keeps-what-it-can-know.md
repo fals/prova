@@ -63,4 +63,6 @@ lean version: prova promises what it can know and says when it cannot
   in a container) are shown with an unknown place.
 - Switching between `make test` and a direct suite starts a new history.
 - Experiment verdicts carry no isolation guarantee against a hostile
-  candidate; review its diff. Workloads see the session's environment.
+  candidate; review its diff. Workloads see the session's environment and
+  the network; `exp new --allow-network` is gone (there is no sandbox for it
+  to open). Protocols stored with `allow_network` still load unchanged.
