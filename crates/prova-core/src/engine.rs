@@ -1746,11 +1746,11 @@ fn observe_child(
         && reason.is_none()
         && status == Status::Finished
         && observed == 0
-        && let Some(line) = sup.tail.iter().find(|l| runner_missing(l))
+        && let Some(tool) = sup.tail.iter().find_map(|l| runner_missing(l))
     {
         reason = Some(format!(
-            "{RUNNER_MISSING} (exit {code}: {}); no test ran",
-            line.trim().chars().take(120).collect::<String>()
+            "{RUNNER_MISSING} (`{}`; exit {code}), and no test ran",
+            tool.chars().take(60).collect::<String>()
         ));
     }
     if !contradictions.is_empty() {
@@ -1958,17 +1958,66 @@ fn observe_child(
 /// The reason prefix of a pytest run that ran no test (exit 4 or 5).
 pub const PYTEST_NO_TEST: &str = "pytest ran no test";
 
-/// The reason prefix of a run whose test runner was not there to start.
-pub const RUNNER_MISSING: &str = "the test runner could not start";
+/// The reason prefix of a run that needed a command that was not there.
+pub const RUNNER_MISSING: &str = "a command the run needed was not found";
 
-/// A line that says the runner itself is missing, not that a test failed.
-fn runner_missing(line: &str) -> bool {
+/// The command or module a line says is missing, when the line has the shape
+/// a shell or Python prints for it (and not a test's own output that merely
+/// ends in "not found"): `sh: 1: pytest: command not found`,
+/// `bash: line 3: x: command not found`, `x: command not found`, dash's
+/// `sh: 1: x: not found`, `python3: No module named pytest`, and a
+/// container client's `exec: "x": executable file not found in $PATH`.
+fn runner_missing(line: &str) -> Option<String> {
     let l = line.trim();
-    l.contains("No module named pytest")
-        || l.contains("No module named 'pytest'")
-        || l.ends_with("command not found")
-        || l.ends_with(": not found")
-        || l.contains("executable file not found")
+    let word = |w: &str| {
+        (!w.is_empty() && !w.contains(char::is_whitespace) && !w.contains(':'))
+            .then(|| w.to_owned())
+    };
+    let shell = |w: &str| {
+        matches!(
+            w.rsplit('/').next(),
+            Some("sh" | "bash" | "dash" | "zsh" | "ksh")
+        )
+    };
+    let number = |w: &str| {
+        let n = w.strip_prefix("line ").unwrap_or(w);
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    };
+    if let Some(body) = l.strip_suffix(": command not found") {
+        let segs: Vec<&str> = body.split(": ").collect();
+        return match segs.as_slice() {
+            [tool] => word(tool),
+            [sh, tool] if shell(sh) => word(tool),
+            [sh, n, tool] if shell(sh) && number(n) => word(tool),
+            _ => None,
+        };
+    }
+    if let Some(body) = l.strip_suffix(": not found") {
+        // dash: `sh: 1: tool: not found`.
+        let segs: Vec<&str> = body.split(": ").collect();
+        return match segs.as_slice() {
+            [sh, n, tool] if shell(sh) && number(n) => word(tool),
+            _ => None,
+        };
+    }
+    if let Some((who, module)) = l.split_once(": No module named ")
+        && who.rsplit('/').next().is_some_and(|w| w.contains("python"))
+        && !who.contains(char::is_whitespace)
+    {
+        let module = module.trim().trim_matches('\'');
+        for m in ["pytest", "unittest"] {
+            if module == m || module.starts_with(&format!("{m}.")) {
+                return Some(m.to_owned());
+            }
+        }
+    }
+    if l.contains("executable file not found in $PATH")
+        && (l.starts_with("docker:") || l.starts_with("podman:") || l.starts_with("Error response"))
+        && let Some(tool) = l.split("exec: \"").nth(1).and_then(|r| r.split('"').next())
+    {
+        return Some(tool.to_owned());
+    }
+    None
 }
 
 /// A line pytest prints when it ran no test: usage errors and empty
@@ -4053,5 +4102,41 @@ mod hang_hint_tests {
         let only: crate::config::Config =
             toml::from_str("[suite.make]\nrun = \"make test\"\n").unwrap();
         assert!(super::direct_suite_hint(&only, "make", "make").is_none());
+    }
+}
+
+#[cfg(test)]
+mod runner_missing_tests {
+    use super::runner_missing;
+
+    #[test]
+    fn shell_shaped_not_found_lines_are_a_missing_command() {
+        for l in [
+            "sh: 1: pytest: command not found",
+            "bash: line 1: pytest: command not found",
+            "/bin/bash: line 3: pytest: command not found",
+            "bash: pytest: command not found",
+            "pytest: command not found",
+            "sh: 1: gsed: not found",
+            "/usr/bin/python3: No module named pytest",
+            "python3: No module named 'pytest'",
+            "python: No module named unittest",
+        ] {
+            assert!(runner_missing(l).is_some(), "{l}");
+        }
+    }
+
+    #[test]
+    fn test_output_that_says_not_found_is_not_a_missing_command() {
+        for l in [
+            "user 42: not found",
+            "FAILED tests/test_a.py::test_x - KeyError: key: not found",
+            "assertion failed: item not found",
+            "test lookup::missing ... FAILED: row 7: not found",
+            "E       ModuleNotFoundError: No module named 'pytest_cov_missing'",
+            "error: file: not found in the manifest",
+        ] {
+            assert!(runner_missing(l).is_none(), "{l}");
+        }
     }
 }

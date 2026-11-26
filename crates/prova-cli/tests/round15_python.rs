@@ -327,7 +327,7 @@ fn a_missing_test_runner_is_errored_not_failed() {
             v["detail"]
                 .as_str()
                 .unwrap()
-                .contains("test runner could not start"),
+                .contains("a command the run needed was not found"),
             "{v}"
         );
     }
@@ -335,6 +335,19 @@ fn a_missing_test_runner_is_errored_not_failed() {
     let v = json(&prova(
         &d,
         &["run", "--json", "--", "sh", "-c", "echo boom; exit 1"],
+    ));
+    assert_eq!(v["outcome"], "failed", "{v}");
+    // A test's own output ending in "not found" is not a missing command.
+    let v = json(&prova(
+        &d,
+        &[
+            "run",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "echo 'user 42: not found'; exit 1",
+        ],
     ));
     assert_eq!(v["outcome"], "failed", "{v}");
 }
