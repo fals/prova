@@ -1288,18 +1288,21 @@ fn observe_child(
                 .then(|| "terminated by signal".to_owned()),
         ),
     };
-    // ADR 0038 section 2: a process the command started still held its
-    // output when it exited 0 (prova killed it): what it would have printed
-    // was never seen, so the pass is unverified. A leaked process that
-    // detached from the output (a build server) cannot print results there.
-    if status == Status::Finished && exit_code == Some(0) && !leaked.is_empty() && output_still_open
-    {
-        sup.emit(EventKind::RunWarning {
-            message: format!(
+    // ADR 0038 section 2: the command exited 0 while its output was still
+    // open: a process it started holds it and could still print results,
+    // so the pass is unverified. A leaked process that detached from the
+    // output (a build server) leaves it closed and the pass stands. One
+    // that left the process group (`setsid`) is not listed, nor killed.
+    if status == Status::Finished && exit_code == Some(0) && output_still_open {
+        let message = if leaked.is_empty() {
+            "a process prova could not find (it left the run's process group) still holds the output after the command exited 0: results it would have printed were never seen".to_owned()
+        } else {
+            format!(
                 "a process it started was still running and holding the output when the command exited 0 ({} killed): results it would have printed were never seen",
                 leaked.len()
-            ),
-        });
+            )
+        };
+        sup.emit(EventKind::RunWarning { message });
     }
     // ADR 0017: the verdict is decided from all the evidence.
     let not_passed = report.not_passed;

@@ -377,6 +377,29 @@ fn a_pass_while_a_started_process_still_runs_is_unverified() {
     );
 }
 
+/// ADR 0038 section 2 with a process that left the run's process group
+/// (`setsid`) and keeps the output open: prova cannot list it, but the
+/// output is still open at exit 0, so the pass is unverified.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pass_while_a_setsid_process_holds_the_output_is_unverified() {
+    let d = workspace("setsidpass");
+    let (code, s) = run_sh(
+        &d,
+        "setsid sh -c 'sleep 4; echo \"test x ... FAILED\"' & echo 'running 1 test'; echo 'test y ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("passed"), Some(0)),
+        "{s}"
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(
+        s["warnings"].to_string().contains("still holds the output"),
+        "{s}"
+    );
+}
+
 /// A leaked process that let go of the output (a build server) cannot
 /// print results there: it is killed and noted, the pass stays verified.
 #[test]
