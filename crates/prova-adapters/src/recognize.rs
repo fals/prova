@@ -3382,7 +3382,7 @@ impl Recognizers {
         self.flush_gotestsum(&mut gts);
         if self.pytest_unknown.get() {
             gts.push(EventKind::RunNote {
-                message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. No quarantine covers them and they share no history.".into(),
+                message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. They keep a history only with other runs of unknown place in this suite, and no quarantine covers them.".into(),
             });
         }
         self.gotestsum_reruns_passed(&mut gts);

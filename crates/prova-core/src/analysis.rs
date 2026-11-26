@@ -358,12 +358,11 @@ pub fn usual_p95_ms(store: &Store, test_id: &str) -> Result<Option<u64>> {
     Ok(percentile(&ms, 95.0))
 }
 
-/// Per-run results of a test, newest first, at most `limit` runs.
-/// One test's results in its suite, newest first (ADR 0037).
-/// Results are the same test when their full names match and their files
-/// match or one is unknown (quiet `cargo test` names no binary), or when
-/// one side knows only the bare name (`go test` text output names no
-/// package). From a cancelled or aborted run, every completed result counts
+/// One test's results in its suite, newest first, at most `limit` runs
+/// (ADR 0037). Results are the same test when their full names match and
+/// their files match (results of unknown place, such as a quiet
+/// `cargo test`, match each other), or when one side knows only the bare
+/// name (`go test` text output names no package). From a cancelled or aborted run, every completed result counts
 /// but the tests it cut off (errored, "did not finish"): a test that fails
 /// while the run is being cancelled is recorded as unfinished (ADR 0020), so
 /// a failure there finished on its own (round 8); `current` is included.

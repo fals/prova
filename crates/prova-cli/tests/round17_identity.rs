@@ -185,7 +185,7 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
 /// rootdir printed through a symlink of the repository (macOS `/var` is
 /// `/private/var`) is still inside it, not an unknown place.
 #[test]
-fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
+fn a_pytest_rootdir_below_the_start_directory_is_the_place_of_a_test() {
     let d = workspace("pyroot");
     std::fs::create_dir_all(d.join("sub2")).unwrap();
     let link = PathBuf::from(format!("{}.link", d.display()));
