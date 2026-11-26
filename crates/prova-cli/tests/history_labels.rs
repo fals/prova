@@ -108,6 +108,31 @@ fn each_suite_has_its_own_history_of_the_same_test() {
     );
 }
 
+/// Review of PR 126 (C), ADR 0037: `history --json` prints one JSON array,
+/// one entry per suite, also for a single suite (it printed one object per
+/// suite per line).
+#[test]
+fn history_json_is_one_array_with_an_entry_per_suite() {
+    let d = workspace("histjson");
+    suites(&d);
+    run(&d, "make", "pass");
+    let one = text(&prova(&d, &["history", "calc::x", "--json"]));
+    let one: serde_json::Value = serde_json::from_str(&one).unwrap();
+    assert_eq!(one.as_array().map(Vec::len), Some(1), "{one}");
+    assert_eq!(one[0]["suite"], "make", "{one}");
+    run(&d, "default", "fail");
+    let two = text(&prova(&d, &["history", "calc::x", "--json"]));
+    let two: serde_json::Value = serde_json::from_str(&two).unwrap();
+    let mut suites: Vec<&str> = two
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["suite"].as_str().unwrap())
+        .collect();
+    suites.sort_unstable();
+    assert_eq!(suites, ["default", "make"], "{two}");
+}
+
 #[test]
 fn cancelled_runs_do_not_make_a_test_flaky() {
     let d = workspace("cancel");
@@ -396,7 +421,7 @@ fn history_names_the_cut_short_runs_in_which_a_test_was_running() {
     );
     let j = text(&prova(&d, &["history", "TestHang", "--json"]));
     let j: serde_json::Value = serde_json::from_str(&j).unwrap();
-    assert_eq!(j["cut_short"][0]["run"], id.as_str(), "{j}");
+    assert_eq!(j[0]["cut_short"][0]["run"], id.as_str(), "{j}");
 }
 
 /// Round 8: result files arrive only at the end, so a hung xUnit/JUnit run

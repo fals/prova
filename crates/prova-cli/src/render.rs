@@ -416,11 +416,7 @@ fn context(f: &prova_core::engine::Failure) -> String {
     format!(" [{}]", parts.join(", "))
 }
 
-pub fn test_stats(s: &prova_core::analysis::TestStats, json: bool) {
-    if json {
-        println!("{}", serde_json::to_string(s).unwrap_or_default());
-        return;
-    }
+pub fn test_stats(s: &prova_core::analysis::TestStats) {
     println!(
         "{}  (suite {})",
         named(&s.display, s.place.as_deref()),

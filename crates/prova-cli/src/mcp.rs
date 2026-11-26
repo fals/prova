@@ -49,7 +49,7 @@ fn tools() -> Value {
         },
         {
             "name": "test_history",
-            "description": "History and flake statistics of a test: failure rate, flips on the same code, passed-on-retry, durations, recent outcomes.",
+            "description": "History and flake statistics of a test, as a JSON array with one entry per suite that ran it: failure rate, flips on the same code, passed-on-retry, durations, recent outcomes.",
             "inputSchema": {"type": "object", "required": ["test"], "properties": {
                 "test": {"type": "string", "description": "Substring of the test's full name"}
             }}

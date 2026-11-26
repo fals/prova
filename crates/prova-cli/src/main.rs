@@ -3154,14 +3154,22 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     exit::USAGE
                 });
             }
-            for (i, (_, pick)) in picks.iter().enumerate() {
-                if i > 0 && !json {
-                    println!();
-                }
+            let mut all = Vec::new();
+            for (_, pick) in &picks {
                 match analysis::stats(&store, pick, window)? {
-                    Some(s) => render::test_stats(&s, json),
+                    Some(s) => all.push(s),
                     None => bail!("test disappeared"),
                 }
+            }
+            if json {
+                // One array, one entry per suite, whatever their number.
+                println!("{}", serde_json::to_string(&all)?);
+            }
+            for (i, s) in all.iter().enumerate().filter(|_| !json) {
+                if i > 0 {
+                    println!();
+                }
+                render::test_stats(s);
             }
             // The exact match was shown: say what else the name matches
             // instead of hiding it (round 18: `flaky_clock` showed the

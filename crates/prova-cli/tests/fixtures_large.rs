@@ -481,7 +481,7 @@ fn check_native(
     let out = String::from_utf8_lossy(&o.stdout);
     let docs: Vec<serde_json::Value> = out
         .lines()
-        .filter(|l| l.starts_with('{'))
+        .filter(|l| l.starts_with(['{', '[']))
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     assert!(
@@ -500,7 +500,8 @@ fn check_native(
         .unwrap();
     assert!(f["message"].as_str().unwrap_or("").contains(said), "{s}");
     // The 1.5 s test carries its own duration, from the stream.
-    let hist = &docs[docs.len() - 1];
+    // `history --json` is an array with one entry per suite.
+    let hist = &docs[docs.len() - 1][0];
     let p50 = hist["p50_ms"].as_u64().unwrap_or(0);
     assert!((1400..5000).contains(&p50), "slow test timed: {hist}");
 }

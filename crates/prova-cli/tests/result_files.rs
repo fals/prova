@@ -104,6 +104,7 @@ fn history_marks_flips_on_same_code_and_retry_passes_as_flaky() {
     assert_eq!(ctx["flaky"], true);
 
     let h = json(&prova(&d, &["history", "suite::b", "--json"]));
+    let h = &h[0];
     assert_eq!(h["runs"], 3);
     assert_eq!(h["failures"], 2);
     assert_eq!(h["transitions"], 2);
