@@ -256,6 +256,24 @@ fn a_quiet_cargo_test_shares_no_history_with_a_known_binary() {
     assert!(out.contains("failed 1x before"), "{out}");
 }
 
+/// Review of PR 126 (C): the quiet result and the known crate's `tests::x`
+/// are two tests; `history` shows both, not the most recent of the two.
+#[test]
+fn history_shows_a_test_of_unknown_place_beside_a_known_one() {
+    let d = workspace("quietcargohist");
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.rust]\nrun = \"if [ ! -f quiet ]; then echo '     Running unittests src/lib.rs (target/debug/deps/calc-0a1b)'; fi; b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; echo 'test tests::x ... FAILED'; exit 1\"\n",
+    )
+    .unwrap();
+    prova(&d, &["run", "rust"]);
+    std::fs::write(d.join("quiet"), "").unwrap();
+    prova(&d, &["run", "rust"]);
+    let h = text(&prova(&d, &["history", "tests::x", "--json"]));
+    let v: serde_json::Value = serde_json::from_str(&h).unwrap();
+    assert_eq!(v.as_array().map(Vec::len), Some(2), "{h}");
+}
+
 /// Round 5: a test cut off by a cancel kept a garbled duplicate identity,
 /// which `prova history` could not tell apart; it is shown as unfinished.
 #[test]

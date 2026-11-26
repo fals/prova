@@ -3092,12 +3092,19 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     String,
                     Vec<(String, String, String)>,
                 > = Default::default();
+                let mut unknown: Vec<(String, String, String)> = Vec::new();
                 for t in &group {
-                    if let Some((Some(file), _)) = analysis::place_of_test(&store, &t.0)?
-                        && !file.starts_with("(package pending)")
-                    {
-                        by_place.entry(file).or_default().push(t.clone());
+                    match analysis::place_of_test(&store, &t.0)? {
+                        Some((Some(file), _)) if !file.starts_with("(package pending)") => {
+                            by_place.entry(file).or_default().push(t.clone());
+                        }
+                        _ => unknown.push(t.clone()),
                     }
+                }
+                // Tests of unknown place are one more place beside the known
+                // ones (a quiet `cargo test` next to a crate's `tests::x`).
+                if !by_place.is_empty() && !unknown.is_empty() {
+                    by_place.insert("unknown place".to_owned(), unknown);
                 }
                 let displays: std::collections::BTreeSet<&str> =
                     group.iter().map(|t| t.1.as_str()).collect();
