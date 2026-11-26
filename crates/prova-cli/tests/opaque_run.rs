@@ -736,7 +736,7 @@ fn a_dead_supervisor_does_not_leave_the_command_running() {
         }
     };
     while run_processes(&id, sup).is_empty() && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
         !run_processes(&id, sup).is_empty(),
@@ -752,10 +752,16 @@ fn a_dead_supervisor_does_not_leave_the_command_running() {
         && std::fs::read_to_string(format!("/proc/{sup}/stat")).is_ok_and(|s| !s.contains(") Z "))
         && std::time::Instant::now() < deadline
     {
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     prova(&d, &["status"]); // reaps the orphan
-    let left = run_processes(&id, sup);
+    // The command dies of the signal the reap sends: wait (bounded) for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut left = run_processes(&id, sup);
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        left = run_processes(&id, sup);
+    }
     assert!(left.is_empty(), "left running: {left:?}");
 }
 
@@ -1246,9 +1252,8 @@ fn fake_docker(d: &Path) -> (String, PathBuf) {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {k}; exit 0;; ps) cat {d}/ps.out 2>/dev/null; exit 0;; inspect) cat {d}/inspect.json 2>/dev/null || echo '[]'; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
-            k = killed.display(),
-            d = d.display()
+            "#!/bin/sh\ncase \"$1\" in kill) echo \"$@\" > {k}; exit 0;; esac\necho 'test m::a ... ok'\nexec sleep 60\n",
+            k = killed.display()
         ),
     )
     .unwrap();
@@ -1313,46 +1318,43 @@ fn cancel_stops_a_named_container_of_the_run() {
     assert!(s.to_string().contains("pv-x"), "{s}");
 }
 
-/// A client with no --name or --cidfile (`./dev` wrappers): prova does not
-/// guess its container from what it mounts, it kills nothing and says so.
+/// ADR 0037: a run killed at `kill_after` stops the container its client
+/// named too, written `--name=x`; a `--name` in the container's own command
+/// names nothing. Why medium: a real supervisor and a fake client.
 #[cfg(target_os = "linux")]
 #[test]
-fn cancel_kills_nothing_for_a_container_that_only_mounts_the_run_directory() {
-    let d = workspace("cancel-container-mount");
+fn kill_after_stops_the_named_container_and_only_that() {
+    let d = workspace("killafter-container");
     let (path, killed) = fake_docker(&d);
-    std::fs::write(
-        d.join("ps.out"),
-        "aaa111bbb222\nold000old000\nother00other\n",
-    )
-    .unwrap();
-    let mount = |id: &str, created: &str, src: &str| {
-        format!(
-            r#"{{"Id":"{id}ffffffff","Created":"{created}","Mounts":[{{"Type":"bind","Source":"{src}"}}]}}"#
+    let run = |args: &[&str]| {
+        let _ = std::fs::remove_file(&killed);
+        let mut a = vec![
+            "run",
+            "--kill-after",
+            "2s",
+            "--json",
+            "--",
+            "docker",
+            "run",
+            "--rm",
+        ];
+        a.extend_from_slice(args);
+        let o = Command::new(PROVA)
+            .args(a)
+            .current_dir(&d)
+            .env("PROVA_HOME", home_of(&d))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        (
+            json(&o),
+            std::fs::read_to_string(&killed).unwrap_or_default(),
         )
     };
-    let cwd = d.canonicalize().unwrap();
-    std::fs::write(
-        d.join("inspect.json"),
-        format!(
-            "[{},{},{}]",
-            mount(
-                "aaa111bbb222",
-                "2999-01-01T00:00:00.5Z",
-                cwd.to_str().unwrap()
-            ),
-            mount(
-                "old000old000",
-                "2000-01-01T00:00:00Z",
-                cwd.to_str().unwrap()
-            ),
-            mount("other00other", "2999-01-01T00:00:00Z", "/elsewhere"),
-        ),
-    )
-    .unwrap();
-    let s = cancel_fake_docker(&d, &path, &["img", "t"]);
-    assert_eq!(s["status"], "cancelled", "{s}");
-    assert!(!killed.exists(), "guessed a container: {s}");
-    assert!(s.to_string().contains("`--name`"), "{s}");
+    let (s, k) = run(&["--name=pv-y", "img", "t"]);
+    assert_eq!(k.trim(), "kill pv-y", "{s}");
+    let (s, k) = run(&["img", "t", "--name", "not-a-container"]);
+    assert!(k.is_empty(), "killed {k:?} the command never named: {s}");
 }
 
 /// Without a name or cidfile the container is not known: prova does not

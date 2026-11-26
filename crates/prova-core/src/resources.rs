@@ -182,22 +182,63 @@ pub fn container_client_runs(cmdline: &str) -> bool {
 }
 
 /// The container a `docker run` command line names: `--name X`, or the id
-/// in its `--cidfile`. None when it names neither (not attributable).
+/// in its `--cidfile`. None when it names neither (not attributable). Only
+/// the client's own options count, the ones before the image: a `--name`
+/// after it belongs to the container's command (`pytest --name foo`).
 pub fn container_of(cmdline: &str) -> Option<String> {
-    let words: Vec<&str> = cmdline.split(' ').collect();
-    let value = |flag: &str| {
-        words.iter().enumerate().find_map(|(i, w)| {
-            if *w == flag {
-                words.get(i + 1).map(|v| (*v).to_owned())
-            } else {
-                w.strip_prefix(&format!("{flag}=")).map(str::to_owned)
-            }
-        })
-    };
-    if let Some(name) = value("--name") {
-        return Some(name);
+    let words: Vec<&str> = cmdline.split(' ').filter(|w| !w.is_empty()).collect();
+    let run = words.iter().position(|w| *w == "run")?;
+    // Options that take no value; any other option without `=` takes the
+    // next word. An unknown flag then swallows at most the image, which
+    // only ends the scan early: it never reads the container's command.
+    const SWITCHES: &[&str] = &[
+        "--rm",
+        "-d",
+        "--detach",
+        "-i",
+        "--interactive",
+        "-t",
+        "--tty",
+        "-it",
+        "-ti",
+        "--init",
+        "--privileged",
+        "--read-only",
+        "-P",
+        "--publish-all",
+        "-q",
+        "--quiet",
+        "--no-healthcheck",
+        "--oom-kill-disable",
+        "--sig-proxy",
+    ];
+    let (mut name, mut cidfile) = (None, None);
+    let mut i = run + 1;
+    while let Some(w) = words.get(i) {
+        if !w.starts_with('-') {
+            break; // the image
+        }
+        let (flag, inline) = match w.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_owned())),
+            None => (*w, None),
+        };
+        let takes_value = inline.is_none() && !SWITCHES.contains(&flag);
+        let value = inline.or_else(|| {
+            takes_value
+                .then(|| words.get(i + 1).map(|v| (*v).to_owned()))
+                .flatten()
+        });
+        match flag {
+            "--name" => name = value,
+            "--cidfile" => cidfile = value,
+            _ => {}
+        }
+        i += if takes_value { 2 } else { 1 };
     }
-    let file = value("--cidfile")?;
+    if name.is_some() {
+        return name;
+    }
+    let file = cidfile?;
     let id = std::fs::read_to_string(file).ok()?;
     let id = id.trim();
     (!id.is_empty()).then(|| id.to_owned())
@@ -751,5 +792,36 @@ mod container_exec_tests {
         assert!(e("kubectl exec pod -- pytest"));
         assert!(!e("docker run --rm img exec ./tests"));
         assert!(!e("docker run --rm img sh -c exec"));
+    }
+}
+
+#[cfg(test)]
+mod container_name_tests {
+    use super::container_of as of;
+
+    #[test]
+    fn the_client_names_its_container() {
+        assert_eq!(
+            of("docker run --rm --name box img pytest"),
+            Some("box".into())
+        );
+        assert_eq!(
+            of("podman run --name=box -v /w:/w img pytest"),
+            Some("box".into())
+        );
+        assert_eq!(
+            of("docker run -it -e A=1 --name box img"),
+            Some("box".into())
+        );
+    }
+
+    /// Review of ADR 0037: a `--name` after the image is the container's own
+    /// command's (`pytest --name foo`), not a container name; killing `foo`
+    /// would stop a container the command never named.
+    #[test]
+    fn a_name_in_the_containers_own_command_is_not_its_name() {
+        assert_eq!(of("docker run --rm img pytest --name foo"), None);
+        assert_eq!(of("docker run -v /w:/w -w /w img sh -c x --name=foo"), None);
+        assert_eq!(of("docker run --rm img --cidfile /tmp/x"), None);
     }
 }
