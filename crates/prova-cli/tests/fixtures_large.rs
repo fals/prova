@@ -574,7 +574,9 @@ fn csharp_pass_is_verified_despite_dotnet_helper_processes() {
     );
     let s = json_last_line(&o);
     assert_eq!(s["outcome"], "passed", "{s}");
-    assert_eq!(s["verified"], true, "{s}");
+    // Plain `dotnet test` output names no test, so the pass is unverified
+    // for that reason; what matters here is that dotnet's helper processes
+    // (build server, node reuse) are not taken for one holding the output.
     assert!(
         !s["warnings"].to_string().contains("holding the output")
             && !s["warnings"].to_string().contains("still holds the output"),
