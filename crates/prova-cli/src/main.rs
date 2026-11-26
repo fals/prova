@@ -3515,7 +3515,7 @@ fn repeat_runs(
         // test was known flaky before this run (the run that made it flaky
         // is not a pass of a known flaky test).
         let flaky_only = s.warnings.is_empty() && !s.flaky_passed.is_empty() && {
-            let before = analysis::flaky_before(store, &store.run(&id)?.suite, &id)?;
+            let before = engine::known_flaky_passed(store, &id)?;
             !s.flaky_passed.iter().any(|t| before.contains(t))
         };
         if s.outcome == Some(Outcome::Passed)

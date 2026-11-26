@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::config::{CommandSpec, RunSpec};
@@ -3010,6 +3011,37 @@ pub fn unverified_runs(
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
 fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
+    flaky_passed_as_of(store, row, &row.id, 50)
+}
+
+/// The tests that passed in `run` and were already known flaky when it
+/// started: flaky as of the suite's run before it, over its whole history
+/// (none when it has no earlier run). A run whose own result makes a test
+/// flaky is not a pass of a known flaky test. Matched by test identity
+/// (name and place), not by name.
+pub fn known_flaky_passed(store: &Store, run: &str) -> Result<Vec<String>> {
+    let row = store.run(run)?;
+    let prev: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT id FROM runs WHERE suite = ?1 AND created_ms < (SELECT created_ms FROM runs WHERE id = ?2)
+              ORDER BY created_ms DESC LIMIT 1",
+            rusqlite::params![row.suite, row.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match prev {
+        Some(prev) => flaky_passed_as_of(store, &row, &prev, i64::MAX as usize),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn flaky_passed_as_of(
+    store: &Store,
+    row: &RunRow,
+    as_of: &str,
+    window: usize,
+) -> Result<Vec<String>> {
     let passed: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT t.id FROM attempts a JOIN tests t ON t.id = a.test_id
@@ -3026,7 +3058,7 @@ fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     if passed.is_empty() {
         return Ok(out);
     }
-    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), 50, Some(&row.id))? {
+    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), window, Some(as_of))? {
         // The same test (name and place) passed in this run.
         if !out.contains(&f.display)
             && crate::analysis::shared_ids(store, &f.test_id)?
@@ -3326,7 +3358,9 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 // quarantined place, can be "not run" here (ADR 0037).
                 let known: bool = store.conn().query_row(
                     "SELECT EXISTS (SELECT 1 FROM tests t JOIN attempts a ON a.test_id = t.id
-                      WHERE t.display = ?1 AND t.suite = ?2 AND a.run_id <> ?3
+                      WHERE t.display = ?1 AND t.suite = ?2
+                        AND a.run_id IN (SELECT id FROM runs WHERE created_ms <
+                              (SELECT created_ms FROM runs WHERE id = ?3))
                         AND (?4 IS NULL OR t.file = ?4))",
                     rusqlite::params![name, row.suite, run, q.file],
                     |r| r.get(0),
