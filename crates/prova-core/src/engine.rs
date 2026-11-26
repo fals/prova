@@ -1285,6 +1285,17 @@ fn observe_child(
                 .then(|| "terminated by signal".to_owned()),
         ),
     };
+    // ADR 0038 section 2: a process the command started was still running
+    // when it exited 0 (prova killed it): what it would have printed was
+    // never seen, so the pass is unverified.
+    if status == Status::Finished && exit_code == Some(0) && !leaked.is_empty() {
+        sup.emit(EventKind::RunWarning {
+            message: format!(
+                "a process it started was still running when the command exited 0 ({} killed): results it would have printed were never seen",
+                leaked.len()
+            ),
+        });
+    }
     // ADR 0017: the verdict is decided from all the evidence.
     let not_passed = report.not_passed;
     let mut contradictions = report.contradictions;

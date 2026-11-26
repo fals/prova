@@ -353,6 +353,30 @@ fn a_retry_pass_is_an_unverified_pass() {
     );
 }
 
+/// ADR 0038 section 2: the command exits 0 while a process it started still
+/// runs and would print a failure later: the pass saw only part of the
+/// results, so it is unverified (a real child, killed by prova).
+#[test]
+fn a_pass_while_a_started_process_still_runs_is_unverified() {
+    let d = workspace("leakedpass");
+    let (code, s) = run_sh(
+        &d,
+        "(sleep 5; echo 'test x ... FAILED') & echo 'running 1 test'; echo 'test y ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; exit 0",
+    );
+    assert_eq!(
+        (s["outcome"].as_str(), code),
+        (Some("passed"), Some(0)),
+        "{s}"
+    );
+    assert_eq!(s["verified"], false, "{s}");
+    assert!(
+        s["warnings"]
+            .to_string()
+            .contains("a process it started was still running"),
+        "{s}"
+    );
+}
+
 /// Round 11: `exit(0)` inside a test under `cargo test --test-threads=1`:
 /// the binary announced 2 tests, reported 1 and stopped before its summary.
 #[test]
