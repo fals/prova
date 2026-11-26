@@ -83,9 +83,10 @@ fn new_exp(d: &Path, extra: &[&str]) {
 
 #[test]
 fn faster_candidate_is_accepted_and_becomes_best() {
-    let d = repo("accept", "0.3");
+    // Gaps wide against a slow arm64 or macOS runner (ADR 0037 cleanup).
+    let d = repo("accept", "0.8");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.05").unwrap();
+    std::fs::write(d.join("delay"), "0.1").unwrap();
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
     let r = json(&o);
@@ -111,7 +112,8 @@ fn faster_candidate_is_accepted_and_becomes_best() {
 
 #[test]
 fn same_code_is_not_an_improvement() {
-    let d = repo("noeffect", "0.02");
+    // Long enough that process start noise is small against the delay.
+    let d = repo("noeffect", "0.3");
     new_exp(&d, &["--min-effect", "20%"]);
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = prova(&d, &["exp", "run", "e", "--json"]);
@@ -724,9 +726,10 @@ fn a_workload_that_rewrites_tracked_files_voids_the_comparison() {
 /// `--against` and became best; `exp best` took any variant.
 #[test]
 fn only_the_baseline_or_a_kept_variant_can_be_the_reference() {
-    let d = repo("against", "0.01");
+    // Wide gaps: the slow variant must be rejected on any runner.
+    let d = repo("against", "0.05");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.08").unwrap();
+    std::fs::write(d.join("delay"), "0.5").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
@@ -734,7 +737,7 @@ fn only_the_baseline_or_a_kept_variant_can_be_the_reference() {
     );
     let r = json(&prova(&d, &["exp", "run", "e", "--json"]));
     assert_eq!(r["comparison"]["verdict"], "reject", "{r}");
-    std::fs::write(d.join("delay"), "0.01").unwrap();
+    std::fs::write(d.join("delay"), "0.05").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "noop"])
             .status
@@ -1113,10 +1116,11 @@ fn a_verdict_without_oracle_or_spec_carries_a_caveat_and_a_careful_next() {
 fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared() {
     // Delays long against process start noise (macOS CI: a 20 ms arm
     // measured 43 ms, then 92 ms, and the comparison was void), with wide
-    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive).
-    let d = repo("notbest", "0.6");
+    // gaps (arm64 CI: 0.2 s against 0.3 s was inconclusive): the best is 5x
+    // faster than the baseline, the middle one 2x.
+    let d = repo("notbest", "0.8");
     new_exp(&d, &[]);
-    std::fs::write(d.join("delay"), "0.1").unwrap();
+    std::fs::write(d.join("delay"), "0.15").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "fast"])
             .status
@@ -1126,7 +1130,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         json(&prova(&d, &["exp", "run", "e", "--json"]))["best"],
         "fast"
     );
-    std::fs::write(d.join("delay"), "0.25").unwrap();
+    std::fs::write(d.join("delay"), "0.4").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "mid"])
             .status
@@ -1145,7 +1149,7 @@ fn accept_against_baseline_says_the_best_is_unchanged_and_logs_what_it_compared(
         "{t}"
     );
     // A discard names its reference.
-    std::fs::write(d.join("delay"), "1.2").unwrap();
+    std::fs::write(d.join("delay"), "1.6").unwrap();
     assert!(
         prova(&d, &["exp", "candidate", "e", "--label", "slow"])
             .status
