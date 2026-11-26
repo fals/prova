@@ -1412,3 +1412,21 @@ fn history_of_an_ad_hoc_suite_shows_its_command() {
         "{j}"
     );
 }
+
+/// Release candidate: `--repeat` said "3 of 4 pass(es) verified little
+/// (known flaky passed)" when the test only became known flaky by the second
+/// run: that run's pass was no pass of an already known flaky test.
+#[test]
+fn repeat_counts_only_passes_after_the_test_was_known_flaky() {
+    let d = workspace("repeat-flaky");
+    std::fs::write(d.join("state"), "0").unwrap();
+    // Fails the first time, passes after; `state` counts the runs.
+    let cmd = "b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; n=$(cat state); echo $((n+1)) > state; if [ \"$n\" = 0 ]; then echo 'test calc::x ... FAILED'; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 101; else echo 'test calc::x ... ok'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; fi";
+    let o = prova(&d, &["run", "--repeat", "4", "--", "sh", "-c", cmd]);
+    let all = format!("{}{}", text(&o), String::from_utf8_lossy(&o.stderr));
+    assert!(all.contains("FLAKY calc::x: failed 1 of 4"), "{all}");
+    assert!(
+        all.contains("2 of 4 pass(es) verified little"),
+        "only runs 3 and 4 passed a test already known flaky: {all}"
+    );
+}

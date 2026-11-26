@@ -823,6 +823,28 @@ pub fn flaky_as_of(
     Ok(out)
 }
 
+/// Names of the tests already known flaky when run `run` started: flaky as
+/// of the suite's run before it (none when it has no earlier run). A run
+/// whose own result makes a test flaky is not a pass of a known flaky test.
+pub fn flaky_before(store: &Store, suite: &str, run: &str) -> Result<Vec<String>> {
+    let prev: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT id FROM runs WHERE suite = ?1 AND created_ms < (SELECT created_ms FROM runs WHERE id = ?2)
+              ORDER BY created_ms DESC LIMIT 1",
+            params![suite, run],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(prev) = prev else {
+        return Ok(Vec::new());
+    };
+    Ok(flaky_as_of(store, Some(suite), 50, Some(&prev))?
+        .into_iter()
+        .map(|t| t.display)
+        .collect())
+}
+
 /// A test's size from what it used (ADR 0025).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SizeView {
