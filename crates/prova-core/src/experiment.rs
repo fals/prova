@@ -1008,9 +1008,9 @@ fn run_trial(
     // can be seen afterwards (ADR 0035 section 4). The guard removes it on
     // every way out of this function.
     let tmp = sandbox_available()
-        .then(|| pycache_dir(dir).join(format!("tmp-{}", crate::ids::new_run_id())))
+        .then(|| arm_scratch(dir).join(format!("tmp-{}", crate::ids::new_run_id())))
         .filter(|t| private_dir(t).is_ok())
-        .map(TrialTmp);
+        .map(Scratch);
     let mut cmd = sandboxed_in(
         dir,
         &p.command[0],
@@ -1026,7 +1026,7 @@ fn run_trial(
         // The workload must not reach prova's own store (round 9).
         .env_remove("PROVA_HOME")
         .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
+        .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
         .process_group(0);
     for (k, val) in &v.params {
         cmd.env(format!("PROVA_PARAM_{}", k.to_ascii_uppercase()), val);
@@ -1149,18 +1149,18 @@ fn run_trial(
     })
 }
 
-/// A trial's private /tmp on the host: removed when the trial ends, and on
-/// every early return (a drop guard), whatever permissions the workload left.
-struct TrialTmp(PathBuf);
+/// A directory removed when dropped (a trial's private /tmp, a worker's
+/// scratch root), on every way out, whatever permissions the workload left.
+struct Scratch(PathBuf);
 
-impl TrialTmp {
+impl Scratch {
     /// Removes it, reporting a failure.
     fn remove(&self) -> std::result::Result<(), String> {
         remove_tree(&self.0)
     }
 }
 
-impl Drop for TrialTmp {
+impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(e) = remove_tree(&self.0) {
             eprintln!("prova: could not remove {}: {e}", self.0.display());
@@ -1324,6 +1324,9 @@ pub fn work(
     tests: &TestReader,
 ) -> Result<()> {
     process::become_subreaper();
+    remove_dead_scratch();
+    // Removed when the comparison ends, however it ends.
+    let _scratch = Scratch(scratch_root(std::process::id()));
     let mut result = work_comparison(store, comparison, parse, count, tests);
     // An error must end the comparison, or it stays "running" and every
     // wait on it waits for nothing (a refused checkout, round 11).
@@ -1530,7 +1533,7 @@ fn work_comparison(
             let ok = sandboxed(&dirs[i], "sh", &["-c".to_owned(), setup.clone()], true)
                 .env_remove("PROVA_HOME")
                 .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONPYCACHEPREFIX", pycache_dir(&dirs[i]))
+                .env("PYTHONPYCACHEPREFIX", arm_scratch(&dirs[i]))
                 .current_dir(&dirs[i])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -2349,7 +2352,7 @@ fn overlay_available() -> bool {
                 .stderr(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = remove_tree(&base);
         ok
     })
 }
@@ -2375,7 +2378,7 @@ fn sandboxed_in(
     overlay: Option<&Path>,
     tmp: Option<&Path>,
 ) -> Command {
-    let state = pycache_dir(dir);
+    let state = arm_scratch(dir);
     let _ = std::fs::create_dir_all(&state);
     let mut c = if sandbox_available() {
         let mut c = Command::new("bwrap");
@@ -2442,17 +2445,39 @@ fn sandboxed_in(
     c
 }
 
-/// A private bytecode cache per checkout, outside both: Python reads
-/// `.pyc` files only from there, so one planted in a checkout's ignored
-/// `__pycache__` is never used (round 10).
-fn pycache_dir(dir: &Path) -> PathBuf {
+/// One checkout's scratch space in this worker: its caches (Go, npm, XDG,
+/// and the private bytecode cache Python reads `.pyc` files from, so one
+/// planted in a checkout's `__pycache__` is never used, round 10) and its
+/// trials' private `/tmp`. It lives under the worker's scratch root, which
+/// is removed when the comparison ends.
+fn arm_scratch(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
-    // Outside /tmp: the sandbox gives each command a private /tmp.
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(format!("prova-arm-{}", &key[..16]))
+    scratch_root(std::process::id()).join(format!("arm-{}", &key[..16]))
+}
+
+/// A worker's scratch root, in the temporary directory.
+fn scratch_root(pid: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("prova-scratch-{pid}"))
+}
+
+/// Removes the scratch roots of workers that are gone: one killed outright
+/// could not remove its own.
+fn remove_dead_scratch() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("prova-scratch-"))
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && !process::alive(pid)
+        {
+            let _ = remove_tree(&e.path());
+        }
+    }
 }
 
 fn base_name_for(store: &Store, comparison: &str) -> Result<String> {
@@ -2635,12 +2660,7 @@ fn checkout_differs(dir: &Path) -> Option<String> {
 /// Deletes an overlay's scratch directory. The kernel makes `work/work` with
 /// no permissions at all, which `remove_dir_all` cannot enter.
 fn remove_scratch(scratch: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(
-        scratch.join("work").join("work"),
-        std::fs::Permissions::from_mode(0o700),
-    );
-    let _ = std::fs::remove_dir_all(scratch);
+    let _ = remove_tree(scratch);
 }
 
 /// The first tracked file of the checkout that an overlay's upper layer
@@ -2745,7 +2765,7 @@ fn satisfies_spec(
     )
     .env_remove("PROVA_HOME")
     .env("PYTHONNOUSERSITE", "1")
-    .env("PYTHONPYCACHEPREFIX", pycache_dir(dir))
+    .env("PYTHONPYCACHEPREFIX", arm_scratch(dir))
     .current_dir(dir)
     .stdin(Stdio::null())
     .stdout(log.try_clone()?)
