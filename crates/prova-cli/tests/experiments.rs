@@ -1602,3 +1602,22 @@ fn exp_export_while_a_comparison_runs_is_partial() {
     let x = json(&prova(&d, &["exp", "export", "e"]));
     assert_eq!(x["partial"], false, "{x}");
 }
+
+/// Release candidate: `exp status` right after `exp candidate` said "no
+/// comparison yet; next: prova exp candidate", though a candidate waited.
+#[test]
+fn status_with_a_recorded_candidate_says_to_run_it() {
+    let d = repo("status-next", "0.01");
+    new_exp(&d, &[]);
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.contains("next: prova exp candidate e"), "{out}");
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let o = prova(&d, &["exp", "status", "e"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains("no comparison yet; next: prova exp run e")
+            && !out.contains("exp candidate e"),
+        "{out}"
+    );
+}

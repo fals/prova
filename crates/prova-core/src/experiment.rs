@@ -2419,6 +2419,9 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ComparisonReport>,
     pub decisions: Vec<serde_json::Value>,
+    /// The latest recorded candidate, when no comparison has run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_candidate: Option<String>,
     /// How to read the kept logs of the latest comparison, when it failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs: Option<String>,
@@ -2566,6 +2569,13 @@ pub fn report_at(store: &Store, exp: &str, at: Option<&str>) -> Result<Report> {
             Some(_) => format!("prova exp log {exp} --comparison {}", c.id),
             None => format!("prova exp log {exp}"),
         });
+    let pending_candidate = match comparison {
+        None => variants(store, exp)?
+            .pop()
+            .map(|v| v.name)
+            .filter(|n| n != "baseline"),
+        Some(_) => None,
+    };
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
@@ -2574,6 +2584,7 @@ pub fn report_at(store: &Store, exp: &str, at: Option<&str>) -> Result<Report> {
         best: e.best,
         comparison,
         decisions,
+        pending_candidate,
         logs,
     })
 }

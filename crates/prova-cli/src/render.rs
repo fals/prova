@@ -1107,10 +1107,16 @@ pub fn experiment_with_next(
         };
         println!("next: {next}");
     } else {
-        println!(
-            "no comparison yet; next: prova exp candidate {}",
-            r.experiment
-        );
+        match &r.pending_candidate {
+            Some(c) => println!(
+                "no comparison yet; next: prova exp run {} (candidate {c})",
+                r.experiment
+            ),
+            None => println!(
+                "no comparison yet; next: prova exp candidate {}",
+                r.experiment
+            ),
+        }
     }
     if !r.decisions.is_empty() {
         // The latest few: the log grows with every candidate (round 7).
