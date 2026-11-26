@@ -776,7 +776,7 @@ pub fn flaky_as_of(
             && s.flaky
         {
             // One test seen as a bare and as a qualified name is one row
-            // (its history is shared): the qualified name shows.
+            // of its suite: the qualified name shows.
             if let Some(o) = out.iter_mut().find(|o| {
                 o.suite == s.suite && o.place == s.place && same_test_name(&o.display, &s.display)
             }) {
@@ -1178,7 +1178,7 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
 /// What history says about one failing test in a run.
 #[derive(Debug, Clone, Serialize)]
 pub struct FailureContext {
-    /// No earlier result of this test anywhere (ADR 0018): it cannot be
+    /// No earlier result of this test in its suite (ADR 0037): it cannot be
     /// called new or old yet.
     pub first_seen: bool,
     /// Earlier runs where this test failed with the same fingerprint.

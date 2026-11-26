@@ -33,6 +33,11 @@ Then:
   template has its own paths (`pytest tests/ -k {filter}`), those paths are
   collected as well and `-k` alone selects. Keep `-k {filter}` in the
   template; prova does the rest.
+- A test's place is the `rootdir:` line pytest prints (`-v`, not `-q`),
+  relative to the repository. With `-q`, or a rootdir that is a path inside a
+  container, prova reads the ids from the directory the run started in, or
+  shows the place as unknown; an unknown place shares no history and no
+  quarantine. Prefer `-v`, so two directories' `test_calc.py::t` stay apart.
 - Use the project's virtualenv: `run = ".venv/bin/python -m pytest -v -rfE"`.
 - Fail fast in the fix loop: add `-x` to `select`.
 - Sizes are what a test uses, not how long it takes: a test that starts

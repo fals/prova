@@ -3180,7 +3180,7 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
         Vec::new()
     };
     // Quarantined tests of this run, with their result: relevant when they
-    // ran here, or their suite (or one sharing tests with this run) did.
+    // ran here, or this suite has run them before.
     let mut quarantined: Vec<QuarantinedTest> = Vec::new();
     // While the run goes on, the quarantined tests with a result so far:
     // a "1 failed" that does not end a first-failure wait is explained

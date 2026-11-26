@@ -250,7 +250,7 @@ like secrets are left out. Each failure in a summary carries context:
 `prova history <test>`, `prova flaky`, `prova diff <a> <b>`, `prova sizes` and
 `prova slowest` (p50 and p95 per test, worst first) read the same data; history
 also shows the test's size and why. A run that leaves a known-flaky test out
-(an exclude filter, a narrower suite sharing tests with the one that ran it)
+(an exclude filter, or a selection that leaves it out of its own suite)
 warns that it did not run and is unverified.
 
 `prova quarantine add <test> --reason ...` marks a known-flaky test
