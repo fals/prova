@@ -863,16 +863,16 @@ fn trials_run_without_the_python_user_site() {
 }
 
 /// Round 11 red team: the shared Go build cache let a candidate patch the
-/// baseline's compiled test; secrets reached trials. Each arm gets its own
-/// caches, and secret-named variables are removed.
+/// baseline's compiled test. Each arm gets its own caches; the session's
+/// environment is otherwise the workload's (ADR 0037: no secret stripping).
 #[test]
-fn trials_get_private_caches_and_no_secrets() {
+fn trials_get_private_caches_and_the_sessions_environment() {
     let d = std::env::temp_dir().join(format!("prova-exp-caches-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("work.sh"),
-        "#!/bin/sh\ncase \"$GOCACHE\" in */prova-scratch-*/arm-*) ;; *) exit 3;; esac\n[ -z \"$MY_API_TOKEN\" ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
+        "#!/bin/sh\ncase \"$GOCACHE\" in */prova-scratch-*/arm-*) ;; *) exit 3;; esac\n[ \"$MY_API_TOKEN\" = s3cret ] || exit 4\necho '{\"metric\":\"t\",\"value\":5}'\n",
     )
     .unwrap();
     sh(
