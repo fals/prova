@@ -2729,9 +2729,10 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                 // Refuse instead of running a command we already know is
                 // wrong (round 11: `make test --until first-failure` ran and
                 // left a bogus failed run in history).
-                bail!(
+                return Err(UsageError(format!(
                     "{f} comes after `--`, so it would go to the command, not to prova: put prova's flags before `--` (to pass it to the command on purpose, wrap it: prova run -- sh -c '...')"
-                );
+                ))
+                .into());
             }
             let (suite_name, mut spec, run_cwd) = if !command.is_empty() {
                 if suite.is_some() {

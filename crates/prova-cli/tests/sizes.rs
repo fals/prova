@@ -45,7 +45,9 @@ fn text(o: &Output) -> String {
 /// `spin N` waits N-1 to N seconds (`$SECONDS` counts whole seconds), so
 /// `spin 2` keeps at least 1 s, and a sample, before the first test. The socket is held
 /// for 3 to 4 s: `$SECONDS` counts whole seconds, and sampling sockets on
-/// macOS is slow (a 1 to 2 s hold was missed there).
+/// macOS is slow (a 1 to 2 s hold was missed there). The child sleeps 3 s
+/// for the same reason: macOS samples processes with `ps`, and a 1.5 s child
+/// was missed on a slow shared runner (main CI), so the test came out small.
 const SUITE: &str = r#"
 spin() { end=$((SECONDS + $1)); while [ $SECONDS -lt $end ]; do :; done; }
 spin 2
@@ -55,7 +57,7 @@ spin 3
 echo '{"type":"test","name":"m::computes","event":"ok"}'
 echo '{"type":"test","event":"started","name":"m::runs_a_child"}'
 spin 1
-sleep 1.5
+sleep 3
 echo '{"type":"test","name":"m::runs_a_child","event":"ok"}'
 echo '{"type":"test","event":"started","name":"m::uses_localhost"}'
 spin 1
