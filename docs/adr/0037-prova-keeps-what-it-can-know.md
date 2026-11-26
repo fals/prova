@@ -28,8 +28,9 @@ lean version: prova promises what it can know and says when it cannot
    repository root: Vitest's root, pytest's rootdir, cargo's test binary and
    crate, nextest's binary id, Go's package. Inferring it from a panic path,
    from container mounts, from a `cd` in the command or from a search of the
-   disk is removed. An unknown place stays unknown and never shares a
-   history, a flaky label or a quarantine.
+   disk is removed. A test of unknown place never shares the history, a
+   flaky label or a quarantine of a test whose place is known; it keeps a
+   history only with other results of unknown place in its suite.
 3. **History is per suite.** A test's history, flakiness, "first time seen"
    and "last passed" come from runs of the same suite; an ad hoc command is
    its own suite. `prova history <name>` lists one entry per suite.
@@ -64,8 +65,12 @@ lean version: prova promises what it can know and says when it cannot
 - Same-named tests whose runner prints no place (quiet `cargo test`, pytest
   in a container) are shown with an unknown place.
 - Switching between `make test` and a direct suite starts a new history.
-  `prova history <name> --json` prints a JSON array with one entry per
-  suite (it printed one object).
+- JSON output changes: `prova history <name> --json` prints a JSON array
+  with one entry per suite (it printed one object; the MCP `test_history`
+  tool returns it as `{"history": [...]}`); `suites` becomes `suite` in
+  `history`, `flaky` and `slowest` JSON; a run's `suite_history` loses
+  `passed_elsewhere`; `exp status --json` loses `integrity` and a
+  comparison's `result` loses `sandbox`. Exit codes are unchanged.
 - Experiment verdicts carry no isolation guarantee against a hostile
   candidate; review its diff. Workloads see the session's environment and
   the network; `exp new --allow-network` is gone (there is no sandbox for it

@@ -44,7 +44,7 @@ verdict (`prova exp export`).
   prints (Vitest root, pytest rootdir, cargo and nextest binaries, Go
   package), relative to the repository. prova does not infer it from panic
   paths, container mounts or a search of the disk; an unknown place is shown
-  as unknown and never shares a history.
+  as unknown and never shares the history of a test whose place is known.
 - **History across suites.** Each suite and each ad hoc command keeps its
   own history; the same test run another way starts its own.
 - **Deliberately adversarial experiment candidates.** prova keeps a
