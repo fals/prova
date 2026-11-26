@@ -483,18 +483,28 @@ fn run_id(o: &Output) -> String {
 #[test]
 fn two_crates_same_name_stay_apart_in_every_list() {
     let d = workspace("lists");
+    // calc flips within suite x (ADR 0036: a flip counts within one
+    // suite); the ignored `state` file keeps the code the same.
+    let x = format!(
+        "if [ \"$(cat state)\" = pass ]; then {}; else {}; fi",
+        nextest("PASS", "FAIL"),
+        nextest("FAIL", "FAIL")
+    );
     std::fs::write(
         d.join("prova.toml"),
         format!(
-            "[suite.x]\nrun = {:?}\n\n[suite.y]\nrun = {:?}\n",
-            nextest("FAIL", "FAIL"),
+            "[suite.x]\nrun = {x:?}\n\n[suite.y]\nrun = {:?}\n",
             nextest("PASS", "FAIL"),
         ),
     )
     .unwrap();
-    let r1 = run_id(&prova(&d, &["run", "x"]));
-    let r2 = run_id(&prova(&d, &["run", "y"]));
-    let r3 = run_id(&prova(&d, &["run", "x"]));
+    let run_x = |state: &str| {
+        std::fs::write(d.join("state"), state).unwrap();
+        run_id(&prova(&d, &["run", "x"]))
+    };
+    let r1 = run_x("fail");
+    let r2 = run_x("pass");
+    let r3 = run_x("fail");
     let diff = text(&prova(&d, &["diff", &r2, &r3]));
     assert!(
         diff.contains("changed, but known flaky (1):\n  tests::flaky (calc)"),

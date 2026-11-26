@@ -258,13 +258,26 @@ fn a_failure_before_the_cancel_is_still_evidence() {
     assert!(h.contains("1 failed"), "{h}");
 }
 
-/// Round 6: `prova flaky` agreed with history only within one suite.
+/// ADR 0036: a test that fails every time one way of running it and passes
+/// another way, on the same code, is not flaky (acceptance 2026-11-26: it
+/// was FLAKY and "nothing else failed"). Its pass elsewhere is still history.
 #[test]
-fn flaky_lists_a_test_that_flipped_across_suites() {
+fn a_pass_in_another_suite_is_not_flaky_evidence() {
     let d = workspace("flakyacross");
     suites(&d);
     run(&d, "make", "pass");
-    run(&d, "default", "fail");
+    run(&d, "make", "pass");
+    let out = run(&d, "default", "fail");
+    assert!(
+        out.contains("FAIL calc::x [new failure") && !out.contains("FLAKY"),
+        "{out}"
+    );
+    assert!(!out.contains("only known flaky"), "{out}");
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(!f.contains("calc::x"), "{f}");
+    // The same flip within one suite is flaky, and `prova flaky` lists it
+    // whichever suite flipped (round 6).
+    run(&d, "default", "pass");
     let f = text(&prova(&d, &["flaky"]));
     assert!(f.contains("calc::x"), "{f}");
 }
