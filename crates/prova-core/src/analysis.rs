@@ -92,17 +92,16 @@ pub struct CutShortRun {
 
 /// The runs cut short in which the test (by name) was running.
 fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&same_sql(
         "SELECT DISTINCT r.id, r.code, r.status, r.created_ms
            FROM attempts a JOIN runs r ON r.id = a.run_id
-          WHERE a.test_id IN (SELECT t2.id FROM tests t1 JOIN tests t2 ON t2.display = t1.display
-                                                        AND t2.suite = t1.suite
+          WHERE a.test_id IN (SELECT t2.id FROM tests t1 JOIN tests t2 ON {SAME}
                                WHERE t1.id = ?1)
             AND a.outcome = 'errored' AND r.status <> 'finished'
             AND a.message LIKE 'test did not finish before the run ended%'
             AND r.id NOT IN (SELECT run_id FROM forgotten)
           ORDER BY r.created_ms DESC LIMIT 10",
-    )?;
+    ))?;
     let rows = stmt
         .query_map(params![test_id], |r| {
             Ok(CutShortRun {
@@ -1317,7 +1316,9 @@ mod tests {
                         attempt: 1,
                         outcome: *outcome,
                         duration_ms: Some(ms(i)),
-                        message: None,
+                        // What a test cut off by a cancel is recorded with.
+                        message: (*outcome == Outcome::Errored)
+                            .then(|| "test did not finish before the run ended".to_owned()),
                         source: crate::model::Level::Recognized,
                         subtest: false,
                         passed_in_iteration: false,
@@ -1329,7 +1330,12 @@ mod tests {
                 &id,
                 100,
                 ts + 5,
-                Status::Finished,
+                // A run with a test cut off was cancelled.
+                if results.iter().any(|r| r.1 == Outcome::Errored) {
+                    Status::Cancelled
+                } else {
+                    Status::Finished
+                },
                 Some(Outcome::Passed),
                 Some(0),
                 None,
@@ -1360,6 +1366,26 @@ mod tests {
         // Zero durations are a framework that reports no time.
         let z = store_with_ms(&runs, |_| 0);
         assert_eq!(usual_p95_ms(&z, &id).unwrap(), None);
+    }
+
+    /// Review of PR 126 (C): the runs cut short while a test ran were found by
+    /// name and suite alone: another binary's test of the same name was
+    /// blamed for them.
+    #[test]
+    fn cut_short_runs_are_of_the_same_test_and_place() {
+        let key = |file: &str| TestKey {
+            file: Some(file.to_owned()),
+            path: vec!["tests".into()],
+            name: "x".into(),
+        };
+        let (a, b) = (key("calc"), key("geo"));
+        let s = store_with(&[(
+            "tree:a",
+            vec![(a.clone(), Outcome::Errored), (b.clone(), Outcome::Passed)],
+        )]);
+        let of = |k: &TestKey| cut_short_runs(&s, &crate::store::test_id("s", k)).unwrap();
+        assert_eq!(of(&a).len(), 1);
+        assert!(of(&b).is_empty(), "another binary's test of the same name");
     }
 
     /// Round 17: `prova flaky` listed a Go test twice, once under the bare
