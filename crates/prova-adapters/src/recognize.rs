@@ -36,6 +36,11 @@ pub struct Recognizers {
     /// A pytest id was named, and one of them in an unknown place.
     pytest_named: std::cell::Cell<bool>,
     pytest_unknown: std::cell::Cell<bool>,
+    /// A `rootdir:` header was read; without one (`--no-header`, `-q`) the
+    /// place of a pytest id is only the start directory, a fallback.
+    pytest_rootdir_seen: bool,
+    /// Ids were named with no rootdir read: the place is that fallback.
+    pytest_unrooted: std::cell::Cell<bool>,
     /// libtest results were read with no test binary named (quiet `cargo
     /// test`): their names have no place.
     libtest_unplaced: std::cell::Cell<bool>,
@@ -572,7 +577,8 @@ impl Recognizers {
         // Results of one name with no place to tell them apart (quiet
         // `cargo test`, pytest from several directories): one result for the
         // run, failed if any failed, and no place of any other run's.
-        let unplaced = key.place_unknown() || (key.file.is_none() && self.libtest_unplaced.get());
+        let unplaced = key.place_unknown()
+            || (key.file.is_none() && (self.libtest_unplaced.get() || self.pytest_unrooted.get()));
         if unplaced && let Some(a) = self.ambiguous.get_mut(&d) {
             a.results += 1;
             self.repeats += 1;
@@ -1351,6 +1357,7 @@ impl Recognizers {
     /// the place unknown, unless it holds the repository (a `prova.toml` in
     /// a subproject).
     fn pytest_rootdir(&mut self, header: &str) {
+        self.pytest_rootdir_seen = true;
         let dir = header.split(", ").next().unwrap_or(header).trim();
         let (Some(cwd), Some(repo)) = (self.cwd.as_ref(), self.repo_root.as_ref()) else {
             self.pytest_dir = PytestDir::Start;
@@ -1402,6 +1409,9 @@ impl Recognizers {
             return pytest_key(id);
         }
         self.pytest_named.set(true);
+        if !self.pytest_rootdir_seen {
+            self.pytest_unrooted.set(true);
+        }
         let from = |p: &str| {
             if p.is_empty() {
                 pytest_key(id)

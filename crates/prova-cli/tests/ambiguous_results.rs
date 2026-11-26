@@ -131,3 +131,57 @@ fn unplaced_same_name_results_are_one_failed_result_with_no_history() {
     let df = text(&prova(&d, &["diff", &r2, &r3]));
     assert!(!df.contains("still failing"), "{df}");
 }
+
+/// `make test` runs pytest in three directories with `-v --no-header`: no
+/// `rootdir:` line, the same id `tests/test_a.py::test_same` three times.
+fn fake_pytest(d: &Path) {
+    let one = |i: usize| {
+        format!(
+            "case \"$(cut -c{i} mode)\" in f) printf '%s\\n' '============================= test session starts ==============================' 'collecting ... collected 1 item' '' 'tests/test_a.py::test_same FAILED                                        [100%]' '' '=================================== FAILURES ===================================' '________________________________ test_same _____________________________________' '' '    def test_same():' '>       assert 1 == 2' 'E       assert 1 == 2' '' 'tests/test_a.py:2: AssertionError' '=========================== short test summary info ============================' 'FAILED tests/test_a.py::test_same - assert 1 == 2' '============================== 1 failed in 0.01s ==============================='; code=1;; *) printf '%s\\n' '============================= test session starts ==============================' 'collecting ... collected 1 item' '' 'tests/test_a.py::test_same PASSED                                        [100%]' '' '============================== 1 passed in 0.01s ==============================='; ;; esac;"
+        )
+    };
+    let script = format!(
+        "#!/bin/sh\n{BUSY} code=0; {} {} {} exit $code\n",
+        one(1),
+        one(2),
+        one(3)
+    );
+    let dir = d.join("rc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pytest");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        d.join("prova.toml"),
+        "[suite.q]\nrun = \"./rc/pytest -v --no-header\"\n",
+    )
+    .unwrap();
+}
+
+/// Probe of 0.3.0: pytest from three directories, no `rootdir:` line; the
+/// start directory stood for all three places, so z's failure was "failed 1x
+/// before" from x's.
+#[test]
+fn pytest_sessions_with_no_rootdir_are_one_failed_result_with_no_history() {
+    let d = workspace("pytest");
+    fake_pytest(&d);
+    let (_, out1, c1) = run(&d, "ppp");
+    assert_eq!(c1, 0, "{out1}");
+    let (r2, out2, c2) = run(&d, "fpf");
+    assert_eq!(c2, 1, "{out2}");
+    assert!(out2.contains("FAIL tests.test_a::test_same"), "{out2}");
+    assert!(
+        out2.contains("cannot tell apart") && out2.contains("pytest with `-v`"),
+        "{out2}"
+    );
+    assert!(!out2.contains("passed before"), "{out2}");
+    let (r3, out3, c3) = run(&d, "fpf");
+    assert_eq!(c3, 1, "{out3}");
+    for label in ["before", "new failure", "FLAKY", "flaky", "last passed"] {
+        assert!(!out3.contains(label), "{label}: {out3}");
+    }
+    let h = text(&prova(&d, &["history", "tests.test_a::test_same"]));
+    assert!(!h.contains(&format!("{r2} passed")), "{h}");
+    let df = text(&prova(&d, &["diff", &r2, &r3]));
+    assert!(!df.contains("still failing"), "{df}");
+}
