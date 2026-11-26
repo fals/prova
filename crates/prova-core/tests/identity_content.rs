@@ -11,7 +11,18 @@ use prova_core::identity::code_identity;
 
 fn git(d: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
-        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        // No background maintenance: it drops lock files under
+        // .git/objects while a test compares them (macOS CI).
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+        ])
         .args(args)
         .current_dir(d)
         .output()
@@ -38,13 +49,14 @@ fn tree12(d: &Path) -> String {
     format!("tree:{}", &git(d, &["rev-parse", "HEAD^{tree}"])[..12])
 }
 
-/// Every file under `.git/objects`: nothing may be added by computing an id.
+/// Every object file under `.git/objects`: nothing may be added by
+/// computing an id. Git's own lock files are not objects.
 fn objects(d: &Path) -> Vec<PathBuf> {
     fn walk(p: &Path, v: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(p).unwrap().flatten() {
             if e.path().is_dir() {
                 walk(&e.path(), v);
-            } else {
+            } else if e.path().extension().is_none_or(|x| x != "lock") {
                 v.push(e.path());
             }
         }
