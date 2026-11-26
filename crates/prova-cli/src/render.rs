@@ -437,8 +437,15 @@ fn context(f: &prova_core::engine::Failure) -> String {
 }
 
 pub fn test_stats(s: &prova_core::analysis::TestStats) {
+    let command = s.suite_command.as_deref().map_or(String::new(), |c| {
+        let c = clean(c);
+        match c.char_indices().nth(60) {
+            Some((i, _)) => format!(": {}...", &c[..i]),
+            None => format!(": {c}"),
+        }
+    });
     println!(
-        "{}  (suite {})",
+        "{}  (suite {}{command})",
         named(&s.display, s.place.as_deref()),
         s.suite
     );

@@ -44,6 +44,9 @@ pub struct TestStats {
     /// The suite whose history this is (an ad hoc command is its own suite):
     /// a history is never shared across suites (ADR 0037).
     pub suite: String,
+    /// The command an ad hoc suite (`cmd:...`) stands for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suite_command: Option<String>,
     /// Other names of the same test (a Go test recorded bare and
     /// package-qualified): a quarantine of either covers it.
     #[serde(skip)]
@@ -660,11 +663,13 @@ fn stats_with(
         .iter()
         .find(|r| r.outcome == Outcome::Passed)
         .map(|r| (r.run.clone(), r.code.clone()));
+    let suite_command = suite_command(store, &suite)?;
     Ok(Some(TestStats {
         test_id: test_id.to_owned(),
         display,
         place,
         suite,
+        suite_command,
         aliases: Vec::new(),
         runs: counted.len(),
         failures,
@@ -686,6 +691,24 @@ fn stats_with(
         recent,
         cut_short: cut_short_runs(store, test_id)?,
     }))
+}
+
+/// The command of an ad hoc suite (named by a hash of it), from its latest run.
+fn suite_command(store: &Store, suite: &str) -> Result<Option<String>> {
+    if !suite.starts_with("cmd:") {
+        return Ok(None);
+    }
+    let spec: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT spec FROM runs WHERE suite = ?1 ORDER BY created_ms DESC LIMIT 1",
+            params![suite],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(spec
+        .and_then(|s| serde_json::from_str::<crate::config::RunSpec>(&s).ok())
+        .map(|s| s.command.display()))
 }
 
 /// Tests whose display name contains `query`, optionally in one suite.

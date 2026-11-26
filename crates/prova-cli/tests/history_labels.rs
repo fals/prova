@@ -1375,3 +1375,40 @@ fn a_repeat_does_not_call_a_test_flaky_from_another_suites_history() {
     assert!(out.contains("2 run(s)"), "{out}");
     assert!(!out.contains("history knows it as flaky"), "{out}");
 }
+
+/// Release candidate: `history` showed an ad hoc suite as `cmd:38dcb90d`
+/// only. It also says the command the name stands for.
+#[test]
+fn history_of_an_ad_hoc_suite_shows_its_command() {
+    let d = workspace("adhoc-command");
+    let cmd = format!("{SCRIPT} # a command with a long tail {}", "x".repeat(120));
+    std::fs::write(d.join("state"), "pass").unwrap();
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    let h = text(&prova(&d, &["history", "calc::x"]));
+    assert!(
+        h.contains("(suite cmd:") && h.contains("sh -c") && h.contains("..."),
+        "{h}"
+    );
+    assert!(!h.contains(&"x".repeat(100)), "shortened: {h}");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["history", "calc::x", "--json"]))).unwrap();
+    assert!(
+        j[0]["suite_command"]
+            .as_str()
+            .unwrap()
+            .contains(&"x".repeat(120)),
+        "{j}"
+    );
+    // A named suite stands for itself.
+    suites(&d);
+    run(&d, "make", "pass");
+    let j: serde_json::Value =
+        serde_json::from_str(&text(&prova(&d, &["history", "calc::x", "--json"]))).unwrap();
+    assert!(
+        j.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["suite"] == "make" && s.get("suite_command").is_none()),
+        "{j}"
+    );
+}
