@@ -492,6 +492,21 @@ fn parse_trx(xml: &str) -> Result<Vec<Case>, ParseError> {
 mod tests {
     use super::*;
 
+    /// Real Catch2 and doctest reports (README-assertion-counters.md): their
+    /// `tests=` counts assertions, so a header above the test cases is not
+    /// a cut report and the pass is not made unverified.
+    #[test]
+    fn real_assertion_counting_reports_are_not_called_incomplete() {
+        for (name, cases) in [
+            ("catch2-selftest.xml", 1045),
+            ("doctest-assertion-macros.xml", 23),
+        ] {
+            let (parsed, problems) = parse_checked(&fixture(name)).unwrap();
+            assert!(parsed.len() >= cases, "{name}: {} results", parsed.len());
+            assert!(problems.is_empty(), "{name}: {problems:?}");
+        }
+    }
+
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/fixtures/junit/{name}",
