@@ -257,7 +257,12 @@ pub fn mann_whitney(x: &[f64], y: &[f64]) -> MannWhitney {
     if !has_ties(x, y) && n * m <= 10_000 && n > 0 && m > 0 {
         let cdf = u_cdf(n, m);
         let k = umax as usize;
-        let sf: f64 = if k == 0 { 1.0 } else { 1.0 - cdf[k - 1] };
+        // Rounding in the cdf can leave its tail a hair below zero.
+        let sf: f64 = if k == 0 {
+            1.0
+        } else {
+            (1.0 - cdf[k - 1]).max(0.0)
+        };
         return MannWhitney {
             u,
             p: (2.0 * sf).min(1.0),
@@ -416,6 +421,16 @@ mod tests {
         assert_eq!(u_distribution(2, 2), vec![1.0, 1.0, 2.0, 1.0, 1.0]);
         let total: f64 = u_distribution(5, 5).iter().sum();
         assert_eq!(total, 252.0); // C(10, 5)
+    }
+
+    /// RC acceptance (Go, 100 + 100 trials, no overlap): the exact tail
+    /// came out as -4e-15 from rounding, printed `p=-0.0000`.
+    #[test]
+    fn a_p_value_is_never_negative() {
+        let x: Vec<f64> = (0..100).map(|i| 1000.0 + f64::from(i)).collect();
+        let y: Vec<f64> = (0..100).map(f64::from).collect();
+        let p = mann_whitney(&x, &y).p;
+        assert!((0.0..=1.0).contains(&p), "p = {p}");
     }
 
     #[test]

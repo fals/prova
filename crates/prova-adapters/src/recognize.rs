@@ -3522,6 +3522,14 @@ impl Recognizers {
         }
     }
 
+    /// A failure was recorded with no place: its history may be another
+    /// crate's test of the same name.
+    fn libtest_failed_unplaced(&self) -> bool {
+        self.seen_keys
+            .iter()
+            .any(|(d, k)| k.file.is_none() && self.seen.get(d).is_some_and(|(_, o)| o.is_failure()))
+    }
+
     /// Events still held when the output ends.
     pub fn finish(&mut self) -> Vec<EventKind> {
         let mut gts = Vec::new();
@@ -3530,6 +3538,11 @@ impl Recognizers {
         self.go_flush_tails();
         self.go_note_all_skipped(&mut gts);
         self.flush_gotestsum(&mut gts);
+        if self.libtest_unplaced.get() && self.libtest_failed_unplaced() {
+            gts.push(EventKind::RunNote {
+                message: "this output names no test binary (quiet `cargo test`): prova cannot tell which crate a test is in, so tests of different crates with one name share a history here. Run `cargo test` without `--quiet` (or the nextest suite `prova adopt` proposes) to keep them apart.".into(),
+            });
+        }
         if self.pytest_unknown.get() {
             gts.push(EventKind::RunNote {
                 message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. They keep a history only with other runs of unknown place in this suite, and no quarantine covers them.".into(),
@@ -4063,6 +4076,24 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// RC acceptance (probe, 0.3.0): quiet `cargo test` names no crate, so
+    /// a failure in crate `a` read "failed 1x before" from crate `a0`'s
+    /// test of the same name. prova cannot tell them apart: it says so.
+    #[test]
+    fn a_quiet_cargo_failure_says_its_crate_is_unknown() {
+        let quiet_fail = "running 1 test\ntest tests::same ... FAILED\n\nfailures:\n    tests::same\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let note = |ev: &[EventKind]| {
+            ev.iter().any(|e| {
+                matches!(e, EventKind::RunNote { message } if message.contains("names no test binary"))
+            })
+        };
+        let (_, ev) = feed_all(quiet_fail);
+        assert!(note(&ev), "{ev:?}");
+        let quiet_pass = "running 1 test\ntest tests::same ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let (_, ev) = feed_all(quiet_pass);
+        assert!(!note(&ev), "no failure, no note: {ev:?}");
     }
 
     fn feed_all(input: &str) -> (Recognizers, Vec<EventKind>) {
