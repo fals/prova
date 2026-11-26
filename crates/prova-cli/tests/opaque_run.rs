@@ -501,7 +501,7 @@ fn detach_prints_only_the_id_and_misplaced_flags_are_flagged() {
     );
     // Round 11: refused, not run with the flag passed to the command.
     let o = prova(&d, &["run", "--", "true", "--detach"]);
-    assert_eq!(o.status.code(), Some(4));
+    assert_eq!(o.status.code(), Some(2), "a usage error (ADR 0038 §5)");
     assert!(String::from_utf8_lossy(&o.stderr).contains("--detach comes after `--`"));
 }
 
