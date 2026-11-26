@@ -691,21 +691,57 @@ fn an_unfinished_line_is_in_the_live_output() {
     prova(&d, &["cancel", &id]);
 }
 
+/// The processes carrying the run's id in their environment: the command
+/// and what it started, never the supervisor.
+#[cfg(target_os = "linux")]
+fn run_processes(run: &str, not: u64) -> Vec<u64> {
+    let want = format!("PROVA_RUN_ID={run}");
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u64>().ok())
+        .filter(|pid| *pid != not)
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == want.as_bytes()))
+        })
+        .collect()
+}
+
 /// Round 9: when the supervisor died, the command ran on and `cancel` said
-/// only "already aborted".
+/// only "already aborted". #125: the supervisor is killed the moment the
+/// command exists (before it could have flushed anything), so nothing but
+/// the run's own start record can find the command again. Bounded waits;
+/// the run's processes are found by the run id they carry.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dead_supervisor_does_not_leave_the_command_running() {
     let d = workspace("deadsup");
     let id = detach(&d, &[], "exec sleep 31.4159");
-    let runs: serde_json::Value =
-        serde_json::from_str(&stdout(&prova(&d, &["status", "--json"]))).unwrap();
-    let sup = runs
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["id"] == id)
-        .and_then(|r| r["supervisor_pid"].as_u64())
-        .expect("supervisor pid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let sup = loop {
+        let runs: serde_json::Value =
+            serde_json::from_str(&stdout(&prova(&d, &["status", "--json"]))).unwrap();
+        let pid = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .and_then(|r| r["supervisor_pid"].as_u64());
+        match pid {
+            Some(pid) => break pid,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            None => panic!("the run never recorded its supervisor"),
+        }
+    };
+    while run_processes(&id, sup).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !run_processes(&id, sup).is_empty(),
+        "the command never started"
+    );
     std::process::Command::new("kill")
         .args(["-9", &sup.to_string()])
         .status()
@@ -719,15 +755,8 @@ fn a_dead_supervisor_does_not_leave_the_command_running() {
         std::thread::yield_now();
     }
     prova(&d, &["status"]); // reaps the orphan
-    let left = std::process::Command::new("pgrep")
-        .args(["-f", "sleep 31.4159"])
-        .output()
-        .unwrap();
-    assert!(
-        left.stdout.is_empty(),
-        "left running: {}",
-        String::from_utf8_lossy(&left.stdout)
-    );
+    let left = run_processes(&id, sup);
+    assert!(left.is_empty(), "left running: {left:?}");
 }
 
 /// Round 9: `--select` with a command said "give either a suite name or a

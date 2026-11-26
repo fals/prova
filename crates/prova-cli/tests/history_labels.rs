@@ -666,8 +666,8 @@ fn a_removed_test_is_reported_once() {
 #[test]
 fn results_faster_than_the_test_ever_ran_are_unverified() {
     let d = workspace("echoed");
-    // The test reports its own 0.6 s; faked, the line comes at once.
-    std::fs::write(d.join("r.sh"), "[ -f fake ] || { b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 0.6; }\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":0.6}'\n").unwrap();
+    // The test reports its own 2 s; faked, the line comes at once.
+    std::fs::write(d.join("r.sh"), "[ -f fake ] || { b=0; while [ $b -lt 60000 ]; do b=$((b+1)); done; sleep 2; }\necho '{\"type\":\"test\",\"event\":\"ok\",\"name\":\"calc::slow\",\"exec_time\":2.0}'\n").unwrap();
     std::fs::write(d.join("prova.toml"), "[suite.t]\nrun = \"sh r.sh\"\n").unwrap();
     for _ in 0..2 {
         assert!(text(&prova(&d, &["run", "t"])).contains("PASSED  "));
