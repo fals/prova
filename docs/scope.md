@@ -55,6 +55,8 @@ verdict (`prova exp export`).
   measurement; review the candidate's diff.
 - **Code inside the user's tests.** prova never injects code into test
   processes. Opt-in recipes (`--inject`) only set the runner's own
-  options and reporters.
+  options and reporters. So a stream is as prompt as its runner: Vitest's
+  reporter hears of a start or an early failure at Vitest's own reporting
+  cadence, which can be a few seconds late.
 
 Decisions behind this page: [ADR 0037](adr/0037-prova-keeps-what-it-can-know.md).

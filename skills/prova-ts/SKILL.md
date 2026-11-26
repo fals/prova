@@ -17,13 +17,10 @@ description: Gives the Vitest, Jest and node --test settings that let prova see 
   ```
 
   Through npm: `npm test -- --reporter=default --reporter="$PROVA_VITEST_REPORTER"`.
-  Vitest 3.x sends a worker's task updates in batches (its `throttle` in
-  `@vitest/runner` can leave the last update unsent until the next one). The
-  reporter adds a setup file of its own (`prova-vitest-setup.mjs`, next to it)
-  to the project's `setupFiles`, which writes each test's start and result from
-  inside the worker, so starts and early failures arrive within a second. If a
-  Vitest does not take it (no `setupFiles` array to extend), the reporter's own
-  events remain and can arrive late.
+  The reporter runs in Vitest's main process only; prova adds no code to the
+  test workers. Starts and early failures arrive at Vitest's own reporting
+  cadence: Vitest 3.x sends a worker's task updates in batches, so one can
+  reach prova a few seconds after it happened.
 - Vitest without the reporter: `npx vitest run --reporter=verbose` prints
   each test with ✓/×, recognized live. Add `--reporter=junit --outputFile=reports/junit.xml`
   (as a second reporter) for durations and messages.

@@ -135,7 +135,9 @@ Every test live with its duration (native level): Rust via cargo-nextest's
 libtest JSON (`prova adopt` proposes it when nextest 0.9.66+ is installed), Go via
 `go test -json`, Python via `inject = ["pytest-reportlog"]`, Vitest via
 `inject = ["vitest-stream"]` plus `--reporter=default --reporter="$PROVA_VITEST_REPORTER"`
-in the suite command.
+in the suite command (the reporter runs in Vitest's main process, so starts and
+early failures arrive at Vitest's own reporting cadence, at times a few seconds
+late).
 
 Exit codes: 0 passed, 1 test failure, 2 usage, 3 stall/slow/killed,
 4 prova or infrastructure error, 5 still running.

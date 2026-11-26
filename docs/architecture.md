@@ -144,7 +144,7 @@ flowchart BT
 - Live levels (2, 3) give the first failure while the run is still going.
 - Result files (1) fill in tests the live output did not show, and never double count.
 - When the framework's own totals exceed what prova saw (quiet output), the summary says so.
-- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command), `go-nocache`, `gotestsum-json` (gotestsum's event stream).
+- Opt-in injection raises the level without editing the project's scripts, and is shown in every summary: `pytest-reportlog` (live stream), `pytest-junit` (report file), `vitest-stream` (prova's reporter; add `--reporter="$PROVA_VITEST_REPORTER"` to the suite command; no code runs in the test workers, so early failures arrive at Vitest's own reporting cadence), `go-nocache`, `gotestsum-json` (gotestsum's event stream).
 - Streams that frameworks write to a file (pytest-reportlog, the Vitest reporter) are read live, like output; their results become rows, and the file is not kept ([ADR 0016](adr/0016-distilled-output-no-log-files.md)).
 
 ## Liveness: slow, stalled, killed
