@@ -209,7 +209,8 @@ fn an_injected_report_that_never_appears_is_warned_about() {
     let w = v["warnings"].to_string();
     assert!(
         w.contains("pytest-reportlog report was never written")
-            && w.contains("did not reach the test process"),
+            && w.contains("did not reach the test process")
+            && w.contains("pytest-reportlog.jsonl"),
         "{v}"
     );
 }

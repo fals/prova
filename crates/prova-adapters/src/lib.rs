@@ -170,7 +170,8 @@ impl Observer for Ladder {
                     .find(|r| r.stream == name)
                     .map_or("injected", |r| r.name);
                 report.warnings.push(format!(
-                    "the {recipe} report was never written: the variable did not reach the test process (a wrapper or container?)"
+                    "the {recipe} report was never written to {}: the variable did not reach the test process, or the path is not visible where the tests ran (a wrapper or container?)",
+                    stream.path.display()
                 ));
             }
         }
