@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExpExport",
+  "type": "object",
+  "properties": {
+    "best": {
+      "description": "The variant later candidates are compared against.",
+      "type": "string"
+    },
+    "best_resets": {
+      "description": "Times the best was set by hand or withdrawn.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExportReset"
+      }
+    },
+    "comparisons": {
+      "description": "Oldest first.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExportComparison"
+      }
+    },
+    "decisions": {
+      "description": "The decision log of the selected comparisons, oldest first.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExportDecision"
+      }
+    },
+    "experiment": {
+      "type": "string"
+    },
+    "hypothesis": {
+      "type": "string"
+    },
+    "partial": {
+      "description": "A selected comparison was still running: its trials and samples are\nthose recorded so far.",
+      "type": "boolean"
+    },
+    "protocol": {
+      "description": "The frozen protocol as stored.",
+      "$ref": "#/$defs/Protocol"
+    },
+    "protocol_hash": {
+      "type": "string"
+    },
+    "schema": {
+      "description": "Always `prova.exp-export.v1`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "experiment",
+    "hypothesis",
+    "protocol",
+    "protocol_hash",
+    "best",
+    "partial",
+    "comparisons",
+    "decisions",
+    "best_resets"
+  ],
+  "$defs": {
+    "Better": {
+      "type": "string",
+      "enum": [
+        "lower",
+        "higher"
+      ]
+    },
+    "ExportComparison": {
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "type": "string"
+        },
+        "candidate": {
+          "type": "string"
+        },
+        "created_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ended_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "result": {
+          "description": "The full verdict details (statistics, reason, caveats), as stored."
+        },
+        "status": {
+          "description": "`running`, `decided`, `failed` or `cancelled`.",
+          "type": "string"
+        },
+        "trials": {
+          "description": "Every trial, warmups and failed ones included, in run order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExportTrial"
+          }
+        },
+        "verdict": {
+          "description": "`accept`, `reject`, `inconclusive` or `invalid`, once decided.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "baseline",
+        "candidate",
+        "status",
+        "created_ms",
+        "trials"
+      ]
+    },
+    "ExportDecision": {
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "type": "string"
+        },
+        "comparison": {
+          "type": "string"
+        },
+        "created_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "description": "`keep`, `discard` or `crash`.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "comparison",
+        "candidate",
+        "decision",
+        "reason",
+        "created_ms"
+      ]
+    },
+    "ExportReset": {
+      "type": "object",
+      "properties": {
+        "created_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "from_best": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "to_best": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_best",
+        "to_best",
+        "reason",
+        "created_ms"
+      ]
+    },
+    "ExportSample": {
+      "type": "object",
+      "properties": {
+        "metric": {
+          "type": "string"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "metric",
+        "value"
+      ]
+    },
+    "ExportTrial": {
+      "type": "object",
+      "properties": {
+        "arm": {
+          "description": "`baseline` or `candidate`.",
+          "type": "string"
+        },
+        "ended_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "exit_code": {
+          "description": "None when the workload could not start or was killed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "fingerprint": {
+          "description": "The machine fingerprint the trial ran on.",
+          "type": "string"
+        },
+        "samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExportSample"
+          }
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "started_ms": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "state": {
+          "description": "`complete` or `failed`.",
+          "type": "string"
+        },
+        "warmup": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "seq",
+        "arm",
+        "warmup",
+        "state",
+        "fingerprint",
+        "started_ms",
+        "ended_ms",
+        "samples"
+      ]
+    },
+    "Guardrail": {
+      "type": "object",
+      "properties": {
+        "better": {
+          "$ref": "#/$defs/Better"
+        },
+        "metric": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "better"
+      ]
+    },
+    "Protocol": {
+      "description": "Declared before any data; frozen at the first trial.",
+      "type": "object",
+      "properties": {
+        "alpha": {
+          "type": "number",
+          "format": "double"
+        },
+        "better": {
+          "$ref": "#/$defs/Better"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "guardrails": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Guardrail"
+          }
+        },
+        "kill_after_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_trials": {
+          "description": "Inconclusive results add trials up to this many per arm.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "metric": {
+          "type": "string"
+        },
+        "min_effect": {
+          "description": "Smallest relative change that matters, e.g. 0.02.",
+          "type": "number",
+          "format": "double"
+        },
+        "min_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "oracle": {
+          "description": "Shell command that must succeed in a variant's directory for that\nvariant to satisfy the specification (model checker, conformance\nreplay, property tests, proof checker). Runs once per arm, before\nany trial; a violating candidate is rejected unmeasured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "Paths a candidate may change (globs; `*` within a segment, `**`\nacross). Empty: anything but test, benchmark and build files\n(`HARNESS_FILES`), which decide the verdict (round 8).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scope_only": {
+          "description": "`scope` is the whole of what a candidate may change; otherwise it adds\nto the default (round 10: allowing go.mod narrowed it to go.mod).",
+          "type": "boolean"
+        },
+        "setup": {
+          "description": "Shell command run once in each variant's directory before any trial\n(e.g. `npm ci`): a baseline worktree has none of the untracked files\n(dependencies, build caches) the working tree has.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "specs": {
+          "description": "The problem's specification (ADR 0015): files frozen by content hash\nwith the protocol, so the goal cannot move after registration.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SpecFile"
+          }
+        },
+        "trials": {
+          "description": "Trials per arm before the first verdict.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warmup": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "metric",
+        "better",
+        "min_effect",
+        "alpha",
+        "trials",
+        "min_trials",
+        "max_trials",
+        "warmup",
+        "command",
+        "kill_after_ms"
+      ]
+    },
+    "SpecFile": {
+      "description": "A specification file: path relative to the repository root, sha256.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ]
+    }
+  }
+}

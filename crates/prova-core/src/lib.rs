@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod config;
 pub mod engine;
+pub mod exp_export;
 pub mod experiment;
 pub mod home;
 pub mod identity;

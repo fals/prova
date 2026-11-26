@@ -1392,3 +1392,189 @@ fn a_comparison_reclaims_its_scratch_space() {
         assert!(kept.is_empty(), "left in {}: {kept:?}", x.display());
     }
 }
+
+/// An experiment with two comparisons: the first fails (its trial prints a
+/// marker and exits 3, so its log is kept), the second measures a faster
+/// candidate. Returns the repository and the first comparison's id.
+fn failed_then_decided(name: &str) -> (PathBuf, String) {
+    let d = repo(name, "0.1");
+    // The workload script is a harness file: allow changing it here.
+    new_exp(&d, &["--change", "**"]);
+    assert!(
+        prova(&d, &["exp", "protocol", "e", "--warmup", "1"])
+            .status
+            .success()
+    );
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\necho boom-marker >&2\nexit 3\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let first = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(first["comparison"]["status"], "failed", "{first}");
+    let old = first["comparison"]["id"].as_str().unwrap().to_owned();
+    std::fs::write(
+        d.join("work.sh"),
+        "#!/bin/sh\nsleep 0.01\necho '{\"metric\":\"mem_kb\",\"value\":100}'\n",
+    )
+    .unwrap();
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let second = json(&prova(&d, &["exp", "run", "e", "--json"]));
+    assert_eq!(second["comparison"]["status"], "decided", "{second}");
+    (d, old)
+}
+
+/// #120 B: the decisions name older comparisons, and what they kept must be
+/// readable once a newer one has started. Medium: two real comparisons.
+#[test]
+fn an_older_comparisons_log_and_status_are_readable_after_a_newer_one() {
+    let (d, old) = failed_then_decided("oldlog");
+    let latest = prova(&d, &["exp", "log", "e"]);
+    assert!(
+        !String::from_utf8_lossy(&latest.stdout).contains("boom-marker"),
+        "the default stays the latest comparison"
+    );
+    let o = prova(&d, &["exp", "log", "e", "--comparison", &old]);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("boom-marker"), "{text}");
+    let one = prova(&d, &["exp", "log", "e", "2", "--comparison", &old]);
+    assert!(String::from_utf8_lossy(&one.stdout).contains("boom-marker"));
+    let s = json(&prova(
+        &d,
+        &["exp", "status", "e", "--comparison", &old, "--json"],
+    ));
+    assert_eq!(s["comparison"]["id"], old.as_str(), "{s}");
+    assert_eq!(s["comparison"]["status"], "failed", "{s}");
+    assert!(
+        s["logs"].as_str().unwrap().contains(&old),
+        "the hint to read its logs names the comparison: {s}"
+    );
+    let bad = prova(
+        &d,
+        &["exp", "status", "e", "--comparison", "nope", "--json"],
+    );
+    assert!(!bad.status.success());
+}
+
+/// #120 C: an agent waits for a long comparison with one command; the bound
+/// is its own, not 9 minutes. A short experiment stands in for a long one.
+#[test]
+fn exp_wait_accepts_a_long_max_wait() {
+    let d = repo("longwait", "0.02");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    let started = json(&prova(&d, &["exp", "run", "e", "--detach", "--json"]));
+    assert!(started["comparison"].is_string(), "{started}");
+    let o = prova(&d, &["exp", "wait", "e", "--max-wait", "1h", "--json"]);
+    let r = json(&o);
+    assert_eq!(r["comparison"]["status"], "decided", "{r}");
+    assert_ne!(o.status.code(), Some(5), "{r}");
+}
+
+/// #120 A: the evidence behind every verdict, through prova.
+/// Medium: two real comparisons, one with a warmup and a failed trial.
+#[test]
+fn exp_export_prints_the_trials_and_samples_of_every_comparison() {
+    let (d, old) = failed_then_decided("export");
+    let before = prova(&d, &["exp", "status", "e", "--json"]).stdout;
+    let o = prova(&d, &["exp", "export", "e"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let x = json(&o);
+    assert_eq!(x["schema"], "prova.exp-export.v1", "{x}");
+    assert_eq!(x["experiment"], "e");
+    assert_eq!(x["partial"], false, "{x}");
+    assert_eq!(x["protocol"]["better"], "lower", "{x}");
+    assert!(x["protocol_hash"].is_string(), "{x}");
+    let cs = x["comparisons"].as_array().unwrap();
+    assert_eq!(cs.len(), 2, "{x}");
+    assert_eq!(cs[0]["id"], old.as_str());
+    let first = cs[0]["trials"].as_array().unwrap();
+    assert_eq!(
+        first.len(),
+        2,
+        "the candidate's warmup failed and stopped it: {x}"
+    );
+    assert_eq!(first[0]["state"], "complete");
+    assert_eq!(first[1]["state"], "failed");
+    assert_eq!(first[1]["warmup"], true, "the warmup is marked: {x}");
+    assert_eq!(first[1]["exit_code"], 3);
+    assert_eq!(cs[0]["status"], "failed");
+    let ok = cs[1]["trials"].as_array().unwrap();
+    assert!(ok.iter().any(|t| t["warmup"] == true), "{x}");
+    let scored: Vec<_> = ok.iter().filter(|t| t["warmup"] == false).collect();
+    assert!(scored.len() >= 10, "5 per arm at least: {x}");
+    for arm in ["baseline", "candidate"] {
+        assert!(scored.iter().any(|t| t["arm"] == arm), "{arm}: {x}");
+    }
+    let sample = &scored[0]["samples"][0];
+    assert!(
+        scored[0]["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["metric"] == "mem_kb" && s["value"] == 100.0),
+        "{x}"
+    );
+    assert!(
+        sample["metric"].is_string() && sample["value"].is_number(),
+        "{x}"
+    );
+    assert!(cs[1]["verdict"].is_string(), "{x}");
+    assert!(cs[1]["result"]["primary"].is_object(), "{x}");
+    assert_eq!(x["decisions"].as_array().unwrap().len(), 2, "{x}");
+    // One comparison, to a file; reading it changes nothing.
+    let file = d.join("out.json");
+    let o = prova(
+        &d,
+        &[
+            "exp",
+            "export",
+            "e",
+            "--comparison",
+            &old,
+            "--output",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let one: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(one["comparisons"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["comparisons"][0]["id"], old.as_str());
+    assert_eq!(one["decisions"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(prova(&d, &["exp", "status", "e", "--json"]).stdout, before);
+    assert!(
+        !prova(&d, &["exp", "export", "e", "--comparison", "nope"])
+            .status
+            .success()
+    );
+}
+
+/// #120 A: while a comparison runs the export is partial, read-only, and
+/// leaves the comparison running. Medium: a real detached worker.
+#[test]
+fn exp_export_while_a_comparison_runs_is_partial() {
+    let d = repo("exportrun", "0.3");
+    new_exp(&d, &[]);
+    assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
+    assert!(prova(&d, &["exp", "run", "e", "--detach"]).status.success());
+    let x = json(&prova(&d, &["exp", "export", "e"]));
+    assert_eq!(x["partial"], true, "{x}");
+    assert_eq!(x["comparisons"][0]["status"], "running", "{x}");
+    let s = json(&prova(&d, &["exp", "status", "e", "--json"]));
+    assert_eq!(s["comparison"]["status"], "running", "{s}");
+    assert!(prova(&d, &["exp", "cancel", "e"]).status.success());
+    let done = json(&prova(
+        &d,
+        &["exp", "wait", "e", "--max-wait", "1m", "--json"],
+    ));
+    assert_eq!(done["comparison"]["status"], "cancelled", "{done}");
+    let x = json(&prova(&d, &["exp", "export", "e"]));
+    assert_eq!(x["partial"], false, "{x}");
+}

@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rusqlite::{OptionalExtension, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{code_identity, machine_fingerprint};
@@ -37,21 +38,21 @@ fn refused<T>(msg: impl Into<String>) -> Result<T> {
     Err(ExpError::Refused(msg.into()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Better {
     Lower,
     Higher,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Guardrail {
     pub metric: String,
     pub better: Better,
 }
 
 /// Declared before any data; frozen at the first trial.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Protocol {
     pub metric: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,7 +98,7 @@ pub struct Protocol {
 }
 
 /// A specification file: path relative to the repository root, sha256.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SpecFile {
     pub path: String,
     pub sha256: String,
@@ -2496,9 +2497,35 @@ pub fn comparison_report(store: &Store, e: &Experiment, id: &str) -> Result<Comp
 }
 
 pub fn report(store: &Store, exp: &str) -> Result<Report> {
+    report_at(store, exp, None)
+}
+
+/// The comparison `id` of an experiment, refused when it is not one of its.
+pub fn check_comparison(store: &Store, exp: &str, id: &str) -> Result<()> {
+    let known: bool = store.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM comparisons WHERE id = ?1 AND experiment = ?2)",
+        params![id, exp],
+        |r| r.get(0),
+    )?;
+    if known {
+        Ok(())
+    } else {
+        refused(format!("experiment {exp} has no comparison {id}"))
+    }
+}
+
+/// `report`, for one comparison (the latest when `None`).
+pub fn report_at(store: &Store, exp: &str, at: Option<&str>) -> Result<Report> {
     let e = get(store, exp)?;
-    let comparison = match latest_comparison(store, exp)? {
-        Some(id) => Some(comparison_report(store, &e, &id)?),
+    let id = match at {
+        Some(id) => {
+            check_comparison(store, exp, id)?;
+            Some(id.to_owned())
+        }
+        None => latest_comparison(store, exp)?,
+    };
+    let comparison = match &id {
+        Some(id) => Some(comparison_report(store, &e, id)?),
         None => None,
     };
     let mut stmt = store.conn().prepare(
@@ -2528,7 +2555,10 @@ pub fn report(store: &Store, exp: &str) -> Result<Report> {
                     .as_ref()
                     .is_some_and(|r| r["specification"] == "violated")
         })
-        .map(|_| format!("prova exp log {exp}"));
+        .map(|c| match at {
+            Some(_) => format!("prova exp log {exp} --comparison {}", c.id),
+            None => format!("prova exp log {exp}"),
+        });
     Ok(Report {
         experiment: e.name,
         hypothesis: e.hypothesis,
