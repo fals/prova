@@ -36,7 +36,9 @@ lean version: prova promises what it can know and says when it cannot
 4. **Experiments defend against honest mistakes, not adversaries.** Kept:
    the frozen protocol, interleaved (ABBA) trials, statistics and Holm,
    verdicts, the oracle and specification check, revalidation (a
-   replication that does not accept withdraws the accept), the harness
+   replication that does not accept withdraws the accept, and so does a
+   void one: a leaked process, a rewritten tracked file or miscounted metric
+   lines, in either arm; revalidate again), the harness
    scope (tests, benchmarks, build files, expected data), per-arm caches and
    scratch space reclaimed when a comparison ends, leaked processes, tracked
    files a trial rewrote, metric line counts, the base 1000x warning,

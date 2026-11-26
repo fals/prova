@@ -1555,6 +1555,13 @@ fn work_comparison(
                 p.min_effect * 100.0
             ));
         }
+        // Say what could not be checked (scope: say when prova cannot know).
+        if cfg!(not(target_os = "linux")) {
+            caveats.push(
+                "this OS gives prova no way to find processes that left a trial's process group: they were not checked"
+                    .to_owned(),
+            );
+        }
         if let Some(sha) = &arms[0].1.commit_sha {
             let others: i64 = store.conn().query_row(
                 "SELECT COUNT(DISTINCT x.name) FROM experiments x JOIN variants v ON v.experiment = x.name
@@ -2809,6 +2816,22 @@ mod revalidation_tests {
         (s, d)
     }
 
+    /// ADR 0037: `--allow-network` is gone, but a protocol stored with it
+    /// still loads, with the hash it was frozen with.
+    #[test]
+    fn a_protocol_stored_with_allow_network_still_loads() {
+        let (s, _d) = fresh();
+        let mut v = serde_json::to_value(protocol()).unwrap();
+        v["allow_network"] = serde_json::json!(true);
+        s.conn()
+            .execute(
+                "UPDATE experiments SET protocol = ?1, protocol_hash = 'frozen-hash' WHERE name = 'e'",
+                params![v.to_string()],
+            )
+            .unwrap();
+        assert_eq!(get(&s, "e").unwrap().protocol_hash, "frozen-hash");
+    }
+
     /// A comparison of c1 against the baseline with five samples per arm.
     fn comparison(s: &Store, id: &str, decided: Option<(&str, serde_json::Value)>, cand: [f64; 5]) {
         let c = s.conn();
@@ -2873,8 +2896,6 @@ mod revalidation_tests {
         assert_eq!(verdict, Verdict::Accept, "{result}");
     }
 
-    /// ADR 0035 section 4: a cache in /tmp took a candidate from 152x over
-    /// the best to 4100x over the original baseline; the warning looks at both.
     #[test]
     fn a_spec_frozen_file_is_not_offered_for_change() {
         let mut p = protocol();

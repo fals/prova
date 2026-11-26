@@ -19,7 +19,8 @@ pub struct ExpExport {
     pub schema: String,
     pub experiment: String,
     pub hypothesis: String,
-    /// The frozen protocol as stored.
+    /// The frozen protocol, in the fields this version knows;
+    /// `protocol_hash` is the hash it was frozen with.
     pub protocol: Protocol,
     pub protocol_hash: String,
     /// The variant later candidates are compared against.
@@ -101,6 +102,9 @@ pub fn export(store: &Store, exp: &str, only: Option<&str>) -> Result<ExpExport,
         experiment::check_comparison(store, exp, id)?;
     }
     let conn = store.conn();
+    // One snapshot: a worker committing mid-export cannot show a running
+    // comparison next to its decision. Read-only: dropped, never committed.
+    let _snapshot = conn.unchecked_transaction()?;
     let mut stmt = conn.prepare(
         "SELECT id, baseline, candidate, status, verdict, result, created_ms, ended_ms
            FROM comparisons WHERE experiment = ?1 AND (?2 IS NULL OR id = ?2)
