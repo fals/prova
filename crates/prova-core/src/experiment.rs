@@ -1324,9 +1324,9 @@ pub fn work(
     tests: &TestReader,
 ) -> Result<()> {
     process::become_subreaper();
-    remove_dead_scratch();
+    remove_abandoned_scratch();
     // Removed when the comparison ends, however it ends.
-    let _scratch = Scratch(scratch_root(std::process::id()));
+    let _scratch = Scratch(scratch_root());
     let mut result = work_comparison(store, comparison, parse, count, tests);
     // An error must end the comparison, or it stays "running" and every
     // wait on it waits for nothing (a refused checkout, round 11).
@@ -2452,29 +2452,56 @@ fn sandboxed_in(
 /// is removed when the comparison ends.
 fn arm_scratch(dir: &Path) -> PathBuf {
     let key = sha256_hex(dir.to_string_lossy().as_bytes());
-    scratch_root(std::process::id()).join(format!("arm-{}", &key[..16]))
+    scratch_root().join(format!("arm-{}", &key[..16]))
 }
 
-/// A worker's scratch root, in the temporary directory.
-fn scratch_root(pid: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("prova-scratch-{pid}"))
+/// This worker's scratch root, in the temporary directory. It holds a lock
+/// file, locked for the worker's whole life, so that no other worker's
+/// sweep takes it for an abandoned one. A pid cannot tell: a `/tmp` shared
+/// by containers has a pid namespace per container. The root is made under
+/// a hidden name and renamed once locked, so a sweep never sees it unlocked.
+fn scratch_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<(PathBuf, Option<std::fs::File>)> = std::sync::OnceLock::new();
+    let (root, _lock) = ROOT.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        // Absolute: the sandbox binds it at its own path.
+        let base = std::path::absolute(&tmp).unwrap_or(tmp);
+        let id = new_run_id();
+        let root = base.join(format!("prova-scratch-{id}"));
+        let staging = base.join(format!(".prova-scratch-{id}"));
+        let claim = || -> std::io::Result<std::fs::File> {
+            private_dir(&staging)?;
+            let lock = std::fs::File::create(staging.join(SCRATCH_LOCK))?;
+            lock.lock()?;
+            std::fs::rename(&staging, &root)?;
+            Ok(lock)
+        };
+        let lock = claim().ok();
+        let _ = remove_tree(&staging);
+        (root, lock)
+    });
+    root.clone()
 }
+
+const SCRATCH_LOCK: &str = ".lock";
 
 /// Removes the scratch roots of workers that are gone: one killed outright
-/// could not remove its own.
-fn remove_dead_scratch() {
+/// could not remove its own. A root is gone when its lock is free.
+fn remove_abandoned_scratch() {
     let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
     for e in rd.flatten() {
-        let name = e.file_name();
-        let pid = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("prova-scratch-"))
-            .and_then(|p| p.parse::<u32>().ok());
-        if let Some(pid) = pid
-            && !process::alive(pid)
+        if !e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("prova-scratch-")
         {
+            continue;
+        }
+        let free =
+            std::fs::File::open(e.path().join(SCRATCH_LOCK)).is_ok_and(|f| f.try_lock().is_ok());
+        if free {
             let _ = remove_tree(&e.path());
         }
     }

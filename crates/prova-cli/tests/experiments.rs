@@ -1625,13 +1625,18 @@ fn a_comparison_reclaims_its_scratch_space() {
         let _ = std::fs::remove_dir_all(x);
         std::fs::create_dir_all(x).unwrap();
     }
-    // A worker killed outright cannot clean up: the next worker does.
-    let mut dead = Command::new("true").spawn().unwrap();
-    let dead_pid = dead.id();
-    dead.wait().unwrap();
-    let left = tmp.join(format!("prova-scratch-{dead_pid}")).join("arm-0");
-    std::fs::create_dir_all(&left).unwrap();
-    std::fs::write(left.join("cache"), "x").unwrap();
+    // A worker killed outright cannot clean up: the next worker does. One
+    // still alive (its lock held, as by a worker in another container
+    // sharing this /tmp) is left alone.
+    let scratch = |name: &str| {
+        let r = tmp.join(name);
+        std::fs::create_dir_all(r.join("arm-0")).unwrap();
+        std::fs::write(r.join("arm-0").join("cache"), "x").unwrap();
+        std::fs::File::create(r.join(".lock")).unwrap()
+    };
+    drop(scratch("prova-scratch-abandoned"));
+    let live = scratch("prova-scratch-live");
+    live.lock().unwrap();
     new_exp(&d, &[]);
     assert!(prova(&d, &["exp", "candidate", "e"]).status.success());
     let o = Command::new(PROVA)
@@ -1647,6 +1652,9 @@ fn a_comparison_reclaims_its_scratch_space() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+    assert!(tmp.join("prova-scratch-live/arm-0/cache").exists());
+    std::fs::remove_dir_all(tmp.join("prova-scratch-live")).unwrap();
+    drop(live);
     for x in [&tmp, &run] {
         let kept: Vec<String> = std::fs::read_dir(x)
             .unwrap()
