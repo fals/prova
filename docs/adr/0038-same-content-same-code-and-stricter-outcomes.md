@@ -26,12 +26,16 @@ owner chose to change:
    equals a commit gets that commit's id. Content no commit has gets
    `tree:<id>` of that content (no `+dirty` suffix); repositories whose
    object format prova cannot hash keep the previous form.
-2. **A pass while the command's processes still run is unverified.** When
-   the command exits 0 and a process it started is still running (it is
-   killed, as before), the pass is `PASSED (unverified)`: results that
-   process would have printed were never seen.
+2. **A pass while the command's output is still open is unverified.** When
+   the command exits 0 while a process it started still holds the run's
+   output (it is killed, as before), the pass is `PASSED (unverified)`:
+   results that process would have printed were never seen. A leftover
+   process that let go of the output (a build server, a daemon) is reported
+   and killed, and the pass stands.
 3. **A cancelled run keeps what failed.** A test that failed before the
-   cancel keeps its failure output, as in a run that ended.
+   cancel keeps the output it printed, as in a run that ended. Runners that
+   print failure details only at the end (pytest's `-rfE` summary, libtest's
+   failures block) have none to keep before a cancel.
 4. **No test ran: unchanged, and said.** A run fails when it is known that
    no test ran (0017); when prova could not see tests (opaque output, `go
    test` without `-v`) the pass stays unverified, because failing every
