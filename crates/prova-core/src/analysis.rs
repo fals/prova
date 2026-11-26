@@ -1162,7 +1162,8 @@ pub fn diff(store: &Store, base: &str, head: &str) -> Result<RunDiff> {
     }
     if !d.fixed.is_empty() || !d.newly_failing.is_empty() {
         let names = Names::new(store);
-        let known: Vec<String> = flaky(store, None, 50)?
+        // Flaky in the suite of these runs: another suite's flips are no evidence.
+        let known: Vec<String> = flaky(store, Some(&rh.suite), 50)?
             .into_iter()
             .map(|s| names.name(&s.display, s.place.as_deref()))
             .collect();

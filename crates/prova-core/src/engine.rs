@@ -2909,15 +2909,15 @@ pub fn unverified_runs(
     Ok(out)
 }
 
-/// Known flaky tests (as of the run) that passed in a finished run,
-/// quarantined ones included (ADR 0034): such a pass proves little (round 7). Read from the
+/// Known flaky tests (as of the run, in its suite) that passed in a finished
+/// run, quarantined ones included (ADR 0034): such a pass proves little (round 7). Read from the
 /// store alone; it once took a full summary of the run, whose history took
 /// summaries of earlier runs in turn, exponential in the number of passes
 /// (round 14: `prova status` used a second of CPU, `wait` a core).
 fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     let passed: std::collections::BTreeSet<String> = {
         let mut stmt = store.conn().prepare(
-            "SELECT DISTINCT t.display FROM attempts a JOIN tests t ON t.id = a.test_id
+            "SELECT DISTINCT t.id FROM attempts a JOIN tests t ON t.id = a.test_id
               WHERE a.run_id = ?1 AND a.outcome = 'passed'
                 AND a.attempt = (SELECT MAX(b.attempt) FROM attempts b
                                   WHERE b.run_id = a.run_id AND b.test_id = a.test_id)
@@ -2931,8 +2931,13 @@ fn flaky_passed_in(store: &Store, row: &RunRow) -> Result<Vec<String>> {
     if passed.is_empty() {
         return Ok(out);
     }
-    for f in crate::analysis::flaky_as_of(store, None, 50, Some(&row.id))? {
-        if passed.contains(&f.display) && !out.contains(&f.display) {
+    for f in crate::analysis::flaky_as_of(store, Some(&row.suite), 50, Some(&row.id))? {
+        // The same test (name and place) passed in this run.
+        if !out.contains(&f.display)
+            && crate::analysis::shared_ids(store, &f.test_id)?
+                .iter()
+                .any(|id| passed.contains(id))
+        {
             out.push(f.display);
         }
     }

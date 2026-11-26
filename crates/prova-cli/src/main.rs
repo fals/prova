@@ -3682,8 +3682,9 @@ fn repeat_runs(
         }
         // A known flaky test that passed every time here proves little
         // (round 9: "every test passed every time" for a 22% flake).
-        for f in analysis::flaky(store, None, 50)? {
-            if let Some((p, 0)) = tally.get(&f.display)
+        let names = analysis::Names::new(store);
+        for f in analysis::flaky(store, Some(&request.suite), 50)? {
+            if let Some((p, 0)) = tally.get(&names.name(&f.display, f.place.as_deref()))
                 && *p > 0
             {
                 println!(

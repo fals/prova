@@ -1206,3 +1206,58 @@ fn a_named_selection_must_run_the_test_it_names() {
         "{out}"
     );
 }
+
+/// A test flaky in suite `make` only (it passed and failed on the same code).
+fn flaky_in_make_only(name: &str) -> PathBuf {
+    let d = workspace(name);
+    suites(&d);
+    run(&d, "make", "pass");
+    run(&d, "make", "fail");
+    let f = text(&prova(&d, &["flaky"]));
+    assert!(f.contains("calc::x"), "{f}");
+    d
+}
+
+/// Review of PR 126 (C), ADR 0037: `prova diff` called a fix "known flaky"
+/// from the flakiness another suite recorded for the same name.
+#[test]
+fn a_diff_does_not_call_a_fix_flaky_from_another_suites_history() {
+    let d = flaky_in_make_only("flakydiff");
+    run(&d, "default", "fail");
+    let failed = text(&prova(&d, &["status", "last", "--json"]));
+    let failed: serde_json::Value = serde_json::from_str(&failed).unwrap();
+    // A fix: other code, so the flip is no flake of this suite.
+    std::fs::write(d.join("fix.txt"), "fix").unwrap();
+    run(&d, "default", "pass");
+    let diff = text(&prova(
+        &d,
+        &["diff", failed["run"].as_str().unwrap(), "last"],
+    ));
+    assert!(
+        diff.contains("fixed") && !diff.contains("known flaky"),
+        "{diff}"
+    );
+}
+
+/// Review of PR 126 (C): a pass was "known flaky passed" (unverified) because
+/// another suite knew the test as flaky.
+#[test]
+fn a_pass_is_not_called_a_flaky_pass_from_another_suites_history() {
+    let d = flaky_in_make_only("flakypassx");
+    let out = run(&d, "default", "pass");
+    assert!(
+        !out.contains("known flaky") && !out.contains("unverified"),
+        "{out}"
+    );
+}
+
+/// Review of PR 126 (C): the `--repeat` note "history knows it as flaky"
+/// came from another suite's history.
+#[test]
+fn a_repeat_does_not_call_a_test_flaky_from_another_suites_history() {
+    let d = flaky_in_make_only("flakyrepeat");
+    std::fs::write(d.join("state"), "pass").unwrap();
+    let out = text(&prova(&d, &["run", "default", "--repeat", "2"]));
+    assert!(out.contains("2 run(s)"), "{out}");
+    assert!(!out.contains("history knows it as flaky"), "{out}");
+}
