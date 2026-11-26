@@ -1221,6 +1221,9 @@ fn observe_child(
             Ok(false)
         };
     let mut cancelled_late = drain(sup, &mut open_streams, observer)?;
+    // Output still open after the drain: a process the command started holds
+    // stdout or stderr and could still print results (ADR 0038 section 2).
+    let output_still_open = open_streams > 0;
     let leaked: Vec<u32> = process::sample_group(pgid).pids.into_iter().collect();
     if !leaked.is_empty() && !cancelled_late {
         process::kill_group(pgid);
@@ -1285,13 +1288,15 @@ fn observe_child(
                 .then(|| "terminated by signal".to_owned()),
         ),
     };
-    // ADR 0038 section 2: a process the command started was still running
-    // when it exited 0 (prova killed it): what it would have printed was
-    // never seen, so the pass is unverified.
-    if status == Status::Finished && exit_code == Some(0) && !leaked.is_empty() {
+    // ADR 0038 section 2: a process the command started still held its
+    // output when it exited 0 (prova killed it): what it would have printed
+    // was never seen, so the pass is unverified. A leaked process that
+    // detached from the output (a build server) cannot print results there.
+    if status == Status::Finished && exit_code == Some(0) && !leaked.is_empty() && output_still_open
+    {
         sup.emit(EventKind::RunWarning {
             message: format!(
-                "a process it started was still running when the command exited 0 ({} killed): results it would have printed were never seen",
+                "a process it started was still running and holding the output when the command exited 0 ({} killed): results it would have printed were never seen",
                 leaked.len()
             ),
         });
