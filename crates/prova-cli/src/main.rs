@@ -2977,34 +2977,6 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     .into());
                 }
             }
-            // One name in several places (two crates' `tests::flaky`) is
-            // several tests: each one's history, with its place.
-            if in_place.is_none() {
-                let mut by_place: std::collections::BTreeMap<String, Vec<_>> = Default::default();
-                for t in found
-                    .iter()
-                    .filter(|t| t.1 == test || found.iter().all(|f| f.1 == t.1))
-                {
-                    if let Some((Some(file), _)) = analysis::place_of_test(&store, &t.0)?
-                        && !file.starts_with("(package pending)")
-                    {
-                        by_place.entry(file).or_default().push(t.clone());
-                    }
-                }
-                if by_place.len() > 1 {
-                    for (i, group) in by_place.values().enumerate() {
-                        if i > 0 {
-                            println!();
-                        }
-                        let id = analysis::most_recent(&store, group)?;
-                        match analysis::stats(&store, &id, window)? {
-                            Some(s) => render::test_stats(&s, json),
-                            None => bail!("test disappeared"),
-                        }
-                    }
-                    return Ok(exit::PASSED);
-                }
-            }
             // Exact names win over partial ones (round 10: 16 matches for a
             // name that is exact in every suite, next to an old renamed one).
             // A name that is exact only in its last part (`TestMod` for
@@ -3025,65 +2997,107 @@ fn dispatch(cmd: Cmd) -> Result<u8> {
                     found
                 }
             };
-            let exact: Vec<_> = found.iter().filter(|t| t.1 == test).collect();
-            // Same name in several suites: take the one that ran most recently.
-            let displays: std::collections::BTreeSet<&str> =
-                found.iter().map(|t| t.1.as_str()).collect();
-            let pick = match (exact.as_slice(), found.as_slice()) {
-                ([one], _) => one.0.clone(),
-                ([], [one]) => one.0.clone(),
-                (_, [_, ..]) if displays.len() == 1 => analysis::most_recent(&store, &found)?,
-                // Several names, one test: they share one history (round 6).
-                (_, [first, ..])
-                    if {
-                        let shared = analysis::shared_ids(&store, &first.0)?;
-                        found.iter().all(|f| shared.contains(&f.0))
-                    } =>
-                {
-                    analysis::most_recent(&store, &found)?
-                }
-                (_, []) => {
-                    return Err(UsageError(format!(
-                        "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
-                    ))
-                    .into());
-                }
-                _ => {
-                    // One line per name, its suites together: a name listed
-                    // once per suite read as tests no name could tell apart
-                    // (round 15).
-                    let names = analysis::Names::new(&store);
-                    let mut by_name: std::collections::BTreeMap<String, Vec<&str>> =
-                        Default::default();
-                    for (id, display, suite) in &found {
-                        let file = analysis::place_of_test(&store, id)?.and_then(|p| p.0);
-                        by_name
-                            .entry(names.name(display, file.as_deref()))
-                            .or_default()
-                            .push(suite);
-                    }
-                    // An empty name asks for the list (as the help says).
-                    if test.is_empty() {
-                        println!("{} tests prova knows:", by_name.len());
-                    } else {
-                        println!("{} tests match {test:?}; be more specific:", by_name.len());
-                    }
-                    for (display, suites) in by_name.iter().take(20) {
-                        println!("  {display}  (suite {})", suites.join(", "));
-                    }
-                    if by_name.len() > 20 {
-                        println!("  ... and {} more", by_name.len() - 20);
-                    }
-                    return Ok(if test.is_empty() {
-                        exit::PASSED
-                    } else {
-                        exit::USAGE
-                    });
-                }
+            if found.is_empty() {
+                return Err(UsageError(format!(
+                    "no test matching {test:?}: prova knows a test once a run showed it individually (`prova history \"\"` lists them)"
+                ))
+                .into());
+            }
+            // History is per suite (ADR 0037): one entry per suite that
+            // knows the test. Within a suite, one name in several places
+            // (two crates' `tests::flaky`) is several tests, each with its
+            // place; a bare and a qualified name of one test are one.
+            let mut by_suite: std::collections::BTreeMap<&str, Vec<&(String, String, String)>> =
+                Default::default();
+            for t in &found {
+                by_suite.entry(t.2.as_str()).or_default().push(t);
+            }
+            let mut picks: Vec<(String, String)> = Vec::new();
+            let display_of = |id: &str| {
+                found
+                    .iter()
+                    .find(|t| t.0 == id)
+                    .map(|t| t.1.clone())
+                    .unwrap_or_default()
             };
-            match analysis::stats_in_suite(&store, &pick, window, suite.as_deref())? {
-                Some(s) => render::test_stats(&s, json),
-                None => bail!("test disappeared"),
+            let mut ambiguous = false;
+            for group in by_suite.values() {
+                let group: Vec<(String, String, String)> =
+                    group.iter().map(|t| (*t).clone()).collect();
+                let mut by_place: std::collections::BTreeMap<
+                    String,
+                    Vec<(String, String, String)>,
+                > = Default::default();
+                for t in &group {
+                    if let Some((Some(file), _)) = analysis::place_of_test(&store, &t.0)?
+                        && !file.starts_with("(package pending)")
+                    {
+                        by_place.entry(file).or_default().push(t.clone());
+                    }
+                }
+                let displays: std::collections::BTreeSet<&str> =
+                    group.iter().map(|t| t.1.as_str()).collect();
+                if by_place.len() > 1 && displays.len() == 1 {
+                    for places in by_place.values() {
+                        let id = analysis::most_recent(&store, places)?;
+                        picks.push((display_of(&id), id));
+                    }
+                } else if group.len() == 1 || displays.len() == 1 {
+                    let id = analysis::most_recent(&store, &group)?;
+                    picks.push((display_of(&id), id));
+                } else {
+                    // Several names, one test: they share one history (round 6).
+                    let shared = analysis::shared_ids(&store, &group[0].0)?;
+                    if group.iter().all(|f| shared.contains(&f.0)) {
+                        let id = analysis::most_recent(&store, &group)?;
+                        picks.push((display_of(&id), id));
+                    } else {
+                        ambiguous = true;
+                    }
+                }
+            }
+            // Suites keep their own history: different names are different
+            // tests, whichever suite knows them.
+            ambiguous |= picks.iter().any(|(d, _)| *d != picks[0].0);
+            if ambiguous {
+                // One line per name, its suites together: a name listed
+                // once per suite read as tests no name could tell apart
+                // (round 15).
+                let names = analysis::Names::new(&store);
+                let mut by_name: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+                for (id, display, suite) in &found {
+                    let file = analysis::place_of_test(&store, id)?.and_then(|p| p.0);
+                    by_name
+                        .entry(names.name(display, file.as_deref()))
+                        .or_default()
+                        .push(suite);
+                }
+                // An empty name asks for the list (as the help says).
+                if test.is_empty() {
+                    println!("{} tests prova knows:", by_name.len());
+                } else {
+                    println!("{} tests match {test:?}; be more specific:", by_name.len());
+                }
+                for (display, suites) in by_name.iter().take(20) {
+                    println!("  {display}  (suite {})", suites.join(", "));
+                }
+                if by_name.len() > 20 {
+                    println!("  ... and {} more", by_name.len() - 20);
+                }
+                return Ok(if test.is_empty() {
+                    exit::PASSED
+                } else {
+                    exit::USAGE
+                });
+            }
+            for (i, (_, pick)) in picks.iter().enumerate() {
+                if i > 0 && !json {
+                    println!();
+                }
+                match analysis::stats(&store, pick, window)? {
+                    Some(s) => render::test_stats(&s, json),
+                    None => bail!("test disappeared"),
+                }
             }
             // The exact match was shown: say what else the name matches
             // instead of hiding it (round 18: `flaky_clock` showed the

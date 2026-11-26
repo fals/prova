@@ -31,10 +31,6 @@ pub struct TestRun {
     /// The run's environment fingerprint (name -> hash of value).
     #[serde(skip)]
     pub env: BTreeMap<String, String>,
-    /// The run's suite (a named suite, or `cmd:<hash>` of an ad hoc
-    /// command): flaky flips count within one (ADR 0036).
-    #[serde(skip)]
-    pub suite: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,9 +41,9 @@ pub struct TestStats {
     /// (ADR 0031 section 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// The suite whose history this is (an ad hoc command is its own suite):
+    /// a history is never shared across suites (ADR 0037).
     pub suite: String,
-    /// Every suite that ran this test (its history is shared, ADR 0018).
-    pub suites: Vec<String>,
     /// Other names of the same test (a Go test recorded bare and
     /// package-qualified): a quarantine of either covers it.
     #[serde(skip)]
@@ -100,6 +96,7 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
         "SELECT DISTINCT r.id, r.code, r.status, r.created_ms
            FROM attempts a JOIN runs r ON r.id = a.run_id
           WHERE a.test_id IN (SELECT t2.id FROM tests t1 JOIN tests t2 ON t2.display = t1.display
+                                                        AND t2.suite = t1.suite
                                WHERE t1.id = ?1)
             AND a.outcome = 'errored' AND r.status <> 'finished'
             AND a.message LIKE 'test did not finish before the run ended%'
@@ -118,25 +115,26 @@ fn cut_short_runs(store: &Store, test_id: &str) -> Result<Vec<CutShortRun>> {
     Ok(rows)
 }
 
-/// What makes two stored tests one test for history (ADR 0018), as the
-/// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another).
-/// A name recorded bare (Go text with no package, quiet `cargo test` with no
-/// crate) is the qualified one only when the name belongs to one place: a
-/// name shared by several places is never matched to one of them (ADR 0035
-/// section 1).
-const SAME_TEST_ON: &str = "(t2.display = t1.display
+/// What makes two stored tests one test for history (ADR 0037), as the
+/// `ON` of a self join of `tests` (`t1` the test asked about, `t2` another):
+/// the same suite, and the same name and place. A name recorded bare (Go
+/// text with no package, quiet `cargo test` with no crate) is the qualified
+/// one only when the suite knows the name in one place: a name shared by
+/// several places is never matched to one of them (ADR 0035 section 1).
+const SAME_TEST_ON: &str = "(t2.suite = t1.suite AND (
+                (t2.display = t1.display
                    AND (COALESCE(t2.file, '') = COALESCE(t1.file, '')
                         OR ((t1.file IS NULL OR t2.file IS NULL)
                             AND (SELECT COUNT(DISTINCT x.file) FROM tests x
-                                 WHERE x.display = t1.display AND x.file IS NOT NULL
+                                 WHERE x.suite = t1.suite AND x.display = t1.display AND x.file IS NOT NULL
                                    AND x.file NOT LIKE '(package pending)%'
                                    AND x.file <> '(unknown directory)') < 2)))
                 OR (t2.name = t1.name
                    AND ((t1.file IS NULL AND t1.path = '[]') OR (t2.file IS NULL AND t2.path = '[]'))
                    AND (SELECT COUNT(DISTINCT COALESCE(x.file, '') || '|' || x.path) FROM tests x
-                        WHERE x.name = t1.name AND NOT (x.file IS NULL AND x.path = '[]')
+                        WHERE x.suite = t1.suite AND x.name = t1.name AND NOT (x.file IS NULL AND x.path = '[]')
                           AND COALESCE(x.file, '') NOT LIKE '(package pending)%'
-                          AND COALESCE(x.file, '') <> '(unknown directory)') < 2)";
+                          AND COALESCE(x.file, '') <> '(unknown directory)') < 2)))";
 
 fn same_sql(sql: &str) -> String {
     sql.replace("{SAME}", SAME_TEST_ON)
@@ -341,39 +339,32 @@ pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 /// test that just started. `stats` answers the same and much more; that is
 /// too much to read once per test while a run records (issue 91). Only
 /// finished, remembered, verified runs count, as in `stats`. A test not yet
-/// recorded under this id is known by its name from other suites.
-pub fn usual_p95_ms(store: &Store, test_id: &str, display: &str) -> Result<Option<u64>> {
-    let read = |ids_sql: &str, key: &str| -> Result<Vec<u64>> {
-        let mut stmt = store.conn().prepare(&format!(
-            "SELECT a.duration_ms FROM attempts a JOIN runs r ON r.id = a.run_id
-              WHERE a.test_id IN ({ids_sql}) AND a.outcome = 'passed' AND a.duration_ms IS NOT NULL
+/// recorded in its suite has no history (ADR 0037).
+pub fn usual_p95_ms(store: &Store, test_id: &str) -> Result<Option<u64>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT a.duration_ms FROM attempts a JOIN runs r ON r.id = a.run_id
+              WHERE a.test_id = ?1 AND a.outcome = 'passed' AND a.duration_ms IS NOT NULL
                 AND r.status = 'finished'
                 AND r.id NOT IN (SELECT run_id FROM forgotten)
                 AND NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r.id AND w.kind = 'run_warning'
                                 AND w.payload LIKE '%; no evidence about the tests%')
                 AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
-              ORDER BY r.created_ms DESC LIMIT 20"
-        ))?;
-        let mut v: Vec<u64> = stmt
-            .query_map(params![key], |r| r.get::<_, i64>(0))?
-            .map(|d| d.map(|d| d.max(0) as u64))
-            .collect::<rusqlite::Result<_>>()?;
-        v.sort_unstable();
-        // Nothing but zeros: a framework that reports no time (round 17).
-        if v.iter().all(|d| *d == 0) {
-            v.clear();
-        }
-        Ok(v)
-    };
-    let mut ms = read("?1", test_id)?;
-    if ms.is_empty() {
-        ms = read("SELECT id FROM tests WHERE display = ?1", display)?;
+              ORDER BY r.created_ms DESC LIMIT 20",
+    )?;
+    let mut ms: Vec<u64> = stmt
+        .query_map(params![test_id], |r| r.get::<_, i64>(0))?
+        .map(|d| d.map(|d| d.max(0) as u64))
+        .collect::<rusqlite::Result<_>>()?;
+    ms.sort_unstable();
+    // Nothing but zeros: a framework that reports no time (round 17).
+    if ms.iter().all(|d| *d == 0) {
+        ms.clear();
     }
     Ok(percentile(&ms, 95.0))
 }
 
 /// Per-run results of a test, newest first, at most `limit` runs.
-/// One test's results, newest first, over every suite that ran it (ADR 0018).
+/// One test's results in its suite, newest first (ADR 0037).
 /// Results are the same test when their full names match and their files
 /// match or one is unknown (quiet `cargo test` names no binary), or when
 /// one side knows only the bare name (`go test` text output names no
@@ -390,17 +381,6 @@ pub fn test_runs_with(
     test_id: &str,
     limit: usize,
     current: Option<&str>,
-) -> Result<Vec<TestRun>> {
-    test_runs_scoped(store, test_id, limit, current, None)
-}
-
-/// `test_runs_with`, only over the runs of one suite when `suite` is given.
-fn test_runs_scoped(
-    store: &Store,
-    test_id: &str,
-    limit: usize,
-    current: Option<&str>,
-    suite: Option<&str>,
 ) -> Result<Vec<TestRun>> {
     let mut stmt = store.conn().prepare(&same_sql(
         "WITH same AS (
@@ -426,13 +406,12 @@ fn test_runs_scoped(
                    AND (r3.id = ?3 OR NOT EXISTS (SELECT 1 FROM events w WHERE w.run_id = r3.id AND w.kind = 'run_warning'
                                                   AND w.payload LIKE '%; no evidence about the tests%'))
                    AND r3.id NOT IN (SELECT run_id FROM forgotten)
-                   AND (?4 IS NULL OR r3.suite = ?4)
                    -- labels of a run are as of that run: later runs do not
                    -- rewrite them (round 13: 'failed 8x before' on a run
                    -- that followed 3 failures)
                    AND (?3 IS NULL OR r3.created_ms <= (SELECT created_ms FROM runs WHERE id = ?3))))
          SELECT a.run_id, r.code, r.created_ms, a.attempt, a.outcome, a.duration_ms, a.message, a.fingerprint, r.env,
-                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration, r.suite
+                json_extract(r.spec, '$.selection'), a.test_id, a.passed_in_iteration
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.test_id IN (SELECT id FROM same)
            AND NOT EXISTS (SELECT 1 FROM superseded s WHERE s.run_id = a.run_id AND s.test_id = a.test_id)
@@ -440,7 +419,7 @@ fn test_runs_scoped(
            AND (r.status = 'finished' OR r.id = ?3 OR a.outcome <> 'errored')
          ORDER BY r.created_ms DESC, a.run_id, a.attempt ASC"),
     )?;
-    let rows = stmt.query_map(params![test_id, limit as i64, current, suite], |r| {
+    let rows = stmt.query_map(params![test_id, limit as i64, current], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -454,7 +433,6 @@ fn test_runs_scoped(
             r.get::<_, Option<String>>(9)?,
             r.get::<_, String>(10)?,
             r.get::<_, i64>(11)? != 0,
-            r.get::<_, String>(12)?,
         ))
     })?;
     // A parent run only because its subtest was selected (Go runs the
@@ -487,7 +465,6 @@ fn test_runs_scoped(
             selection,
             row_test,
             passed_in_iteration,
-            run_suite,
         ) = row?;
         // Only its pass says nothing of the parent: a failure there is the
         // parent's too, as its subtest's (round 18: the two disagreed).
@@ -541,7 +518,6 @@ fn test_runs_scoped(
                     message: if outcome.is_failure() { msg } else { None },
                     fingerprint: fp,
                     env,
-                    suite: run_suite,
                 })
             }
         }
@@ -561,31 +537,11 @@ pub fn stats(store: &Store, test_id: &str, window: usize) -> Result<Option<TestS
     stats_with(store, test_id, window, None)
 }
 
-/// `stats`, over the runs of one suite only (`prova history --suite`).
-pub fn stats_in_suite(
-    store: &Store,
-    test_id: &str,
-    window: usize,
-    suite: Option<&str>,
-) -> Result<Option<TestStats>> {
-    stats_scoped(store, test_id, window, None, suite)
-}
-
 fn stats_with(
     store: &Store,
     test_id: &str,
     window: usize,
     current: Option<&str>,
-) -> Result<Option<TestStats>> {
-    stats_scoped(store, test_id, window, current, None)
-}
-
-fn stats_scoped(
-    store: &Store,
-    test_id: &str,
-    window: usize,
-    current: Option<&str>,
-    only_suite: Option<&str>,
 ) -> Result<Option<TestStats>> {
     let meta: Option<(String, String, Option<String>)> = store
         .conn()
@@ -599,23 +555,7 @@ fn stats_scoped(
         return Ok(None);
     };
     let place = Names::new(store).place(&display, file.as_deref());
-    let recent = test_runs_scoped(store, test_id, window, current, only_suite)?;
-    let suites: Vec<String> = {
-        let mut stmt = store.conn().prepare(&same_sql(
-            "SELECT DISTINCT t2.suite FROM tests t1 JOIN tests t2
-               ON {SAME}
-                -- a Go test seen before its package is known (`(package
-                -- pending) #N`) is the qualified test of that name that ran
-                -- most recently
-                OR (t1.file LIKE '(package pending) #%' AND t1.path = '[]' AND t2.id IN (
-                      SELECT q.id FROM tests q JOIN attempts qa ON qa.test_id = q.id JOIN runs qr ON qr.id = qa.run_id
-                      WHERE q.suite = t1.suite AND q.name = t1.name AND q.path <> '[]'
-                      ORDER BY qr.created_ms DESC LIMIT 1))
-             WHERE t1.id = ?1 ORDER BY t2.suite"),
-        )?;
-        stmt.query_map(params![test_id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
+    let recent = test_runs_with(store, test_id, window, current)?;
     let counted: Vec<&TestRun> = recent
         .iter()
         .filter(|r| r.outcome != Outcome::Skipped)
@@ -628,8 +568,6 @@ fn stats_scoped(
     // A flip is flaky only on the same code in the same environment: a test
     // that fails only when a variable is set is environment-dependent, not
     // flaky (round 11). Runs recorded before the fingerprint share "".
-    // And in the same suite: one that fails only one way of running it is
-    // not flaky either (ADR 0036).
     let env_key = |r: &TestRun| {
         r.env
             .iter()
@@ -637,14 +575,12 @@ fn stats_scoped(
             .collect::<Vec<_>>()
             .join(",")
     };
-    let mut by_code: BTreeMap<(&str, &str, String), BTreeSet<bool>> = BTreeMap::new();
+    let mut by_code: BTreeMap<(&str, String), BTreeSet<bool>> = BTreeMap::new();
     // Outside git the code version is unknown: two runs there are never
     // "the same code" (round 12: a fix in a project without git was
     // called a flaky flip).
     for r in counted.iter().filter(|r| r.code != "nogit") {
-        let e = by_code
-            .entry((r.code.as_str(), r.suite.as_str(), env_key(r)))
-            .or_default();
+        let e = by_code.entry((r.code.as_str(), env_key(r))).or_default();
         e.insert(r.outcome.is_failure());
         // Passed and failed within the one run: both results on this code.
         if r.passed_and_failed {
@@ -656,7 +592,7 @@ fn stats_scoped(
     let flips = by_code
         .iter()
         .filter(|(_, s)| s.len() == 2)
-        .map(|((code, _, _), _)| *code)
+        .map(|((code, _), _)| *code)
         .collect::<BTreeSet<_>>()
         .len();
     // Same code, opposite results, different environments: name the
@@ -667,12 +603,10 @@ fn stats_scoped(
     let mut env_passes: BTreeSet<&str> = BTreeSet::new();
     if flips == 0 {
         for p in counted.iter().filter(|r| r.outcome == Outcome::Passed) {
-            for f in counted.iter().filter(|r| {
-                r.outcome.is_failure()
-                    && r.code == p.code
-                    && r.suite == p.suite
-                    && r.code != "nogit"
-            }) {
+            for f in counted
+                .iter()
+                .filter(|r| r.outcome.is_failure() && r.code == p.code && r.code != "nogit")
+            {
                 for k in p.env.keys().chain(f.env.keys()) {
                     if p.env.get(k) != f.env.get(k) {
                         env_dependent.insert(k.clone());
@@ -733,7 +667,6 @@ fn stats_scoped(
         display,
         place,
         suite,
-        suites,
         aliases: Vec::new(),
         runs: counted.len(),
         failures,
@@ -811,15 +744,13 @@ pub fn most_recent(store: &Store, candidates: &[(String, String, String)]) -> Re
     Ok(best.1)
 }
 
-/// Flaky tests among those seen in the last `runs` runs of any suite.
+/// Flaky tests among those seen in the last `runs` runs of their suite.
 pub fn flaky(store: &Store, suite: Option<&str>, window: usize) -> Result<Vec<TestStats>> {
     flaky_as_of(store, suite, window, None)
 }
 
 /// Tests that failed somewhere, whose history is worth reading for flakiness.
-/// A history is shared across suites (ADR 0018), and a test that failed in
-/// one suite may have flipped in another; a flip counts within one suite
-/// (ADR 0036). A failure of a provisional name whose package was
+/// A flip counts within one suite (ADR 0037). A failure of a provisional name whose package was
 /// learned later (superseded in that run) is the qualified test's, which
 /// history shows (round 18); but a test superseded in one run is still its
 /// own where it failed unsuperseded in another.
@@ -851,10 +782,9 @@ pub fn flaky_as_of(
         {
             // One test seen as a bare and as a qualified name is one row
             // (its history is shared): the qualified name shows.
-            if let Some(o) = out
-                .iter_mut()
-                .find(|o| o.place == s.place && same_test_name(&o.display, &s.display))
-            {
+            if let Some(o) = out.iter_mut().find(|o| {
+                o.suite == s.suite && o.place == s.place && same_test_name(&o.display, &s.display)
+            }) {
                 if o.display != s.display {
                     if s.display.len() > o.display.len() {
                         let old = std::mem::replace(&mut o.display, s.display.clone());
@@ -1050,20 +980,21 @@ pub struct SizeReport {
 pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
     use crate::config::Size;
     let mut stmt = store.conn().prepare(
-        "SELECT id, display, file FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
+        "SELECT id, display, file, suite FROM tests WHERE (?1 IS NULL OR suite = ?1) ORDER BY display",
     )?;
-    let rows: Vec<(String, String, Option<String>)> = stmt
-        .query_map(params![suite], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let rows: Vec<(String, String, Option<String>, String)> = stmt
+        .query_map(params![suite], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let names = Names::new(store);
-    // One test, one count: the same test in several suites shares its
-    // history (round 12: a 5-test project showed 12 tests). The most
-    // decided view wins.
-    let mut views: BTreeMap<String, Option<SizeView>> = BTreeMap::new();
-    for (id, display, file) in rows {
+    // One test of one suite, one count (ADR 0037); a bare and a qualified
+    // name of one suite's test count once, the most decided view winning.
+    let mut views: BTreeMap<(String, String), Option<SizeView>> = BTreeMap::new();
+    for (id, display, file, suite) in rows {
         let view = observed_size(store, &id)?;
         let e = views
-            .entry(names.name(&display, file.as_deref()))
+            .entry((names.name(&display, file.as_deref()), suite))
             .or_insert(None);
         let better = match (&*e, &view) {
             (None, Some(_)) => true,
@@ -1075,7 +1006,24 @@ pub fn sizes(store: &Store, suite: Option<&str>) -> Result<SizeReport> {
         }
     }
     let mut r = SizeReport::default();
-    for (display, view) in views {
+    // A name shows its suite only where several suites hold it.
+    let mut suites_of: BTreeMap<&str, usize> = BTreeMap::new();
+    for (name, _) in views.keys() {
+        *suites_of.entry(name).or_default() += 1;
+    }
+    let shown: BTreeMap<(String, String), String> = views
+        .keys()
+        .map(|(name, suite)| {
+            let label = if suites_of[name.as_str()] > 1 {
+                format!("{name} (suite {suite})")
+            } else {
+                name.clone()
+            };
+            ((name.clone(), suite.clone()), label)
+        })
+        .collect();
+    for (key, view) in views {
+        let display = shown[&key].clone();
         match view.as_ref().and_then(|v| v.size) {
             Some(Size::Small) => r.small += 1,
             Some(Size::Medium) => r.medium += 1,
@@ -1408,13 +1356,13 @@ mod tests {
         let id = crate::store::test_id("s", &k);
         let full = stats(&s, &id, 20).unwrap().unwrap().p95_ms;
         assert_eq!(full, Some(800));
-        assert_eq!(usual_p95_ms(&s, &id, &k.display()).unwrap(), full);
-        // A test never seen under this id is known by its name.
+        assert_eq!(usual_p95_ms(&s, &id).unwrap(), full);
+        // The same name in another suite is no history of this one (ADR 0037).
         let other = crate::store::test_id("other", &k);
-        assert_eq!(usual_p95_ms(&s, &other, &k.display()).unwrap(), full);
+        assert_eq!(usual_p95_ms(&s, &other).unwrap(), None);
         // Zero durations are a framework that reports no time.
         let z = store_with_ms(&runs, |_| 0);
-        assert_eq!(usual_p95_ms(&z, &id, &k.display()).unwrap(), None);
+        assert_eq!(usual_p95_ms(&z, &id).unwrap(), None);
     }
 
     /// Round 17: `prova flaky` listed a Go test twice, once under the bare
@@ -1488,7 +1436,7 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SlowRow {
     pub test: String,
-    pub suites: Vec<String>,
+    pub suite: String,
     /// Results with a duration the numbers come from.
     pub runs: usize,
     pub p50_ms: u64,
@@ -1496,8 +1444,8 @@ pub struct SlowRow {
 }
 
 /// The `n` slowest tests, worst first by p50 then p95, over each test's
-/// last `window` finished results with a duration. Like history, one test
-/// seen in several suites is one row. Forgotten runs and runs that are no
+/// last `window` finished results with a duration. Like history, a test is
+/// one row per suite (ADR 0037). Forgotten runs and runs that are no
 /// evidence about the tests do not count (as in `test_runs`).
 pub fn slowest(
     store: &Store,
@@ -1528,22 +1476,21 @@ pub fn slowest(
         ))
     })?;
     let names = Names::new(store);
-    let mut by_test: BTreeMap<String, (BTreeSet<String>, Vec<u64>)> = BTreeMap::new();
+    let mut by_test: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     for row in rows {
         let (display, suite, ms, file) = row?;
-        let e = by_test
-            .entry(names.name(&display, file.as_deref()))
-            .or_default();
-        e.0.insert(suite);
-        e.1.push(ms);
+        by_test
+            .entry((names.name(&display, file.as_deref()), suite))
+            .or_default()
+            .push(ms);
     }
     let mut out: Vec<SlowRow> = by_test
         .into_iter()
-        .filter_map(|(test, (suites, mut ms))| {
+        .filter_map(|((test, suite), mut ms)| {
             ms.sort_unstable();
             Some(SlowRow {
                 test,
-                suites: suites.into_iter().collect(),
+                suite,
                 runs: ms.len(),
                 p50_ms: percentile(&ms, 50.0)?,
                 p95_ms: percentile(&ms, 95.0)?,

@@ -438,9 +438,12 @@ fn r18_flaky_and_history_agree_when_failures_run_on() {
     let fail = go(
         "'=== RUN   TestM' '--- FAIL: TestM (0.00s)' '=== RUN   TestM' '--- FAIL: TestM (0.00s)'",
     );
-    prova(&d, &["run", "--", "sh", "-c", &mixed]);
+    // One command (history is per suite): the file `state` switches it.
+    let cmd = format!("if [ -f state ]; then {fail}; else {mixed}; fi");
+    prova(&d, &["run", "--", "sh", "-c", &cmd]);
+    std::fs::write(d.join("state"), "").unwrap();
     for n in 0..6 {
-        prova(&d, &["run", "--", "sh", "-c", &fail]);
+        prova(&d, &["run", "--", "sh", "-c", &cmd]);
         let h = text(&prova(&d, &["history", "TestM"]));
         let f = text(&prova(&d, &["flaky"]));
         assert_eq!(
@@ -501,7 +504,7 @@ fn r18_pytest_in_a_container_has_an_unknown_place() {
         let o = text(&prova(&d, &["run", "--", "sh", "-c", &cmd]));
         assert!(o.contains("rootdir is outside the repository"), "{o}");
         assert!(!o.contains("tests.a.") && !o.contains("tests.b."), "{o}");
-        assert!(!o.contains("FLAKY"), "{o}");
+        assert!(o.contains("first time seen") && !o.contains("FLAKY"), "{o}");
     }
 }
 

@@ -236,7 +236,7 @@ like secrets are left out. Each failure in a summary carries context:
 
 | Tag | Meaning |
 |---|---|
-| `first time seen: no history yet` | no earlier result for this test anywhere |
+| `first time seen: no history yet` | no earlier result for this test in this suite |
 | `new failure` | its earlier results all passed |
 | `failed 3x before` | a known, pre-existing failure, whatever its message |
 | `has not passed yet` | earlier results exist, but none passed |
@@ -475,9 +475,9 @@ These are stable interfaces; changing them is a breaking change.
 Experiment commands: 0 accept (or no comparison yet), 1 reject, inconclusive
 or invalid, 3 cancelled, 4 failed, 5 still running.
 
-**History is per test, not per suite.** The same test (same file and full
-name) run by different suites shares one history; only runs that finished
-count. Runs with a warning ending "no evidence about the tests", and runs
+**History is per suite and test.** The same test run by different suites
+(or an ad hoc command) has one history in each, never a shared one (ADR
+0037); only runs that finished count. Runs with a warning ending "no evidence about the tests", and runs
 taken out with `prova forget`, count nowhere. Labels are listed under
 [Memory](#memory-history-and-flaky-tests). Rust test binaries are named by
 target, whichever runner reports them (cargo, nextest).

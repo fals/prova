@@ -592,13 +592,11 @@ impl Supervisor<'_> {
     /// History p95 times 3 (at least 1s), else the size default (ADR 0004).
     fn slow_budget(&self, test: &TestKey) -> (Duration, BudgetFrom) {
         let id = crate::store::test_id(&self.suite, test);
-        // The history is shared across suites (ADR 0018): a test this suite
-        // has not recorded yet may be known from another (round 9: 60 s
-        // default in `make` while `default` knew it takes 3 ms). Only the
-        // p95 is needed, and this runs once per test while recording: the
-        // full `stats` made a run with history cost milliseconds per test
-        // (issue 91).
-        match crate::analysis::usual_p95_ms(self.store, &id, &test.display()) {
+        // Only the p95 is needed, and this runs once per test while
+        // recording: the full `stats` made a run with history cost
+        // milliseconds per test (issue 91). A test this suite has not
+        // recorded yet has no history (ADR 0037).
+        match crate::analysis::usual_p95_ms(self.store, &id) {
             Ok(Some(p95)) => (
                 Duration::from_millis((p95 * 3).max(1000)),
                 BudgetFrom::History,
@@ -2517,27 +2515,9 @@ fn runner_failure_summary(line: &str) -> bool {
         || line == "[INFO] BUILD FAILURE"
 }
 
-/// Whether the tests of `run` share a test with any of `suites`: a suite
-/// that runs part of what another suite runs (0027 §6).
-fn overlaps(store: &Store, run: &str, suites: &[String]) -> Result<bool> {
-    for suite in suites {
-        let hit: bool = store.conn().query_row(
-            "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t1 ON t1.id = a.test_id
-                              JOIN tests t2 ON t2.display = t1.display
-                             WHERE a.run_id = ?1 AND t2.suite = ?2)",
-            rusqlite::params![run, suite],
-            |r| r.get(0),
-        )?;
-        if hit {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// The warning for known-flaky tests that have no result in this full run
-/// although this suite, or a suite sharing tests with it, ran them: leaving a
-/// flaky test out of the command proves nothing about it (ADR 0027 §6).
+/// The warning for known-flaky tests of this suite that have no result in
+/// this full run: leaving a flaky test out of the command proves nothing
+/// about it (ADR 0027 §6, ADR 0037: a flaky test is of one suite).
 /// Quarantined tests too: a quarantine never makes a run look better (0034).
 fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String>> {
     let ran: std::collections::BTreeSet<String> = {
@@ -2551,7 +2531,7 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         return Ok(None);
     }
     let mut left: Vec<String> = Vec::new();
-    for f in crate::analysis::flaky(store, None, 50)? {
+    for f in crate::analysis::flaky(store, Some(suite), 50)? {
         // A name recorded bare (`TestX`, text output before Go results were
         // qualified by package) is the test `pkg::TestX` this run has.
         if ran.contains(&f.display)
@@ -2560,16 +2540,7 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         {
             continue;
         }
-        // Another suite sharing tests with this one is evidence only when
-        // the flaky test's neighbours (its file, or its module) ran here: a
-        // suite that runs everything shares tests with a narrow one that
-        // never meant to run it (round 15: `small` warned about a flaky
-        // test of `medium`, because `spec` runs both).
-        if f.suites.iter().any(|s| s == suite)
-            || (overlaps(store, run, &f.suites)? && neighbour_ran(store, run, &f.display)?)
-        {
-            left.push(f.display);
-        }
+        left.push(f.display);
     }
     if left.is_empty() {
         return Ok(None);
@@ -2581,21 +2552,6 @@ fn left_out_flaky(store: &Store, run: &str, suite: &str) -> Result<Option<String
         left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
         if left.len() > 5 { ", ..." } else { "" }
     )))
-}
-
-/// Whether this run recorded a test of the same file (or, with no file, the
-/// same module path) as the test named `display`.
-fn neighbour_ran(store: &Store, run: &str, display: &str) -> Result<bool> {
-    Ok(store.conn().query_row(
-        "SELECT EXISTS (SELECT 1 FROM attempts a JOIN tests t ON t.id = a.test_id
-                         WHERE a.run_id = ?1
-                           AND EXISTS (SELECT 1 FROM tests f WHERE f.display = ?2
-                                         AND ((f.file IS NOT NULL AND f.file = t.file)
-                                           OR (f.file IS NULL AND t.file IS NULL
-                                               AND f.path = t.path AND f.path <> '[]'))))",
-        rusqlite::params![run, display],
-        |r| r.get(0),
-    )?)
 }
 
 // ------------------------------------------------------------------ wait
@@ -3377,14 +3333,13 @@ pub fn summarize(store: &Store, run: &str, reason: WaitReason, last_seq: u64) ->
                 continue;
             }
             if result.is_none() && !(blind && row.level < Level::Recognized) {
-                let suites: Vec<String> = {
-                    let mut stmt = store
-                        .conn()
-                        .prepare("SELECT DISTINCT suite FROM tests WHERE display = ?1")?;
-                    stmt.query_map(rusqlite::params![name], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?
-                };
-                if !suites.contains(&row.suite) && !overlaps(store, run, &suites)? {
+                // Only this suite's own tests can be "not run" here.
+                let known: bool = store.conn().query_row(
+                    "SELECT EXISTS (SELECT 1 FROM tests WHERE display = ?1 AND suite = ?2)",
+                    rusqlite::params![name, row.suite],
+                    |r| r.get(0),
+                )?;
+                if !known {
                     continue;
                 }
             }

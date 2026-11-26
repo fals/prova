@@ -13,7 +13,7 @@ fn workspace(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("prova-r17id-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join(".gitignore"), "state\n").unwrap();
+    std::fs::write(d.join(".gitignore"), "state\nmode\n").unwrap();
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
@@ -141,23 +141,31 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
             first.0, first.1, second.0, second.1
         )
     };
+    // One suite, three orders of execution (history is per suite).
     std::fs::write(
         d.join("prova.toml"),
         format!(
-            "[suite.a]\nrun = {:?}\n\n[suite.b]\nrun = {:?}\n\n[suite.c]\nrun = {:?}\n",
-            nx(("PASS", "alpha::it"), ("FAIL", "beta::it"), 100),
-            nx(("FAIL", "beta::it"), ("PASS", "alpha::it"), 100),
-            nx(("PASS", "alpha::it"), ("PASS", "beta::it"), 0),
+            "[suite.s]\nrun = {:?}\n",
+            format!(
+                "m=$(cat mode); if [ $m = a ]; then {}; elif [ $m = b ]; then {}; else {}; fi",
+                nx(("PASS", "alpha::it"), ("FAIL", "beta::it"), 100),
+                nx(("FAIL", "beta::it"), ("PASS", "alpha::it"), 100),
+                nx(("PASS", "alpha::it"), ("PASS", "beta::it"), 0),
+            )
         ),
     )
     .unwrap();
-    let out = text(&prova(&d, &["run", "a"]));
+    let go = |mode: &str| {
+        std::fs::write(d.join("mode"), mode).unwrap();
+        text(&prova(&d, &["run", "s"]))
+    };
+    let out = go("a");
     assert!(out.contains("tests: 1 passed, 1 failed"), "{out}");
     assert!(out.contains("FAIL integ (beta::it)"), "{out}");
-    let out = text(&prova(&d, &["run", "b"]));
+    let out = go("b");
     assert!(out.contains("FAIL integ (beta::it)"), "{out}");
     assert!(out.contains("failed 1x before"), "{out}");
-    let out = text(&prova(&d, &["run", "c"]));
+    let out = go("c");
     assert!(
         out.contains("tests: 2 passed"),
         "two passing, one name: {out}"
