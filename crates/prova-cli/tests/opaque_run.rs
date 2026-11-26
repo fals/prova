@@ -973,7 +973,7 @@ fn tests_known_only_from_result_files_get_a_size() {
     let d = workspace("file-sizes");
     let script = |extra: &str| {
         format!(
-            "echo building; while [ $SECONDS -lt 4 ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
+            "echo building; SECONDS=0; while [ $SECONDS -lt 4 ]; do :; done; {extra} printf '<testsuite name=\"C\"><testcase classname=\"C\" name=\"a\"/><testcase classname=\"C\" name=\"b\"/></testsuite>' > junit.xml"
         )
     };
     prova(
