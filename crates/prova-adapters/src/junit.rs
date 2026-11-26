@@ -130,6 +130,10 @@ struct Frame {
     header_failed: u64,
     cases_failed: u64,
     has_child_suite: bool,
+    /// Catch2 (`hostname="tbd"`) and doctest (`status=` on test cases) put
+    /// the number of assertions in `tests=`: it says nothing about how many
+    /// test cases the file should hold.
+    counts_assertions: bool,
 }
 
 fn header_count(e: &BytesStart<'_>, name: &[u8]) -> u64 {
@@ -159,7 +163,7 @@ fn parse_junit(xml: &str) -> Result<(Vec<Case>, Vec<String>), ParseError> {
     // (a class that failed to initialize, a `ignoreFailures` build): the
     // gap is an error of the suite itself.
     let close_suite = |f: Frame, name: &str, out: &mut Vec<Case>, problems: &mut Vec<String>| {
-        if !f.has_child_suite && f.header_tests > f.cases {
+        if !f.has_child_suite && !f.counts_assertions && f.header_tests > f.cases {
             problems.push(format!(
                 "suite {name:?} counts {} tests in its header but the file holds {}",
                 f.header_tests, f.cases
@@ -236,6 +240,8 @@ fn parse_junit(xml: &str) -> Result<(Vec<Case>, Vec<String>), ParseError> {
                             header_tests: header_count(e, b"tests"),
                             header_failed: header_count(e, b"failures")
                                 + header_count(e, b"errors"),
+                            counts_assertions: attr(e, b"hostname").as_deref() == Some("tbd")
+                                || attr(e, b"assertions").is_some(),
                             ..Frame::default()
                         };
                         let name = attr(e, b"name").unwrap_or_default();
@@ -247,6 +253,11 @@ fn parse_junit(xml: &str) -> Result<(Vec<Case>, Vec<String>), ParseError> {
                         }
                     }
                     b"testcase" => {
+                        if attr(e, b"status").is_some()
+                            && let Some(f) = frames.last_mut()
+                        {
+                            f.counts_assertions = true;
+                        }
                         let c = Current {
                             name: attr(e, b"name").unwrap_or_default(),
                             classname: attr(e, b"classname"),
@@ -499,6 +510,38 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Catch2 and doctest put the number of assertions in `tests=`: a
+    /// passing run must stay verified, while a header that counts more tests
+    /// than a plain JUnit file holds is still incomplete.
+    #[test]
+    fn header_counts_of_assertion_counting_generators_are_not_missing_tests() {
+        let catch2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="exe" errors="0" failures="0" tests="12" hostname="tbd" time="0.003" timestamp="2024-05-01T10:00:00Z">
+    <testcase classname="exe.global" name="Factorial" time="0.001"/>
+    <testcase classname="exe.global" name="Sum" time="0.001"/>
+    <system-out/>
+    <system-err/>
+  </testsuite>
+</testsuites>"#;
+        let (cases, problems) = parse_checked(catch2).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert!(problems.is_empty(), "{problems:?}");
+        let doctest = r#"<testsuites>
+  <testsuite name="exe" errors="0" failures="0" tests="9">
+    <testcase classname="a.cpp" name="adds" status="run"/>
+    <testcase classname="a.cpp" name="subs" status="run"/>
+  </testsuite>
+</testsuites>"#;
+        let (_, problems) = parse_checked(doctest).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        // The truncated plain JUnit file still warns.
+        let plain = r#"<testsuite name="s" tests="2" errors="0" failures="0">
+            <testcase classname="s" name="a" time="0.1"/></testsuite>"#;
+        let (_, problems) = parse_checked(plain).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     /// Round 14: a suite's header counts an error no test case shows (a
