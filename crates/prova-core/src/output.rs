@@ -172,13 +172,25 @@ pub fn plain(line: &str) -> std::borrow::Cow<'_, str> {
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            if chars.clone().next() == Some('[') {
-                chars.next();
-                for d in chars.by_ref() {
-                    if ('@'..='~').contains(&d) {
-                        break;
+            match chars.clone().next() {
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
                     }
                 }
+                // A charset designation (`ESC ( B`, which cargo prints with
+                // colour) is three bytes, a keypad or reset sequence two.
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                    chars.next();
+                }
+                Some('=' | '>' | '7' | '8' | 'c') => {
+                    chars.next();
+                }
+                _ => {}
             }
         } else {
             out.push(c);
@@ -790,6 +802,16 @@ mod tests {
             d.push(l);
         }
         d.finish(passed)
+    }
+
+    #[test]
+    fn plain_strips_charset_designations_cargo_emits_with_colour() {
+        // `cargo test --color always` prints ESC ( B (US-ASCII designation)
+        // around its colour sequences: "ESC(B ESC[0m test a ... ok".
+        let raw = "\u{1b}(B\u{1b}[0mtest tests::a ... \u{1b}(B\u{1b}[0;32mok\u{1b}(B\u{1b}[m";
+        assert_eq!(plain(raw), "test tests::a ... ok");
+        assert_eq!(plain("a\u{1b}=b\u{1b}>c"), "abc");
+        assert_eq!(plain("a\u{1b}"), "a");
     }
 
     #[test]
