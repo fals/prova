@@ -170,16 +170,15 @@ fn integration_tests_of_two_crates_keep_their_crate_not_their_order() {
     );
 }
 
-/// Round 17 (probe B4): pytest names tests from its rootdir, so
-/// `sub2/tests/test_calc.py::test_flaky` and the root's
-/// `tests/test_calc.py::test_flaky` were both `tests.test_calc::test_flaky`.
-/// Ids are read from prova's working directory.
+/// Round 17 (probe B4), ADR 0037: pytest prints ids relative to the directory
+/// it ran in, not to its rootdir: the place is the directory prova started
+/// the run in, whatever rootdir below the repository the header prints. A
+/// rootdir printed through a symlink of the repository (macOS `/var` is
+/// `/private/var`) is still inside it, not an unknown place.
 #[test]
 fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     let d = workspace("pyroot");
     std::fs::create_dir_all(d.join("sub2")).unwrap();
-    // The rootdir printed through a symlink of the working directory (macOS
-    // temp dirs: `/var` is `/private/var`) is still below it.
     let link = PathBuf::from(format!("{}.link", d.display()));
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(&d, &link).unwrap();
@@ -207,22 +206,17 @@ fn pytest_ids_are_relative_to_the_working_directory_not_the_rootdir() {
     prova(&d, &["run", "root"]);
     let out = text(&prova(&d, &["run", "sub"]));
     assert!(
-        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
+        out.contains("FAIL tests.test_calc::test_flaky") && !out.contains("sub2.tests"),
         "named from the working directory: {out}"
     );
-    let all = text(&prova(&d, &["history", ""]));
-    assert!(
-        all.contains("sub2.tests.test_calc::test_flaky")
-            && all.contains("  tests.test_calc::test_flaky")
-            && !all.contains("second result"),
-        "{all}"
-    );
+    assert!(!out.contains("outside the repository"), "{out}");
 }
 
 /// Round 17 follow-up: pytest prints ids relative to the directory it runs
 /// in (`cwd_relative_nodeid`), not to its rootdir, and `-q` prints no
-/// rootdir at all. prova checks which directory holds the test's file:
-/// the working directory, a `cd` in the command, the rootdir.
+/// rootdir at all. The place is the directory the run started in, relative
+/// to the repository, whatever the rootdir is; a `cd` in the command is not
+/// read (ADR 0037).
 #[test]
 fn pytest_ids_are_named_from_the_directory_pytest_ran_in() {
     let d = workspace("pydir");
@@ -245,11 +239,6 @@ fn pytest_ids_are_named_from_the_directory_pytest_ran_in() {
     let suites = [
         // `pytest -v sub2/tests` from the root: rootdir sub2, ids from the root.
         ("verbose", verbose("sub2/tests/test_calc.py::test_flaky")),
-        // `cd sub2 && pytest -q tests`: no rootdir printed.
-        (
-            "cdquiet",
-            format!("cd sub2 && {}", quiet("tests/test_calc.py::test_flaky")),
-        ),
         // `pytest -q` at the root.
         ("rootquiet", quiet("tests/test_calc.py::test_flaky")),
     ];
@@ -264,29 +253,20 @@ fn pytest_ids_are_named_from_the_directory_pytest_ran_in() {
         "{out}"
     );
     assert!(!out.contains("sub2.sub2"), "{out}");
-    let out = text(&prova(&d, &["run", "cdquiet"]));
-    assert!(
-        out.contains("FAIL sub2.tests.test_calc::test_flaky"),
-        "{out}"
-    );
     let out = text(&prova(&d, &["run", "rootquiet"]));
     assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
     assert!(!out.contains("sub2"), "{out}");
 }
 
-/// When the directory pytest ran in cannot be told (two `cd` targets hold
-/// the file), the test's place is unknown: it is said, and no quarantine of
+/// When pytest's rootdir lies outside the repository (a path inside a
+/// container), the test's place is unknown: it is said, and no quarantine of
 /// another directory's test of that id sets its failure aside.
 #[test]
 fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
     let d = workspace("pyunknown");
-    for dir in ["tests", "sub2/tests", "sub3/tests"] {
-        std::fs::create_dir_all(d.join(dir)).unwrap();
-        std::fs::write(d.join(dir).join("test_calc.py"), "").unwrap();
-    }
-    let out = |outcome: &str, code: u8| {
+    let out = |root: &str, outcome: &str, code: u8| {
         format!(
-            "{BUSY} printf '%s\\n' 'tests/test_calc.py::test_flaky {outcome} [100%]' '=== 1 {} in 0.01s ==='; exit {code}",
+            "{BUSY} printf '%s\\n' 'rootdir: {root}' 'tests/test_calc.py::test_flaky {outcome} [100%]' '=== 1 {} in 0.01s ==='; exit {code}",
             outcome.to_lowercase()
         )
     };
@@ -294,8 +274,8 @@ fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
         d.join("prova.toml"),
         format!(
             "[suite.root]\nrun = {:?}\n\n[suite.two]\nrun = {:?}\n",
-            out("PASSED", 0),
-            format!("(cd sub2; true); cd sub3; {}", out("FAILED", 1)),
+            out(&d.display().to_string(), "PASSED", 0),
+            out("/w", "FAILED", 1),
         ),
     )
     .unwrap();
@@ -314,7 +294,7 @@ fn a_pytest_test_of_unknown_directory_is_not_set_aside_by_a_quarantine() {
     let o = prova(&d, &["run", "two"]);
     let out = text(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
-    assert!(out.contains("cannot tell which test is which"), "{out}");
+    assert!(out.contains("rootdir is outside the repository"), "{out}");
     assert!(out.contains("FAIL tests.test_calc::test_flaky"), "{out}");
     assert!(!out.contains("test_flaky failed (r"), "{out}");
     // The quarantine line says what happened to it, not "not seen".
@@ -414,7 +394,7 @@ fn quarantine_in_takes_the_place_in_each_frameworks_form() {
         ),
         (
             "test_flaky",
-            "printf '%s\\n' 'rootdir: /x' 'tests/test_calc.py::test_flaky PASSED [ 50%]' 'sub/tests/test_calc.py::test_flaky FAILED [100%]' '' '=== 1 failed, 1 passed in 0.01s ==='; exit 1",
+            "printf '%s\\n' 'tests/test_calc.py::test_flaky PASSED [ 50%]' 'sub/tests/test_calc.py::test_flaky FAILED [100%]' '' '=== 1 failed, 1 passed in 0.01s ==='; exit 1",
             &[
                 ("tests/test_calc.py", "tests.test_calc::test_flaky"),
                 ("tests.test_calc", "tests.test_calc::test_flaky"),

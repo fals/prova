@@ -32,10 +32,7 @@ pub struct Recognizers {
     pub repo_root: Option<std::path::PathBuf>,
     /// pytest's rootdir as its header printed it (`-q` prints none).
     pytest_root: Option<std::path::PathBuf>,
-    /// The run's command line: a `cd` in it moves pytest, whose ids are
-    /// relative to the directory it runs in.
-    pub command: Option<String>,
-    /// Where pytest ran, as a path below the working directory (`sub2`):
+    /// Where pytest ran, as a path below the repository root (`sub2`):
     /// put before its ids. Settled on the first id.
     pytest_dir: std::cell::OnceCell<PytestDir>,
     /// gotestsum `pkgname`: each package's last status line (`✓`/`✖`), the
@@ -1213,154 +1210,27 @@ impl Recognizers {
         self.pytest_root = Some(std::path::PathBuf::from(dir));
     }
 
-    /// Where pytest ran. The terminal ids of pytest are relative to the
-    /// directory it runs in, not to its rootdir (`cwd_relative_nodeid`), and
-    /// `-q` prints no rootdir: the directory is the one that holds the id's
-    /// file. Without a `cd` in the command that is the working directory;
-    /// with one, its target; then the rootdir; then any directory below.
-    /// When these cannot tell, the place is unknown and said so.
-    fn pytest_dir(&self, id: &str) -> &PytestDir {
+    /// Where pytest ran: its ids are relative to the directory it ran in,
+    /// the one the run started in. A `rootdir:` header outside the
+    /// repository (a path inside a container) leaves the place unknown.
+    fn pytest_dir(&self) -> &PytestDir {
         self.pytest_dir.get_or_init(|| {
-            let Some(cwd) = &self.cwd else {
-                return PytestDir::Prefix(String::new());
-            };
-            let file = id.split("::").next().unwrap_or(id);
-            // Either path may run through a symlink (macOS `/var` is
-            // `/private/var`): compare them resolved.
-            let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            let base = canon(cwd);
-            let has = |dir: &std::path::Path| dir.join(file).is_file();
-            let rel = |dir: &std::path::Path| {
-                canon(dir)
-                    .strip_prefix(&base)
-                    .ok()
-                    .map(|r| r.to_string_lossy().trim_matches('/').to_owned())
-            };
-            // Through a container client the directory pytest ran in is the
-            // container's: the client's mount maps it under the repository.
-            if let Some(dir) = self.container_dir()
-                && has(&dir)
-                && let Some(p) = rel(&dir)
-            {
-                return PytestDir::Prefix(p);
+            let outside = self.pytest_root.as_ref().is_some_and(|root| {
+                let Some(base) = self.repo_root.as_ref().or(self.cwd.as_ref()) else {
+                    return false;
+                };
+                // Either path may run through a symlink (macOS `/var` is
+                // `/private/var`): compare them resolved.
+                let canon =
+                    |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(root).strip_prefix(canon(base)).is_err()
+            });
+            if outside {
+                PytestDir::Unknown
+            } else {
+                PytestDir::Prefix(self.start_prefix())
             }
-            let moved: Vec<String> = self
-                .command
-                .as_deref()
-                .map(cd_targets)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|t| {
-                    let dir = base.join(t);
-                    (dir.is_dir() && has(&dir)).then(|| rel(&dir)).flatten()
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            match moved.as_slice() {
-                [one] => return PytestDir::Prefix(one.clone()),
-                [] => {}
-                _ => return PytestDir::Unknown,
-            }
-            if has(&base) {
-                return PytestDir::Prefix(String::new());
-            }
-            if let Some(p) = self.pytest_root.as_deref().filter(|r| has(r)).and_then(rel) {
-                return PytestDir::Prefix(p);
-            }
-            let below = dirs_holding(&base, file);
-            match below.as_slice() {
-                [one] => return PytestDir::Prefix(rel(one).unwrap_or_default()),
-                [] => {}
-                _ => return PytestDir::Unknown,
-            }
-            // Nothing on disk to check (a container, another machine): the
-            // rootdir below the working directory, as before.
-            PytestDir::Prefix(
-                self.pytest_root
-                    .as_deref()
-                    .and_then(rel)
-                    .unwrap_or_default(),
-            )
         })
-    }
-
-    /// The host directory a container client's `-w`/pytest's rootdir names:
-    /// the container path under one of the `-v host:container` mounts (or
-    /// `--mount src=..,dst=..`) of the command.
-    fn container_dir(&self) -> Option<std::path::PathBuf> {
-        let cwd = self.cwd.as_ref()?;
-        let cmd = self.command.as_deref()?;
-        // Words without their quotes: `-v "$PWD":/w` is `-v $PWD:/w`.
-        let all: Vec<String> = cmd
-            .split_whitespace()
-            .map(|w| {
-                w.chars()
-                    .filter(|c| *c != '"' && *c != '\'')
-                    .collect::<String>()
-            })
-            .filter(|w| !w.is_empty())
-            .collect();
-        // Only the client's own options count (`docker run ... IMAGE`):
-        // pytest's `-v` after the image is not a volume.
-        let words: Vec<&str> = docker_options(&all);
-        let host_of = |h: &str| {
-            let h = h
-                .replace("${PWD}", &cwd.to_string_lossy())
-                .replace("$PWD", &cwd.to_string_lossy())
-                .replace("$(pwd)", &cwd.to_string_lossy());
-            let p = std::path::PathBuf::from(&h);
-            if p.is_absolute() { p } else { cwd.join(p) }
-        };
-        let mut mounts: Vec<(std::path::PathBuf, String)> = Vec::new();
-        let mut workdir: Option<String> = None;
-        for (i, w) in words.iter().enumerate() {
-            let next = words.get(i + 1).copied();
-            match *w {
-                "-v" | "--volume" => {
-                    if let Some((h, rest)) = next.and_then(|n| n.split_once(':')) {
-                        let c = rest.split(':').next().unwrap_or(rest);
-                        mounts.push((host_of(h), c.to_owned()));
-                    }
-                }
-                "-w" | "--workdir" => workdir = next.map(str::to_owned),
-                "--mount" => {
-                    let kv = |k: &[&str]| {
-                        next?.split(',').find_map(|p| {
-                            let (a, b) = p.split_once('=')?;
-                            k.contains(&a).then(|| b.to_owned())
-                        })
-                    };
-                    if let (Some(h), Some(c)) = (kv(&["src", "source"]), kv(&["dst", "target"])) {
-                        mounts.push((host_of(&h), c));
-                    }
-                }
-                other => {
-                    if let Some(v) = other
-                        .strip_prefix("--workdir=")
-                        .or_else(|| other.strip_prefix("-w="))
-                    {
-                        workdir = Some(v.to_owned());
-                    }
-                }
-            }
-        }
-        let at = self
-            .pytest_root
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .or(workdir)?;
-        mounts
-            .iter()
-            .filter(|(_, c)| {
-                let c = c.trim_end_matches('/');
-                at == c || at.starts_with(&format!("{c}/"))
-            })
-            .max_by_key(|(_, c)| c.len())
-            .map(|(h, c)| {
-                let rest = at[c.trim_end_matches('/').len()..].trim_start_matches('/');
-                h.join(rest)
-            })
     }
 
     /// Whether Vitest's root lies below the working directory.
@@ -1378,20 +1248,11 @@ impl Recognizers {
         if !(id.contains("::") || id.ends_with(".py")) {
             return pytest_key(id);
         }
-        let start = self.start_prefix();
-        match self.pytest_dir(id) {
-            PytestDir::Prefix(p) if !p.is_empty() || !start.is_empty() => {
-                let dir = [start.as_str(), p.as_str()]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                pytest_key(&format!("{dir}/{id}"))
-            }
+        match self.pytest_dir() {
+            PytestDir::Prefix(p) if !p.is_empty() => pytest_key(&format!("{p}/{id}")),
             PytestDir::Prefix(_) => pytest_key(id),
-            // Another directory's test of the same id must never be taken
-            // for this one: its place is marked, and no quarantine covers it.
+            // A rootdir outside the repository: the place is marked unknown
+            // and never shares a history or a quarantine.
             PytestDir::Unknown => {
                 let mut key = pytest_key(id);
                 key.file = Some(prova_core::model::UNKNOWN_PLACE.to_owned());
@@ -2265,14 +2126,14 @@ impl Recognizers {
             r.strip_suffix(" stdout ----")
                 .or_else(|| r.strip_suffix(" stderr ----"))
         }) {
-            self.close_libtest_block(out);
+            self.close_libtest_block();
             self.libtest_block = Some((self.libtest_key(name.trim()), Vec::new()));
             return true;
         }
         if self.libtest_block.is_some() {
             let t = line.trim();
             if t == "failures:" || t.starts_with("test result:") {
-                self.close_libtest_block(out);
+                self.close_libtest_block();
             } else if let Some((_, lines)) = self.libtest_block.as_mut() {
                 lines.push(line.to_owned());
                 return true;
@@ -3445,96 +3306,15 @@ impl Recognizers {
         self.finished(key, Outcome::Failed, ms, msg, Level::Recognized, out);
     }
 
-    /// The failure block of a libtest test is over. A test whose place was
-    /// unknown (`cargo test --quiet` prints no `Running` line) is told by
-    /// the path its panic message names: that place replaces the unknown one
-    /// (ADR 0035 section 1), so another crate's test of the same name never
-    /// lends its history.
-    fn close_libtest_block(&mut self, out: &mut Vec<EventKind>) {
-        let Some((mut key, lines)) = self.libtest_block.take() else {
+    /// The failure block of a libtest test is over: its output is kept
+    /// with the test.
+    fn close_libtest_block(&mut self) {
+        let Some((key, lines)) = self.libtest_block.take() else {
             return;
         };
         let text = lines.join("\n").trim().to_owned();
-        if key.file.is_none()
-            && !self.holding
-            && let Some(place) = self.panic_place(&text, &key.name)
-            && let Some((_, Outcome::Failed | Outcome::Errored)) = self.seen.get(&key.unique())
-        {
-            let old = key.clone();
-            key.file = Some(place);
-            out.push(EventKind::TestFinished {
-                test: key.clone(),
-                attempt: 1,
-                outcome: Outcome::Failed,
-                duration_ms: None,
-                message: None,
-                source: Level::Recognized,
-                subtest: false,
-                passed_in_iteration: false,
-            });
-            out.push(EventKind::TestSuperseded {
-                test: old,
-                by: key.clone(),
-            });
-        }
         if !text.is_empty() {
             self.failure_output.push((key, text));
-        }
-    }
-
-    /// The place (test binary, as nextest names it) a panic message's path
-    /// gives: `geo/src/lib.rs` is `geo`, `geo/tests/it.rs` is `geo::it`.
-    /// `None` without the file on disk (a container) or a package around it.
-    fn panic_place(&self, text: &str, test: &str) -> Option<String> {
-        let path = text.lines().find_map(|l| {
-            let (_, rest) = l.split_once(" panicked at ")?;
-            let mut parts = rest.trim().trim_end_matches(':').rsplitn(3, ':');
-            let (_col, _line, file) = (parts.next()?, parts.next()?, parts.next()?);
-            Some(file.to_owned())
-        })?;
-        let bases = [self.cwd.as_ref(), self.repo_root.as_ref()];
-        let abs = bases
-            .into_iter()
-            .flatten()
-            .map(|b| b.join(&path))
-            .find(|p| p.is_file())?;
-        let stop = self.repo_root.as_ref().or(self.cwd.as_ref())?;
-        // Only a file of this repository's own code, not a dependency's, and
-        // only the file that holds the test itself: a panic inside a helper
-        // crate or library code names where the failure surfaced, not where
-        // the test lives. When unsure the place stays unknown.
-        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let abs = canon(&abs);
-        let stop = canon(stop);
-        let rel_to_repo = abs.strip_prefix(&stop).ok()?;
-        if rel_to_repo.components().any(|c| c.as_os_str() == ".cargo") {
-            return None;
-        }
-        let leaf = test.rsplit("::").next().unwrap_or(test);
-        let source = std::fs::read_to_string(&abs).ok()?;
-        if !source.contains(&format!("fn {leaf}(")) {
-            return None;
-        }
-        let mut dir = abs.parent()?.to_path_buf();
-        loop {
-            if let Ok(toml) = std::fs::read_to_string(dir.join("Cargo.toml"))
-                && let Some(name) = cargo_package_name(&toml)
-            {
-                let krate = name.replace('-', "_");
-                let rel = abs.strip_prefix(&dir).ok()?;
-                let mut comps = rel.components();
-                return match (comps.next(), comps.next(), comps.next()) {
-                    (Some(a), Some(b), None) if a.as_os_str() == "tests" => {
-                        let stem = std::path::Path::new(b.as_os_str()).file_stem()?;
-                        Some(format!("{krate}::{}", stem.to_string_lossy()))
-                    }
-                    (Some(a), ..) if a.as_os_str() == "src" => Some(krate),
-                    _ => None,
-                };
-            }
-            if dir == stop || !dir.pop() {
-                return None;
-            }
         }
     }
 
@@ -3569,7 +3349,7 @@ impl Recognizers {
         self.flush_gotestsum(&mut gts);
         if matches!(self.pytest_dir.get(), Some(PytestDir::Unknown)) {
             gts.push(EventKind::RunNote {
-                message: "pytest's test ids are relative to the directory it ran in, and more than one directory holds that file: prova cannot tell which test is which. No quarantine covers them, and their history is kept apart. Run pytest from one directory, or give the file path from the working directory.".into(),
+                message: "pytest's rootdir is outside the repository: prova cannot tell where its tests live. No quarantine covers them and they share no history.".into(),
             });
         }
         self.gotestsum_reruns_passed(&mut gts);
@@ -3592,7 +3372,7 @@ impl Recognizers {
         }
         self.close_pass_output();
         self.close_libtest_running(&mut gts);
-        self.close_libtest_block(&mut gts);
+        self.close_libtest_block();
         let mut held_pass = Vec::new();
         self.surefire_flush(&mut held_pass);
         self.jest_close_file(&mut held_pass);
@@ -3867,122 +3647,6 @@ fn nextest_binary(id: &str) -> String {
 enum PytestDir {
     Prefix(String),
     Unknown,
-}
-
-/// The words of a container client's own options in a command line: after
-/// `docker run` (or `podman run`/`exec`) up to the image. Empty without one.
-fn docker_options(words: &[String]) -> Vec<&str> {
-    // Options that take their value as the next word.
-    const VALUED: &[&str] = &[
-        "-v",
-        "--volume",
-        "-w",
-        "--workdir",
-        "--mount",
-        "-e",
-        "--env",
-        "-u",
-        "--user",
-        "--name",
-        "-p",
-        "--publish",
-        "--network",
-        "--net",
-        "--entrypoint",
-        "-h",
-        "--hostname",
-        "--env-file",
-        "--platform",
-        "--cpus",
-        "-m",
-        "--memory",
-        "--label",
-        "-l",
-        "--add-host",
-        "--tmpfs",
-        "--device",
-        "--group-add",
-        "--cap-add",
-        "--cap-drop",
-        "--security-opt",
-        "--shm-size",
-        "--ulimit",
-        "--pull",
-        "--restart",
-        "--runtime",
-    ];
-    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
-    let Some(at) = words
-        .iter()
-        .position(|w| matches!(base(w).as_str(), "docker" | "podman" | "nerdctl"))
-    else {
-        return Vec::new();
-    };
-    let mut rest = words[at + 1..].iter();
-    if !matches!(
-        rest.next().map(String::as_str),
-        Some("run" | "exec" | "create")
-    ) {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    while let Some(w) = rest.next() {
-        if !w.starts_with('-') {
-            break; // the image
-        }
-        out.push(w.as_str());
-        if VALUED.contains(&w.as_str())
-            && let Some(v) = rest.next()
-        {
-            out.push(v.as_str());
-        }
-    }
-    out
-}
-
-/// The words after `cd` or `pushd` in a command line: where it may move.
-fn cd_targets(command: &str) -> Vec<String> {
-    prova_core::config::cd_targets(command)
-}
-
-/// The directories below `base` (a few levels, no hidden or vendored ones)
-/// that hold the file.
-fn dirs_holding(base: &std::path::Path, file: &str) -> Vec<std::path::PathBuf> {
-    const SKIP: &[&str] = &[
-        "node_modules",
-        "target",
-        "venv",
-        "site-packages",
-        "__pycache__",
-    ];
-    let mut found = Vec::new();
-    let mut level = vec![base.to_path_buf()];
-    for _ in 0..4 {
-        let mut next = Vec::new();
-        for dir in &level {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || SKIP.contains(&name.as_str()) {
-                    continue;
-                }
-                let path = e.path();
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    if path.join(file).is_file() {
-                        found.push(path.clone());
-                    }
-                    next.push(path);
-                }
-            }
-        }
-        level = next;
-        if found.len() > 1 {
-            break;
-        }
-    }
-    found
 }
 
 /// `name` of the `[package]` table of a Cargo.toml (a workspace-only
