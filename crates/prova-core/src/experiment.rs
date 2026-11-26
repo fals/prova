@@ -697,7 +697,7 @@ pub fn add_variant(
         // git there is nothing to snapshot: the variant keeps running in the
         // working tree as before. A snapshot is stored as a `ref` variant
         // (the schema ties a commit to that kind); its `code` keeps the
-        // working-tree identity, `+dirty` included.
+        // working-tree content's tree id.
         None => {
             let sha = snapshot(store, exp, name)?;
             let kind = if sha.is_some() { "ref" } else { "workdir" };

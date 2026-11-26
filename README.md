@@ -26,7 +26,7 @@ people who run them.
 ```console
 $ prova run --until first-failure -- make test
 run 3fa9c1d2  suite cmd:38dcb90d  `make test`
-FAILING (run still going)  1.2s  level recognized output  code tree:4e1f0c..+dirty:9a2b..
+FAILING (run still going)  1.2s  level recognized output  code tree:9a2b7c..
   FAIL calc::divides [new failure, last passed at tree:4e1f0c..]: expected 4, got 16
   FAIL calc::flaky_clock [failed 3x before, FLAKY]: clock tick landed on a bad boundary
 next: fix and rerun, or `prova cancel 3fa9c1d2`; `prova wait 3fa9c1d2 --after 14` to keep watching
