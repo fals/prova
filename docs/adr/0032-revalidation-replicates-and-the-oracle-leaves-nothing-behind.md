@@ -1,6 +1,6 @@
 # 0032: A revalidation replicates and adds no comparison; the oracle leaves nothing behind; recording a result does not read the whole history
 
-Status: Accepted (2026-11-25). Amends [0007](0007-experiments.md) (Holm family and the re-validation of the winner), [0021](0021-verdicts-under-adversarial-candidates.md) (what a candidate may change; its Consequences) and [0023](0023-evidence-hygiene-and-experiment-isolation.md) (its same-user limit).
+Status: Accepted (2026-11-25). Amends [0007](0007-experiments.md) (Holm family and the re-validation of the winner), [0021](0021-verdicts-under-adversarial-candidates.md) (what a candidate may change; its Consequences) and [0023](0023-evidence-hygiene-and-experiment-isolation.md) (its same-user limit). Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

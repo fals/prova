@@ -10,6 +10,7 @@
 [Getting started](docs/getting-started.md) •
 [For agents](#for-agents) •
 [Architecture](docs/architecture.md) •
+[Scope](docs/scope.md) •
 [Vision](docs/vision.md)
 
 </div>

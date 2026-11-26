@@ -15,6 +15,7 @@
 
 ## Understand prova
 
+- [Scope](docs/scope.md): what prova promises and what it does not (no guessing of unnamed containers, test places or adversarial experiment candidates)
 - [Architecture](docs/architecture.md): components, code map, diagrams of the test loop, liveness, storage, experiments, invariants
 - [Vision](docs/vision.md): the problem statement
 

@@ -1,6 +1,6 @@
 # 0023: Evidence hygiene for test history; more isolation between arms
 
-Status: Accepted (2026-11-23). Amends [0022](0022-checkouts-load-and-impossible-results.md) (failing now, scope, isolation), [0021](0021-verdicts-under-adversarial-candidates.md) (`--change`) and [0017](0017-no-false-passes.md) (more causes of an unverified pass).
+Status: Accepted (2026-11-23). Amends [0022](0022-checkouts-load-and-impossible-results.md) (failing now, scope, isolation), [0021](0021-verdicts-under-adversarial-candidates.md) (`--change`) and [0017](0017-no-false-passes.md) (more causes of an unverified pass). Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

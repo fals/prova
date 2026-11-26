@@ -1,6 +1,6 @@
 # 0035: Places come from the repository; history compares like with like; containers are claimed once; experiments close runner configs
 
-Status: Accepted (2026-11-25). Amends [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) §2 and §4, [0033](0033-places-are-checked-on-disk-and-quarantines-keep-them.md), and [0032](0032-revalidation-replicates-and-the-oracle-leaves-nothing-behind.md) §1 and §2.
+Status: Accepted (2026-11-25). Amends [0031](0031-quarantine-needs-one-runner-call-and-tests-keep-their-place.md) §2 and §4, [0033](0033-places-are-checked-on-disk-and-quarantines-keep-them.md), and [0032](0032-revalidation-replicates-and-the-oracle-leaves-nothing-behind.md) §1 and §2. Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 

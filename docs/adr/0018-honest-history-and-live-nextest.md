@@ -1,6 +1,6 @@
 # 0018: Honest history labels, and nextest results while they happen
 
-Status: Accepted (2026-11-23). Amends [0006](0006-identity-history-flakiness.md) (what one test's history is; which runs count) and [0017](0017-no-false-passes.md) (what a thin pass says). Amended by [0036](0036-a-flaky-flip-happens-within-one-suite.md): flaky flips count within one suite.
+Status: Accepted (2026-11-23). Amends [0006](0006-identity-history-flakiness.md) (what one test's history is; which runs count) and [0017](0017-no-false-passes.md) (what a thin pass says). Amended by [0036](0036-a-flaky-flip-happens-within-one-suite.md): flaky flips count within one suite. Superseded in part by [0037](0037-prova-keeps-what-it-can-know.md).
 
 ## Context
 
